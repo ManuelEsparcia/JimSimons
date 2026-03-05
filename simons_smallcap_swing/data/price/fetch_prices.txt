@@ -1,0 +1,193 @@
+Modulo: data/price/fetch_prices.py
+
+1) Objetivo
+Este modulo descarga y normaliza precios diarios OHLCV (y campos auxiliares disponibles) para el universo de small caps de EE. UU. en un rango temporal definido, garantizando trazabilidad, reproducibilidad y consistencia temporal (point-in-time) para etapas posteriores (ajustes, features, labels, backtest).
+
+2) Alcance
+Incluye:
+- Descarga incremental por simbolo y rango de fechas.
+- Estandarizacion de esquema de columnas.
+- Validaciones basicas de integridad en ingestion.
+- Persistencia en formato canonico (parquet) con metadatos de run.
+- Registro de cobertura y fallos por ticker.
+
+No incluye:
+- Ajustes corporativos finales (split/dividend adjustment): lo hara adjust_prices.py.
+- QC estadistico profundo: lo hara qc_prices.py.
+- Construccion del universo: lo hara data/universe/*.
+
+3) Dependencias aguas arriba y aguas abajo
+Upstream:
+- Universo de tickers PIT (lista efectiva por fecha o snapshot de trabajo).
+- Calendario de mercado (sesiones).
+- Configuracion de proveedor de datos.
+
+Downstream:
+- data/price/adjust_prices.py
+- data/price/qc_prices.py
+- features/build_features.py
+- labels/build_labels.py
+
+4) Contrato de entrada
+Entrada minima requerida:
+- tickers: lista de simbolos (string) o ruta a dataset de universo.
+- start_date: fecha inicio (YYYY-MM-DD).
+- end_date: fecha fin (YYYY-MM-DD).
+- provider: identificador de proveedor ("polygon", "tiingo", "stooq", etc; configurable).
+- frequency: "1d" (en esta fase solo diario).
+- force_full_refresh: bool (opcional, default false).
+- run_id: identificador unico de corrida.
+
+Parametros opcionales:
+- chunk_size_tickers: tamano de lote para peticiones.
+- request_timeout_sec
+- max_retries
+- backoff_base_sec
+- rate_limit_qps
+- exchange_filter (si aplica)
+
+5) Contrato de salida
+Dataset principal (raw prices canonical):
+Ruta sugerida:
+- data/price/raw/provider={provider}/freq=1d/date={asof_date}/part-*.parquet
+
+Columnas minimas esperadas:
+- symbol (string)
+- date (date, timezone-naive en calendario de mercado)
+- open (float64)
+- high (float64)
+- low (float64)
+- close (float64)
+- volume (float64 o int64 segun proveedor)
+- vwap (float64, nullable)
+- trades_count (int64, nullable)
+- source_provider (string)
+- ingest_ts_utc (timestamp)
+- run_id (string)
+
+Constraints:
+- PK logica: (symbol, date, source_provider)
+- Sin duplicados por PK logica.
+- date dentro de [start_date, end_date].
+- Tipos consistentes con schema central.
+
+Artefactos auxiliares:
+- coverage_report.{json|parquet}: cobertura por ticker (dias esperados vs recibidos).
+- failures_report.{json|parquet}: errores por ticker/codigo HTTP/mensaje.
+- run_manifest.json: parametros, version de codigo, hash de config, conteos.
+
+6) Reglas de negocio
+- No usar informacion futura: solo barras historicas publicadas para cada date.
+- Si el proveedor entrega timestamps intradia, agregarlos/normalizarlos a sesion diaria oficial.
+- Normalizar simbolos a un formato canonico (uppercase, trim).
+- Mantener datos faltantes como null cuando aplique; no imputar aqui.
+- Reintentos solo para errores transitorios (timeouts, 429, 5xx).
+- Errores permanentes (404, simbolo invalido) se reportan y se continua.
+
+7) Flujo del proceso (alto nivel)
+1. Cargar config y validar argumentos.
+2. Resolver lista efectiva de tickers.
+3. Particionar tickers por lotes.
+4. Para cada ticker:
+   - Resolver rango incremental (si existe historico local).
+   - Solicitar datos al proveedor con retries y rate limit.
+   - Parsear respuesta al schema canonico.
+   - Aplicar validaciones de ingestion (campos obligatorios y tipos).
+5. Concatenar resultados y eliminar duplicados por PK logica.
+6. Persistir parquet particionado.
+7. Generar reportes de cobertura/fallos.
+8. Emitir metricas de run (filas, tickers ok, tickers fail, latencia, etc).
+
+8) Validaciones minimas en ingestion
+Por fila:
+- high >= max(open, close, low) cuando todos no-null.
+- low <= min(open, close, high) cuando todos no-null.
+- volume >= 0.
+- date parseable y dentro de rango.
+
+Por ticker:
+- Fechas monotonicas ascendentes.
+- Sin duplicados de date.
+- Porcentaje de dias faltantes reportado (no necesariamente bloqueante).
+
+9) Estrategia incremental
+- Si force_full_refresh=false:
+  - Detectar ultima fecha disponible local por ticker.
+  - Descargar solo desde max(local_date + 1, start_date).
+- Si force_full_refresh=true:
+  - Reingestar rango completo solicitado.
+- Nunca sobrescribir silenciosamente sin versionado de run.
+
+10) Manejo de errores y observabilidad
+Errores recuperables:
+- timeout, 429, 5xx -> retry con backoff exponencial y jitter.
+
+Errores no recuperables:
+- simbolo inexistente/formato invalido.
+- credenciales invalidas (fallo global).
+- schema incompatible del proveedor (fail-fast configurable).
+
+Logging estructurado:
+- nivel INFO: progreso por lote.
+- nivel WARNING: gaps/cobertura baja.
+- nivel ERROR: ticker fallido con causa.
+
+Metricas recomendadas:
+- total_tickers, tickers_ok, tickers_failed
+- rows_ingested
+- pct_missing_sessions_avg
+- provider_http_error_rate
+- run_duration_sec
+
+11) Interfaz de ejecucion (CLI sugerida)
+python -m data.price.fetch_prices ^
+  --provider polygon ^
+  --start-date 2014-01-01 ^
+  --end-date 2026-03-01 ^
+  --universe-path data/universe/current.parquet ^
+  --frequency 1d ^
+  --run-id fetch_prices_20260305_001
+
+12) Estructura interna recomendada (funciones)
+- load_config(...)
+- load_universe_tickers(...)
+- get_incremental_window(symbol, start_date, end_date, ...)
+- fetch_symbol_prices(symbol, start_date, end_date, provider_client, ...)
+- normalize_provider_frame(df_raw, provider)
+- validate_ingestion_frame(df_symbol)
+- persist_prices(df_all, output_path, partition_cols)
+- build_coverage_report(df_all, expected_calendar, tickers)
+- build_failures_report(errors)
+- main()
+
+13) Criterios de aceptacion (Definition of Done)
+- Ejecuta end-to-end sin caidas por errores de uno o pocos tickers.
+- Genera dataset parquet con schema canonico y sin duplicados de PK.
+- Produce reportes de cobertura y errores consumibles por QC.
+- Soporta modo incremental y full refresh.
+- Logs y metricas suficientes para auditar una corrida.
+- Reproducible por run_id + config hash.
+
+14) Casos de prueba minimos (para tests/)
+- Caso feliz: 3 tickers, rango corto, salida con columnas correctas.
+- Retry: proveedor responde 429/5xx y luego exito.
+- Error permanente: ticker invalido queda en failures_report.
+- Incremental: segunda corrida solo trae fechas nuevas.
+- Duplicados en respuesta proveedor: deduplica correctamente.
+- Schema drift: columna inesperada/ausente segun politica configurada.
+
+15) Riesgos y decisiones abiertas
+- Definir proveedor primario y fallback (coste/licencia/cobertura).
+- Politica exacta de dias faltantes para ticker iliquido.
+- Convencion final de timezone/date cuando proveedor usa UTC timestamp.
+- Regla de versionado de datasets (particion por run vs overwrite controlado).
+
+16) Checklist rapido de implementacion
+- [ ] Cliente de proveedor desacoplado por interfaz.
+- [ ] Rate limit centralizado.
+- [ ] Retries con backoff y jitter.
+- [ ] Normalizacion de schema.
+- [ ] Validaciones de ingestion.
+- [ ] Persistencia parquet + manifest.
+- [ ] Coverage/failures report.
+- [ ] CLI con argumentos y defaults en config.

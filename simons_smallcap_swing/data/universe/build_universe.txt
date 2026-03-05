@@ -1,0 +1,215 @@
+Modulo: data/universe/build_universe.py
+
+1) Objetivo
+Construir el universo invertible point-in-time (PIT) de small caps de EE. UU. por fecha de sesion, con reglas reproducibles y auditables, evitando survivorship bias y dejando trazabilidad completa de por que un ticker entra/sale del universo.
+
+2) Alcance
+Incluye:
+- Integracion de fuentes base de simbolos/listings.
+- Construccion de membresia diaria PIT por ticker.
+- Aplicacion de filtros de elegibilidad (precio, liquidez, market cap, tipo de activo, etc).
+- Marcado de estados (active, halted, delisted, excluded_by_rule).
+- Generacion de snapshots y tabla historica de membresia.
+
+No incluye:
+- Descarga de precios (fetch_prices).
+- Ajuste de precios (adjust_prices).
+- QC final profundo del universo (universe_qc.py).
+- Mitigacion detallada de survivorship a nivel metodologico (survivorship.py lo audita/complementa).
+
+3) Dependencias aguas arriba y aguas abajo
+Upstream:
+- Data de listings/identificadores (ticker, CUSIP/CIK/FIGI si aplica).
+- Calendario de mercado.
+- Datos PIT de market cap, volumen y precio (raw o pre-QC segun politica).
+- Eventos corporativos relevantes para continuidad de simbolo.
+
+Downstream:
+- data/price/fetch_prices.py
+- features/build_features.py
+- labels/build_labels.py
+- backtest/run_walkforward.py
+- validation/leakage_audit.py
+
+4) Definicion de universo (reglas de negocio)
+Reglas base sugeridas (configurables):
+- Region/mercado: acciones listadas en EE. UU.
+- Tipo de instrumento: common stock (excluir ETFs, ADRs segun politica, preferreds, warrants, rights, SPAC units si aplica).
+- Segmento: small caps por market cap PIT.
+- Filtro de precio minimo (ej. close >= 1 USD o 2 USD).
+- Filtro de liquidez minima (ADV20 USD o shares).
+- Filtro de antiguedad minima de cotizacion (opcional).
+
+Principios:
+- Elegibilidad se evalua con datos disponibles hasta t (o t-1 si se ejecuta a cierre/next open).
+- Toda exclusion debe quedar con motivo codificado.
+- Reglas parametrizables y versionadas por config hash.
+
+5) Contrato de entrada
+Entradas minimas:
+- start_date, end_date
+- listing_master_path (o provider listing API)
+- fundamentals/marketcap PIT path (si aplica)
+- liquidity inputs path (precio/volumen PIT)
+- calendar_path
+- universe_config_path
+- run_id
+
+Campos minimos esperados (tabla base de simbolos):
+- symbol
+- listing_exchange
+- security_type
+- list_date
+- delist_date (nullable)
+- status (active/inactive)
+
+Campos recomendados adicionales:
+- cik / cusip / figi / issuer_id
+- sector / industry (si disponible PIT)
+
+6) Contrato de salida
+Salida principal historica:
+- data/universe/history/date={yyyy-mm-dd}/part-*.parquet
+
+Columnas minimas:
+- date
+- symbol
+- is_eligible (bool)
+- eligibility_reason (enum/string codificado)
+- market_cap_usd (nullable)
+- adv20_usd (nullable)
+- close_ref (nullable)
+- listing_exchange
+- security_type
+- in_universe_rank (opcional: ranking por cap/liquidez)
+- run_id
+- config_hash
+- ingest_ts_utc
+
+Snapshots derivados:
+- data/universe/current.parquet (ultimo dia del rango)
+- data/universe/constituents_{date}.parquet
+- data/universe/exclusions_{date}.parquet
+
+Artefactos auxiliares:
+- universe_manifest.json
+- universe_counts_by_day.parquet
+- universe_turnover_stats.parquet
+
+7) Reglas PIT y anti-bias
+- No incluir tickers con fecha de listado posterior a la fecha evaluada.
+- Mantener tickers delisted dentro de su ventana historica valida.
+- Para market cap/liquidez, usar valores conocidos a la fecha de decision (sin backfill futuro).
+- Si hay cambios de ticker por corporate action, preservar continuidad via identificador estable cuando sea posible.
+- Si no existe mapping fiable, registrar ruptura y razon.
+
+8) Flujo del proceso (alto nivel)
+1. Cargar config y validar parametros.
+2. Cargar maestro de listados + calendario.
+3. Expandir panel date x symbol dentro de ventana de vida del instrumento.
+4. Enriquecer panel con market cap/liquidez/precio PIT.
+5. Aplicar reglas de elegibilidad en orden determinista.
+6. Etiquetar is_eligible y eligibility_reason.
+7. Construir salidas historicas y snapshot current.
+8. Calcular estadisticas de cobertura/turnover.
+9. Persistir outputs y manifest.
+
+9) Orden recomendado de filtros
+1. Tipo de instrumento permitido.
+2. Bolsa/mercado permitido.
+3. Ventana de vida (list_date <= date <= delist_date o delist null).
+4. Precio minimo.
+5. Liquidez minima (ADV20).
+6. Small-cap band por market cap (percentil o umbral absoluto configurado).
+7. Reglas especiales (halt prolongado, flags regulatorios, etc).
+
+10) Validaciones minimas
+Integridad:
+- Sin duplicados en (date, symbol).
+- is_eligible siempre no-null.
+- eligibility_reason presente cuando is_eligible=false.
+
+Consistencia temporal:
+- Ningun simbolo aparece antes de list_date.
+- Simbolo no aparece despues de delist_date salvo politica explicita.
+- Cambios bruscos de conteo diario del universo se reportan (warning).
+
+Sanidad de filtros:
+- market_cap_usd >= 0 cuando no-null.
+- adv20_usd >= 0 cuando no-null.
+- close_ref > 0 cuando no-null.
+
+11) Manejo de casos especiales
+- Ticker changes/mergers/spin-offs: resolver mapping por instrumento cuando haya identificador estable.
+- Delist por quiebra: mantener historia previa y excluir desde fecha efectiva.
+- Datos faltantes de market cap/liquidez:
+  - politica configurable: excluir por defecto o fallback temporal acotado.
+- IPO reciente:
+  - permitir entrada solo tras ventana minima (si regla activada).
+
+12) Observabilidad y trazabilidad
+Logging estructurado:
+- INFO: progreso por fecha/lote.
+- WARNING: faltantes de datos PIT, saltos de conteo, mappings ambiguos.
+- ERROR: fallos de schema/joins criticos.
+
+Metricas:
+- n_symbols_master
+- n_symbols_eligible_promedio
+- n_excluded_by_reason_{code}
+- turnover_daily_mean
+- pct_missing_market_cap
+- pct_missing_liquidity
+- run_duration_sec
+
+13) Interfaz de ejecucion (CLI sugerida)
+python -m data.universe.build_universe ^
+  --start-date 2014-01-01 ^
+  --end-date 2026-03-01 ^
+  --listing-master-path data/universe/source/listings.parquet ^
+  --calendar-path data/calendar/us_equities.parquet ^
+  --config-path configs/data/universe.yaml ^
+  --run-id build_universe_20260305_001
+
+14) Estructura interna recomendada (funciones)
+- load_universe_config(...)
+- load_listing_master(...)
+- load_calendar(...)
+- build_life_window_panel(df_listings, calendar)
+- enrich_with_market_cap(df_panel, market_cap_source, ...)
+- enrich_with_liquidity(df_panel, price_volume_source, ...)
+- apply_eligibility_rules(df_panel, config)
+- compute_turnover_stats(df_universe_hist)
+- persist_universe_outputs(df_hist, df_current, output_paths, ...)
+- main()
+
+15) Criterios de aceptacion (Definition of Done)
+- Genera universo PIT diario reproducible y auditable.
+- No presenta survivorship bias obvio por construccion.
+- Toda exclusion tiene razon codificada.
+- Produce snapshot current util para fetch_prices y pipeline diario.
+- Entrega manifest + metricas para auditoria operativa.
+
+16) Casos de prueba minimos (para tests/)
+- IPO entra solo despues de list_date (y ventana minima si aplica).
+- Delisted permanece en historia previa y sale en fecha correcta.
+- Exclusion por tipo de instrumento (ETF/warrant).
+- Filtro de precio y liquidez aplicado correctamente en fecha dada.
+- Cambio de ticker con identificador estable preserva continuidad.
+- Datos faltantes de market cap siguen politica configurada.
+- No duplicados en (date, symbol) tras joins.
+
+17) Riesgos y decisiones abiertas
+- Definir small-cap por umbral absoluto vs percentil dinamico.
+- Politica exacta para ADRs/SPACs/penny stocks extremos.
+- Calidad del mapping de identificadores entre proveedores.
+- Tradeoff entre cobertura y pureza cuando faltan datos PIT.
+
+18) Checklist rapido de implementacion
+- [ ] Config de reglas versionada (yaml + hash).
+- [ ] Panel PIT date x symbol construido correctamente.
+- [ ] Filtros aplicados en orden determinista.
+- [ ] Motivos de exclusion codificados y completos.
+- [ ] Outputs historicos + current + manifest.
+- [ ] Metricas de cobertura/turnover.
+- [ ] Tests de IPO/delist/ticker change/filtros.

@@ -1,0 +1,283 @@
+Modulo: backtest/engine.py
+
+1) Objetivo
+Ejecutar un backtest event-driven y reproducible para estrategias cross-sectional en small caps, simulando decisiones, ordenes, fills, costes, impacto y accounting diario de forma neta y point-in-time (PIT).
+
+2) Alcance
+Incluye:
+- Loop temporal de simulacion por sesion.
+- Construccion de cartera target a partir de scores/senales.
+- Generacion de ordenes y simulacion de fills.
+- Aplicacion de costes (fees, slippage, borrow, impacto).
+- Accounting completo de PnL, cash, exposiciones y riesgo.
+- Persistencia de trazas y reportes de auditoria.
+
+No incluye:
+- Generacion de senales/modelo (upstream).
+- Optimizacion de hiperparametros del modelo.
+- Ejecucion real en broker (solo simulacion research).
+
+3) Dependencias aguas arriba y aguas abajo
+Upstream:
+- models/predictions/... (scores diarios)
+- portfolio/* (constraints, sizing, neutralize, optimizer)
+- execution/* (cost_model, impact_model, fills_simulator)
+- data/price/adjusted y universo PIT
+- calendario de mercado
+
+Downstream:
+- backtest/report.py
+- backtest/attribution.py
+- validation/validation_suite.py
+- research/capacity_analysis/*
+
+4) Principios de simulacion
+- Neto o no existe: toda metrica principal debe ser neta de costes/impacto.
+- PIT estricto: en fecha t solo usar datos disponibles a decision_cut.
+- Determinismo: misma config + mismos inputs => mismo resultado.
+- Auditabilidad: cada posicion y fill trazable a una decision.
+- Conservadurismo: defaults realistas en liquidez/impacto.
+
+5) Contrato de entrada
+Entradas minimas:
+- signals_path (date, symbol, score o target_weight_raw)
+- prices_path (open/high/low/close/volume ajustados)
+- universe_path (is_eligible por fecha)
+- config_path (backtest params)
+- run_id
+
+Opcionales:
+- borrow_path
+- corporate_actions_path
+- benchmark_path
+- risk_factor_exposures_path
+
+Parametros clave de config:
+- rebalance_frequency: daily/weekly
+- decision_time: close_t o open_t+1
+- execution_price_model: next_open | vwap_proxy | custom
+- max_gross, max_net, max_position
+- turnover_limit
+- transaction_cost_bps
+- impact_model_params
+- borrow_fee_model
+- cash_buffer
+- latency_days (si aplica)
+
+6) Contrato de salida
+Trazas principales:
+- backtest/runs/{run_id}/positions_daily.parquet
+- backtest/runs/{run_id}/orders.parquet
+- backtest/runs/{run_id}/fills.parquet
+- backtest/runs/{run_id}/pnl_daily.parquet
+- backtest/runs/{run_id}/exposures_daily.parquet
+
+Resumen:
+- backtest/runs/{run_id}/summary.json
+- backtest/runs/{run_id}/performance_metrics.json
+- backtest/runs/{run_id}/engine_manifest.json
+
+Campos minimos recomendados
+positions_daily:
+- date, symbol
+- position_shares
+- position_notional
+- weight
+- side
+
+orders:
+- date, symbol, order_id
+- target_shares, delta_shares
+- order_type, tif
+
+fills:
+- date, symbol, order_id
+- fill_shares, fill_price
+- slippage_bps, impact_cost, fee_cost
+
+pnl_daily:
+- date
+- gross_pnl
+- net_pnl
+- trading_cost
+- borrow_cost
+- financing_cost
+- nav
+- return_daily
+
+7) Reglas PIT y anti-leakage
+- Senales de t no pueden usar precios de ejecucion futuros fuera del modelo permitido.
+- Si execution=next_open, orden generada al cierre t ejecuta en open t+1.
+- Delistings/suspensiones se procesan en la fecha efectiva sin conocimiento futuro.
+- Universe filters aplicados por fecha de decision.
+- Corporate actions aplicadas segun fecha efectiva y snapshot versionado.
+
+8) Flujo del motor (alto nivel)
+1. Inicializar estado (cash, posiciones, nav, config, calendario).
+2. Para cada fecha de simulacion:
+   - Cargar universe y precios de la fecha.
+   - Cargar score/senales disponibles a decision_cut.
+   - Construir target weights (sizing + constraints + neutralizacion).
+   - Traducir target a ordenes delta.
+   - Simular fills (liquidez, parcialidad, impacto, slippage).
+   - Actualizar posiciones y cash.
+   - Marcar cartera a mercado.
+   - Calcular PnL bruto/neto y metricas de riesgo.
+   - Persistir trazas del dia.
+3. Cerrar run y calcular metricas agregadas.
+
+9) Modelo de ejecucion y fills
+Opciones base:
+- full_fill_at_next_open (baseline simple).
+- partial_fill_by_volume_limit (participation cap sobre ADV).
+- vwap_proxy_with_impact (mas realista).
+
+Reglas recomendadas:
+- max participation por simbolo (ej. 5-10% ADV diario).
+- Ordenes que exceden liquidez se rellenan parcialmente y arrastran remanente.
+- Slippage aumenta con participation y volatilidad.
+
+10) Costes e impacto
+Componentes:
+- fee fija/variable por transaccion.
+- spread/slippage.
+- market impact no lineal (funcion de participation).
+- borrow cost diario para cortos.
+
+PnL:
+- gross_pnl = pnl_mark_to_market + realized_trade_pnl
+- net_pnl = gross_pnl - trading_cost - impact_cost - borrow_cost - financing
+
+11) Constraints y control de riesgo
+Constraints tipicos:
+- max gross exposure
+- max net exposure
+- max weight por posicion
+- max sector/industry exposure
+- turnover max diario
+- min liquidity filter
+
+Controles:
+- hard reject de ordenes que violan limites.
+- soft scaling de pesos cuando excede riesgo total.
+- kill-switch opcional por drawdown intrarun.
+
+12) Accounting y mark-to-market
+Estado minimo:
+- cash
+- posiciones por simbolo
+- costo promedio
+- NAV
+- equity curve
+
+Reglas:
+- mark-to-market diario con precio de cierre de la sesion (o regla definida).
+- separar realized vs unrealized PnL.
+- mantener ledger de transacciones para reconciliacion.
+
+13) Metricas de performance recomendadas
+Retorno/riesgo:
+- CAGR, volatility, Sharpe, Sortino
+- max drawdown, Calmar
+- skew/kurtosis de retornos
+
+Ejecucion/capacidad:
+- turnover promedio
+- implementation shortfall
+- fill_rate
+- participation promedio
+
+Calidad de senal:
+- hit ratio
+- long-short spread
+- contribution by decile
+
+14) Validaciones minimas
+Integridad:
+- sin duplicados en ids de orden/fill.
+- balance contable consistente (cash + posiciones = NAV dentro de tolerancia).
+- sin precios no validos en fills.
+
+Temporal:
+- no operaciones fuera de fechas de mercado.
+- no look-ahead en senal/precio de ejecucion.
+
+Riesgo:
+- exposiciones dentro de limites configurados o flags explicitos.
+
+15) Manejo de casos especiales
+- Delisting:
+  - cerrar posicion segun politica (ultimo precio disponible/haircut).
+- Halts/suspensiones:
+  - impedir fills cuando no hay negociacion.
+- Corporate actions (split/merge):
+  - ajustar shares/costo de posicion para continuidad contable.
+- Missing price:
+  - politica configurable: carry last price con flag o forzar liquidacion controlada.
+
+16) Observabilidad y trazabilidad
+Logging:
+- INFO: progreso por fecha y resumen diario.
+- WARNING: violaciones suaves de limite, fills parciales, datos faltantes.
+- ERROR: inconsistencia contable o datos criticos corruptos.
+
+Metricas operativas:
+- n_trading_days
+- n_orders, n_fills
+- avg_fill_rate
+- total_cost_bps
+- max_dd_runtime
+- run_duration_sec
+
+17) Interfaz de ejecucion (CLI sugerida)
+python -m backtest.engine ^
+  --signals-path models/predictions/lgbm/latest_scores.parquet ^
+  --prices-path data/price/adjusted/mode=dual_output ^
+  --universe-path data/universe/history ^
+  --config-path configs/backtest/base.yaml ^
+  --run-id backtest_engine_20260305_001
+
+18) Estructura interna recomendada (funciones)
+- load_backtest_config(...)
+- load_market_inputs(...)
+- init_portfolio_state(initial_capital, cfg)
+- build_target_weights(signals_df, state, cfg)
+- apply_portfolio_constraints(target_w, exposures, cfg)
+- generate_orders(current_pos, target_w, prices, cfg)
+- simulate_fills(orders, market_data, cost_model, impact_model, cfg)
+- update_accounting(state, fills, market_close, cfg)
+- compute_daily_metrics(state, cfg)
+- persist_daily_outputs(...)
+- finalize_backtest_report(...)
+- main()
+
+19) Criterios de aceptacion (Definition of Done)
+- Corre end-to-end en rango temporal configurado.
+- Produce trazas completas (orders/fills/positions/pnl) reconciliables.
+- Metricas netas calculadas correctamente.
+- Sin leakage temporal detectado en auditoria.
+- Reproducible por run_id + config hash + version de datos.
+
+20) Casos de prueba minimos (para tests/)
+- Estrategia sintetica con fills completos y PnL esperado.
+- Fills parciales por limite de liquidez.
+- Costes/impacto reducen PnL neto correctamente.
+- Constraint de max_position recorta pesos correctamente.
+- Delisting forza cierre de posicion segun politica.
+- Reconciliacion contable diaria dentro de tolerancia.
+- Sin look-ahead en modo next_open.
+
+21) Riesgos y decisiones abiertas
+- Nivel de realismo del modelo de impacto vs complejidad.
+- Politica exacta para delisting/halt con datos incompletos.
+- Parametrizacion de costes para small caps iliquidas.
+- Tradeoff velocidad vs granularidad event-driven.
+
+22) Checklist rapido de implementacion
+- [ ] Estado contable y loop diario determinista.
+- [ ] Integracion con sizing/constraints/neutralize.
+- [ ] Simulador de fills con liquidez y slippage.
+- [ ] Cost model + borrow + impacto.
+- [ ] Persistencia de trazas y manifest.
+- [ ] Metricas de performance y riesgo.
+- [ ] Tests de reconciliacion y anti-leakage.

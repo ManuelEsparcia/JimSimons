@@ -1,0 +1,235 @@
+Modulo: features/build_features.py
+
+1) Objetivo
+Construir el dataset de features point-in-time (PIT) para modelado cross-sectional de small caps, transformando datos de precios/fundamentales/microestructura en senales limpias, estandarizadas y reproducibles, sin leakage temporal.
+
+2) Alcance
+Incluye:
+- Carga y alineacion temporal de fuentes (precios ajustados, universo, fundamentales PIT, borrow proxy).
+- Ingenieria de features por familias (momentum, reversal, volatilidad, liquidez, calidad de flujo, fundamentales, interacciones).
+- Estandarizacion cross-sectional por fecha.
+- Winsorizacion/clipping robusto.
+- Persistencia de feature matrix + metadata del run.
+
+No incluye:
+- QC final de features (feature_qc.py).
+- Generacion de labels (labels/build_labels.py).
+- Entrenamiento de modelos.
+
+3) Dependencias aguas arriba y aguas abajo
+Upstream:
+- data/price/adjusted/... (OHLCV ajustado)
+- data/universe/history/... (membresia PIT)
+- data/edgar/point_in_time... (fundamentales PIT)
+- data/borrow/... (coste/availability proxy)
+- calendario de mercado
+
+Downstream:
+- features/feature_qc.py
+- labels/build_labels.py
+- models/*/train_*.py
+- backtest/run_walkforward.py
+
+4) Principios de diseno
+- PIT estricto: feature en fecha t solo usa info disponible hasta t (o t-1 segun decision timing).
+- Determinismo: mismas entradas + mismo config => misma salida.
+- Modularidad: cada familia de features desacoplada y versionable.
+- Trazabilidad: cada columna de feature debe tener definicion y dependencia explicita.
+
+5) Contrato de entrada
+Entradas minimas:
+- universe_history_path
+- prices_adjusted_path
+- fundamentals_pit_path (opcional segun familia activada)
+- borrow_proxy_path (opcional)
+- start_date, end_date
+- feature_config_path
+- run_id
+
+Campos minimos esperados:
+- universe: date, symbol, is_eligible
+- prices: symbol, date, open_adj, high_adj, low_adj, close_adj, volume_adj
+- fundamentales PIT: symbol, asof_date, metricas financieras
+
+Parametros clave de config:
+- feature_families_enabled
+- lookbacks (5, 10, 20, 63, 126, 252, etc)
+- winsor_limits
+- standardization_mode (zscore/robust rank)
+- min_history_per_symbol
+- min_cross_section_size
+- decision_lag_days (0 o 1)
+
+6) Contrato de salida
+Salida principal:
+- features/store/date={yyyy-mm-dd}/part-*.parquet
+
+Columnas base requeridas:
+- date
+- symbol
+- is_eligible
+- run_id
+- config_hash
+
+Columnas de features:
+- prefijo por familia, por ejemplo:
+  - mom_ret_20d, mom_ret_63d
+  - rev_ret_5d
+  - vol_realized_20d
+  - liq_adv20_usd, liq_turnover_20d
+  - micro_spread_proxy, micro_gap_open
+  - fund_profit_margin_ttm, fund_accruals
+  - int_mom_x_liq
+
+Metadatos auxiliares:
+- features/metadata/feature_dictionary_{run_id}.json
+- features/metadata/feature_lineage_{run_id}.parquet
+- features/metadata/build_manifest_{run_id}.json
+
+7) Familias de features sugeridas
+Precio/retornos:
+- momentum multi-horizonte
+- reversal corto plazo
+- volatilidad realizada y rango intradia
+
+Liquidez/microestructura:
+- ADV en USD
+- turnover
+- Amihud proxy
+- gap overnight y range ratios
+
+Fundamentales PIT:
+- growth, quality, profitability, leverage
+- deltas QoQ/YoY PIT-safe
+
+Borrow/crowding:
+- borrow fee proxy
+- availability proxy
+
+Interacciones:
+- momentum x liquidez
+- quality x volatility
+
+8) Reglas PIT y anti-leakage
+- Features de ventana usan solo observaciones <= date - decision_lag.
+- Fundamentales usan asof_date/filing availability, nunca fiscal period future-backfilled.
+- No forward fill ilimitado:
+  - usar horizon maxima por campo (ej. 90/180 dias), luego null.
+- No usar universe_current en fechas historicas.
+- Guardar en manifest el "asof cut" de cada fuente.
+
+9) Flujo del proceso (alto nivel)
+1. Cargar config y validar.
+2. Cargar universo PIT y filtrar is_eligible.
+3. Cargar fuentes y alinear (date, symbol).
+4. Construir features por familia (funciones separadas).
+5. Aplicar decision lag global.
+6. Winsorizar/clipear por fecha.
+7. Estandarizar cross-sectional por fecha.
+8. Aplicar mascara de historial minimo.
+9. Persistir feature matrix + metadata + manifest.
+
+10) Estandarizacion y transformaciones
+Opciones recomendadas:
+- rank_gauss por fecha para colas pesadas.
+- zscore robusto con mediana/MAD.
+- clipping a percentiles [1, 99] o configurable.
+
+Reglas:
+- No mezclar estadisticas entre fechas.
+- Si cross-section del dia < min_cross_section_size: marcar fecha como baja_confianza.
+- Mantener columnas raw opcionales para auditoria.
+
+11) Manejo de nulos
+- Nulos estructurales permitidos (ej. fundamentales no reportados).
+- Definir politica por familia:
+  - keep_null (modelo maneja missing)
+  - impute_cross_section_median (solo si configurado)
+- Registrar null_rate por feature/date para QC.
+
+12) Validaciones minimas
+Integridad:
+- Sin duplicados en (date, symbol).
+- Fecha dentro de rango solicitado.
+- Solo simbolos en universo elegible del dia.
+
+Sanidad numerica:
+- Sin inf/-inf.
+- Distribuciones razonables por feature (flags si outliers extremos).
+- Correlacion perfecta entre features distintas reportada como warning.
+
+Cobertura:
+- feature_coverage_rate por columna >= umbral minimo configurable.
+- cross_section_count diario reportado.
+
+13) Observabilidad y trazabilidad
+Logging:
+- INFO: progreso por familia/fecha.
+- WARNING: alta tasa de nulos, cobertura baja, drift de distribucion.
+- ERROR: schema mismatch o joins criticos.
+
+Metricas:
+- n_features_total
+- n_rows_output
+- pct_null_global
+- feature_coverage_p50/p10
+- n_dates_low_confidence
+- run_duration_sec
+
+14) Interfaz de ejecucion (CLI sugerida)
+python -m features.build_features ^
+  --universe-history-path data/universe/history ^
+  --prices-adjusted-path data/price/adjusted/mode=dual_output ^
+  --fundamentals-pit-path data/edgar/point_in_time ^
+  --borrow-proxy-path data/borrow/current.parquet ^
+  --start-date 2014-01-01 ^
+  --end-date 2026-03-01 ^
+  --config-path configs/features/base.yaml ^
+  --run-id build_features_20260305_001
+
+15) Estructura interna recomendada (funciones)
+- load_feature_config(...)
+- load_universe_history(...)
+- load_prices_adjusted(...)
+- load_fundamentals_pit(...)
+- build_price_features(df_prices, cfg)
+- build_liquidity_features(df_prices, cfg)
+- build_microstructure_features(df_prices, cfg)
+- build_fundamental_features(df_fund, cfg)
+- build_borrow_features(df_borrow, cfg)
+- build_interaction_features(df_feat, cfg)
+- apply_decision_lag(df_feat, lag_days)
+- standardize_cross_section(df_feat, cfg)
+- persist_feature_store(df_feat, metadata, output_path, ...)
+- main()
+
+16) Criterios de aceptacion (Definition of Done)
+- Produce feature matrix PIT sin leakage verificable.
+- Todas las features tienen diccionario y lineage trazable.
+- Soporta ejecucion reproducible por config/run_id.
+- Cobertura y calidad suficientes para pasar feature_qc.
+- Integracion directa con labels/modelos sin transformaciones ad-hoc adicionales.
+
+17) Casos de prueba minimos (para tests/)
+- Ventanas de retorno calculadas correctamente (20d/63d) en serie sintetica.
+- decision_lag=1 desplaza features sin fuga temporal.
+- Fundamental con asof tardio no aparece antes de disponibilidad.
+- Winsorizacion y zscore por fecha correctos.
+- No duplicados tras merges multi-fuente.
+- Politica de nulos aplicada segun config.
+- Simbolos fuera de universo del dia no aparecen en salida.
+
+18) Riesgos y decisiones abiertas
+- Numero final de features vs riesgo de multiple testing.
+- Politica de imputacion de nulos por familia/modelo.
+- Costo computacional de features complejas en universo grande.
+- Dependencia de calidad PIT de fundamentales/borrrow.
+
+19) Checklist rapido de implementacion
+- [ ] Config de features y lookbacks versionada.
+- [ ] Builders por familia desacoplados.
+- [ ] Alineacion temporal PIT con decision_lag.
+- [ ] Estandarizacion cross-sectional robusta.
+- [ ] Metadata (dictionary + lineage + manifest).
+- [ ] Metricas de cobertura/nulos por feature.
+- [ ] Tests de leakage y formulas base.

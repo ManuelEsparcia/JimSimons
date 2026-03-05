@@ -1,0 +1,213 @@
+Modulo: features/feature_qc.py
+
+1) Objetivo
+Validar calidad, estabilidad y seguridad temporal del feature store antes de modelado, detectando leakage, drift, baja cobertura, colinealidad extrema y anomalias numericas; emitir un veredicto de gates (pass/warn/fail).
+
+2) Alcance
+Incluye:
+- Checks de integridad estructural (schema, duplicados, tipos).
+- Checks de cobertura (por feature, por fecha, por simbolo).
+- Checks de leakage temporal (look-ahead proxies).
+- Checks estadisticos (outliers, distribuciones, drift, correlacion).
+- Reporte de hallazgos + score agregado de calidad.
+
+No incluye:
+- Correccion automatica de features (salvo opcionalmente flags de drop candidatos).
+- Entrenamiento del modelo.
+- Validacion de labels (labels/*).
+
+3) Dependencias aguas arriba y aguas abajo
+Upstream:
+- features/store/... (build_features)
+- features/metadata/feature_dictionary_*.json
+- universe history (para cobertura esperada)
+- opcional: labels para leakage cruzado adicional
+
+Downstream:
+- models/*/train_*.py
+- validation/validation_suite.py
+- ops/data_health.py
+
+4) Preguntas que debe responder el modulo
+- El dataset de features es utilizable para entrenar sin riesgo metodologico?
+- Hay senales de leakage temporal o join erroneo?
+- Que features deben bloquearse o revisarse?
+- La cobertura y estabilidad son suficientes para seguir pipeline?
+
+5) Contrato de entrada
+Entradas minimas:
+- feature_store_path
+- feature_dictionary_path
+- start_date, end_date
+- qc_config_path
+- run_id
+
+Opcionales:
+- labels_path (para leakage proxy con target)
+- universe_history_path
+- reference_window_path (baseline historico para drift)
+
+Campos minimos esperados:
+- date, symbol, run_id
+- columnas de features numericas
+
+6) Contrato de salida
+Reportes principales:
+- features/qc/qc_summary.json
+- features/qc/qc_feature_level.parquet
+- features/qc/qc_date_level.parquet
+- features/qc/qc_failures.parquet
+- features/qc/qc_drift_report.parquet
+
+Campos sugeridos en qc_feature_level:
+- feature_name
+- null_rate_global
+- coverage_rate_global
+- p01, p50, p99
+- outlier_rate
+- drift_score
+- leakage_score
+- collinearity_risk
+- gate_status (pass/warn/fail)
+- recommended_action (keep/drop/review)
+
+Artefactos:
+- features/qc/qc_manifest.json
+- features/qc/qc_flags.json
+
+7) Checks obligatorios (core)
+Integridad:
+- schema esperado vs observado.
+- duplicados en (date, symbol).
+- tipos numericos validos para features.
+
+Cobertura:
+- null_rate por feature y por fecha.
+- coverage_rate por feature en cross-section diaria.
+- fechas con cross-section insuficiente.
+
+Numerica:
+- infinities/NaN fuera de politica permitida.
+- constant features (varianza ~ 0).
+- outliers extremos por feature/date.
+
+Dependencia entre features:
+- correlacion pairwise alta (>|0.98| configurable).
+- VIF aproximado o matriz condicionada para bloques.
+
+Leakage (proxy):
+- shift test: correlacion feature_t con target_{t-1} vs target_{t+1} (si labels disponibles).
+- availability test: features con timestamp de origen posterior a decision_cut.
+- suspiciously high predictive power en ventana corta (flag, no prueba concluyente).
+
+Drift:
+- PSI/KS/Jensen-Shannon vs ventana de referencia.
+- drift por feature y agregado diario.
+
+8) Gates de aceptacion (ejemplo configurable)
+- Gate 1 Integridad: 0 duplicados, schema valido (critico).
+- Gate 2 Cobertura: >= X% features con coverage >= umbral.
+- Gate 3 Leakage: leakage_score agregado <= umbral critico.
+- Gate 4 Drift: drift_score agregado <= umbral.
+- Gate 5 Colinealidad: pct_features_high_corr <= umbral.
+
+Resultado global:
+- pass: sin fallos criticos.
+- warn: fallos menores dentro de tolerancia.
+- fail: cualquier gate critico incumplido.
+
+9) Reglas PIT y anti-leakage
+- Todos los checks deben respetar decision_lag configurado.
+- Si hay labels en QC, usar solo horizonte coherente con pipeline (sin mezclar objetivos).
+- Comparativas de drift y leakage deben ejecutarse por fecha, no mezclando todo el panel sin control temporal.
+- Guardar version/hash de config y diccionario de features.
+
+10) Flujo del proceso (alto nivel)
+1. Cargar config, feature store y diccionario.
+2. Validar estructura base y columnas obligatorias.
+3. Ejecutar checks de cobertura e integridad.
+4. Ejecutar checks numericos y de colinealidad.
+5. Ejecutar checks de leakage proxy (si labels/source timestamps disponibles).
+6. Ejecutar analisis de drift vs referencia.
+7. Calcular score por feature y score global.
+8. Aplicar gates y generar recomendaciones.
+9. Persistir reportes + manifest + flags.
+
+11) Manejo de casos especiales
+- Feature nueva sin baseline de drift:
+  - marcar "new_feature", excluir de gate de drift o usar baseline corto.
+- Feature casi siempre nula por diseno:
+  - permitir si esta etiquetada como sparse_expected en dictionary.
+- Cambios de definicion de feature entre runs:
+  - detectar por hash de formula/lineage y bloquear comparaciones directas.
+- Universo diario muy pequeno:
+  - flexibilizar tests estadisticos y elevar warning de baja potencia.
+
+12) Observabilidad y trazabilidad
+Logging:
+- INFO: avance por bloque de checks.
+- WARNING: features con riesgo medio (cobertura/drift/colinealidad).
+- ERROR: fallos criticos (schema, leakage severo).
+
+Metricas operativas:
+- n_features_checked
+- n_features_failed
+- n_features_warn
+- qc_global_score
+- n_critical_failures
+- run_duration_sec
+
+13) Interfaz de ejecucion (CLI sugerida)
+python -m features.feature_qc ^
+  --feature-store-path features/store ^
+  --feature-dictionary-path features/metadata/feature_dictionary_latest.json ^
+  --labels-path labels/store/latest.parquet ^
+  --start-date 2014-01-01 ^
+  --end-date 2026-03-01 ^
+  --config-path configs/validation/feature_qc.yaml ^
+  --run-id feature_qc_20260305_001
+
+14) Estructura interna recomendada (funciones)
+- load_qc_config(...)
+- load_feature_store(...)
+- load_feature_dictionary(...)
+- validate_schema_and_keys(df_feat, dictionary)
+- compute_coverage_metrics(df_feat, cfg)
+- compute_numeric_sanity_metrics(df_feat, cfg)
+- compute_collinearity_metrics(df_feat, cfg)
+- compute_leakage_proxies(df_feat, df_labels, cfg)
+- compute_drift_metrics(df_feat, df_ref, cfg)
+- aggregate_qc_scores(df_metrics, cfg)
+- apply_feature_gates(df_metrics, cfg)
+- persist_qc_reports(...)
+- main()
+
+15) Criterios de aceptacion (Definition of Done)
+- Emite veredicto global pass/warn/fail reproducible.
+- Identifica features problematicas con recomendacion accionable.
+- Detecta fallos criticos de integridad y leakage.
+- Reportes consumibles por modelos y pipeline de validacion.
+
+16) Casos de prueba minimos (para tests/)
+- Duplicados en (date,symbol) disparan fail critico.
+- Feature constante detectada y marcada.
+- Cobertura baja dispara warn/fail segun umbral.
+- Feature con leakage sintetico (shift incorrecto) detectada.
+- Drift fuerte vs referencia detectado por PSI/KS.
+- Feature sparse_expected no falla injustamente.
+- Cambio de schema rompe gate de integridad.
+
+17) Riesgos y decisiones abiertas
+- Umbrales finales de drift/leakage pueden requerir calibracion por regimen.
+- Posibles falsos positivos en leakage proxy sin labels robustos.
+- Costo computacional de correlacion completa para miles de features.
+- Necesidad de baseline historico estable para drift de largo plazo.
+
+18) Checklist rapido de implementacion
+- [ ] Config de gates/umbrales versionada.
+- [ ] Checks core de integridad y cobertura.
+- [ ] Leakage proxies con decision_lag coherente.
+- [ ] Drift y colinealidad por feature.
+- [ ] Score agregado + pass/warn/fail.
+- [ ] Reportes parquet/json + manifest.
+- [ ] Tests sinteticos de fallos criticos.

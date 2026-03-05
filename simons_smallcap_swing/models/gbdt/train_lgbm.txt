@@ -1,0 +1,222 @@
+Modulo: models/gbdt/train_lgbm.py
+
+1) Objetivo
+Entrenar modelos LightGBM para prediccion cross-sectional de retornos/labels en small caps, usando splits temporales purged, controles anti-overfitting y trazabilidad completa de experimentos.
+
+2) Alcance
+Incluye:
+- Carga de features + labels + splits purged.
+- Entrenamiento LGBM (regresion y/o clasificacion).
+- Validacion temporal por fold y agregacion de metricas OOS.
+- Early stopping, control de regularizacion y class/weight handling.
+- Persistencia de modelos, predicciones OOF/OOS y reportes.
+
+No incluye:
+- Generacion de features/labels.
+- Optimizacion masiva de hiperparametros (tune_hyperparams.py).
+- Blending/stacking final (models/ensemble/*).
+
+3) Dependencias aguas arriba y aguas abajo
+Upstream:
+- features/store/... + feature_qc pass
+- labels/store/... + label_valid_flag
+- labels/splits/purged_splits...
+- configs/model/lgbm.yaml
+
+Downstream:
+- models/inference/predict.py
+- models/inference/model_registry.py
+- models/ensemble/blender.py
+- backtest/run_walkforward.py
+
+4) Tareas que debe resolver el modulo
+- Construir datasets train/valid/test por fold sin leakage.
+- Entrenar modelo con objetivo configurado (regresion/ranking/clasificacion).
+- Medir performance OOS consistente en tiempo.
+- Guardar artefactos suficientes para reproducir e inferir.
+
+5) Contrato de entrada
+Entradas minimas:
+- features_path
+- labels_path
+- splits_path (purged/embargo ya aplicados)
+- config_path
+- run_id
+
+Opcionales:
+- sample_weights_path
+- group_info_path (si objetivo ranking)
+- base_model_path (warm start opcional)
+
+Campos minimos esperados:
+- keys: date, symbol
+- features numericas
+- target principal (ej. y_fwd_ret_net_10d o y_cls_up_10d)
+- split metadata: fold_id, split_role, inclusion_flag
+
+Parametros clave de config:
+- objective: regression | binary | lambdarank
+- metric: rmse/mae/auc/ndcg@k/ic
+- boosting_type: gbdt | dart
+- num_leaves
+- max_depth
+- learning_rate
+- n_estimators / num_boost_round
+- min_data_in_leaf
+- feature_fraction
+- bagging_fraction, bagging_freq
+- lambda_l1, lambda_l2
+- early_stopping_rounds
+- monotone_constraints (opcional)
+
+6) Contrato de salida
+Modelos:
+- models/artifacts/lgbm/{run_id}/fold_{k}/model.txt
+- models/artifacts/lgbm/{run_id}/fold_{k}/model_meta.json
+
+Predicciones:
+- models/predictions/lgbm/{run_id}/oof.parquet
+- models/predictions/lgbm/{run_id}/fold_{k}_test_pred.parquet
+- models/predictions/lgbm/{run_id}/latest_scores.parquet
+
+Reportes:
+- models/reports/lgbm/{run_id}/metrics_by_fold.parquet
+- models/reports/lgbm/{run_id}/metrics_summary.json
+- models/reports/lgbm/{run_id}/feature_importance.parquet
+- models/reports/lgbm/{run_id}/training_manifest.json
+
+Campos minimos de predicciones:
+- date, symbol, fold_id
+- y_true
+- y_pred
+- split_role
+- run_id
+
+7) Reglas PIT y anti-leakage
+- Entrenar solo con muestras train inclusion_flag=true.
+- Validar/testear solo en segmentos temporales posteriores segun split.
+- Prohibido re-fit usando test fold para tuning manual dentro de la misma corrida.
+- Features y labels deben compartir misma convencion decision_lag.
+- Si hay calibracion, usar solo valid fold (nunca test final).
+
+8) Flujo del proceso (alto nivel)
+1. Cargar config, features, labels, splits.
+2. Unir por (date, symbol) y filtrar label_valid_flag.
+3. Construir matrices por fold (train/valid/test).
+4. Aplicar prechecks (nulos, columnas constantes, shape minima).
+5. Entrenar LGBM con early stopping sobre valid.
+6. Generar predicciones valid/test por fold.
+7. Calcular metricas por fold y agregadas OOS.
+8. Guardar artefactos, importancias y manifest.
+9. Emitir veredicto de gates de modelo (pass/warn/fail).
+
+9) Metricas recomendadas
+Regresion:
+- IC Spearman por fecha y promedio.
+- RMSE / MAE OOS.
+- hit ratio signo(y_pred * y_true > 0).
+
+Clasificacion:
+- AUC ROC / PR AUC.
+- logloss.
+- calibration error (ECE/Brier).
+
+Portafolio proxy (offline):
+- top-bottom spread simulado (sin costes y con costes basicos).
+- turnover proxy si hay scores diarios.
+
+Estabilidad:
+- varianza de metricas entre folds.
+- degradacion train->valid (overfit gap).
+
+10) Gates de aceptacion (ejemplo configurable)
+- Gate 1: metrica principal OOS >= umbral minimo.
+- Gate 2: overfit_gap <= umbral.
+- Gate 3: estabilidad entre folds (std <= umbral).
+- Gate 4: cobertura de predicciones >= umbral.
+- Gate 5: no leakage flags criticos.
+
+Resultado:
+- pass / warn / fail con razones codificadas.
+
+11) Manejo de pesos y desbalance
+Regresion:
+- sample_weight opcional por liquidez/calidad.
+
+Clasificacion:
+- class_weight balanced o peso custom.
+- threshold de decision separado de entrenamiento.
+
+Ranking:
+- group por fecha (cross-sectional ranking diario) si se usa lambdarank.
+
+12) Manejo de features
+- Eliminar columnas no numericas/sin varianza.
+- Opcional: drop features con null_rate > umbral.
+- Usar misma lista de features entre folds para comparabilidad.
+- Guardar feature_list_final en manifest.
+
+13) Observabilidad y trazabilidad
+Logging:
+- INFO: avance por fold y mejor iteracion.
+- WARNING: fold pequeno, metricas inestables, drift de distribucion.
+- ERROR: fallo de entrenamiento o fuga detectada.
+
+Metricas operativas:
+- n_folds_trained
+- best_iteration_por_fold
+- train_rows/valid_rows/test_rows
+- runtime_por_fold
+- total_runtime_sec
+
+14) Interfaz de ejecucion (CLI sugerida)
+python -m models.gbdt.train_lgbm ^
+  --features-path features/store ^
+  --labels-path labels/store ^
+  --splits-path labels/splits/purged_splits_latest.parquet ^
+  --config-path configs/models/lgbm_base.yaml ^
+  --run-id train_lgbm_20260305_001
+
+15) Estructura interna recomendada (funciones)
+- load_training_config(...)
+- load_features(...)
+- load_labels(...)
+- load_splits(...)
+- build_fold_dataset(df_feat, df_lab, df_splits, fold_id, cfg)
+- prepare_lgbm_datasets(train_df, valid_df, feature_cols, target_col, weights)
+- train_one_fold_lgbm(train_set, valid_set, params, cfg)
+- predict_one_fold(model, df_fold, feature_cols)
+- compute_fold_metrics(df_pred, cfg)
+- aggregate_metrics(all_fold_metrics)
+- export_artifacts_and_reports(...)
+- main()
+
+16) Criterios de aceptacion (Definition of Done)
+- Entrena todos los folds sin leakage ni fallos criticos.
+- Produce metricas OOS y OOF reproducibles.
+- Guarda modelos y manifest listos para inferencia.
+- Gates de promocion calculados y reportados.
+
+17) Casos de prueba minimos (para tests/)
+- Entrenamiento basico en dataset sintetico (regresion).
+- Clasificacion con desbalance y class_weight.
+- Split con fold vacio dispara warning/fail controlado.
+- Early stopping selecciona best_iteration valida.
+- OOF pred cubre exactamente indices valid de cada fold.
+- Falla controlada si faltan columnas de target/features.
+- Reproducibilidad con seed fija (metricas/model hash estable dentro de tolerancia).
+
+18) Riesgos y decisiones abiertas
+- Objetivo final (regresion vs ranking vs clasificacion) por estrategia.
+- Sensibilidad a ruido en labels netos de costes.
+- Riesgo de sobreajuste por hiperparametros agresivos.
+- Tradeoff interpretabilidad vs performance.
+
+19) Checklist rapido de implementacion
+- [ ] Carga/merge robusto de features+labels+splits.
+- [ ] Pipeline por fold con early stopping.
+- [ ] Metricas OOS + OOF por objetivo.
+- [ ] Export de modelos/predicciones/reportes.
+- [ ] Gates pass/warn/fail.
+- [ ] Manifest completo (params, seeds, feature_list, hashes).
+- [ ] Tests sinteticos de integridad y leakage.
