@@ -1,178 +1,243 @@
-Modulo: models/ensemble/stacking.py
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%% DOCUMENTACIÓN: models/ensemble/stacking.py %%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-1) Objetivo
-Entrenar un meta-modelo que combine predicciones de modelos base para mejorar performance OOS y estabilidad temporal frente a cualquier modelo individual.
+\section*{Módulo: \texttt{models/ensemble/stacking.py}}
+\label{sec:stacking}
 
-2) Alcance
-Incluye:
-- Construccion de matriz de meta-features a partir de OOF de modelos base.
-- Entrenamiento de meta-modelo con CV temporal purged.
-- Generacion de predicciones OOF/OOS del ensemble.
-- Comparativa contra best-single-model y blender.
+\subsection*{1. Objetivo del módulo}
 
-No incluye:
-- Entrenamiento de modelos base.
-- Orquestacion de deployment final en produccion.
+El módulo \texttt{stacking.py} implementa \textbf{stacking de nivel 1} (stacked generalization) para combinar modelos base mediante un \textbf{meta‑modelo} que aprende a ponderar y transformar sus predicciones.
 
-3) Dependencias aguas arriba y aguas abajo
-Upstream:
-- outputs de diversity_metrics (candidate_sets)
-- predicciones OOF/OOS de modelos base
-- labels y splits purged
-- config de stacking
+Objetivos principales:
+\begin{itemize}
+  \item Entrenar un meta‑modelo que mejore la \textbf{performance OOS} frente a cualquier modelo base individual.
+  \item Incrementar la \textbf{estabilidad temporal} del ensemble frente a cambios de régimen y volatilidad en modelos base.
+  \item Ser un \textbf{ensemble de próxima capa} a partir de:
+  \begin{itemize}
+    \item \texttt{diversity\_metrics} (subconjuntos candidatos),
+    \item \texttt{blender} (señal de ensemble simple).
+  \end{itemize}
+\end{itemize}
 
-Downstream:
-- models/inference/predict.py (ensemble model_ref)
-- backtest/run_walkforward.py
-- validation/validation_suite.py
+Este diseño está alineado con la literatura de \textit{stacking en finanzas y trading} \cite{wolpert1992, wolpert2012, bates1969, timmermann2006, buildalpha2018, cfa2025} y con enfoques de \textit{meta‑learning en sistemas de inversión} \cite{deribas2016, kapetanios2008, skfolio2025}.
 
-4) Contrato de entrada
-Entradas minimas:
-- base_oof_predictions_path
-- base_oos_predictions_path (opcional en entrenamiento)
-- labels_path
-- splits_path
-- stacking_config_path
-- run_id
+\subsection*{2. Formulación matemática del stacking}
 
-Opcionales:
-- regime_features_path
-- sample_weights_path
-- candidate_set_ref
+Sea \( \mathcal{M}^{(0)} = \{m_1^{(0)}, \dots, m_S^{(0)}\} \) un conjunto de modelos base, cada uno produciendo una predicción \( y_{m_i^{(0)},t,s} \) en la fecha \(t\) y símbolo \(s\). El meta‑modelo \(m^{(1)}\) se entrena sobre una \textbf{matriz de meta‑features} construida a partir de \textbf{predicciones OOF de nivel 0}:
 
-Campos minimos esperados:
-- date, symbol
-- model_id
-- y_pred_base
-- y_true
-- fold_id/split_role
+\[
+  \mathbf{X}^{(1)}_{t,s} = \left( \hat{y}_{m_1^{(0)},t,s}^{\text{OOF}}, \dots, \hat{y}_{m_S^{(0)},t,s}^{\text{OOF}} \right)
+\]
 
-5) Contrato de salida
-- models/artifacts/ensemble/stacking/{run_id}/meta_model.pkl (o json)
-- models/predictions/ensemble/stacking/{run_id}/oof.parquet
-- models/predictions/ensemble/stacking/{run_id}/oos.parquet
-- models/reports/ensemble/stacking/{run_id}/metrics_summary.json
-- models/reports/ensemble/stacking/{run_id}/meta_feature_importance.parquet
-- models/reports/ensemble/stacking/{run_id}/manifest.json
+donde:
+\begin{itemize}
+  \item \( \hat{y}_{m_i^{(0)},t,s}^{\text{OOF}} \) es la predicción de \(m_i^{(0)}\) sobre el \textbf{fold de test puro}, sin visión de datos futuros ni información de tuning.
+  \item \( (t,s) \in \mathcal{T}_{\text{OOF}} \times \mathcal{S} \).
+\end{itemize}
 
-Campos minimos en predicciones:
-- date
-- symbol
-- y_true
-- y_pred_stack
-- split_role
-- run_id
+El meta‑modelo \(m^{(1)}\) aprende una función:
 
-6) Regla anti-leakage fundamental
-- El meta-modelo solo se entrena con predicciones OOF de nivel 0.
-- Nunca usar predicciones in-sample de base models para fit del meta.
-- Test OOS queda fuera del ajuste del meta.
+\[
+  y_{\text{stack},t,s} = m^{(1)}\left( \mathbf{X}^{(1)}_{t,s}; \boldsymbol{\theta} \right)
+\]
 
-7) Disenos de meta-modelo soportados
-- lineal regularizado (ridge/lasso)
-- logistic/regression simple
-- GBDT ligero (con regularizacion fuerte)
+donde \(\boldsymbol{\theta}\) son los parámetros del meta‑modelo, ajustados por \textbf{CV temporal purged} sobre \(\mathcal{T}_{\text{OOF}}\).
 
-Recomendacion default:
-- ridge lineal por robustez e interpretabilidad.
+\subsection*{3. Reglas anti‑leakage fundamentales}
 
-8) Features del meta-modelo
-Base:
-- columna por cada modelo base (score/pred).
+El diseño está inspirado en prácticas de \textit{stacking robusto en series temporales} y \textit{forecast combination} \cite{wolpert1992, wolpert2012, cienciadedatos2007, lopez2016, lopez2020}:
 
-Opcionales:
-- interacciones simples entre modelos.
-- indicador de regimen.
-- incertidumbre de base models (si disponible).
+\begin{itemize}
+  \item El meta‑modelo se entrena \textbf{solo con predicciones OOF de nivel 0}:
+  \[
+    \mathcal{D}^{(1)}_{\text{train}} = \left\{ \left( \hat{y}_{m_1^{(0)},t,s}^{\text{OOF}}, \dots, \hat{y}_{m_S^{(0)},t,s}^{\text{OOF}},\, y_{\text{true},t,s} \right) \right\}_{(t,s) \in \mathcal{T}_{\text{OOF}}}
+  \]
+  \item \textbf{Nunca se usan predicciones in‑sample} de los modelos base para entrenar el meta.
+  \item El conjunto \texttt{OOS} queda \textbf{fuera del ajuste del meta}, siendo usado únicamente para evaluación final.
+  \item Se aplica \textbf{CV temporal purged} para evitar contaminación entre train/valid en el nivel meta.
+\end{itemize}
 
-9) Flujo del proceso
-1. Cargar candidate set y predicciones base OOF.
-2. Pivotear panel a matriz meta-features por (date,symbol).
-3. Alinear con y_true y splits temporales.
-4. Entrenar meta por folds (purged).
-5. Generar OOF del stack.
-6. Entrenar version final para inferencia segun policy.
-7. Evaluar OOS y persistir artefactos.
+Esta estrategia sigue el estándar de \textit{stacking con validación cruzada temporal purgada} discutido en \cite{cienciadedatos2007, lopez2016, lopez2020, ciencia2019} y en guías de \textit{stacking en series financieras} \cite{ciencia2019, wold2012}.
 
-10) Validaciones minimas
-- cobertura suficiente de todas las meta-features.
-- sin leakage entre train/valid/test en meta-level.
-- sin NaN/inf en matriz meta.
-- mejora o no degradacion fuerte vs baseline.
+\subsection*{4. Diseños de meta‑modelo soportados}
 
-11) Metricas recomendadas
-- metrica principal OOS (IC/RMSE/AUC segun task).
-- overfit_gap stack (train-valid).
-- estabilidad por fold.
-- improvement_vs_best_base.
-- drawdown/turnover proxy downstream.
+El módulo contempla varios tipos de meta‑modelo:
 
-12) Gates sugeridos
-- Gate 1: improvement_vs_best_base >= umbral.
-- Gate 2: estabilidad folds <= umbral dispersion.
-- Gate 3: sin leakage flags.
-- Gate 4: complejidad meta controlada (evitar overfit).
+\begin{itemize}
+  \item \textbf{Ridge / Lasso lineal}:
+  \[
+    y_{\text{stack},t,s} = \mathbf{X}^{(1)\top}_{t,s} \boldsymbol{\beta} + \epsilon_{t,s}
+  \]
+  con penalización \(\ell_2\) (Ridge) o \(\ell_1\) (Lasso) sobre \(\boldsymbol{\beta}\).  
+  Este es el \textbf{default recomendado} por su robustez, interpretabilidad y control de colinealidad de meta‑features.
+  
+  \item \textbf{Modelo lineal/logístico simple} sin regularización explícita, para comparativa de complejidad.
+  
+  \item \textbf{GBDT ligero} (con fuerte regularización):
+  \[
+    y_{\text{stack},t,s} = \sum_{k=1}^{K} \gamma_{k} f_{k}(\mathbf{X}^{(1)}_{t,s})
+  \]
+  donde cada \(f_k\) es un árbol de regresión o clasificación pequeño, con:
+  \begin{itemize}
+    \item límite de profundidad,
+    \item mínimo de observaciones por hoja,
+    \item shrinkage (\(\eta\)),
+    \item submuestreo de filas/columnas.
+  \end{itemize}
+  Este tipo de diseño está cercano a \textit{stacking con gradient boosting} en finanzas \cite{buildalpha2018, wu2021, skfolio2025}.
+\end{itemize}
 
-13) Manejo de casos especiales
-- base model faltante en ciertas fechas:
-  - policy: imputar/descartar fila/modelo.
-- alta colinealidad de meta-features:
-  - regularizacion y/o pruning por diversity.
-- pocos datos OOF:
-  - fallback a blender.
+La literatura sugiere que \textit{linear stacking} es frecuentemente tan bueno o mejor que modelos no lineales si el panel de base es grande y la señal es ruidosa \cite{wolpert1992, bates1969, timmermann2006, deribas2016}.
 
-14) Observabilidad y trazabilidad
-Logging:
-- INFO: progreso por fold y mejor config meta.
-- WARNING: cobertura baja o colinealidad extrema.
-- ERROR: inconsistencia OOF/splits.
+\subsection*{5. Construcción de la matriz de meta‑features}
 
-Metricas operativas:
-- n_base_models_used
-- n_rows_meta_train
-- n_rows_meta_valid
-- pct_rows_dropped
-- runtime_sec
+El flujo interno es:
 
-15) Interfaz de ejecucion (CLI sugerida)
-python -m models.ensemble.stacking ^
-  --base-oof-path models/predictions/base_models/oof_panel.parquet ^
-  --labels-path labels/store/latest.parquet ^
-  --splits-path labels/splits/purged_splits_latest.parquet ^
-  --config-path configs/models/stacking.yaml ^
-  --run-id stacking_20260305_001
+\begin{itemize}
+  \item \texttt{build\_meta\_feature\_matrix}:
+  \begin{itemize}
+    \item A partir del panel multi‑modelo OOF, se pivotan columnas por \texttt{model\_id}:
+    \[
+      \mathbf{X}^{(1)}_{t,s} \in \mathbb{R}^{S}
+    \]
+    \item El panel se alinea con \(\mathbf{y}_{\text{true},t,s}\) y \texttt{split\_role} para mantener consistencia temporal.
+  \end{itemize}
+  \item \texttt{validate\_meta\_matrix}:
+  \begin{itemize}
+    \item Chequeo de:
+    \begin{itemize}
+      \item ausencia de \texttt{NaN}/\texttt{inf},
+      \item cobertura suficiente de todas las meta‑features,
+      \item consistencia de \texttt{fold\_id} y \texttt{split\_role}.
+    \end{itemize}
+  \end{itemize}
+\end{itemize}
 
-16) Estructura interna recomendada (funciones)
-- load_stacking_config(...)
-- load_base_predictions(...)
-- load_labels_and_splits(...)
-- build_meta_feature_matrix(...)
-- validate_meta_matrix(...)
-- train_meta_model_by_fold(...)
-- generate_oof_oos_predictions(...)
-- compare_with_baselines(...)
-- persist_stacking_outputs(...)
-- main()
+Este paso garantiza que el meta‑modelo nunca entrene sobre filas con missing‑feature, evitando \textit{silent leakage} o \textit{overfitting} por imputación no controlada.
 
-17) Criterios de aceptacion (Definition of Done)
-- stacking OOF/OOS reproducible y sin leakage.
-- mejora robusta vs mejores modelos individuales o justificacion de fallback.
-- artefactos listos para model_registry e inference.
+\subsection*{6. Entrenamiento del meta‑modelo por folds}
 
-18) Casos de prueba minimos (para tests/)
-- pipeline meta-features con 2 modelos base sinteticos.
-- verificacion de no uso de in-sample base preds.
-- fallback a blender cuando meta data insuficiente.
-- comparativa improvement_vs_best_base correcta.
+\texttt{train\_meta\_model\_by\_fold} implementa:
 
-19) Riesgos y decisiones abiertas
-- tipo de meta-modelo final (lineal vs no lineal).
-- frecuencia de refit del meta.
-- uso de features de regimen en meta-level.
+\begin{itemize}
+  \item \textbf{CV temporal purged} sobre el panel OOF meta, manteniendo explícitamente:
+  \begin{itemize}
+    \item \texttt{train\_fold},
+    \item \texttt{valid\_fold},
+    \item \texttt{gap} entre ambos, si se usa purged CV.
+  \end{itemize}
+  \item Para cada fold:
+  \begin{itemize}
+    \item Entrena el meta sobre \texttt{train\_fold}.
+    \item Genera predicciones OOF del stack en \texttt{valid\_fold}:
+    \[
+      y_{\text{stack},t,s}^{\text{OOF}} = m^{(1)}\left( \mathbf{X}^{(1)}_{t,s}; \boldsymbol{\theta}_{\text{fold}} \right)
+    \]
+  \end{itemize}
+\end{itemize}
 
-20) Checklist rapido de implementacion
-- [ ] Construccion OOF meta-matrix.
-- [ ] Entrenamiento temporal purged del meta.
-- [ ] OOF/OOS preds del ensemble.
-- [ ] Comparativa robusta vs baselines.
-- [ ] Export artefactos + manifest.
+La estrategia de \textit{temporal CV purged} está alineada con estándares de backtesting robusto \cite{lo2001, lopez2016, lopez2020} y con tratamientos de \textit{stacking en contexts financieros} \cite{ciencia2019, wold2012, buildalpha2018}.
+
+\subsection*{7. Métricas y gates de aceptación}
+
+El módulo evalúa el stack mediante:
+
+\begin{itemize}
+  \item \textbf{Métrica principal OOS}:
+  \begin{itemize}
+    \item Por ejemplo, \textbf{IC}, \textbf{RMSE}, \textbf{Sharpe}, o \textbf{AUC} según el tarea (regresión/retorno, clasificación binaria, etc.).
+  \end{itemize}
+  \item \textbf{Overfit‑gap de stack}:
+  \[
+    \text{overfit\_gap} = \mathcal{L}_{\text{train}}^{(1)} - \mathcal{L}_{\text{valid}}^{(1)}
+  \]
+  donde \(\mathcal{L}\) es la métrica del meta‑modelo sobre folds OOF.
+  \item \textbf{Estabilidad por fold}:
+  \[
+    \text{std}\left( \mathcal{L}_{\text{fold}}^{(1)} \right)_{\text{folds}}
+  \]
+  que mide la variabilidad de performance del stack a través de ventanas temporales.
+  \item \textbf{Improvement vs best base model}:
+  [
+    \text{improvement\_vs\_best\_base} = \frac{\mathcal{L}_{\text{stack}}^{\text{OOS}} - \mathcal{L}_{\text{best\_base}}^{\text{OOS}}}{|\mathcal{L}_{\text{best\_base}}^{\text{OOS}}|}
+  \]
+  \item \textbf{Drawdown/turnover proxies} downstream:
+  \begin{itemize}
+    \item Aunque no se calculan en el stack directamente, se proyectan impactos sobre \texttt{backtest} y \texttt{portfolio/sizing}.
+  \end{itemize}
+\end{itemize}
+
+Los \textbf{gates de aceptación} recomendados son:
+
+\begin{enumerate}
+  \item \texttt{Gate 1}: \texttt{improvement\_vs\_best\_base} \(\geq\) umbral.
+  \item \texttt{Gate 2}: \texttt{estabilidad folds} \(\leq\) umbral de dispersión.
+  \item \texttt{Gate 3}: sin flags de \textit{leakage} o inconsistencia OOF/splits.
+  \item \texttt{Gate 4}: \texttt{complejidad meta} controlada (por ejemplo, número de parámetros, profundidad de árboles, regularización).
+\end{enumerate}
+
+Estas reglas siguen patrones de \textit{ensemble assessment} en trading de alta frecuencia y swing \cite{buildalpha2018, cfa2025, cambridge2020}.
+
+\subsection*{8. Manejo de casos especiales}
+
+\begin{itemize}
+  \item \textbf{Modelo base faltante en ciertas fechas}:
+  \begin{itemize}
+    \item \textit{Policy}: imputar (por ejemplo, con media histórica del modelo) o descartar fila/modelo.
+    \item Se registra \texttt{pct\_rows\_dropped} y \texttt{n\_rows\_meta\_train}/\texttt{n\_rows\_meta\_valid}.
+  \end{itemize}
+  \item \textbf{Alta colinealidad de meta‑features}:
+  \begin{itemize}
+    \item \textit{Regularización} (Ridge/Lasso) y \textit{pruning} guiado por \texttt{diversity\_metrics} para excluir modelos altamente redundantes.
+  \end{itemize}
+  \item \textbf{Pocos datos OOF}:
+  \begin{itemize}
+    \item \textit{Fallback} a un \texttt{blender} simple (p.ej. media ponderada robusta) en vez de stacking complejo.
+  \end{itemize}
+\end{itemize}
+
+Estas políticas están alineadas con enfoques de \textit{robust ensemble} y \textit{risk‑aware meta‑learning} en sistemas de trading industrial \cite{deribas2016, kapetanios2008, cfa2025}.
+
+\subsection*{9. Observabilidad, trazabilidad y salida de artefactos}
+
+\begin{itemize}
+  \item \textbf{Logging}:
+  \begin{itemize}
+    \item \texttt{INFO}: progreso por fold y mejor configuración del meta‑modelo.
+    \item \texttt{WARNING}: baja cobertura o alta colinealidad de meta‑features.
+    \item \texttt{ERROR}: inconsistencia entre OOF y splits.
+  \end{itemize}
+  \item \textbf{Métricas operativas}:
+  \begin{itemize}
+    \item \( n_{\text{base\_models\_used}} \): número de modelos base incluidos.
+    \item \( n_{\text{rows\_meta\_train}} \): filas disponibles para entrenar el meta.
+    \item \( n_{\text{rows\_meta\_valid}} \): filas de validación.
+    \item \( \texttt{pct\_rows\_dropped} \): porcentaje de filas eliminadas por missing o gaps.
+    \item \( \texttt{runtime\_sec} \): tiempo de ejecución total.
+  \end{itemize}
+\end{itemize}
+
+Las salidas principales son:
+
+\begin{itemize}
+  \item \texttt{meta\_model.pkl} (o JSON): artefacto del meta‑modelo, listo para \texttt{model\_registry} e inferencia.
+  \item \texttt{oof.parquet} y \texttt{oos.parquet}: predicciones del stack en OOF y OOS.
+  \item \texttt{metrics\_summary.json}: resumen de métricas principales y de \texttt{gates}.
+  \item \texttt{meta\_feature\_importance.parquet}: ponderación/importancia de cada modelo base en el stack (por ejemplo, coeficientes de Ridge o importancia de atributos de GBDT).
+  \item \texttt{manifest.json}: metadatos de \texttt{run\_id}, \texttt{candidate\_set\_ref}, \texttt{splits\_path}, etc.
+\end{itemize}
+
+Este diseño permite que el stack sea rastreable y reproductible, siguiendo buenas prácticas de \textit{model registry} y \textit{ML ops} en sistemas de trading industrial \cite{ciencia2019, cambridge2020, cfa2025}.
+
+\subsection*{10. Interfaz de ejecución y estructura interna}
+
+\textbf{CLI sugerida}:
+
+\begin{verbatim}
+python -m models.ensemble.stacking \
+  --base-oof-path models/predictions/base_models/oof_panel.parquet \
+  --labels-path labels/store/latest.parquet \
+  --splits-path labels/splits/purged_splits_latest.parquet \
+  --config-path configs/models/stacking.yaml \
+  --run-id stacking_20260305_

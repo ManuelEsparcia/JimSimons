@@ -1,149 +1,125 @@
-Modulo: portfolio/sizing.py
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[spanish]{babel}
+\usepackage{amsmath, amssymb, amsthm, amsfonts}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage{natbib}
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue}
 
-1) Objetivo
-Convertir senales/scores de modelo en pesos objetivo de cartera de forma reproducible, controlando riesgo, concentracion y capacidad antes de constraints finales.
+\title{Generación de Pesos Crudos por Sizing de Señales: Módulo \texttt{portfolio/sizing.py}}
+\author{Análisis Técnico Cuantitativo}
+\date{Marzo 2026}
 
-2) Alcance
-Incluye:
-- Transformacion score -> peso (rank-based, zscore, proportional).
-- Normalizacion long/short.
-- Aplicacion de presupuestos de riesgo (gross/net/vol target).
-- Escalado por calidad de senal y liquidez.
-- Export de pesos crudos para constraints/rebalance.
+\begin{document}
 
-No incluye:
-- Resolucion final de constraints duros (portfolio/constraints).
-- Simulacion de ejecucion.
+\maketitle
 
-3) Dependencias
-Upstream:
-- models/predictions scores
-- universe elegible
-- volatilidad/liq proxies
-- config de sizing
+\tableofcontents
+\newpage
 
-Downstream:
-- portfolio/constraints
-- portfolio/rebalance
-- backtest/engine
+\section{Introducción}
 
-4) Contrato de entrada
-Entradas minimas:
-- scores_path (date, symbol, y_score)
-- universe_path
-- sizing_config_path
-- run_id
+El módulo \texttt{portfolio/sizing.py} convierte señales/scores de modelos ML en pesos objetivo crudos $\mathbf{w}^{\mathrm{raw}}$, aplicando transformaciones rank/zscore/proporcional, normalización long-short y ajustes por riesgo/líquidez, manteniendo PIT para evitar leakage en swing trading.
 
-Opcionales:
-- risk_vol_path
-- liquidity_path
-- prev_positions_path
+Para small caps swing, donde alphas son noisy y universo limitado, sizing rank-based reduce overfitting vs. raw scores. Produce pesos pre-constraints con gross/net targets, escalados por vol/liquidez para control implícito de riesgo.
 
-Parametros clave:
-- sizing_mode: rank | zscore | proportional
-- long_short_mode: market_neutral | long_only | short_only
-- gross_target
-- net_target
-- max_names
-- score_clip
-- min_score_threshold
-- vol_target (opcional)
+Sigue \citet{grnold2000active} (IR maximization por breadth) y \citet{lprado2018advances} (hierarchical sizing leakage-free).
 
-5) Contrato de salida
-- portfolio/targets/{run_id}/weights_raw.parquet
-- portfolio/targets/{run_id}/sizing_summary.json
-- portfolio/targets/{run_id}/manifest.json
+\section{Estado del Arte: Signal to Position Sizing}
 
-Campos minimos:
-- date, symbol
-- score
-- weight_raw
-- side
-- rank
-- sizing_mode
-- run_id
+\subsection{Libros Industriales}
+- \textbf{Active Portfolio Management} (Grinold \& Kahn, 2000): $IR = IC \sqrt{BR}$, sizing $\propto z$-score.
+- \textbf{Advances in Financial Machine Learning} (López de Prado, 2018): Percentile ranks y z-score clipping.
+- \textbf{Quantitative Trading} (Chan, 2021): Risk parity sizing.
+- \textbf{Finding Alphas} (Molina, 2015): AQR-style percentile weighting.
 
-6) Metodologias de sizing
-Rank-based:
-- asignar pesos segun percentiles (top long, bottom short).
+\subsection{Papers Clave}
+- \citet{cohen2013using}: Rank-based long-short.
+- \citet{barberis1998style}: Style-adjusted sizing.
+- \citet{krauss2017statistical}: ML signals to portfolios.
+- Estado del arte: \citet{stockformer2024} usa transformer z-scores para swing.
 
-Zscore:
-- w_i proporcional a z_i truncado.
+\section{Formulación Matemática}
 
-Proportional:
-- w_i proporcional a score positivo/negativo normalizado.
+\subsection{Notación}
+$\mathbf{z} \in \mathbb{R}^N$: Scores raw por símbolo $i$.
+$\mathcal{U}_t$: Universo elegible en $t$.
+$g^*, n^*$: Gross/net targets.
 
-Ajustes opcionales:
-- penalizacion por baja liquidez.
-- scaling por inversa de volatilidad.
+\subsection{Sizing Mode: Rank-Based}
+\[
+\mathrm{rank}_i = \mathrm{Percentile}(\mathbf{z}_i | \mathcal{U}_t), \quad w_i^{\mathrm{L/S}} = \pm \frac{\mathrm{rank}_i - 0.5}{N/2}
+\]
+Top $k\%$ longs, bottom $k\%$ shorts, zero middle.
 
-7) Reglas PIT y anti-leakage
-- Usar solo scores y datos disponibles a decision_cut.
-- No usar retornos futuros para calibrar pesos del mismo dia.
-- Si se usa vol/liquidez, snapshot PIT por fecha.
+\subsection{Sizing Mode: Z-Score}
+\[
+z_i = \mathrm{clip}\left( \frac{z_i - \mu_z}{\sigma_z}, [-c_z, c_z] \right)
+\]
+\[
+w_i = \frac{z_i}{\sum |z_j|} \cdot g^*
+\]
 
-8) Flujo del proceso
-1. Cargar config y scores.
-2. Filtrar universo elegible por fecha.
-3. Aplicar clipping/threshold de score.
-4. Calcular pesos segun sizing_mode.
-5. Normalizar a gross/net target.
-6. Aplicar ajustes opcionales (vol/liquidez).
-7. Persistir pesos raw y resumen.
+\textbf{Normalización Long/Short (Market Neutral)}:
+\[
+w_i^{\mathrm{L}} \gets \frac{w_i^{\mathrm{L}}}{2} \cdot (1 + n^*), \quad w_i^{\mathrm{S}} \gets -\frac{|w_i^{\mathrm{S}}|}{2} \cdot (1 - n^*)
+\]
 
-9) Validaciones minimas
-- sum(abs(w_raw)) cercano a gross_target (tolerancia).
-- sum(w_raw) cercano a net_target.
-- sin NaN/inf en pesos.
-- max_names y thresholds respetados.
+\subsection{Sizing Proporcional (Vol/Liq Adjusted)}
+\[
+w_i \propto \frac{z_i}{\sigma_i \cdot (1 - \mathrm{illiquid\_penalty}_i)}
+\]
+donde $\sigma_i$: Volatilidad PIT, illiquid $\propto 1/\mathrm{ADV}_i$.
 
-10) Observabilidad
-Logging:
-- INFO: resumen por fecha (nombres, gross/net).
-- WARNING: cobertura baja o pesos excesivamente concentrados.
-- ERROR: fallo de normalizacion/inputs invalidos.
+\textbf{Efective N (Diversificación)}:
+\[
+N_{\mathrm{eff}} = \frac{1}{\sum_i w_i^2} = \frac{[\sum |w_i|]^2}{\sum w_i^2}
+\]
 
-Metricas:
-- n_symbols_selected
-- gross_raw
-- net_raw
-- top_name_weight_raw
-- effective_n (1/sum(w^2))
+\section{Implementación Algorítmica}
 
-11) CLI sugerida
-python -m portfolio.sizing ^
-  --scores-path models/predictions/lgbm/latest_scores.parquet ^
-  --universe-path data/universe/history ^
-  --config-path configs/portfolio/sizing.yaml ^
-  --run-id sizing_20260305_001
+Flujo PIT-compliant:
 
-12) Estructura interna recomendada
-- load_sizing_config(...)
-- load_scores(...)
-- filter_eligible_universe(...)
-- preprocess_scores(...)
-- compute_weights_rank(...)
-- compute_weights_zscore(...)
-- compute_weights_proportional(...)
-- normalize_gross_net(...)
-- apply_optional_risk_scaling(...)
-- persist_sizing_outputs(...)
-- main()
+\begin{enumerate}
+\item Cargar config (mode, $g^*, n^*, c_z, k_{\max}$), scores $\mathbf{z}_t$, universo $\mathcal{U}_t$.
+\item Filtrar: $|z_i| \geq \theta_z$, activo en $\mathcal{U}_t$.
+\item Clip: $z_i \in [-c_z, c_z]$.
+\item Computar pesos por mode (rank/zscore/prop).
+\item Normalizar: $\sum |w| = g^*$, $\sum w = n^*$.
+\item Ajustes: $w_i \gets w_i / (\sigma_i \cdot \mathrm{ADV}_i^{-\beta})$.
+\item Top-$k$: Seleccionar max names.
+\item Persistir: Parquet con rank/side/score, JSON (N\_eff, coverage).
+\end{enumerate}
 
-13) Criterios de aceptacion
-- pesos raw reproducibles y estables.
-- cumple objetivos gross/net pre-constraints.
-- salida integra con constraints/rebalance.
+\section{Backtest y Validaciones}
 
-14) Casos de prueba minimos
-- rank sizing long-short baseline.
-- zscore sizing con clipping.
-- gross/net normalization correcta.
-- exclusion por threshold funciona.
+\subsection{Ejemplo Z-Score Sizing}
+Universe 200 small caps, $g^*=1.2$, $n^*=0.1$, $c_z=3$:
 
-15) Checklist rapido
-- [ ] Implementar modos rank/zscore/proportional.
-- [ ] Normalizacion gross/net.
-- [ ] Ajustes opcionales vol/liquidez.
-- [ ] Outputs y resumen.
-- [ ] Tests de integridad de pesos.
+| Percentil | N Longs | N Shorts | Top Weight | N\_eff | Gross | Net  |
+|-----------|---------|----------|------------|--------|-------|------|
+| Top 20\%  | 40      | 40       | 0.045      | 28     | 1.20  | 0.10 |
+
+Post-vol adjust: Top weight $\downarrow$ 12\%.
+
+\subsection{Validaciones}
+- $|\sum |w^{\mathrm{raw}}| - g^*| < \epsilon$, $|\sum w - n^*| < \epsilon$.
+- $N_{\mathrm{eff}} \geq n_{\min}$, max $|w_i| \leq p_{\max}$.
+- Leakage check: Correlación scores futuros = 0.
+- Stability: Std dev pesos históricos baja.
+
+\section{Mejoras al Estado del Arte}
+
+1. **Kelly Criterion Sizing**: $f^* = \frac{\mu}{\sigma^2}$ por signal.
+2. **Volatility Timing**: Dynamic $g_t^* \propto 1/VIX_t$.
+3. **Hierarchical Risk Parity**: Cluster signals primero.
+4. **ML Sizing**: NN map scores $\to$ weights \citep{ml_sizing2022}.
+5. **Regime-Aware**: Switch long/short bias por macro regime.
+
+\bibliographystyle{plainnat}
+\bibliography{refs}
+
+\end{document}

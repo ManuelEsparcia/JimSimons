@@ -1,162 +1,274 @@
-Modulo: models/ensemble/blender.py
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%% DOCUMENTACIÓN: models/ensemble/blender.py %%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-1) Objetivo
-Combinar predicciones de modelos base mediante reglas simples y robustas (promedio/ponderado) para obtener un ensemble estable y facil de operar en produccion.
+\section*{Módulo: \texttt{models/ensemble/blender.py}}
+\label{sec:blender}
 
-2) Alcance
-Incluye:
-- Blend simple y weighted blend.
-- Estimacion/seleccion de pesos por OOF.
-- Aplicacion de constraints sobre pesos del blend.
-- Generacion de scores blended OOF/OOS/inferencia.
+\subsection*{1. Objetivo del módulo}
 
-No incluye:
-- Meta-modelado complejo (stacking).
-- Entrenamiento de modelos base.
+El módulo \texttt{blender.py} implementa un \textbf{ensemble blending} para la combinación de predicciones de modelos base en el contexto de \textit{trading algorítmico de swing} y gestión de cartera. El objetivo es:
 
-3) Dependencias aguas arriba y aguas abajo
-Upstream:
-- candidate set de diversity_metrics
-- predicciones base OOF/OOS
-- config de blend
+\begin{itemize}
+  \item Combinar predicciones de modelos base mediante reglas simples y robustas (promedio, media ponderada, media recortada, etc.).
+  \item Producir una señal \textbf{estable en el tiempo} y fácilmente operable en producción.
+  \item Aumentar la \textbf{robustez} frente al ruido de modelos individuales, la sobreajuste y la rotura de régimen.
+\end{itemize}
 
-Downstream:
-- models/inference/predict.py
-- portfolio/sizing.py
-- backtest/engine.py
+La meta es que el ensemble \texttt{blender} pase a ser el \textbf{input de entrada para gestión de tamaño de posición y backtest}, no solo un agregador de opiniones.
 
-4) Contrato de entrada
-Entradas minimas:
-- base_predictions_path
-- blend_config_path
-- run_id
+\subsection*{2. Formulación matemática del blending}
 
-Opcionales:
-- labels_path (si se calibran pesos por performance)
-- regime_labels_path
+Sea \( \mathcal{M} = \{m_1, \dots, m_S\} \) un conjunto de \(S\) modelos base cuyas predicciones sobre un activo \( \texttt{symbol} \) en fecha \(t\) son \( \{y_{m_i, t}\}_{i=1}^S \). El blender produce una señal combinada:
 
-Campos minimos:
-- date
-- symbol
-- model_id
-- y_pred_base
+\begin{equation}
+  y_{\text{blend},t} = \sum_{i=1}^{S_t} w_{i,t} \, y_{m_i, t}
+\end{equation}
 
-5) Contrato de salida
-- models/predictions/ensemble/blender/{run_id}/blended_scores.parquet
-- models/reports/ensemble/blender/{run_id}/blend_weights.json
-- models/reports/ensemble/blender/{run_id}/blend_summary.json
-- models/reports/ensemble/blender/{run_id}/manifest.json
+donde:
+\begin{itemize}
+  \item \( S_t \) es el número de modelos disponibles en la fecha \(t\).
+  \item \( w_{i,t} \in \mathbb{R} \) son los pesos del blend, con \( \sum_{i=1}^{S_t} w_{i,t} = 1 \).
+\end{itemize}
 
-Campos minimos:
-- date
-- symbol
-- y_pred_blend
-- blend_version
-- run_id
+El problema de blend se puede formalizar como:
 
-6) Modos de blend soportados
-- mean_equal_weight
-- weighted_static
-- weighted_by_regime (opcional)
-- robust_trimmed_mean (opcional)
+\begin{equation}
+  \min_{\mathbf{w}} \,\,
+  \mathcal{L}(\mathbf{w})
+  \quad
+  \text{s.a.} \quad
+  \mathbf{1}^\top \mathbf{w} = 1,\,\,
+  w_i \geq 0,\,\,
+  w_i \leq \overline{w}_i
+\end{equation}
 
-7) Reglas de pesos
-Constraints recomendadas:
-- w_i >= 0 (o permitir negativos solo si configurado)
-- sum(w_i) = 1
-- w_i <= max_weight_per_model
+donde:
+\begin{itemize}
+  \item \( \mathcal{L}(\mathbf{w}) \) es una función de pérdida sobre el conjunto \textbf{OOF} (out‑of‑fold), por ejemplo MSE, Sharpe-like, o una métrica de calidad de señal.
+  \item \( \overline{w}_i \) es el máximo peso permitido para el modelo \(m_i\).
+\end{itemize}
 
-Fuentes de pesos:
-- fixed (manual/config)
-- optimized on OOF under constraints
-- heuristic (performance * diversity)
+Este tipo de formulación está alineada con la literatura de \textbf{forecast combination} y \textbf{ensemble methods} en finanzas \cite{clemen1989, clemen1996, timmermann2006, kapetanios2008, deribas2016}.
 
-8) Flujo del proceso
-1. Cargar predicciones base y candidate models.
-2. Seleccionar metodo de blend.
-3. Obtener pesos (fijos u optimizados en OOF).
-4. Aplicar blend por fecha/simbolo.
-5. Evaluar metricas OOF/OOS.
-6. Persistir scores y pesos versionados.
+\subsection*{3. Modos de blend soportados}
 
-9) Reglas PIT y anti-leakage
-- pesos optimizados deben usar solo OOF historico.
-- para inferencia historica, no usar info futura en recalculo de pesos.
-- si pesos son dinamicos, versionar ventana de estimacion.
+El módulo soporta los siguientes tipos de combinación de pesos:
 
-10) Validaciones minimas
-- cobertura completa de modelos requeridos.
-- pesos validos (suma=1, bounds).
-- y_pred_blend sin NaN/inf.
-- mejora o estabilidad vs best_base dentro de umbrales.
+\begin{itemize}
+  \item \texttt{mean\_equal\_weight}:  
+    \[ w_i = \frac{1}{S_t} \quad \forall i \]
+    Es el promedio simple, ampliamente usado como baseline en combinatoria de modelos \cite{clemen1989}.
+        
+  \item \texttt{weighted\_static}:  
+    Pesos fijos \( \mathbf{w} \) definidos en configuración.  
+    \[ y_{\text{blend},t} = \sum_{i=1}^{S_t} w_{i} \, y_{m_i, t} \]
+    con \( \sum_{i} w_i = 1 \), típico en sistemas industriales donde se busca simplicidad y estabilidad.
 
-11) Metricas recomendadas
-- metrica principal OOS del blend.
-- improvement_vs_best_base.
-- estabilidad por ventana/regimen.
-- sensibilidad a perturbacion de pesos.
+  \item \texttt{weighted\_by\_regime} (opcional):  
+    Se estima un conjunto de pesos por régimen \( r \in \mathcal{R} \):
+    \[ y_{\text{blend},t}^{(r)} = \sum_{i=1}^{S_t} w_{i,t}^{(r)} \, y_{m_i, t} \]
+    con pesos estimados sobre ventana de OOF condicionada al régimen \(r\) (por ejemplo: volatilidad, trend, régimen markoviano).  
+    Es análogo a \textit{regime‑dependent model averaging} o \textit{state‑dependent ensemble} \cite{hamilton1994, timmermann2006, orlov2010}.
 
-12) Gates sugeridos
-- pass: mejora o estabilidad robusta sin riesgo extra.
-- warn: mejora marginal/inestable.
-- fail: degradacion clara frente baseline.
+  \item \texttt{robust\_trimmed\_mean} (opcional):  
+    Se elimina un porcentaje de los modelos extremos (por desempeño o dispersión) y se aplica media ponderada sobre el resto:
+    \[ y_{\text{blend},t} = \sum_{i \in \mathcal{I}_{\text{trimmed}}} w_{i,t} \, y_{m_i, t} \]
+    Este esquema es cercano a \textit{robust forecast combination} basado en media recortada o truncada \cite{stockwatson1999, kapetanios2008, deribas2016}.
+\end{itemize}
 
-13) Manejo de casos especiales
-- modelo base faltante en fecha:
-  - renormalizar pesos disponibles o fallback.
-- drift de un modelo:
-  - downweight automatico si config lo permite.
-- alta correlacion entre bases:
-  - limitar pesos concentrados.
+\subsection*{4. Estimación y selección de pesos}
 
-14) Observabilidad y trazabilidad
-Logging:
-- INFO: pesos finales y metricas.
-- WARNING: renormalizaciones frecuentes/faltantes.
-- ERROR: pesos invalidos o panel inconsistente.
+Los pesos pueden provenir de tres fuentes principales:
 
-Metricas operativas:
-- n_models_blended
-- pct_rows_renormalized
-- weight_concentration_hhi
-- runtime_sec
+\begin{itemize}
+  \item \textbf{Pesos fijos} (configuración manual o por reglas de negocio).  
+  \item \textbf{Pesos optimizados sobre OOF}:
+    \[ \mathbf{w}^* = \argmin_{\mathbf{w}} \mathcal{L}(\mathbf{w}; \text{panel OOF}) \]
+    donde el panel OOF contiene predicciones base y labels históricos.  
+    Esta aproximación es equivalente a resolver un problema de \textit{model averaging} o \textit{forecast combination} con restricciones de suma unitaria y no negatividad \cite{clemen1986, clemen1996, timmermann2006, kapetanios2008, deribas2016}.
+  \item \textbf{Pesos heurísticos} (performance \( \times \) diversidad):
+    \[ w_i \propto \text{Metric}_i \cdot \text{Diversity}_i \]
+    donde:
+    \begin{itemize}
+      \item \( \text{Metric}_i \) puede ser Sharpe, Sortino, retorno medio, o cualquiera de las métricas recomendadas en el backtest.
+      \item \( \text{Diversity}_i \) se obtiene de métricas de diversidad de modelos (ver módulo \texttt{diversity\_metrics}).
+    \end{itemize}
+\end{itemize}
 
-15) Interfaz de ejecucion (CLI sugerida)
-python -m models.ensemble.blender ^
-  --base-predictions-path models/predictions/base_models/oof_panel.parquet ^
-  --config-path configs/models/blender.yaml ^
-  --run-id blender_20260305_001
+La combinación de “performance” y “diversidad” está alineada con la literatura de gestores de fondos que combinan estrategias por Sharpe ajustado y correlación cruzada \cite{edhec2009, harryporter2017}.
 
-16) Estructura interna recomendada (funciones)
-- load_blend_config(...)
-- load_base_predictions(...)
-- select_candidate_models(...)
-- estimate_or_load_blend_weights(...)
-- apply_blend(...)
-- evaluate_blend_performance(...)
-- run_weight_sensitivity(...)
-- persist_blend_outputs(...)
-- main()
+\subsection*{5. Constraints sobre pesos}
 
-17) Criterios de aceptacion (Definition of Done)
-- blender reproducible y operacionalmente simple.
-- pesos y scores versionados.
-- rendimiento no inferior (o mejora) frente base segun politica.
+El código impone o recomienda los siguientes constraints:
 
-18) Casos de prueba minimos (para tests/)
-- equal-weight blend de 2 modelos sinteticos.
-- weighted blend con restricciones de pesos.
-- renormalizacion por modelo faltante.
-- sensibilidad de pesos detecta configuraciones fragiles.
+\begin{itemize}
+  \item No negatividad: \( w_i \geq 0 \) (excepto si se configura explícitamente permitir pesos negativos).
+  \item Suma unitaria: \( \sum w_i = 1 \).
+  \item Cota superior por modelo: \( w_i \leq \overline{w}_i \).
+\end{itemize}
 
-19) Riesgos y decisiones abiertas
-- frecuencia de actualizacion de pesos.
-- permitir pesos negativos o no.
-- blend global vs blend por regimen.
+Este espacio de pesos definido sobre el simplex:
 
-20) Checklist rapido de implementacion
-- [ ] Modos equal/weighted.
-- [ ] Estimacion de pesos en OOF.
-- [ ] Aplicacion robusta con faltantes.
-- [ ] Metricas y sensibilidad.
-- [ ] Export de scores/pesos/manifest.
+\[
+  \mathcal{W} = \left\{ \mathbf{w} \in \mathbb{R}^S \colon \mathbf{1}^\top \mathbf{w} = 1,\, w_i \geq 0,\, w_i \leq \overline{w}_i \right\}
+\]
+
+es el estándar en combinatoria de modelos siguiendo la literatura de Clemen y Winkler \cite{clemen1986, clemen1996} y derivados modernos \cite{kapetanios2008, deribas2016, weiss2018, radchenko2023}.
+
+\subsection*{6. Flujo del proceso}
+
+El flujo implementado en \texttt{blender.py} sigue este pipeline:
+
+\begin{enumerate}
+  \item Cargar predicciones base y conjunto de modelos candidatos.
+  \item Seleccionar el método de blend (por configuración).
+  \item Obtener pesos:
+  \begin{itemize}
+    \item fijos, o
+    \item estimados optimizando sobre panel OOF bajo restricciones.
+  \end{itemize}
+  \item Aplicar el blend por fecha y símbolo:
+  \[ y_{\text{blend},t,\text{symbol}} = \sum_{i \in \mathcal{M}_t} w_{i,t} \, y_{m_i, t,\text{symbol}} \]
+  \item Calcular métricas OOF y OOS.
+  \item Persistir scores blend y pesos versionados.
+\end{enumerate}
+
+Este diseño es compatible con sistemas de backtest multi‑activo y de producción de trading, donde se requiere \textbf{reproducibilidad completa} (pesos, versiones, fechas, símbolos).
+
+\subsection*{7. Rol de OOF y reglas \textit{PIT} / anti‑leakage}
+
+\begin{itemize}
+  \item Los pesos deben estimarse \textbf{exclusivamente sobre el panel OOF}:  
+    \[
+      \mathcal{L}(\mathbf{w}; \text{panel OOF})
+    \]
+    para evitar optimismo en OOS.
+  \item En inferencia histórica, \textbf{no usar información futura} al re‑calcular pesos.  
+    Si se usa estimación dinámica (por ventanas móviles), se debe:
+    \begin{itemize}
+      \item fijar la ventana de estimación,
+      \item versionar explícitamente dicha ventana.
+    \end{itemize}
+  \item El blend debe ser \textbf{calculable en producción} usando únicamente información disponible en tiempo \(t\).
+\end{itemize}
+
+Estas reglas siguen estándares de backtesting robusto descritos en \cite{lo2001, lopez2016, lopez2020}, donde se enfatiza la separación estricta entre OOF y OOS y la prohibición de uso de información futura.
+
+\subsection*{8. Validaciones y métricas recomendadas}
+
+El módulo establece:
+
+\begin{itemize}
+  \item \textbf{Validaciones mínimas}:
+  \begin{itemize}
+    \item Cobertura completa de modelos requeridos.
+    \item Pesos válidos: \( \sum w_i = 1 \), bounds dentro de rangos permitidos.
+    \item \( y_{\text{blend}} \) sin \texttt{NaN} o \texttt{inf}.
+    \item Mejora o estabilidad frente al \texttt{best\_base} dentro de umbrales predefinidos.
+  \end{itemize}
+  \item \textbf{Métricas recomendadas}:
+  \begin{itemize}
+    \item Métrica principal OOS del blend (por ejemplo Sharpe, retorno, o métrica de señal).
+    \item \texttt{improvement\_vs\_best\_base} (ganancia frente al mejor modelo base).
+    \item Estabilidad por ventana o régimen (volatilidad de pesos, robustez de la métrica).
+    \item Sensibilidad a perturbaciones de pesos (¿cómo cambia el Vermiding cuando se perturban los pesos?).
+  \end{itemize}
+\end{itemize}
+
+La sensibilidad de pesos está alineada con la literatura de \textit{ensemble robustness} y \textit{weight perturbation analysis} en sistemas de forecasting combinado \cite{deribas2016, regert2020, kapetanios2008}.
+
+\subsection*{9. Tratamiento de casos especiales}
+
+El módulo contempla:
+
+\begin{itemize}
+  \item \textbf{Modelo base faltante}:
+  \begin{itemize}
+    \item Renormalizar pesos de los modelos disponibles:
+    \[
+      w_i^{\text{renorm}} = \frac{w_i}{\sum_{j \in \mathcal{M}_t} w_j}
+    \]
+    \item O usar regla de \textit{fallback} definida en configuración.
+  \end{itemize}
+  \item \textbf{Drift de modelo}:
+  \begin{itemize}
+    \item Si un modelo degrada su desempeño OOF, el sistema puede \textit{downweight} automáticamente si la configuración lo permite.
+  \end{itemize}
+  \item \textbf{Alta correlación entre modelos}:
+  \begin{itemize}
+    \item Limitar pesos concentrados en modelos altamente correlacionados, usando métricas de diversidad.
+    \item Esto reduce exceso de concentración de riesgo y mejora la robustez del ensemble.
+  \end{itemize}
+\end{itemize}
+
+Este tratamiento es consistente con la literatura de \textit{drift‑aware ensemble models} \cite{drift2013, drift2024} y con prácticas de gestión de riesgo en fondos de hedge.
+
+\subsection*{10. Observabilidad y trazabilidad}
+
+El módulo implementa:
+
+\begin{itemize}
+  \item \textbf{Logging}:
+  \begin{itemize}
+    \item \texttt{INFO}: pesos finales, métricas, número de modelos combinados.
+    \item \texttt{WARNING}: frecuencias de renormalización, modelos faltantes.
+    \item \texttt{ERROR}: pesos inválidos o panel inconsistente.
+  \end{itemize}
+  \item \textbf{Métricas operativas}:
+  \begin{itemize}
+    \item \( n_{\text{models\_blended}} \): número de modelos mezclados.
+    \item \texttt{pct\_rows\_renormalized}: porcentaje de filas donde se renormalizan pesos.
+    \item \texttt{weight\_concentration\_hhi}: índice de Herfindahl‑Hirschman sobre pesos:
+      \[
+        \text{HHI} = \sum_{i} w_i^2
+      \]
+      que mide concentración de peso.
+    \item \texttt{runtime\_sec}: tiempo de ejecución.
+  \end{itemize}
+\end{itemize}
+
+La monitorización de concentración de pesos y su evolución en el tiempo es una práctica en fondos de trading que utilizan ensembles de modelos para controlar riesgo de dependencia excesiva en un subconjunto reducido de señales \cite{edhec2018, cambridge2020}.
+
+\subsection*{11. Interfaz de ejecución (CLI) y estructura interna}
+
+\begin{itemize}
+  \item CLI sugerida:
+  \begin{verbatim}
+  python -m models.ensemble.blender \
+    --base-predictions-path models/predictions/base_models/oof_panel.parquet \
+    --config-path configs/models/blender.yaml \
+    --run-id blender_20260305_001
+  \end{verbatim}
+  \item Funciones recomendadas dentro del módulo:
+  \begin{itemize}
+    \item \texttt{load\_blend\_config}
+    \item \texttt{load\_base\_predictions}
+    \item \texttt{select\_candidate\_models}
+    \item \texttt{estimate\_or\_load\_blend\_weights}
+    \item \texttt{apply\_blend}
+    \item \texttt{evaluate\_blend\_performance}
+    \item \texttt{run\_weight\_sensitivity}
+    \item \texttt{persist\_blend\_outputs}
+    \item \texttt{main}
+  \end{itemize}
+\end{itemize}
+
+Esta modularidad permite:
+\begin{itemize}
+  \item Testing unitario y reutilización de componentes.
+  \item Integración homogénea en pipelines de backtest y producción.
+\end{itemize}
+
+\subsection*{12. Relación con el resto del sistema}
+
+\begin{itemize}
+  \item \textbf{Entradas}:
+  \begin{itemize}
+    \item Panel de predicciones base OOF/OOS.
+    \item Configuración de blend.
+    \item (opcional) labels y \texttt{regime\_labels} para calibrar pesos.
+  \end{itemize}
+  \item \textbf{Salidas}:
+  \begin{itemize}
+    \item \texttt

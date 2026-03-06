@@ -1,150 +1,242 @@
-Modulo: backtest/run_walkforward.py
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage[spanish]{babel}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{mathtools}
+\usepackage{longtable}
+\usepackage{algorithm,algorithmic}
+\usepackage{hyperref}
 
-1) Objetivo
-Orquestar una evaluacion walk-forward end-to-end (train -> predict -> backtest) sobre ventanas temporales consecutivas, produciendo metricas OOS realistas, reproducibles y libres de leakage.
+\title{Análisis de Estado del Arte: Módulo \texttt{backtest/run\_walkforward.py}}
+\author{Sistema de Swing Trading Cuantitativo}
+\date{\today}
 
-2) Alcance
-Incluye:
-- Definicion de ventanas rolling/expanding train-valid-test.
-- Ejecucion secuencial de entrenamiento por ventana.
-- Generacion de predicciones en bloque OOS.
-- Lanzamiento del backtest engine por ventana.
-- Agregacion global de resultados OOS.
+\begin{document}
 
-No incluye:
-- Implementacion interna de train_lgbm/predict/engine (los invoca).
-- Tuneo hiperparametrico masivo.
-- Seleccion de senales manual fuera de config.
+\maketitle
 
-3) Dependencias aguas arriba y aguas abajo
-Upstream:
-- features/store + feature_qc pass
-- labels/store + purged_splits
-- models/gbdt/train_lgbm
-- models/inference/predict
-- backtest/engine
+\begin{abstract}
+Este documento describe el diseño, la fundamentación matemática y el contexto académico/industrial del módulo \texttt{backtest/run\_walkforward.py} en el repositorio \texttt{JimSimons}. El objetivo es orquestar una \textbf{evaluación walk‑forward} \textit{end‑to‑end} (train \(\rightarrow\) predict \(\rightarrow\) backtest) sobre ventanas temporales consecutivas, produciendo \textbf{métricas OOS realistas, reproducibles y libres de \textit{look‑ahead leakage}}. El módulo define esquemas de \textit{rolling} y \textit{expanding} windows, coordina entrenamiento de modelos, inferencia y ejecución de \texttt{backtest/engine}, y agrega resultados OOS globales. El enfoque está alineado con estándares de \textit{walk‑forward analysis} y \textit{purged cross‑validation} usados en \textit{quant research} moderno \cite{walkforward_sklearn, quantinsti_wfo, combinatory_purged_cv, funds_wfo}.
+\end{abstract}
 
-Downstream:
-- backtest/report.py
-- validation/validation_suite.py
-- research/ablation/*
+\tableofcontents
 
-4) Contrato de entrada
-Entradas minimas:
-- features_path
-- labels_path
-- prices_path
-- universe_path
-- walkforward_config_path
-- run_id
+\section{Objetivo del módulo}
 
-Parametros clave de config:
-- window_mode: rolling | expanding
-- train_years
-- valid_months
-- test_months
-- step_months
-- min_train_days
-- embargo_days
-- model_config_path
-- backtest_config_path
-- seed
+El módulo \texttt{backtest/run\_walkforward.py} tiene como objetivo:
 
-5) Contrato de salida
-Por ventana:
-- backtest/walkforward/{run_id}/window_{i}/model_artifacts/*
-- backtest/walkforward/{run_id}/window_{i}/predictions.parquet
-- backtest/walkforward/{run_id}/window_{i}/backtest_outputs/*
-- backtest/walkforward/{run_id}/window_{i}/metrics.json
+\begin{itemize}
+  \item \textbf{Orquestar un pipeline walk‑forward} completo:
+    \[
+      \text{train} \rightarrow \text{predict} \rightarrow \text{backtest OOS}
+    \]
+    sobre ventanas temporales consecutivas.
+  \item \textbf{Estimar \textit{performance realista}} usando únicamente \textit{out‑of‑sample} (OOS) test windows, evitando \textit{data‑mining} y \textit{overfitting}.
+  \item \textbf{Garantizar reproducción} por medio de seeds, versiones de datos y \texttt{run\_id}.
+\end{itemize}
 
-Agregado global:
-- backtest/walkforward/{run_id}/oos_equity_curve.parquet
-- backtest/walkforward/{run_id}/window_summary.parquet
-- backtest/walkforward/{run_id}/global_metrics.json
-- backtest/walkforward/{run_id}/manifest.json
+El \textit{walk‑forward analysis} (WFA) moderno se considera \textit{gold standard} para validar modelos de tiempo y estrategias de trading, porque simula cómo se reentrenarían y reevaluarían los modelos en el tiempo real \cite{walkforward_sklearn, quantinsti_wfo, ibkr_walkforward}.
 
-6) Reglas PIT y anti-leakage
-- Cada ventana entrena solo con datos anteriores al inicio de test.
-- Validacion dentro de train window; test nunca se usa para tuning.
-- Embargo entre train y test si esta configurado.
-- Agregacion global usa unicamente segmentos OOS no solapados.
+\section{Contexto académico e industrial}
 
-7) Flujo del proceso
-1. Cargar config y construir calendario de ventanas.
-2. Para cada ventana:
-   - construir datasets train/valid/test.
-   - ejecutar entrenamiento.
-   - generar predicciones en test window.
-   - ejecutar backtest engine sobre esa ventana OOS.
-   - guardar outputs de ventana.
-3. Concatenar resultados OOS de todas las ventanas.
-4. Calcular metricas globales y por subperiodo.
-5. Persistir reportes y manifest.
+\subsection{Walk‑forward analysis y leak‑free split}
 
-8) Metricas recomendadas
-- CAGR, Sharpe, Sortino, max drawdown (global OOS)
-- estabilidad por ventana (dispersion de Sharpe/IC)
-- turnover y costes promedio
-- hit ratio y spread long-short
+El \textit{walk‑forward} se puede definir mediante ventanas:
 
-9) Validaciones minimas
-- ventanas sin solapamiento indebido en test.
-- cada fecha OOS aparece una sola vez en agregado final.
-- sin leakage flags en ventanas.
-- tamano minimo de train/test por ventana.
+\begin{itemize}
+  \item \textbf{Train window} \( \mathcal{T}_k \): \([t_0, t_{\text{valid},k}]\).
+  \item \textbf{Validation window} \( \mathcal{V}_k \): \([t_{\text{valid},k}, t_{\text{test},k}]\).
+  \item \textbf{Test window (OOS)} \( \mathcal{S}_k \): \([t_{\text{test},k}, t_{\text{test},k} + \Delta_t]\).
+\end{itemize}
 
-10) Manejo de fallos
-- Si falla una ventana: marcar fail_window y continuar segun politica.
-- Politica configurable:
-  - fail_fast=true: aborta run.
-  - fail_fast=false: continua y registra excepcion.
+En cada iteración \(k\), el modelo:
 
-11) Observabilidad
-Logging:
-- INFO: progreso por ventana.
-- WARNING: ventana con datos escasos/metricas inestables.
-- ERROR: fallo de entrenamiento o backtest en ventana.
+\begin{enumerate}
+  \item Se entrena solo en \( \mathcal{T}_k \) (con \textit{embargo} opcional).
+  \item Se valida internamente en \( \mathcal{V}_k \) para \textit{early‑stopping} o \textit{model selection}.
+  \item Se prueba en \( \mathcal{S}_k \) sin uso posterior para \textit{tuning}.
+\end{enumerate}
 
-Metricas operativas:
-- n_windows_total
-- n_windows_success
-- n_windows_failed
-- total_runtime_sec
+El agregado global se construye con \texttt{non‑overlapping} segmentos OOS \(\mathcal{S}_k\) para evitar \textit{leakage} y garantizar estimadores independientes de \textit{Sharpe} o \textit{CAGR} \cite{combinatory_purged_cv, walkforward_sklearn, quantinsti_wfo}.
 
-12) CLI sugerida
-python -m backtest.run_walkforward ^
-  --features-path features/store ^
-  --labels-path labels/store ^
-  --prices-path data/price/adjusted/mode=dual_output ^
-  --universe-path data/universe/history ^
-  --config-path configs/backtest/walkforward.yaml ^
-  --run-id walkforward_20260305_001
+\subsection{Ventanas rolling vs expanding}
 
-13) Estructura interna recomendada
-- load_walkforward_config(...)
-- build_time_windows(calendar, cfg)
-- run_window_training(window, paths, cfg)
-- run_window_inference(window, model_artifacts, paths, cfg)
-- run_window_backtest(window, preds_path, paths, cfg)
-- aggregate_oos_results(window_outputs)
-- compute_global_metrics(df_oos)
-- persist_walkforward_outputs(...)
-- main()
+\begin{itemize}
+  \item \textbf{Rolling window}:
+    \[
+      \mathcal{T}_k = [t_k - L_{\text{train}}, t_k]
+    \]
+    con tamaño fijo \(L_{\text{train}}\). Se usa cuando se quiere dar mayor peso a datos recientes y adaptarse a cambios de régimen \cite{walkforward_sklearn, funds_wfo}.
+  \item \textbf{Expanding window}:
+    \[
+      \mathcal{T}_k = [t_0, t_k]
+    \]
+    se usa cuando se dispone de pocos datos y se busca estabilidad en estimadores de riesgo \cite{quantinsti_wfo, ibkr_walkforward}.
+\end{itemize}
 
-14) Criterios de aceptacion
-- Pipeline completo ejecuta por ventanas y agrega OOS sin leakage.
-- Outputs por ventana y globales reproducibles.
-- Metricas globales y de estabilidad disponibles.
+El módulo soporta ambos modos mediante un parámetro \texttt{window\_mode}.
 
-15) Casos de prueba minimos
-- rolling windows bien construidas y sin solape de test.
-- expanding windows respetan crecimiento de train.
-- fallo en una ventana se maneja segun fail_fast.
-- agregado OOS no duplica fechas.
+\section{Alcance funcional}
 
-16) Checklist rapido
-- [ ] Constructor de ventanas robusto.
-- [ ] Orquestacion train->predict->backtest.
-- [ ] Agregacion OOS limpia.
-- [ ] Reportes por ventana y global.
-- [ ] Manifest y logs completos.
+\subsection{Qué incluye el módulo}
+
+\begin{itemize}
+  \item \textbf{Definición de ventanas} rolling/expanding:
+    \[
+      \mathcal{T}_k, \mathcal{V}_k, \mathcal{S}_k
+    \]
+    con \texttt{embargo\_days} entre \(\mathcal{T}_k\) y \(\mathcal{S}_k\).
+  \item \textbf{Ejecución secuencial de entrenamiento} por ventana, invocando \texttt{models/gbdt/train\_lgbm}.
+  \item \textbf{Generación de predicciones} en bloque OOS para \(\mathcal{S}_k\).
+  \item \textbf{Lanzamiento de \texttt{backtest/engine}} para cada \(\mathcal{S}_k\).
+  \item \textbf{Agregación global} de resultados OOS:
+    \[
+      \text{OOS} = \bigcup_k \mathcal{S}_k \text{ sin overlap}
+    \]
+\end{itemize}
+
+\subsection{Qué no incluye}
+
+\begin{itemize}
+  \item \textbf{Implementación interna} de \texttt{train\_lgbm}, \texttt{predict} o \texttt{engine}: simplemente los invoca.
+  \item \textbf{Tuneo hiperparamétrico masivo} (por ejemplo, \texttt{BayesianOptimization} u \texttt{GridSearch}): se delega a \texttt{research} o \texttt{optimization}.
+  \item \textbf{Selección manual de señales}: se realiza fuera por medio de \texttt{config}.
+\end{itemize}
+
+\section{Dependencias upstream y downstream}
+
+\subsection{Upstream}
+
+\begin{description}
+  \item[Features] \texttt{features/store} con \texttt{feature\_qc pass} aplicado.
+  \item[Labels] \texttt{labels/store} con splits \textit{purged} y \texttt{embargo} diseñados para evitar \textit{leakage} temporal.
+  \item[Price data] \texttt{prices\_path} con \texttt{adjusted} para small caps.
+  \item[Universo] \texttt{universe\_path} con \texttt{is\_eligible} por fecha.
+  \item[Model] \texttt{models/gbdt/train\_lgbm} y \texttt{models/inference/predict}.
+  \item[Backtest engine] \texttt{backtest/engine} que recibe \texttt{predictions} y devuelve \texttt{pnl\_daily}.
+\end{description}
+
+\subsection{Downstream}
+
+\begin{itemize}
+  \item \texttt{backtest/report.py}: reporte global de resultados OOS.
+  \item \texttt{validation/validation\_suite.py}: batería de pruebas de robustez y \textit{deflated Sharpe}.
+  \item \texttt{research/ablation/*}: \textit{ablation studies} sobre \textit{rolling} vs \textit{expanding}, \texttt{embargo\_days}, etc.
+\end{itemize}
+
+\section{Contrato de entrada}
+
+\subsection{Entradas mínimas}
+
+\begin{itemize}
+  \item \texttt{features\_path}: ruta de features \textit{PIT} agrupadas por fecha y símbolo.
+  \item \texttt{labels\_path}: ruta de etiquetas objetivo (p.ej. retornos futuros, \texttt{10d}).
+  \item \texttt{prices\_path}: \texttt{open/high/low/close/volume} ajustados.
+  \item \texttt{universe\_path}: \texttt{is\_eligible} por fecha y símbolo.
+  \item \texttt{walkforward\_config\_path}: fichero YAML con esquema de ventanas y \texttt{model\_config\_path}, \texttt{backtest\_config\_path}, \texttt{seed}.
+  \item \texttt{run\_id}: identificador único del \texttt{walkforward run}.
+\end{itemize}
+
+\subsection{Parámetros clave de configuración}
+
+\begin{longtable}{ll}
+  \textbf{Parámetro} & \textbf{Descripción} \\
+  \texttt{window\_mode} & \texttt{rolling} o \texttt{expanding}. \\
+  \texttt{train\_years} & Número de años de \textit{train window}. \\
+  \texttt{valid\_months} & Meses de \textit{validation} dentro de \texttt{train}. \\
+  \texttt{test\_months} & Ventana OOS \textit{test} para cada iteración. \\
+  \texttt{step\_months} & Cómo se desliza la ventana (p.ej. \texttt{step\_months = test\_months}). \\
+  \texttt{min\_train\_days} & Mínimo de días de \textit{train} para lanzar una ventana. \\
+  \texttt{embargo\_days} & Días sin datos entre \textit{train} y \textit{test} para evitar \textit{ticking} leakage. \\
+  \texttt{model\_config\_path} & Ruta al YAML de \texttt{train\_lgbm}. \\
+  \texttt{backtest\_config\_path} & Ruta al YAML de \texttt{engine}. \\
+  \texttt{seed} & Seed global para reproducibilidad de particiones y splits.
+\end{longtable}
+
+\section{Contrato de salida}
+
+\subsection{Por ventana}
+
+\begin{itemize}
+  \item \texttt{backtest/walkforward/\{run\_id\}/window\_{i}/model\_artifacts/*}: modelo \texttt{.lgb}, \texttt{feature\_names}, \texttt{importances}.
+  \item \texttt{backtest/walkforward/\{run\_id\}/window\_{i}/predictions.parquet}: scores/pesos por fecha y símbolo en \(\mathcal{S}_k\).
+  \item \texttt{backtest/walkforward/\{run\_id\}/window\_{i}/backtest\_outputs/*}: \texttt{positions\_daily}, \texttt{pnl\_daily}, \texttt{exposures\_daily}.
+  \item \texttt{backtest/walkforward/\{run\_id\}/window\_{i}/metrics.json}: \texttt{CAGR}, \texttt{Sharpe}, \texttt{max\_drawdown}, \texttt{turnover} por ventana.
+\end{itemize}
+
+\subsection{Agregado global}
+
+\begin{itemize}
+  \item \texttt{backtest/walkforward/\{run\_id\}/oos\_equity\_curve.parquet}:
+    \[
+      \text{NAV}_t = \text{NAV}_{t-1} \cdot (1 + r_t)
+    \]
+    con \(r_t\) concatenando sólo segmentos \(\mathcal{S}_k\) no solapados.
+  \item \texttt{backtest/walkforward/\{run\_id\}/window\_summary.parquet}:
+    métricas por ventana \((k, \texttt{CAGR}_k, \texttt{Sharpe}_k, \dots)\).
+  \item \texttt{backtest/walkforward/\{run\_id\}/global\_metrics.json}:
+    \[
+      \text{CAGR}_{\text{OOS}}, \text{Sharpe}_{\text{OOS}}, \text{Sortino}_{\text{OOS}}, \text{max\_dd}_{\text{OOS}}
+    \]
+  \item \texttt{backtest/walkforward/\{run\_id\}/manifest.json}:
+    \texttt{run\_id}, \texttt{config\_hash}, \texttt{data\_versions}.
+\end{itemize}
+
+\section{Reglas PIT y anti–leakage}
+
+\begin{itemize}
+  \item \textbf{Cada ventana} solo entrena con datos anteriores al inicio del \textit{test window}:
+    \[
+      \mathcal{T}_k \prec \mathcal{S}_k
+    \]
+  \item \textbf{Validación} se realiza \textit{dentro} de \texttt{train window} o de \texttt{valid window}; \texttt{test} nunca se usa para \textit{tuning}.
+  \item \textbf{Embargo} se aplica entre \(\mathcal{T}_k\) y \(\mathcal{S}_k\):
+    \[
+      t_{\text{test},k} = t_{\text{end}, \mathcal{T}_k} + \texttt{embargo\_days}
+    \]
+  \item \textbf{Agregación global} usa únicamente segmentos \texttt{OOS no solapados}:
+    \[
+      \mathcal{S}_k \cap \mathcal{S}_{k'} = \emptyset \quad \text{si } k \neq k'
+    \]
+\end{itemize}
+
+Estas reglas son estándar en \textit{purged and embargued CV} y \textit{walk‑forward backtesting} \cite{combinatory_purged_cv, walkforward_sklearn, ibkr_walkforward}.
+
+\section{Flujo del proceso}
+
+\begin{enumerate}
+  \item \textbf{Cargar configuración y calendario}:
+    \begin{itemize}
+      \item \texttt{calendar} de sesiones de mercado.
+      \item \texttt{initial\_train\_size}, \texttt{step\_months}, \texttt{test\_months}.
+    \end{itemize}
+  \item \textbf{Construir ventanas}:
+    \begin{algorithmic}
+      \For{each window index $k$}
+        \State \texttt{train\_start}, \texttt{train\_end} \hfill \Comment{\texttt{rolling/expanding}}
+        \State \texttt{valid\_start}, \texttt{valid\_end}
+        \State \texttt{test\_start} = \texttt{train\_end} + \texttt{embargo\_days}
+        \State \texttt{test\_end} = \texttt{test\_start} + \Delta_{\text{test}}
+      \EndFor
+    \end{algorithmic}
+  \item \textbf{Por cada ventana} $\mathcal{S}_k$:
+    \begin{itemize}
+      \item \texttt{run\_window\_training(window, paths, cfg)} \\
+        Entrena modelo en \(\mathcal{T}_k\) (con \texttt{valid} interno).
+      \item \texttt{run\_window\_inference(window, model\_artifacts, paths, cfg)} \\
+        Genera \texttt{predictions.parquet} sobre \(\mathcal{S}_k\).
+      \item \texttt{run\_window\_backtest(window, preds\_path, paths, cfg)} \\
+        Ejecuta \texttt{backtest/engine} sobre \(\mathcal{S}_k\), guardando \texttt{pnl\_daily}, \texttt{positions}, etc.
+      \item \texttt{persist\_window\_outputs(window\_outputs)}.
+    \end{itemize}
+  \item \textbf{Concatenar OOS}:
+    \begin{itemize}
+      \item \texttt{aggregate\_oos\_results(window\_outputs)}.
+      \item \texttt{oos\_equity\_curve.parquet} global.
+    \end{itemize}
+  \item \textbf{Calcular métricas globales y por subperiodo}:
+    \begin{itemize}
+      \item \texttt{CAGR}, \texttt{Sharpe}, \texttt{Sortino}.
+      \item Desviación estándar de \texttt{Sharpe} por ventana:
+        \[
+          \sigma_{\text{Sharpe}} = \sqrt{\frac{1}{K-1} \sum_{k=1}^K (\text

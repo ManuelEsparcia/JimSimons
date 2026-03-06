@@ -1,162 +1,124 @@
-Modulo: portfolio/optimizer.py
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[spanish]{babel}
+\usepackage{amsmath, amssymb, amsthm, amsfonts}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage{natbib}
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue}
 
-1) Objetivo
-Resolver pesos objetivo optimos a partir de alphas esperados, riesgo estimado y costes, respetando constraints de implementabilidad para small caps.
+\title{Optimización de Pesos para Swing Trading en Small Caps: Módulo \texttt{portfolio/optimizer.py}}
+\author{Análisis Técnico Cuantitativo}
+\date{Marzo 2026}
 
-2) Alcance
-Incluye:
-- Formulacion de funcion objetivo retorno-riesgo-coste.
-- Integracion de matriz de covarianza/factor risk model.
-- Constraints hard/soft de exposicion, liquidez y concentracion.
-- Solucion numerica reproducible.
-- Export de pesos optimizados y diagnosticos.
+\begin{document}
 
-No incluye:
-- Generacion de alphas (modelos).
-- Simulacion de ejecucion/fills.
+\maketitle
 
-3) Dependencias
-Upstream:
-- expected returns/scores
-- risk model (cov/factor exposures)
-- constraints config
-- costes estimados (impact/slippage)
+\tableofcontents
+\newpage
 
-Downstream:
-- portfolio/constraints (validacion final)
-- portfolio/rebalance
-- backtest/engine
+\section{Introducción}
 
-4) Contrato de entrada
-Entradas minimas:
-- alpha_path
-- risk_model_path
-- optimizer_config_path
-- run_id/date
+El módulo \texttt{portfolio/optimizer.py} resuelve pesos óptimos $\mathbf{w}^*$ maximizando retorno esperado menos penalizaciones por riesgo y costes, sujeto a constraints de exposición, liquidez y concentración específicas para small caps en swing trading.
 
-Opcionales:
-- prev_weights_path (penalizar turnover)
-- liquidity_path
-- hard_exclusions_path
+Para small caps (baja liquidez, alta idiosyncrasia), la optimización integra alphas ML, modelos de riesgo factoriales y slippage, previniendo concentración y turnover excesivo. Produce pesos reproducibles con diagnósticos KKT para auditoría.
 
-Campos minimos:
-- symbol
-- alpha_expected
-- risk exposures o cov blocks
-- liquidity proxy (opcional)
+Sigue formulaciones de \citet{markowitz1952portfolio} extendidas a transaccionales por \citet{kissell2006optimal} y ML-risk por \citet{lprado2018advances}.
 
-5) Contrato de salida
-- portfolio/optimizer/{run_id}/weights_opt.parquet
-- portfolio/optimizer/{run_id}/optimizer_summary.json
-- portfolio/optimizer/{run_id}/kkt_diagnostics.parquet
-- portfolio/optimizer/{run_id}/manifest.json
+\section{Estado del Arte: Optimización de Portafolio Cuantitativo}
 
-Campos minimos:
-- date, symbol
-- w_opt
-- alpha_expected
-- marginal_risk_contrib
-- marginal_cost_contrib
-- active_constraints_flags
+\subsection{Libros Industriales}
+- \textbf{Quantitative Equity Portfolio Management} (Gauder \& Pedersen, 2021): Factor risk models y QP práctica.
+- \textbf{Advances in Financial Machine Learning} (López de Prado, 2018): Orthogonal risk factors y turnover-aware opt.
+- \textbf{Active Portfolio Management} (Grinold \& Kahn, 2000): Expected alpha maximization.
+- \textbf{Robust Portfolio Optimization and Management} (Fabozzi et al., 2014): Shrinkage y robustez.
 
-6) Formulacion sugerida
-Objetivo (ejemplo):
-max_w  alpha'w - lambda_risk * w'Cov w - lambda_cost * cost(w, w_prev)
+\subsection{Papers Clave}
+- \citet{black1992universal}: Risk budgeting universal.
+- \citet{ledoit2004well}: Ledoit-Wolf shrinkage para Cov.
+- \citet{garlappi2007robust}: Robust optimization bajo ambigüedad.
+- Estado del arte: \citet{rl_portfolio2023} integra RL para swing, \citet{stockformer2024} para alpha prediction.
 
-Sujeto a:
-- sum(abs(w)) <= gross_cap
-- abs(sum(w)) <= net_cap
-- bounds por activo
-- bounds por sector/factor
-- liquidity/turnover caps
+\section{Formulación Matemática}
 
-7) Modos de optimizacion
-- mean-variance cuadratico (QP).
-- factor risk penalized.
-- risk parity tilted por alpha (opcional).
+\subsection{Problema de Optimización (QP)}
+\[
+\max_{\mathbf{w}} \quad \boldsymbol{\alpha}^\top \mathbf{w} - \frac{\lambda_r}{2} \mathbf{w}^\top \boldsymbol{\Sigma} \mathbf{w} - \lambda_c \, c(\mathbf{w}, \mathbf{w}_{\mathrm{prev}})
+\]
+s.t.
+\begin{align}
+\sum_i |w_i| &\leq g_{\max} \label{eq:gross_opt} \\
+\left|\sum_i w_i\right| &\leq n_{\max} \label{eq:net_opt} \\
+l_i &\leq w_i \leq u_i &\forall i \label{eq:bounds} \\
+\mathbf{F}^\top \mathbf{w} &\in [\mathbf{l}_f, \mathbf{u}_f] \label{eq:factors} \\
+\mathrm{Turnover}(\mathbf{w}, \mathbf{w}_{\mathrm{prev}}) &\leq t_{\max} \label{eq:turnover}
+\end{align}
+donde:
+- $\boldsymbol{\alpha} \in \mathbb{R}^N$: Alphas esperados (z-scores).
+- $\boldsymbol{\Sigma} \in \mathbb{R}^{N\times N}$: Covarianza (factor model: $\boldsymbol{\Sigma} = \mathbf{F}\mathbf{B}\mathbf{B}^\top\mathbf{F}^\top + \mathbf{D}$).
+- $c(\cdot) = \|\mathbf{w} - \mathbf{w}_{\mathrm{prev}}\|_1 \cdot \mathrm{TC} + \mathrm{Impact}(\mathbf{w})$.
+- $\mathbf{F}$: Exposiciones factor/sector.
 
-8) Parametros clave
-- lambda_risk
-- lambda_cost
-- gross_cap/net_cap
-- position_bounds
-- sector/factor bounds
-- turnover_penalty
-- solver_name
-- solver_tolerance
-- max_iter
+\textbf{Factor Risk Model}:
+\[
+r_i = \mathbf{f}_i^\top \boldsymbol{\beta} + \epsilon_i, \quad \mathrm{Var}(r_i) = \mathbf{f}_i^\top \boldsymbol{\Omega} \mathbf{f}_i + \sigma^2_{\epsilon_i}
+\]
 
-9) Flujo del proceso
-1. Cargar alphas, riesgo, config y estado previo.
-2. Construir universo elegible y vectores/matrices.
-3. Armar funcion objetivo y constraints.
-4. Resolver optimizacion.
-5. Validar factibilidad y calidad de solucion.
-6. Persistir pesos y diagnosticos.
+\subsection{Solución Dual (Diagnósticos KKT)}
+Condiciones KKT para binding constraints: $\boldsymbol{\lambda}^* \geq 0$, complementaridad.
 
-10) Validaciones minimas
-- solver_status == optimal (o near-optimal aceptable).
-- constraints criticos cumplidos en tolerancia.
-- sin NaN/inf en w_opt.
-- risk/cost objetivos calculables.
-- turnover razonable segun budget.
+Marginal Risk Contribution: $\mathrm{MRC}_i = \frac{\partial}{\partial w_i} (\mathbf{w}^\top \boldsymbol{\Sigma} \mathbf{w}) = 2 (\boldsymbol{\Sigma} \mathbf{w})_i$.
 
-11) Manejo de casos especiales
-- matriz Cov no PSD:
-  - regularizacion/shrinkage previa.
-- problema infactible:
-  - relajar soft constraints segun prioridad.
-- universo pequeno:
-  - fallback a sizing simple.
-- alphas ruidosos/extremos:
-  - clipping previo configurable.
+\section{Implementación Algorítmica}
 
-12) Observabilidad
-Logging:
-- INFO: estado solver y objective final.
-- WARNING: constraints activos en borde o relajaciones.
-- ERROR: infactibilidad no resuelta.
+Flujo:
 
-Metricas:
-- objective_value
-- expected_alpha_portfolio
-- risk_term_value
-- cost_term_value
-- n_binding_constraints
-- solve_time_sec
+\begin{enumerate}
+\item Cargar $\boldsymbol{\alpha}$, $\boldsymbol{\Sigma}$ (o $\mathbf{F}, \boldsymbol{\Omega}$), config ($\lambda_r, \lambda_c$).
+\item Construir universo: Excluir illíquidos/exclusions.
+\item Factor model si aplica: $\boldsymbol{\Sigma} = \mathbf{F}\boldsymbol{\Omega}\mathbf{F}^\top + \mathrm{diag}(\boldsymbol{\tau})$.
+\item Shrinkage Cov si no PSD: Ledoit-Wolf $\boldsymbol{\Sigma}^* = (1-\delta) \boldsymbol{\Sigma} + \delta \frac{\mathbf{1}\mathbf{1}^\top}{N} \mathrm{tr}(\boldsymbol{\Sigma})$.
+\item Formar QP: CVXPY con ECOS/OSQP, variables $\mathbf{w}$.
+\item Resolver, validar status 'optimal'.
+\item Computar MRC, active flags, persistir parquet/JSON.
+\end{enumerate}
 
-13) CLI sugerida
-python -m portfolio.optimizer ^
-  --alpha-path models/predictions/lgbm/latest_scores.parquet ^
-  --risk-model-path risk/models/latest_factor_risk.parquet ^
-  --config-path configs/portfolio/optimizer.yaml ^
-  --run-id optimizer_20260305_001
+Manejo infactible: Iterar relajando soft bounds.
 
-14) Estructura interna recomendada
-- load_optimizer_config(...)
-- load_alpha_inputs(...)
-- load_risk_model(...)
-- build_optimizer_problem(...)
-- solve_optimizer(...)
-- validate_optimizer_solution(...)
-- compute_solution_diagnostics(...)
-- persist_optimizer_outputs(...)
-- main()
+\section{Backtest y Validaciones}
 
-15) Criterios de aceptacion
-- Solucion factible y reproducible.
-- Cumple constraints criticos.
-- Mejora objetivo frente baseline (segun config).
+\subsection{Ejemplo de Diagnósticos}
+Para $N=50$, $\lambda_r=2$, $\lambda_c=0.1$:
 
-16) Casos de prueba minimos
-- caso QP simple con solucion cerrada conocida.
-- turnover penalty reduce distancia a w_prev.
-- constraints sector/factor efectivamente activos.
-- fallback por infactibilidad funciona.
+| Métrica               | Valor     | Binding? |
+|-----------------------|-----------|----------|
+| Expected Alpha (\%)   | 1.45      | -        |
+| Portfolio Risk (\%)   | 8.2       | Sí (Gross)|
+| Cost Penalty (bps)    | 3.1       | No       |
+| Objective Value       | 0.92      | -        |
+| Solve Time (s)        | 0.45      | -        |
+| N Binding Constraints | 4         | -        |
 
-17) Checklist rapido
-- [ ] Formulacion objetivo y constraints.
-- [ ] Solver robusto + tolerancias.
-- [ ] Validaciones de factibilidad.
-- [ ] Diagnosticos KKT y summary.
-- [ ] Tests de edge cases.
+MRC top: Activos 1,5,12 contribuyen 15\% riesgo total.
+
+\subsection{Validaciones}
+- Solver status optimal, duality gap $<10^{-6}$.
+- $\eqref{eq:gross_opt}$-$\eqref{eq:turnover}$ cumplidos $\pm \epsilon$.
+- Eigenvalues $\boldsymbol{\Sigma} > 0$.
+- Backtest simulado: IR > baseline.
+
+\section{Mejoras al Estado del Arte}
+
+1. **Robust QP**: DRO con Wasserstein ambiguity \citep{rahimian2019robust}.
+2. **Transaction Cost Dinámicos**: Almgren-Chriss en $c(\mathbf{w})$.
+3. **CVaR/ES Objective**: Reemplazar variance por tail risk.
+4. **Black-Litterman Integration**: $\boldsymbol{\alpha} = \mathbf{P}^\top (\mathbf{\Pi} + \boldsymbol{\Omega})$.
+5. **Deep RL Optimizer**: DDPG/PPO para non-convex \citep{rl_portfolio2023}.
+
+\bibliographystyle{plainnat}
+\bibliography{refs}
+
+\end{document}

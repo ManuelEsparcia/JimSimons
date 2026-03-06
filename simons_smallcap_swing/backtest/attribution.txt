@@ -1,156 +1,288 @@
-Modulo: backtest/attribution.py
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage[spanish]{babel}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{mathtools}
+\usepackage{algorithm,algorithmic}
+\usepackage{longtable}
+\usepackage{hyperref}
 
-1) Objetivo
-Descomponer PnL y riesgo de la estrategia para cuantificar contribuciones de alpha, factores, sizing, timing y costes, separando rendimiento real de exposiciones accidentales.
+\title{Análisis de Estado del Arte: Módulo \texttt{backtest/attribution.py}}
+\author{Sistema de Swing Trading Cuantitativo}
+\date{\today}
 
-2) Alcance
-Incluye:
-- attribution por activo/sector/factor.
-- descomposicion bruto->neto por componentes de coste.
-- attribution temporal (diaria/mensual/por regimen).
-- attribution por modelo/ensemble (si aplica).
+\begin{document}
 
-No incluye:
-- estimacion primaria del factor model (risk/factor_model.py).
-- diagnosticos operativos generales (diagnostics.py).
+\maketitle
 
-3) Dependencias
-Upstream:
-- backtest outputs (positions/fills/pnl)
-- factor exposures/returns
-- cost breakdown
-- regime labels (opcional)
+\begin{abstract}
+Este documento describe el diseño, la fundamentación matemática y el contexto académico/industrial del módulo \texttt{backtest/attribution.py} en el repositorio \texttt{JimSimons}. El objetivo es descomponer el P\&L y el riesgo de la estrategia cuantitativa, separando contribuciones de \textit{alpha}, factores sistémicos, \textit{sizing}, \textit{timing} y costes de transacción. Se adopta una formulación de contributing returns y factor attribution compatible con la literatura de \textit{performance attribution} y \textit{factor-based portfolio analysis}, y se alinea con estándares de reconciliación de P\&L en backtesting industrial. El módulo está diseñado para producir outputs estructurados en formato \texttt{parquet} y \texttt{json} que permitan análisis de regímenes, ablation studies y optimización de la rentabilidad neta.
+\end{abstract}
 
-Downstream:
-- backtest/report.py
-- validation/validation_suite.py
-- research/ablation/*
+\tableofcontents
 
-4) Contrato de entrada
-Entradas minimas:
-- backtest_run_path
-- attribution_config_path
-- run_id
+\section{Objetivo del módulo}
 
-Opcionales:
-- factor_model_path
-- benchmark_path
-- regime_states_path
+El módulo \texttt{backtest/attribution.py} tiene como objetivo principal realizar una \textbf{attribution de P\&L y riesgo} a distintos niveles de granularidad:
 
-5) Contrato de salida
-- backtest/attribution/{run_id}/pnl_waterfall.parquet
-- backtest/attribution/{run_id}/factor_attribution.parquet
-- backtest/attribution/{run_id}/sector_attribution.parquet
-- backtest/attribution/{run_id}/asset_contribution.parquet
-- backtest/attribution/{run_id}/attribution_summary.json
-- backtest/attribution/{run_id}/manifest.json
+\begin{itemize}
+  \item \textbf{Alpha} asociado al modelo de señales.
+  \item Exposiciones a factores sistémicos (beta de mercado, factores de estilo, sectores).
+  \item Impacto de \textit{sizing} y \textit{timing} de la estrategia.
+  \item Descomposición de costes: \textit{trading cost}, \textit{impact cost}, \textit{borrow cost}, etc.
+\end{itemize}
 
-Campos minimos factor_attribution:
-- date
-- factor_name
-- exposure
-- factor_return
-- contribution_pnl
-- contribution_return
+El propósito es distinguir entre:
+\begin{itemize}
+  \item \textbf{Rendimiento deseado}: originado por el \textit{alpha} del modelo y la selección de activos.
+  \item \textbf{Exposiciones accidentales}: sesgos no intencionados a factores sistémicos o a estructuras de coste.
+\end{itemize}
 
-6) Descomposiciones recomendadas
-Waterfall neta:
-- gross_pnl
-- trading_cost
-- impact_cost
-- borrow_cost
-- net_pnl
+Este tipo de análisis es estándar en hedge funds cuantitativos y en equipos de \textit{risk management} de estrategias de \textit{long–short} y factor investing \cite{asness2013, brinson1986, factorattributionCFI}.
 
-Factor attribution:
-- market beta contribution
-- style factors (size/value/momentum/quality/etc)
-- sector residual contributions
+\section{Contexto académico e industrial}
 
-Alpha residual:
-- contribution no explicada por factores/costes.
+\subsection{Performance attribution y factor attribution}
 
-7) Metodologia base
-Daily contribution:
-- contrib_i,t = w_i,t-1 * r_i,t (ajustado por convencion de timing)
+La \textit{performance attribution} clásica, como el método de Brinson, descompone el retorno de un portfolio en efectos de \textit{allocation} y \textit{selection} por sector o activo \cite{brinson1986}. En el mundo cuantitativo moderno, esta idea se extiende a modelos factoriales:
 
-Factor contribution:
-- contrib_factor,t = exposure_factor,t-1 * factor_return_t
+\[
+r_{p,t} = \alpha_t + \sum_{f} \beta_{f,t-1} \cdot r_{f,t} + \varepsilon_t
+\]
 
-Residual alpha:
-- alpha_resid_t = portfolio_return_t - sum_factor_contrib_t - cost_terms_t
+donde:
+\begin{itemize}
+  \item \( r_{p,t} \): retorno del portfolio en el día \( t \).
+  \item \( \beta_{f,t-1} \): exposición del portfolio al factor \( f \) en el instante \( t-1 \).
+  \item \( r_{f,t} \): retorno del factor \( f \) en el día \( t \).
+  \item \( \alpha_t \): retorno residual no explicado por factores, atribuible a selección de activos o timing.
+\end{itemize}
 
-8) Reglas PIT y anti-leakage
-- exposiciones y pesos usados en t deben corresponder a informacion disponible en t-1/t segun convencion.
-- no usar exposures retroajustadas con informacion futura.
-- alinear exactamente calendarios de retorno y factores.
+Este enfoque es descrito en detallado en manuales de CFA \cite{factorattributionCFI} y en guías prácticas de factor attribution de AQR \cite{aqr_factor_exposures}.
 
-9) Flujo del proceso
-1. Cargar artefactos de posiciones, pnl y costes.
-2. Calcular contribuciones por activo.
-3. Agregar por sector/factor.
-4. Construir waterfall bruto->neto.
-5. Calcular residual alpha y resumen.
-6. Persistir reportes.
+\subsection{Atribución de P\&L y costes de transacción}
 
-10) Validaciones minimas
-- suma contribuciones ~= retorno portfolio (tolerancia).
-- consistency check bruto-neto.
-- cobertura de factores suficiente.
-- sin NaN criticos en contribuciones.
+En el ámbito de factor investing y trading cuantitativo, se analiza también el impacto de costes de transacción sobre el retorno neto \cite{factor_cost_alpha_architect}. La diferencia entre retorno bruto y retorno neto se puede expresar como:
 
-11) Manejo de casos especiales
-- exposiciones faltantes:
-  - fallback residual bucket y warning.
-- corporate actions que alteran series:
-  - usar posiciones/returns ajustadas coherentes.
-- cambios de universo abruptos:
-  - normalizar contribuciones por AUM del dia.
+\[
+\text{P\&L}_{\text{neto},t} = \text{P\&L}_{\text{bruto},t} - \text{Cost}_{\text{trading},t} - \text{Cost}_{\text{impact},t} - \text{Cost}_{\text{borrow},t} - \cdots
+\]
 
-12) Observabilidad
-Logging:
-- INFO: avance por capa de attribution.
-- WARNING: gap en cobertura factor/sector.
-- ERROR: reconciliacion no cierra.
+donde cada componente se atribuye a decisiones de \textit{turnover}, \textit{liquidity}, \textit{financing}, etc. Este “waterfall” es clave para evaluar la \textit{capacity} de una estrategia y su robustez industrial.
 
-Metricas operativas:
-- reconciliation_error_mean
-- pct_days_unexplained_high
-- alpha_residual_mean
-- runtime_sec
+\section{Alcance del módulo}
 
-13) CLI sugerida
-python -m backtest.attribution ^
-  --backtest-run-path backtest/runs/backtest_engine_20260305_001 ^
-  --factor-model-path risk/models/factor_model_latest ^
-  --config-path configs/backtest/attribution.yaml ^
-  --run-id attribution_20260305_001
+El módulo realiza atribución a distintos niveles:
 
-14) Estructura interna recomendada
-- load_attribution_config(...)
-- load_backtest_artifacts(...)
-- compute_asset_level_contributions(...)
-- compute_sector_attribution(...)
-- compute_factor_attribution(...)
-- build_pnl_waterfall(...)
-- compute_residual_alpha(...)
-- validate_attribution_reconciliation(...)
-- persist_attribution_outputs(...)
-- main()
+\begin{itemize}
+  \item \textbf{Por activo}: contribución de cada activo al P\&L.
+  \item \textbf{Por sector}: agregación de contribuciones por sector.
+  \item \textbf{Por factor}: contribución de factores de riesgo (market beta, tamaño, valor, momento, calidad, etc.).
+  \item \textbf{Residual alpha}: componente no explicado por factores ni costes.
+  \item \textbf{Temporal}: diaria, mensual, por régimen de mercado (si se proporcionan etiquetas de régimen).
+  \item \textbf{Por modelo/ensemble}: cuando la estrategia es un conjunto de modelos, se puede descomponer la contribución de cada modelo.
+\end{itemize}
 
-15) Criterios de aceptacion
-- reconciliacion robusta de PnL.
-- visibilidad clara de fuentes de retorno/riesgo/coste.
-- outputs accionables para research y risk.
+El módulo \textit{no} incluye:
+\begin{itemize}
+  \item Estimación primaria del factor model (que se delega a \texttt{risk/factor_model.py}).
+  \item Diagnósticos generales de operaciones (diagnósticos de ejecución, slippage, etc.), que quedan en \texttt{diagnostics.py}.
+\end{itemize}
 
-16) Casos de prueba minimos
-- reconciliacion exacta en dataset sintetico simple.
-- coste elevado reduce net attribution correctamente.
-- factor contribution detecta beta dominante.
-- fallo controlado cuando no cierra reconciliacion.
+\section{Dependencias y flujo de datos}
 
-17) Checklist rapido
-- [ ] asset/sector/factor attribution.
-- [ ] waterfall bruto->neto.
-- [ ] residual alpha.
-- [ ] checks de reconciliacion.
-- [ ] outputs + manifest.
+El módulo depende de varios artefactos upstream:
+
+\begin{description}
+  \item[Backtest outputs] Posiciones, órdenes ejecutadas (\texttt{fills}), y P\&L bruto.
+  \item[Factor exposures / returns] Matriz de exposiciones factoriales y series temporales de retornos de factores.
+  \item[Cost breakdown] Descomposición de costes por tipo (trading, impact, borrow, etc.).
+  \item[Regime labels (opcional)] Etiquetas de régimen de mercado (alta/baja volatilidad, tendencia, etc.).
+\end{description}
+
+Los resultados de \texttt{attribution.py} son consumidos por:
+\begin{itemize}
+  \item \texttt{backtest/report.py}: generación de reportes.
+  \item \texttt{validation/validation_suite.py}: batería de validaciones de calidad del modelo.
+  \item \texttt{research/ablation/*}: estudios de ablation para entender el impacto de componentes del modelo.
+\end{itemize}
+
+\section{Contrato de entrada y salida}
+
+\subsection{Entradas}
+
+Entradas mínimas:
+\begin{itemize}
+  \item \texttt{backtest_run_path}: ruta donde se encuentran los resultados del backtest (posiciones, P\&L, etc.).
+  \item \texttt{attribution_config_path}: fichero de configuración YAML especificando, por ejemplo, qué factores usar, qué niveles de agregación y tolerancias de reconciliación.
+  \item \texttt{run_id}: identificador único del backtest.
+\end{itemize}
+
+Entradas opcionales:
+\begin{itemize}
+  \item \texttt{factor_model_path}: ruta al modelo de factores.
+  \item \texttt{benchmark_path}: ruta al benchmark de referencia.
+  \item \texttt{regime_states_path}: ruta a las etiquetas de régimen.
+\end{itemize}
+
+\subsection{Salidas}
+
+El módulo persiste los siguientes artefactos:
+
+\begin{itemize}
+  \item \texttt{backtest/attribution/\{run\_id\}/pnl\_waterfall.parquet}
+  \item \texttt{backtest/attribution/\{run\_id\}/factor\_attribution.parquet}
+  \item \texttt{backtest/attribution/\{run\_id\}/sector\_attribution.parquet}
+  \item \texttt{backtest/attribution/\{run\_id\}/asset\_contribution.parquet}
+  \item \texttt{backtest/attribution/\{run\_id\}/attribution\_summary.json}
+  \item \texttt{backtest/attribution/\{run\_id\}/manifest.json}
+\end{itemize}
+
+El esquema mínimo para \texttt{factor_attribution} incluye los siguientes campos:
+
+\begin{longtable}{ll}
+  \textbf{Campo} & \textbf{Descripción} \\
+  \texttt{date} & Fecha de la observación. \\
+  \texttt{factor\_name} & Nombre del factor (p.ej. \texttt{MARKET}, \texttt{SIZE}, \texttt{VALUE}). \\
+  \texttt{exposure} & Exposición del portfolio al factor en $t-1$. \\
+  \texttt{factor\_return} & Retorno del factor en $t$. \\
+  \texttt{contribution\_pnl} & Contribución al P\&L atribuida al factor. \\
+  \texttt{contribution\_return} & Contribución al retorno atribuida al factor. \\
+\end{longtable}
+
+\section{Descomposiciones de P\&L recomendadas}
+
+Se definen varias capas de descomposición:
+
+\subsection{Waterfall bruto $\rightarrow$ neto}
+
+\[
+\text{P\&L}_{\text{neto},t} = \text{P\&L}_{\text{bruto},t}
+  - C_{\text{trading},t}
+  - C_{\text{impact},t}
+  - C_{\text{borrow},t}
+\]
+
+donde:
+\begin{itemize}
+  \item \(\text{P\&L}_{\text{bruto},t}\): retorno antes de costes.
+  \item \(C_{\text{trading},t}\): comisiones de brokerage, charges, etc.
+  \item \(C_{\text{impact},t}\): impacto de mercado por volumen ejecutado.
+  \item \(C_{\text{borrow},t}\): coste de financiación de posiciones vendidas.
+\end{itemize}
+
+Esta estructura permite analizar la rentabilidad neta de la estrategia y detectar si el \textit{alpha} bruto se está erosionando por costes.
+
+\subsection{Factor attribution}
+
+Se descompone el retorno del portfolio en:
+
+\begin{itemize}
+  \item \textbf{Contribución de beta de mercado}.
+  \item \textbf{Contribución de factores de estilo}: tamaño (\textit{size}), valor (\textit{value}), momento (\textit{momentum}), calidad (\textit{quality}), etc.
+  \item \textbf{Contribuciones residuales por sector} no explicadas por factores sistémicos.
+\end{itemize}
+
+Matemáticamente, para un factor \(f\):
+
+\[
+\text{contrib}_{f,t} = \beta_{f,t-1} \cdot r_{f,t}
+\]
+
+donde \(\beta_{f,t-1}\) es la exposición del portfolio al factor \(f\) en \(t-1\) y \(r_{f,t}\) es el retorno del factor en \(t\).
+
+\subsection{Alpha residual}
+
+La contribución residual de \textit{alpha} se define como:
+
+\[
+\alpha_{\text{resid},t} = r_{p,t} - \sum_{f} \text{contrib}_{f,t} - C_{\text{total},t}
+\]
+
+donde \(C_{\text{total},t}\) es el vector de costes. Esta cantidad representa el rendimiento atribuible a selección de activos no capturado por factores ni a errores de coste.
+
+\section{Metodología base}
+
+\subsection{Contribuciones diarias por activo}
+
+La contribución diaria de un activo \(i\) al P\&L se define como:
+
+\[
+\text{contrib}_{i,t} = w_{i,t-1} \cdot r_{i,t}
+\]
+
+donde:
+\begin{itemize}
+  \item \(w_{i,t-1}\): peso del activo \(i\) en el portfolio en \(t-1\).
+  \item \(r_{i,t}\): retorno del activo \(i\) en \(t\).
+\end{itemize}
+
+La convención de timing es fundamental: pesos y exposiciones se toman en \(t-1\) para evitar \textit{look‑ahead}.
+
+\subsection{Contribución por factor}
+
+Para un factor \(f\), la contribución diaria es:
+
+\[
+\text{contrib}_{\text{factor},f,t} = \beta_{f,t-1} \cdot r_{f,t}
+\]
+
+donde \(\beta_{f,t-1}\) se puede calcular como:
+\[
+\beta_{f,t-1} = \sum_{i} w_{i,t-1} \cdot \beta_{i,f,t-1}
+\]
+
+y \(\beta_{i,f,t-1}\) es la exposición del activo \(i\) al factor \(f\), que proviene de un modelo factorial externo.
+
+\subsection{Alpha residual diario}
+
+El retorno residual de \textit{alpha} se calcula como:
+
+\[
+\alpha_{\text{resid},t} = r_{p,t} - \sum_{f} \text{contrib}_{\text{factor},f,t} - C_{\text{total},t}
+\]
+
+Esta variable puede ser utilizada como \textit{target} para análisis de regímenes o para estudios de robustez de \textit{alpha} frente a factores sistémicos.
+
+\section{Reglas de PIT y anti–leakage}
+
+Para evitar \textit{look‑ahead bias} y reconciliación incorrecta se imponen las siguientes reglas:
+
+\begin{itemize}
+  \item Las exposiciones y pesos utilizados en la fecha \(t\) deben corresponder a información disponible en \(t-1\) (o en el cierre de \(t-1\)), según la convención de la estrategia.
+  \item No se utilizan exposiciones \textit{retroajustadas} con información futura.
+  \item Se alinea exactamente el calendario de retornos de activos, factores y costes, asegurando que la serie temporal sea homogénea.
+\end{itemize}
+
+Estas reglas son estándar en backtesting industrial y en frameworks de \textit{risk attribution} institucional \cite{factorattributionCFI, aqr_factor_exposures}.
+
+\section{Flujo del proceso}
+
+El proceso de atribución se organiza en los siguientes pasos:
+
+\begin{enumerate}
+  \item \textbf{Cargar artefactos de backtest}: posiciones, P\&L bruto, costes y factores.
+  \item \textbf{Calcular contribuciones por activo}: usando \(w_{i,t-1} \cdot r_{i,t}\).
+  \item \textbf{Agregar por sector/factor}: agrupar contribuciones de activos por sector o factor.
+  \item \textbf{Construir waterfall bruto $\rightarrow$ neto}: aplicar costes al P\&L bruto.
+  \item \textbf{Calcular residual alpha}: diferencia entre retorno observado y suma de contribuciones de factores y costes.
+  \item \textbf{Persistir reportes}: guardar los ficheros \texttt{parquet} y \texttt{json}.
+\end{enumerate}
+
+Este flujo permite mantener un pipeline limpio y reproducible que puede ser integrado en sistemas de CI/CD de backtesting.
+
+\section{Validaciones mínimas}
+
+Se definen las siguientes validaciones:
+
+\begin{itemize}
+  \item La suma de contribuciones (por activo, factor, sector) debe ser aproximadamente igual al retorno del portfolio, dentro de una tolerancia definida en la configuración:
+  \[
+    \left| r_{p,t} - \sum_{i} \text{contrib}_{i,t} \right| \leq \epsilon
+  \]
+  \item La diferencia entre P\&L bruto y neto debe ser consistente con la suma de costes:
+  \[
+    \left| \text{P\&L}_{\text{bruto},t} - \text{P\&L}_{\text{neto},t} - C_{\text{total},t} \right| \leq \epsilon
+  \]
+  \item La cobertura de factores debe ser suficiente para explicar una parte significativa del P\&L. Si el porcentaje de retorno no explicado es alto, se lanza un \texttt{WARNING}.
+  \item No debe haber valores \texttt{NaN} en campos críticos como \texttt{con

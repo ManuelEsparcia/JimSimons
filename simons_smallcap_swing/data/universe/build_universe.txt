@@ -1,215 +1,268 @@
-Modulo: data/universe/build_universe.py
+\section{Módulo: \texttt{data/universe/build\_universe.py}}
+\label{sec:build_universe}
 
-1) Objetivo
-Construir el universo invertible point-in-time (PIT) de small caps de EE. UU. por fecha de sesion, con reglas reproducibles y auditables, evitando survivorship bias y dejando trazabilidad completa de por que un ticker entra/sale del universo.
+\subsection{Objetivo y filosofía de diseño}
+\label{sec:build_universe:objective}
 
-2) Alcance
-Incluye:
-- Integracion de fuentes base de simbolos/listings.
-- Construccion de membresia diaria PIT por ticker.
-- Aplicacion de filtros de elegibilidad (precio, liquidez, market cap, tipo de activo, etc).
-- Marcado de estados (active, halted, delisted, excluded_by_rule).
-- Generacion de snapshots y tabla historica de membresia.
+El módulo \texttt{build\_universe.py} construye el \textbf{universo invertible point‑in‑time (PIT) diario de small caps de EE.\ UU.}, con el objetivo de:
 
-No incluye:
-- Descarga de precios (fetch_prices).
-- Ajuste de precios (adjust_prices).
-- QC final profundo del universo (universe_qc.py).
-- Mitigacion detallada de survivorship a nivel metodologico (survivorship.py lo audita/complementa).
+\begin{itemize}
+  \item \textbf{Evitar survivorship bias} en el diseño de la base de datos.
+  \item Mantener \textbf{trazabilidad completa} de por qué un ticker entra o sale del universo.
+  \item Soportar \textbf{reproducibilidad} y \textbf{auditabilidad} industrial, compatible con pipelines de investigación quant y backtesting industrial.
+\end{itemize}
 
-3) Dependencias aguas arriba y aguas abajo
-Upstream:
-- Data de listings/identificadores (ticker, CUSIP/CIK/FIGI si aplica).
-- Calendario de mercado.
-- Datos PIT de market cap, volumen y precio (raw o pre-QC segun politica).
-- Eventos corporativos relevantes para continuidad de simbolo.
+La filosofía de diseño sigue principios análogos a los utilizados en índices institucionales (\textit{e.g.} MSCI Global Investable Market \cite{msci2024}, Russell 2000 \cite{lseg2024}) y en frameworks de universo PIT utilizados en fondos sistemáticos \cite{quantjourney2025}.
+\begin{itemize}
+  \item \textbf{PIT}: los datos de \textit{market cap}, liquidez y precio usados en la fecha de decisión \(t\) no pueden incorporar información futura.
+  \item \textbf{Inversión parametrizable}: el universo se construye a partir de un \texttt{config.yaml} versionado, con \texttt{config\_hash} asociado.
+  \item \textbf{Explicabilidad}: toda exclusión debe estar acompañada de una \texttt{eligibility\_reason} codificada.
+\end{itemize}
 
-Downstream:
-- data/price/fetch_prices.py
-- features/build_features.py
-- labels/build_labels.py
-- backtest/run_walkforward.py
-- validation/leakage_audit.py
+\subsection{Definición formal del universo invertible}
+\label{sec:build_universe:formal}
 
-4) Definicion de universo (reglas de negocio)
-Reglas base sugeridas (configurables):
-- Region/mercado: acciones listadas en EE. UU.
-- Tipo de instrumento: common stock (excluir ETFs, ADRs segun politica, preferreds, warrants, rights, SPAC units si aplica).
-- Segmento: small caps por market cap PIT.
-- Filtro de precio minimo (ej. close >= 1 USD o 2 USD).
-- Filtro de liquidez minima (ADV20 USD o shares).
-- Filtro de antiguedad minima de cotizacion (opcional).
+Sea \(\mathcal{T}\) el conjunto de títulos listados en EE.\ UU., con \(\mathcal{E} \subseteq \mathcal{T}\) el subconjunto de \textit{common stocks} elegibles por tipo de instrumento. Sea \(t \in \mathcal{D}\) una fecha de sesión en el calendario de mercado, y \(\mathcal{U}_t \subseteq \mathcal{E}\) el universo invertible en esa fecha.
 
-Principios:
-- Elegibilidad se evalua con datos disponibles hasta t (o t-1 si se ejecuta a cierre/next open).
-- Toda exclusion debe quedar con motivo codificado.
-- Reglas parametrizables y versionadas por config hash.
+\paragraph{Entradas}
+\label{par:build_universe:inputs}
+\begin{itemize}
+  \item \(\mathcal{D} = [t_0, t_1]\): rango de fechas de sesión \texttt{start\_date, end\_date}.
+  \item \(\mathcal{L}\): maestro de listados, con atributos por ticker \(s \in \mathcal{T}\):
+  \begin{itemize}
+    \item \(\mathtt{symbol}\), \(\mathtt{listing\_exchange}\), \(\mathtt{security\_type}\),
+    \item \(\mathtt{list\_date}\), \(\mathtt{delist\_date}\) (nullable),
+    \item \(\mathtt{status}\) (active/inactive, paused/suspended, etc.).
+  \end{itemize}
+  \item \(\mathcal{M}_t\): \textit{market cap} ajustado en USD a la fecha \(t\).
+  \item \(\mathcal{V}_t\): \textit{ADV20} en USD o acciones a la fecha \(t\).
+  \item \(\mathcal{P}_t\): precio de cierre ref \(p_{t,s}\) en fecha \(t\).
+  \item \(\mathcal{C}\): calendario de mercado (fechas de sesión).
+\end{itemize}
 
-5) Contrato de entrada
-Entradas minimas:
-- start_date, end_date
-- listing_master_path (o provider listing API)
-- fundamentals/marketcap PIT path (si aplica)
-- liquidity inputs path (precio/volumen PIT)
-- calendar_path
-- universe_config_path
-- run_id
+\paragraph{Reglas de negocio (configurables)}
+\label{par:build_universe:rules}
+Sea \(r = \{\text{rules}\}\) un conjunto de reglas parametrizables (definido en \texttt{universe\_config.yaml}):
 
-Campos minimos esperados (tabla base de simbolos):
-- symbol
-- listing_exchange
-- security_type
-- list_date
-- delist_date (nullable)
-- status (active/inactive)
+\begin{itemize}
+  \item \textbf{Tipo de instrumento}:
+  \[
+    s \in \mathcal{E} \Leftrightarrow \texttt{security\_type}(s) = \textsc{common\_stock} \wedge \text{no ADR/ETF/pref/SPAC/warrant}^r
+  \]
+  \item \textbf{Bolsa/mercado}:
+  \[
+    s \in \mathcal{E} \Rightarrow \mathtt{listing\_exchange}(s) \in \mathcal{E}_{\text{US}}
+  \]
+  \item \textbf{Small cap}:
+  \[
+    s \in \mathcal{E}_{\text{small}} \Leftrightarrow \mathtt{market\_cap\_usd}(s,t) \in [\underline{M}, \overline{M}] \ \text{or} \ \text{percentil}^r
+  \]
+  \item \textbf{Precio mínimo}:
+  \[
+    p_{t,s} \geq p_{\min}
+  \]
+  \item \textbf{Liquidez mínima}:
+  \[
+    \mathtt{adv20\_usd}(s,t) \geq v_{\min}
+  \]
+  \item \textbf{Antigüedad mínima} (opcional):
+  \[
+    t - \mathtt{list\_date}(s) \geq \Delta t_{\min}
+  \]
+\end{itemize}
 
-Campos recomendados adicionales:
-- cik / cusip / figi / issuer_id
-- sector / industry (si disponible PIT)
+La definición de universo condicional a la información disponible hasta \(t\) (o \(t-1\), según ejecución):
 
-6) Contrato de salida
-Salida principal historica:
-- data/universe/history/date={yyyy-mm-dd}/part-*.parquet
+\[
+  s \in \mathcal{U}_t \ : \ 
+  \begin{cases}
+    s \in \mathcal{E} \\
+    \mathtt{list\_date}(s) \leq t \leq \mathtt{delist\_date}(s) \vee \texttt{delist\_date}(s) = \mathtt{null} \\
+    \mathtt{p\_min}^r(p_{t,s}) \\
+    \mathtt{v\_min}^r(\mathtt{adv20}(s,t)) \\
+    \mathtt{cap\_band}^r(\mathtt{mkt\_cap}(s,t)) \\
+    \text{reglas especiales de mercado/estado}
+  \end{cases}
+\]
 
-Columnas minimas:
-- date
-- symbol
-- is_eligible (bool)
-- eligibility_reason (enum/string codificado)
-- market_cap_usd (nullable)
-- adv20_usd (nullable)
-- close_ref (nullable)
-- listing_exchange
-- security_type
-- in_universe_rank (opcional: ranking por cap/liquidez)
-- run_id
-- config_hash
-- ingest_ts_utc
+\subsection{Arquitectura de datos y anti‑bias PIT}
+\label{sec:build_universe:pit}
 
-Snapshots derivados:
-- data/universe/current.parquet (ultimo dia del rango)
-- data/universe/constituents_{date}.parquet
-- data/universe/exclusions_{date}.parquet
+\paragraph{Panel PIT \texttt{date x symbol}}
+\label{par:build_universe:panel}
+A partir de \(\mathcal{L}\) y \(\mathcal{C}\), se construye un panel \(\mathcal{P} = \{(t,s)\}\) tal que:
 
-Artefactos auxiliares:
-- universe_manifest.json
-- universe_counts_by_day.parquet
-- universe_turnover_stats.parquet
+\[
+  (t,s) \in \mathcal{P} \Leftrightarrow 
+  \mathtt{list\_date}(s) \leq t \leq \max\{\mathtt{delist\_date}(s), t_{\max}\}
+\]
+donde \(t_{\max}\) es el máximo de \(\mathcal{D}\). Esto garantiza:
+\begin{itemize}
+  \item ningún ticker aparece antes de \(\mathtt{list\_date}(s)\),
+  \item los tickers \textit{delisted} se mantienen hasta su fecha de deslistado.
+\end{itemize}
 
-7) Reglas PIT y anti-bias
-- No incluir tickers con fecha de listado posterior a la fecha evaluada.
-- Mantener tickers delisted dentro de su ventana historica valida.
-- Para market cap/liquidez, usar valores conocidos a la fecha de decision (sin backfill futuro).
-- Si hay cambios de ticker por corporate action, preservar continuidad via identificador estable cuando sea posible.
-- Si no existe mapping fiable, registrar ruptura y razon.
+\paragraph{Anti‑bias por construcción}
+\label{par:build_universe:anti_bias}
+El diseño impide los principales \textit{survivorship bias}:
+\begin{itemize}
+  \item \textbf{Exclusión temprana de delistados}: \(\mathtt{delist\_date}(s)\) se usa para borrar \((t,s)\) a partir de \(t > \mathtt{delist\_date}(s)\).
+  \item \textbf{Exclusión de IPOs prematuras}: \(\Delta t_{\min}\) en listado.
+  \item \textbf{Sin backfill futuro}: \(\mathcal{M}_t, \mathcal{V}_t, \mathcal{P}_t\) se obtienen únicamente con datos disponibles hasta \(t\) (o \(t-1\)).
+\end{itemize}
 
-8) Flujo del proceso (alto nivel)
-1. Cargar config y validar parametros.
-2. Cargar maestro de listados + calendario.
-3. Expandir panel date x symbol dentro de ventana de vida del instrumento.
-4. Enriquecer panel con market cap/liquidez/precio PIT.
-5. Aplicar reglas de elegibilidad en orden determinista.
-6. Etiquetar is_eligible y eligibility_reason.
-7. Construir salidas historicas y snapshot current.
-8. Calcular estadisticas de cobertura/turnover.
-9. Persistir outputs y manifest.
+\subsection{Enriquecimiento con features PIT}
+\label{sec:build_universe:enrichment}
 
-9) Orden recomendado de filtros
-1. Tipo de instrumento permitido.
-2. Bolsa/mercado permitido.
-3. Ventana de vida (list_date <= date <= delist_date o delist null).
-4. Precio minimo.
-5. Liquidez minima (ADV20).
-6. Small-cap band por market cap (percentil o umbral absoluto configurado).
-7. Reglas especiales (halt prolongado, flags regulatorios, etc).
+\paragraph{Market cap y liquidez}
+\label{par:build_universe:capvol}
+Dado \(\mathcal{P}\), se enriquece con:
+\begin{itemize}
+  \item \(\mathtt{market\_cap\_usd}(s,t)\),
+  \item \(\mathtt{adv20\_usd}(s,t)\),
+  \item \(\mathtt{close\_ref}(s,t)\).
+\end{itemize}
 
-10) Validaciones minimas
-Integridad:
-- Sin duplicados en (date, symbol).
-- is_eligible siempre no-null.
-- eligibility_reason presente cuando is_eligible=false.
+Si no existe valor PIT para \(\mathtt{mkt\_cap}\) o \(\mathtt{adv20}\), se aplica una política configurable:
+\[
+  \mathtt{strategy\_missing}(r) :
+  \begin{cases}
+    \text{excluir}      & \text{(default)} \\
+    \text{forward\_fill} & \text{(ventana temporal limitada)} \\
+    \text{proxy}         & \text{(por sector/market cap)}
+  \end{cases}
+\]
 
-Consistencia temporal:
-- Ningun simbolo aparece antes de list_date.
-- Simbolo no aparece despues de delist_date salvo politica explicita.
-- Cambios bruscos de conteo diario del universo se reportan (warning).
+\subsection{Aplicación de filtros en orden determinista}
+\label{sec:build_universe:filter_order}
 
-Sanidad de filtros:
-- market_cap_usd >= 0 cuando no-null.
-- adv20_usd >= 0 cuando no-null.
-- close_ref > 0 cuando no-null.
+Los filtros aplicados forman una secuencia determinista \(\mathcal{F} = \{F_1, F_2, \dots, F_k\}\) para cada \((t,s)\):
 
-11) Manejo de casos especiales
-- Ticker changes/mergers/spin-offs: resolver mapping por instrumento cuando haya identificador estable.
-- Delist por quiebra: mantener historia previa y excluir desde fecha efectiva.
-- Datos faltantes de market cap/liquidez:
-  - politica configurable: excluir por defecto o fallback temporal acotado.
-- IPO reciente:
-  - permitir entrada solo tras ventana minima (si regla activada).
+\begin{enumerate}
+  \item \textbf{Tipo de instrumento}: \(F_1(s)\).
+  \item \textbf{Bolsa/mercado}: \(F_2(s)\).
+  \item \textbf{Ventana de vida}: \(F_3(t,s)\).
+  \item \textbf{Precio mínimo}: \(F_4(p_{t,s})\).
+  \item \textbf{Liquidez mínima}: \(F_5(\mathtt{adv20}(s,t))\).
+  \item \textbf{Banda de small cap}: \(F_6(\mathtt{mkt\_cap}(s,t))\).
+  \item \textbf{Reglas especiales}: securities halted, flags regulatorios, etc.
+\end{enumerate}
 
-12) Observabilidad y trazabilidad
-Logging estructurado:
-- INFO: progreso por fecha/lote.
-- WARNING: faltantes de datos PIT, saltos de conteo, mappings ambiguos.
-- ERROR: fallos de schema/joins criticos.
+Para cada \((t,s)\):
+\[
+  \mathtt{eligibility}(t,s) := \prod_{i=1}^k \mathbb{I}(F_i(t,s) = \texttt{True})
+\]
+Si \(\mathtt{eligibility}(t,s) = 0\), se registra \(\mathtt{eligibility\_reason}(t,s)\) codificando el primer filtro que falla (o todos, según detalle deseado).
 
-Metricas:
-- n_symbols_master
-- n_symbols_eligible_promedio
-- n_excluded_by_reason_{code}
-- turnover_daily_mean
-- pct_missing_market_cap
-- pct_missing_liquidity
-- run_duration_sec
+\subsection{Estado de membresía y tracking devida}
+\label{sec:build_universe:states}
 
-13) Interfaz de ejecucion (CLI sugerida)
-python -m data.universe.build_universe ^
-  --start-date 2014-01-01 ^
-  --end-date 2026-03-01 ^
-  --listing-master-path data/universe/source/listings.parquet ^
-  --calendar-path data/calendar/us_equities.parquet ^
-  --config-path configs/data/universe.yaml ^
-  --run-id build_universe_20260305_001
+Se definen estados discretos \( \mathtt{state}(t,s) \in \Omega_{\text{state}} \):
 
-14) Estructura interna recomendada (funciones)
-- load_universe_config(...)
-- load_listing_master(...)
-- load_calendar(...)
-- build_life_window_panel(df_listings, calendar)
-- enrich_with_market_cap(df_panel, market_cap_source, ...)
-- enrich_with_liquidity(df_panel, price_volume_source, ...)
-- apply_eligibility_rules(df_panel, config)
-- compute_turnover_stats(df_universe_hist)
-- persist_universe_outputs(df_hist, df_current, output_paths, ...)
-- main()
+\begin{itemize}
+  \item \texttt{active}            : si \(\mathtt{eligibility}(t,s) = 1\).
+  \item \texttt{halted}           : si \(s\) está suspendido en mercado.
+  \item \texttt{delisted}         : si \(t > \mathtt{delist\_date}(s)\).
+  \item \texttt{excluded\_by\_rule} : si \(F_i(t,s) = 0\) para algún \(i\).
+\end{itemize}
 
-15) Criterios de aceptacion (Definition of Done)
-- Genera universo PIT diario reproducible y auditable.
-- No presenta survivorship bias obvio por construccion.
-- Toda exclusion tiene razon codificada.
-- Produce snapshot current util para fetch_prices y pipeline diario.
-- Entrega manifest + metricas para auditoria operativa.
+La historia de \(\mathtt{state}(t,s)\) se persiste en \texttt{parquet} para auditoría de \textit{turnover} y \textit{survivorship}.
 
-16) Casos de prueba minimos (para tests/)
-- IPO entra solo despues de list_date (y ventana minima si aplica).
-- Delisted permanece en historia previa y sale en fecha correcta.
-- Exclusion por tipo de instrumento (ETF/warrant).
-- Filtro de precio y liquidez aplicado correctamente en fecha dada.
-- Cambio de ticker con identificador estable preserva continuidad.
-- Datos faltantes de market cap siguen politica configurada.
-- No duplicados en (date, symbol) tras joins.
+\subsection{Outputs y estructura de archivos}
+\label{sec:build_universe:outputs}
 
-17) Riesgos y decisiones abiertas
-- Definir small-cap por umbral absoluto vs percentil dinamico.
-- Politica exacta para ADRs/SPACs/penny stocks extremos.
-- Calidad del mapping de identificadores entre proveedores.
-- Tradeoff entre cobertura y pureza cuando faltan datos PIT.
+\paragraph{Historia diaria}
+\label{par:build_universe:hist}
+\begin{itemize}
+  \item Ruta:
+  \[
+    \texttt{data/universe/history/date=\{yyyy-mm-dd\}/part-*.parquet}
+  \]
+  \item Schema mínimo:
+  \begin{itemize}
+    \item \texttt{date}                  : fecha de sesión.
+    \item \texttt{symbol}                : ticker.
+    \item \texttt{is\_eligible}          : \(\in \{0,1\}\).
+    \item \texttt{eligibility\_reason}   : \texttt{enum} o \texttt{string} codificada.
+    \item \texttt{market\_cap\_usd}      : \texttt{float} (nullable).
+    \item \texttt{adv20\_usd}            : \texttt{float} (nullable).
+    \item \texttt{close\_ref}            : \texttt{float} (nullable).
+    \item \texttt{listing\_exchange}     : \texttt{string}.
+    \item \texttt{security\_type}        : \texttt{string}.
+    \item \texttt{in\_universe\_rank}    : ranking por \texttt{market\_cap} o \texttt{liquidity} (opcional).
+    \item \texttt{run\_id}, \texttt{config\_hash}, \texttt{ingest\_ts\_utc}.
+  \end{itemize}
+\end{itemize}
 
-18) Checklist rapido de implementacion
-- [ ] Config de reglas versionada (yaml + hash).
-- [ ] Panel PIT date x symbol construido correctamente.
-- [ ] Filtros aplicados en orden determinista.
-- [ ] Motivos de exclusion codificados y completos.
-- [ ] Outputs historicos + current + manifest.
-- [ ] Metricas de cobertura/turnover.
-- [ ] Tests de IPO/delist/ticker change/filtros.
+\paragraph{Snapshots y artefactos}
+\label{par:build_universe:snapshots}
+\begin{itemize}
+  \item \texttt{data/universe/current.parquet}:
+  \[
+    \mathcal{U}_{t_{\max}} \cup \text{campos de tracking}
+  \]
+  \item \texttt{data/universe/constituents\_\{date\}.parquet}:
+  \[
+    \{(s,t) \in \mathcal{P} \mid \mathtt{eligibility}(t,s) = 1\}
+  \]
+  \item \texttt{data/universe/exclusions\_\{date\}.parquet}:
+  \[
+    \{(s,t) \in \mathcal{P} \mid \mathtt{eligibility}(t,s) = 0\}
+  \]
+  \item \texttt{universe\_manifest.json}:
+  \[
+    \{(t, |\mathcal{U}_t|), \text{conteo de exclusiones por motivo}, \text{checksums}\}
+  \]
+  \item \texttt{universe\_counts\_by\_day.parquet}:
+  \[
+    \{t, |\mathcal{U}_t|, |\mathcal{E}_t|\}
+  \]
+  \item \texttt{universe\_turnover\_stats.parquet}:
+  \[
+    \text{turnover}(t) := \frac{|\mathcal{U}_t \setminus \mathcal{U}_{t-1}| + |\mathcal{U}_{t-1} \setminus \mathcal{U}_t|}{|\mathcal{U}_{t-1} \cup \mathcal{U}_t|}
+  \]
+\end{itemize}
+
+\subsection{Validación y observabilidad}
+\label{sec:build_universe:validations}
+
+\paragraph{Integridad de datos}
+\label{par:build_universe:integrity}
+\begin{itemize}
+  \item \textbf{Sin duplicados}:
+  \[
+    \forall t_1 \neq t_2 \text{ o } s_1 \neq s_2 \Rightarrow (t_1,s_1) \neq (t_2,s_2)
+  \]
+  \item \textbf{Campo no nulo}:
+  \[
+    \mathtt{is\_eligible} \in \{0,1\}, \quad \text{siempre disponible}
+  \]
+  \item \textbf{Motivo de exclusión}:
+  \[
+    \mathtt{eligibility\_reason}(t,s) \text{ presente} \iff \mathtt{is\_eligible}(t,s) = 0
+  \]
+\end{itemize}
+
+\paragraph{Consistencia temporal}
+\label{par:build_universe:temporal_consistency}
+\begin{itemize}
+  \item \textbf{Antes de listado}:
+  \[
+    \forall (t,s) \in \mathcal{P}: t \geq \mathtt{list\_date}(s)
+  \]
+  \item \textbf{Después de deslistado}:
+  \[
+    t > \mathtt{delist\_date}(s) \Rightarrow s \notin \mathcal{U}_t
+  \]
+  \item \textbf{Jump de tamaño}:
+  \[
+    \Delta \mathcal{U}_t := |\mathcal{U}_t| - |\mathcal{U}_{t-1}|
+  \]
+  se reporta como \texttt{WARNING} si \(|\Delta \mathcal{U}_t| > \tau_{\text{jump}}\).
+\end{itemize}
+
+\paragraph{Sanidad de filtros}
+\label{par:build_universe:sanity_checks}
+\begin{itemize}
+  \item \(\mathtt{market\_cap\_usd}(s,t) \geq 0\) si no nulo.
+  \item \(\mathtt{adv20\_us

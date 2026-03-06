@@ -1,51 +1,188 @@
-Modulo: models/gbdt/calibrate.py
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[spanish]{babel}
+\usepackage{amsmath, amssymb, bm, amsthm, mathtools}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{siunitx}
 
-1) Objetivo
-Calibrar salidas de modelos GBDT (probabilidades/scores) para mejorar interpretabilidad y estabilidad de decision threshold/ranking downstream.
+\DeclareMathOperator{\E}{\mathbb{E}}
+\DeclareMathOperator{\Var}{Var}
+\DeclareMathOperator{\Bias}{Bias}
+\DeclareMathOperator{\Calib}{Calib}
+\DeclareMathOperator{\Prob}{\mathbb{P}}
+\DeclareMathOperator{\Acc}{Acc}
+\DeclareMathOperator{\Conf}{Conf}
+\DeclareMathOperator{\Softmax}{Softmax}
+\DeclareMathOperator{\Logit}{Logit}
+\DeclareMathOperator{\MC}{MC}
 
-2) Alcance
-Incluye calibracion post-hoc (Platt/Isotonic/temperature), evaluacion de calibration error y export de calibrator versionado.
+\title{Calibración de probabilidades en modelos GBDT \\ \texttt{models/gbdt/calibrate.py}}
+\author{}
+\date{}
 
-3) Entradas
-- oof_predictions_path
-- y_true_path
-- calibration_config_path
-- run_id
+\begin{document}
 
-4) Salidas
-- models/calibration/{run_id}/calibrator.pkl (o json)
-- models/calibration/{run_id}/calibrated_oof.parquet
-- models/calibration/{run_id}/calibration_summary.json
-- models/calibration/{run_id}/manifest.json
+\maketitle
 
-5) Metodos soportados
-- platt scaling
-- isotonic regression
-- temperature scaling (segun tipo de modelo)
+\section{Objetivo y contexto industrial}
 
-6) Reglas anti-leakage
-- calibrator entrenado solo con OOF/valid, nunca test final.
-- si hay temporal split, calibracion respetar cronologia.
+El módulo \texttt{models/gbdt/calibrate.py} tiene como objetivo la \textbf{calibración post-hoc} de las salidas de modelos Gradient Boosting Decision Trees (GBDT), típicamente LightGBM o XGBoost, con el fin de que las probabilidades estimadas \(\hat{p}_i = \hat{f}(x_i)\) sean cercanas a la tasa de frecuencia empírica de eventos \(\Prob(y=1 \mid \hat{p}_i)\) en el conjunto de validación. [web:65][web:66]  
+Una buena calibración es fundamental en entornos de riesgo crédito, trading cuantitativo y sistemas de decisión industrial, donde los umbrales de decisión (thresholds) y rankings basados en scores se usan directamente en producción. [web:59][web:67]
 
-7) Flujo
-1. Cargar preds y targets.
-2. Seleccionar metodo segun config.
-3. Fit calibrator.
-4. Evaluar antes/despues (ECE, Brier, logloss).
-5. Persistir calibrator y reportes.
+Formalmente, dado un modelo base \(f: \mathcal{X} \rightarrow \mathbb{R}^C\) (scores, logits o probabilidades), queremos construir un \textbf{calibrador} \(g: \mathbb{R}^C \rightarrow \Delta^{C-1}\) tal que, para cualquier región \(R \subseteq \mathbb{R}^C\),
 
-8) Validaciones
-- monotonia/probabilidad en [0,1] (clasificacion)
-- mejora o no degradacion severa de metricas de calibracion
-- cobertura completa de filas calibradas
+\begin{equation}
+\E[y \mid \hat{p} \in R] \approx \E[\hat{p} \mid \hat{p} \in R],
+\label{eq:calibration}
+\end{equation}
+\noindent donde \(\hat{p} = g(f(x))\) es la probabilidad calibrada y \(y \in \{0,1\}\). [web:70][web:73]
 
-9) CLI
+\section{Métodos de calibración soportados}
+
+El módulo implementa tres métodos estándar de calibración post-hoc:
+
+\subsection{Platt scaling (logística unidimensional)}
+
+Sea \(s_i = f(x_i)\) el score o logit de un modelo binario. La calibración de Platt asume una transformación logística:
+
+\begin{equation}
+p_i = \sigma(A s_i + B) = \frac{1}{1 + \exp(-A s_i - B)},
+\end{equation}
+\noindent donde los parámetros \(A,B \in \mathbb{R}\) se ajustan minimizando la log-verosimilitud (logloss) en un conjunto de validación:
+
+\begin{equation}
+(A^*, B^*) = \argmin_{A,B} \sum_{i \in \text{calib}} \left[ -y_i \log \sigma(A s_i + B) - (1-y_i) \log(1 - \sigma(A s_i + B)) \right].
+\end{equation}
+[web:62][web:69][web:72]
+
+Este método es paramétrico y funciona bien cuando la curva de calibración es aproximadamente sigmoidea, típica en GBDT. [web:65][web:66]
+
+\subsection{Isotonic regression}
+
+La regresión isotónica es un método \textbf{no paramétrico} que busca una función \(g\) no decreciente minimizando:
+
+\begin{equation}
+g^* = \argmin_{g \in \mathcal{G}} \sum_{i \in \text{calib}} (y_i - g(s_i))^2,
+\end{equation}
+\noindent donde \(\mathcal{G}\) denota el conjunto de funciones no decrecientes. [web:63][web:69]
+
+La solución puede representarse como una función escalonada constante por tramos, guardada internamente como una tabla de puntos de cambio. Este método puede capturar curvas de calibración más complejas, pero requiere un tamaño de conjunto de calibración suficiente para evitar sobreajuste. [web:65][web:66]
+
+\subsection{Temperature scaling (para modelos de tipo logit)}
+
+En modelos que generan logits \(\bm{z}_i \in \mathbb{R}^C\), la temperatura scaling modifica la softmax:
+
+\begin{equation}
+p_i^{(k)} = \frac{\exp(z_i^{(k)} / T)}{\sum_{j=1}^C \exp(z_i^{(j)} / T)},
+\end{equation}
+\noindent donde \(T > 0\) es un parámetro aprendido minimizando la logloss o la ECE en un conjunto de calibración:
+
+\begin{equation}
+T^* = \argmin_{T > 0} \sum_{i \in \text{calib}} \ell(y_i, \bm{p}_i(T)),
+\end{equation}
+\noindent con \(\ell\) la cross‑entropy o una métrica de calibración adecuada. [web:61][web:63][web:69]
+
+Este método es especialmente útil en modelos de boosting que retornan logits o scores no normalizados, y es computacionalmente ligero en producción. [web:61][web:59]
+
+\section{Métricas de calibración y evaluación}
+
+El módulo evalúa la calidad de la calibración antes y después de aplicar el calibrador usando:
+
+\subsection{Expected Calibration Error (ECE)}
+
+Sea \(M\) el número de bins uniformes/discretizados en \([0,1]\). Definimos:
+
+\begin{align}
+\Acc(B_m) &= \frac{1}{|B_m|}\sum_{i \in B_m} \mathbf{1}(y_i = 1), \\
+\Conf(B_m) &= \frac{1}{|B_m|}\sum_{i \in B_m} \hat{p}_i,
+\end{align}
+\noindent donde \(B_m\) es el conjunto de muestras cuya probabilidad calibrada cae en el bin \(m\). La ECE se define como:
+
+\begin{equation}
+\text{ECE} = \sum_{m=1}^{M} \frac{|B_m|}{n} \left| \Acc(B_m) - \Conf(B_m) \right|.
+\end{equation}
+[web:64][web:70][web:73]
+
+Una ECE cercana a cero indica buena calibración global, aunque sigue siendo sensible a la elección de \(M\). [web:64][web:70]
+
+\subsection{Brier score y logloss}
+
+\begin{align}
+\text{Brier}(y, \hat{p}) &= \frac{1}{n} \sum_{i=1}^n (y_i - \hat{p}_i)^2, \\
+\text{Logloss}(y, \hat{p}) &= \frac{1}{n} \sum_{i=1}^n \left[ -y_i \log \hat{p}_i - (1-y_i) \log(1 - \hat{p}_i) \right].
+\end{align}
+
+Ambas son \textbf{score propios} y permiten distinguir entre calibración y discriminación. [web:67][web:73]
+
+\section{Estado del arte y literatura de referencia}
+
+La calibración de modelos GBDT mediante Platt scaling e isotonic regression fue estudiada en profundidad en trabajos clásicos de Niculescu‑Mizil y Caruana, donde se muestra que la calibración mejora drásticamente la calidad de las probabilidades predichas por boosting, a menudo superando a otros métodos de aprendizaje supervisado. [web:65][web:66]  
+
+Más recientemente, \textbf{temperature scaling} ha sido explorado como alternativa ligera y eficiente en modelos profundos y tabulares, mostrando resultados comparables o superiores a isotonic regression en muchos datasets, especialmente cuando el conjunto de calibración es moderado. [web:61][web:59]  
+
+Trabajos sobre \textbf{probability calibration trees} consideran modelos de calibración locales, donde la función \(g\) se aprende por regiones del espacio de entrada, lo que puede ser útil en sistemas de alto riesgo donde la calibración debe ser robusta en subpoblaciones específicas. [web:68][web:71]
+
+\section{Implementación concreta en \texttt{calibrate.py}}
+
+El flujo de trabajo del módulo sigue las siguientes etapas:
+
+\begin{enumerate}
+    \item \textbf{Carga de datos}: los archivos \texttt{oof_predictions.parquet} y \texttt{y\_true.parquet} se cargan separados para evitar cualquier tipo de \textit{data leakage}.
+    \item \textbf{Selección de método}: según el fichero \texttt{calibration.yaml}, se elige entre Platt scaling, isotonic regression o temperature scaling.
+    \item \textbf{Ajuste del calibrador}: se entrena el calibrador únicamente sobre el conjunto OOF/validación, nunca sobre test.
+    \item \textbf{Evaluación}: se computan ECE, Brier y logloss antes y después de la calibración, almacenando resultados detallados en \texttt{calibration\_summary.json}.
+    \item \textbf{Persistencia}: el calibrador se serializa (pkl o JSON) y se guarda en \texttt{models/calibration/\{run\_id\}} junto con las predicciones calibradas en formato \texttt{parquet}.
+\end{enumerate}
+
+\section{Reglas anti-leakage y temporalidad}
+
+Para garantizar validez industrial del sistema:
+
+\begin{itemize}
+    \item El calibrador se entrena exclusivamente con datos OOF o de validación, sin acceso a datos de test final.
+    \item En presencia de \textit{temporal split}, se exige que la calibración respete la cronología temporal: los datos de calibración deben ser estrictamente anteriores a los datos de inferencia.
+\end{itemize}
+
+Estas reglas son estándar en la práctica cuantitativa y aseguran que la mejora de calibración observada en el backtest se generalice a la producción. [web:53][web:56]
+
+\section{Validaciones y doctrina de diseño}
+
+El módulo incorpora varias validaciones:
+
+\begin{itemize}
+    \item \textbf{Monotonía y rango}: la salida del calibrador debe ser una función no decreciente y \(\hat{p}_i \in [0,1]\) (en clasificación binaria).
+    \item \textbf{Métricas}: se exige que el calibrador no degrade severamente ECE, Brier o logloss respecto al modelo base.
+    \item \textbf{Cobertura}: todas las filas del fichero de predicciones deben ser calibradas; se registra en \texttt{manifest.json} el número de filas procesadas y cualquier error.
+\end{itemize}
+
+Estas comprobaciones encajan dentro de frameworks de \textit{model validation} industriales descritos en capítulos de libros de algoritmic trading y risk management, donde la robustez operacional es tan crítica como el rendimiento financiero. [web:56][web:59]
+
+\section{CLI y reutilización industrial}
+
+La interfaz de línea de comandos:
+
+\begin{verbatim}
 python -m models.gbdt.calibrate ^
   --oof-predictions-path models/predictions/lgbm/run_latest/oof.parquet ^
   --y-true-path labels/store/latest.parquet ^
   --config-path configs/models/calibration.yaml ^
   --run-id calibrate_20260305_001
+\end{verbatim}
 
-10) DoD
-- calibrator reutilizable en inference.
-- reporte de mejora de calibracion disponible.
+permite integrar el módulo en pipelines de CI/CD y en sistemas de backtest versionados. El calibrador persistido \texttt{calibrator.pkl} puede reutilizarse directamente en inferencia, garantizando consistencia entre calibración y trading en producción. [web:48][web:56]
+
+\section{Definición de “Done” (DoD)}
+
+El módulo considera completado el proceso cuando:
+
+\begin{itemize}
+    \item Existe un calibrador serializado y versionado usable en producción.
+    \item El reporte de mejora de calibración (\texttt{calibration_summary.json}, ECE, Brier, logloss) está disponible y revisionable.
+\end{itemize}
+
+Este criterio de aceptación encaja con estándares de desarrollo de modelos cuantitativos en entornos financieros, donde la trazabilidad y la reproducibilidad son obligatorias. [web:56][web:59]
+
+\end{document}

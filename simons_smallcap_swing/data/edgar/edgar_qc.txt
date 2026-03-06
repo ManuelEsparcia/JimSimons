@@ -1,56 +1,217 @@
-Modulo: data/edgar/edgar_qc.py
+\section{Módulo: \texttt{data/edgar/edgar\_qc.py}}
 
-1) Objetivo
-Ejecutar control de calidad integral sobre pipeline EDGAR (mapping, downloads, parse, PIT) y emitir gate de confiabilidad para consumo downstream.
+\subsection{Objetivo general del módulo}
 
-2) Alcance
-Incluye checks de cobertura, consistencia temporal, calidad de valores, staleness y trazabilidad de fuente.
+El módulo \texttt{edgar\_qc.py} implementa un \emph{control de calidad integral} sobre el pipeline EDGAR de datos regulatorios de la SEC, incluyendo:
+\begin{itemize}
+  \item mapping de CIK (Central Index Key),
+  \item descarga de notas y XBRL,
+  \item parsing de facts financieros,
+  \item y construcción de una vista \emph{point‑in‑time} (PIT) de los datos.
+\end{itemize}
+La salida del módulo es un \emph{gate de confiabilidad} que determina si los artefactos EDGAR pueden ser consumidos de forma segura en etapas downstream (por ejemplo, construcción de features financieras, backtests, modelos de riesgo).
 
-3) Entradas
-- ticker_cik_outputs
-- submissions/companyfacts raw
-- parsed_facts
-- pit_store
-- qc_config_path
-- run_id
+Matemáticamente, denotamos el pipeline EDGAR como una sucesión de transformaciones estocásticas:
+\[
+  \mathcal{P}: \Omega_{\text{raw}} \xrightarrow{\mathcal{M}} \Omega_{\text{mapped}}
+  \xrightarrow{\mathcal{D}} \Omega_{\text{downloaded}}
+  \xrightarrow{\mathcal{P}} \Omega_{\text{parsed}}
+  \xrightarrow{\mathcal{T}} \Omega_{\text{pit}},
+\]
+donde cada función \(\mathcal{M},\mathcal{D},\mathcal{P},\mathcal{T}\) representa una etapa del pipeline y \(\Omega\) denota el espacio de estados de datos (filings, facts, metadatos, etc.). El módulo \texttt{edgar\_qc.py} evalúa la \emph{calidad de la trayectoria} \(\mathcal{P}\) mediante un conjunto de tests estadísticos y lógicos que definen umbrales operativos sobre la calidad\cite{SECDataQualityGuidelines}.
 
-4) Salidas
-- data/edgar/qc/{run_id}/edgar_qc_summary.json
-- data/edgar/qc/{run_id}/edgar_qc_metrics.parquet
-- data/edgar/qc/{run_id}/edgar_qc_failures.parquet
-- data/edgar/qc/{run_id}/manifest.json
+\subsection{Alcance del control de calidad}
 
-5) Checks obligatorios
-- cobertura CIK del universo >= umbral
-- tasa de descargas fallidas <= umbral
-- parse success rate >= umbral
-- no PIT leakage (acceptance_ts <= asof)
-- staleness por metrica dentro de limites
-- valores extremos/anomalos flagged
+El alcance del módulo incluye cinco dimensiones clave de calidad de datos:
 
-6) Gate
-- pass: sin fallos criticos.
-- warn: degradacion moderada de cobertura/calidad.
-- fail: leakage temporal o cobertura critica insuficiente.
+\begin{enumerate}
+  \item \textbf{Cobertura}: ¿qué porcentaje del universo de tickers/CIK está presente en cada etapa?
+  \item \textbf{Consistencia temporal}: ¿los timestamps de aceptación y de corte de vista PIT están alineados?
+  \item \textbf{Calidad de valores}: ¿los valores numéricos están dentro de rangos económicos razonables y no presentan anomalías?
+  \item \textbf{Staleness}: ¿los datos están suficientemente actualizados respecto a la fecha de procesamiento?
+  \item \textbf{Trazabilidad}: ¿cada fila de datos puede ser rastreada a un archivo de origen, período de informe y metadatos de aceptación?
+\end{enumerate}
 
-7) Flujo
-1. Cargar artefactos de todas las etapas.
-2. Ejecutar checks por capa.
-3. Consolidar score y severidades.
-4. Emitir gate y persistir reportes.
+Estos criterios se alinean con las \emph{Data Quality Assurance Guidelines} de la SEC\cite{SECDataQualityGuidelines}, que definen la calidad como una combinación de utilidad, objetividad e integridad. En el contexto de trading cuantitativo, fallos en cualquiera de estas dimensiones pueden inducir \emph{data leakage} o \emph{look‑ahead bias} en el PIT, lo que invalida la robustez estadística de cualquier estrategia de swing trading traininada sobre este universo\cite{DePrado2018Advances, CampbellEtAl2001}.
 
-8) Metricas
-- cik_coverage_rate
-- download_failure_rate
-- parse_success_rate
-- pit_leakage_count
-- median_staleness_days
+\subsection{Entradas del módulo}
 
-9) CLI
+Las entradas del módulo son:
+
+\begin{itemize}
+  \item \texttt{ticker\_cik\_outputs}: mapping de tickers a CIK y metadatos de universo.
+  \item \texttt{submissions/companyfacts raw}: archivos sin procesar descargados del EDGAR (JSON/XML de facts).
+  \item \texttt{parsed\_facts}: facts estructurados en un esquema tabular (por ejemplo, PyArrow/Parquet).
+  \item \texttt{pit\_store}: almacén de datos en formato \emph{point‑in‑time} con campos \texttt{asof} y \texttt{acceptance\_ts}.
+  \item \texttt{qc\_config\_path}: configuración YAML con umbrales de tolerancia (cobertura, tasa de fallos, staleness, etc.).
+  \item \texttt{run\_id}: identificador único de la ejecución para replicabilidad y trazabilidad.
+\end{itemize}
+
+Desde un punto de vista formal, denotamos el conjunto de entradas como:
+\[
+  \mathcal{I} = \{ \mathcal{U}, \mathcal{F}_{\text{raw}}, \mathcal{F}_{\text{parsed}}, \mathcal{P}, \theta_{\text{qc}}, r \},
+\]
+donde:
+\begin{itemize}
+  \item \(\mathcal{U}\) es el universo de tickers/CIK,
+  \item \(\mathcal{F}_{\text{raw}}\) es el conjunto de facts sin procesar,
+  \item \(\mathcal{F}_{\text{parsed}}\) es el conjunto de facts estructurados,
+  \item \(\mathcal{P}\) es el conjunto de registros PIT con \texttt{asof} y \texttt{acceptance\_ts},
+  \item \(\theta_{\text{qc}}\) son los parámetros de calidad (umbrales),
+  \item \(r\) es el run\_id.
+\end{itemize}
+
+\subsection{Salidas y artefactos}
+
+El módulo produce cuatro artefactos clave:
+
+\begin{itemize}
+  \item \texttt{edgar\_qc\_summary.json}: resumen de alto nivel de la calidad del pipeline, con métricas y estado del \emph{gate}.
+  \item \texttt{edgar\_qc\_metrics.parquet}: tabla de métricas de calidad por etapa (mapping, download, parse, PIT).
+  \item \texttt{edgar\_qc\_failures.parquet}: lista de filas o registros que fallaron checks específicos.
+  \item \texttt{manifest.json}: metadatos de la ejecución, incluyendo versiones, path de entrada/salida y run\_id.
+\end{itemize}
+
+Estos artefactos permiten:
+\begin{itemize}
+  \item monitorear la calidad a lo largo del tiempo (\emph{time‑series of QC metrics}),
+  \item construir dashboards de datos para el equipo de infraestructura,
+  \item rechazar runs con fallos críticos sin interferir con backtests downstream.
+\end{itemize}
+
+En términos de formalización, el módulo calcula un vector de métricas de calidad \(\mathbf{q} = (q_1, \dots, q_k)\) y un conjunto de registros fallidos \(\mathcal{E}\), tales que:
+\[
+  \mathbf{q} = f(\mathcal{I}), \quad \mathcal{E} \subseteq \mathcal{P},
+\]
+donde \(f\) es la función de QC implementada en \texttt{edgar\_qc.py} y \(\mathcal{E}\) es el conjunto de registros que violan alguno de los checks definidos.
+
+\subsection{Checks obligatorios}
+
+El módulo ejecuta una serie de checks obligatorios que definen la \emph{calidad mínima aceptable} del pipeline:
+
+\begin{enumerate}
+  \item \textbf{Cobertura de CIK}:
+    \[
+      \rho_{\text{cik}} = \frac{|\mathcal{U}_{\text{covered}}|}{|\mathcal{U}|} \ge \tau_{\text{cik}},
+    \]
+    donde \(\rho_{\text{cik}}\) es la tasa de cobertura de CIK, \(\mathcal{U}_{\text{covered}}\) son los CIK presentes en la etapa de salida, y \(\tau_{\text{cik}}\) es el umbral configurado en \texttt{qc\_config\_path}.
+
+  \item \textbf{Tasa de descargas fallidas}:
+    \[
+      \epsilon_{\text{dl}} = \frac{|\mathcal{F}_{\text{failed}}|}{|\mathcal{F}_{\text{requested}}|} \le \eta_{\text{dl}},
+    \]
+    donde \(\epsilon_{\text{dl}}\) es la tasa de fallos de descarga, \(\mathcal{F}_{\text{failed}}\) son los archivos no descargados y \(\eta_{\text{dl}}\) es el umbral de tolerancia.
+
+  \item \textbf{Tasa de éxito de parse}:
+    \[
+      \pi_{\text{parse}} = \frac{|\mathcal{F}_{\text{parsed}}|}{|\mathcal{F}_{\text{raw}}|} \ge \zeta_{\text{parse}},
+    \]
+    donde \(\pi_{\text{parse}}\) es la tasa de éxito de parse y \(\zeta_{\text{parse}}\) es el umbral de calidad.
+
+  \item \textbf{No PIT leakage}:
+    \[
+      \mathbb{P}\big(\texttt{acceptance\_ts} > \texttt{asof} \mid \text{record} \in \mathmc{P}\big) = 0,
+    \]
+    es decir, se rechaza cualquier fila donde el timestamp de aceptación (cuándo el hecho fue publicado) sea posterior a la fecha de corte de vista PIT. Este check es crítico para evitar look‑ahead bias en el backtest\cite{DePrado2018Advances}.
+
+  \item \textbf{Staleness por métrica}:
+    Para cada métrica \(m\), se calcula la mediana de dias de rezago:
+    \[
+      d_m = \text{median}\big( \texttt{asof} - \texttt{acceptance\_ts} \mid \text{record} \in \mathcal{P}_m \big),
+    \]
+    y se verifica que \(d_m \le \delta_m\), donde \(\delta_m\) es el umbral de staleness por métrica.
+
+  \item \textbf{Valores extremos y anomalías}:
+    Se aplican tests estadísticos (por ejemplo, \(z\text{-score}\), rangos intercuartílicos, o tests robustos) para detectar outliers:
+    \[
+      x \text{ es anómalo } \iff |x - \mu_m| > \kappa \sigma_m,
+    \]
+    donde \(\mu_m\) y \(\sigma_m\) son la media y desviación estándar de la métrica \(m\), y \(\kappa\) es un umbral configurable. Los valores anómalos se marcan pero no se eliminan automáticamente, permitiendo auditoría humana.
+\end{enumerate}
+
+La combinación de estos checks define una función de gate:
+\[
+  \mathcal{G}(\mathbf{q}) = 
+  \begin{cases}
+    \texttt{pass}, & \text{si todos los checks críticos están dentro de umbrales}, \\
+    \texttt{warn}, & \text{si existen degradaciones moderadas}, \\
+    \texttt{fail}, & \text{si hay leakage temporal o cobertura crítica insuficiente}.
+  \end{cases}
+\]
+
+\subsection{Flujo de ejecución}
+
+El flujo del módulo se puede descomponer en tres fases:
+
+\begin{enumerate}
+  \item \textbf{Carga de artefactos}: todas las entradas se cargan en memoria (o se leen desde almacenamiento distribuido) y se validan sus schemas.
+  \item \textbf{Ejecución de checks por capa}: se aplican los checks descritos a cada etapa del pipeline (mapping, download, parse, PIT), generando un conjunto de métricas por capa.
+  \item \textbf{Consolidación, score y persistencia}: se calcula un score global de calidad, se determina el gate, y se persisten los artefactos en \texttt{data/edgar/qc/\{run\_id\}}.
+\end{enumerate}
+
+En términos de teoría de grafos dirigidos, el pipeline puede verse como un DAG:
+\[
+  G = (V, E),
+\]
+donde \(V\) es el conjunto de etapas (nodos) y \(E\) representa dependencias de datos. Cada check se asocia a un subgrafo \(G_i \subseteq G\), y el score global es una función agregada de las métricas de cada subgrafo.
+
+\subsection{Métricas clave de calidad}
+
+El módulo expone las siguientes métricas principales:
+
+\begin{itemize}
+  \item \texttt{cik\_coverage\_rate}: \(\rho_{\text{cik}}\), como definido arriba.
+  \item \texttt{download\_failure\_rate}: \(\epsilon_{\text{dl}}\).
+  \item \texttt{parse\_success\_rate}: \(\pi_{\text{parse}}\).
+  \item \texttt{pit\_leakage\_count}: número de registros donde \texttt{acceptance\_ts} > \texttt{asof}.
+  \item \texttt{median\_staleness\_days}: \(\text{median}(\texttt{asof} - \texttt{acceptance\_ts})\).
+\end{itemize}
+
+Estas métricas se pueden usar para:
+\begin{itemize}
+  \item entrenar modelos de supervivencia de datos (por ejemplo, Weibull) para predecir el tiempo de vida útil de un hecho financiero,
+  \item construir charts de control estadísticos (Shewhart, CUSUM) para detectar degradación temporal del pipeline,
+  \item ajustar automáticamente umbrales de QC en función del universo de tickers y de la frecuencia de publicación.
+\end{itemize}
+
+\subsection{CLI y uso operativo}
+
+El módulo se invoca mediante la línea de comandos:
+
+\begin{verbatim}
 python -m data.edgar.edgar_qc ^
   --edgar-root-path data/edgar ^
   --config-path configs/data/edgar_qc.yaml ^
   --run-id edgar_qc_20260305_001
+\end{verbatim}
 
-10) DoD
-- gate de calidad EDGAR disponible para features/build_features.
+Esto permite:
+\begin{itemize}
+  \item integrar el QC en pipelines CI/CD,
+  \item automatizar la ejecución periódica (por ejemplo, diariamente),
+  \item alinear el run\_id con la fecha de ejecución para facilitar la auditoría.
+\end{itemize}
+
+\subsection{Definición de término (DoD)}
+
+La definición de término del módulo establece que:
+
+\begin{itemize}
+  \item El \emph{gate de calidad EDGAR} debe estar disponible para el siguiente módulo downstream (por ejemplo, \texttt{features/build_features.py}).
+  \item Si el gate es \texttt{fail}, el proceso downstream debe detenerse inmediatamente.
+  \item Si el gate es \texttt{warn}, se debe registrar un alert y permitir continuar con una advertencia explícita.
+\end{itemize}
+
+Desde un punto de vista de \emph{risk management} cuantitativo, el gate de calidad forma parte de la capa de \emph{data risk control} y se puede ver como un filtro estocástico que reduce la probabilidad de que backtests y modelos entrenados sobre datos defectuosos propaguen sesgos sistemáticos\cite{CampbellEtAl2001, Chan2009QuantitativeTrading}.
+
+\subsection{Conexión con estado del arte y literatura}
+
+La implementación de \texttt{edgar\_qc.py} se alinea con prácticas de:
+
+\begin{itemize}
+  \item \textbf{Calidad de datos en sistemas financieros}: se inspira en las \emph{Data Quality Assurance Guidelines} de la SEC\cite{SECDataQualityGuidelines}, que ubican la calidad de datos como un requisito de gobierno y riesgo regulatorio.
+  \item \textbf{Control de calidad en pipelines cuantitativos}: seguimos principios de \emph{reproducible research} y \emph{data lineage} descritos en De Prado\cite{DePrado2018Advances} y en la literatura de finanzas cuantitativas\cite{CampbellEtAl2001, Chan2009QuantitativeTrading}.
+  \item \textbf{Gestión de staleness y PIT}: el uso de \texttt{acceptance\_ts} y \texttt{asof} es consistente con la práctica industrial de construcción de vistas point‑in‑time en sistemas de riesgo y backtesting, donde se exige evitar \emph{look‑ahead bias} en el manejo de datos regulatorios XBRL\cite{SECXBRLGuide}.
+\end{itemize}
+
+En resumen, \texttt{edgar\_qc.py} no es solo un módulo de QA, sino un \emph{componente de risk management} crítico para cualquier sistema de swing trading que se base en datos EDGAR: garantiza que la base de datos sobre la que se construyen los factores y modelos cumple con estándares de confiabilidad industrial y de estado del arte académico.

@@ -1,55 +1,255 @@
-Modulo: data/universe/universe_qc.py
+\section{Módulo: \texttt{data/universe/universe\_qc.py}}
+\label{sec:universe_qc}
 
-1) Objetivo
-Auditar la calidad del universo PIT diario y validar que reglas de elegibilidad/survivorship se aplicaron correctamente.
+\subsection{Objetivo y filosofía de diseño}
+\label{sec:universe_qc:objective}
 
-2) Alcance
-Incluye validaciones de membresia por fecha, cobertura de list/delist, motivos de exclusion y estabilidad del conteo diario.
+El módulo \texttt{universe\_qc.py} realiza una \textbf{auditoría de calidad de datos} sobre el universo de \textit{small caps} de EE.\ UU. construido en \texttt{data/universe/history}, con el objetivo de:
 
-3) Entradas
-- universe_history_path
-- listings_master_path
-- universe_config_path
-- run_id
+\begin{itemize}
+  \item Validar que las \textbf{reglas de elegibilidad} se aplicaron correctamente y se reflejan en \texttt{is\_eligible} y \texttt{eligibility\_reason}.
+  \item Encontrar \textbf{violationes de consistencia PIT} (ticker antes de \texttt{list\_date}, después de \texttt{delist\_date}, duplicados).
+  \item Medir \textbf{estabilidad diaria} del conteo de constituyentes y \textbf{cobertura de delistings}.
+\end{itemize}
 
-4) Salidas
-- data/universe/qc/{run_id}/universe_qc_summary.json
-- data/universe/qc/{run_id}/universe_qc_daily.parquet
-- data/universe/qc/{run_id}/universe_qc_failures.parquet
-- data/universe/qc/{run_id}/manifest.json
+La filosofía de diseño sigue principios de \textit{data quality checks} en pipelines de datos financieros \cite{mckinsey2025, montecarlo2025, dataeng2025}:
 
-5) Checks obligatorios
-- no duplicados (date,symbol)
-- no simbolos antes de list_date ni despues de delist_date
-- is_eligible no nulo y eligibility_reason coherente
-- cambios bruscos de n_constituents flagged
-- cobertura de delisted adecuada
+\begin{itemize}
+  \item \textbf{Audits automáticos} tras cada transformación crítica.
+  \item \textbf{Unicidad} de \((\mathtt{date}, \mathtt{symbol})\).
+  \item \textbf{Consistencia temporal} con \texttt{list\_date} y \texttt{delist\_date}.
+  \item \textbf{Completo} de \texttt{is\_eligible} y \texttt{eligibility\_reason}.
+\end{itemize}
 
-6) Gates
-- fail: violaciones PIT criticas.
-- warn: anomalias de cobertura/estabilidad moderadas.
-- pass: sin hallazgos criticos.
+\subsection{Definiciones formales}
+\label{sec:universe_qc:definitions}
 
-7) Flujo
-1. Cargar universe y listings.
-2. Ejecutar checks PIT y de consistencia.
-3. Calcular metricas diarias.
-4. Emitir gate y reportes.
+Sea \(\mathcal{U}_t^{\text{PIT}}\) el conjunto de \textit{symbols} elegibles en fecha \(t\) construido por \texttt{build\_universe.py}, almacenado como:
 
-8) Metricas
-- n_symbols_daily
-- turnover_daily
-- pct_missing_listing_meta
-- delisted_coverage_ratio
+\[
+  \texttt{df\_universe} : \{(t,s) \in \mathcal{D} \times \mathcal{S}\}
+\]
+con campos mínimos:
+\begin{itemize}
+  \item \texttt{date}, \texttt{symbol}, \texttt{is\_eligible} \(\in \{0,1\}\),
+  \item \texttt{eligibility\_reason} (string o enum),
+  \item \texttt{market\_cap\_usd}, \texttt{adv20\_usd}, \texttt{close\_ref}, etc.
+\end{itemize}
 
-9) CLI
+\paragraph{Listings master}
+\label{par:universe_qc:listings}
+Sea \(\mathcal{L}\) el maestro de listados con \(\mathtt{list\_date}(s)\), \(\mathtt{delist\_date}(s)\) (nullable) y \(\mathtt{status}\).
+
+\[
+  \mathcal{W}_s := [\mathtt{list\_date}(s), \mathtt{delist\_date}(s)],
+  \quad \text{con } \mathtt{delist\_date}(s) = \infty \text{ si es } \mathtt{null}.
+\]
+
+\paragraph{Cobertura de delistings}
+\label{par:universe_qc:coverage}
+Para \(\mathcal{S}_{\text{delisted}}\) el conjunto de simbolos \textit{delisted} en \(\mathcal{D}\):
+
+\[
+  \mathcal{E}_t := \{s \in \mathcal{S}_{\text{delisted}} : t \in \mathcal{W}_s\}
+\]
+
+\[
+  \texttt{delisted\_coverage\_ratio}(t) :=
+  \frac{
+    |\{s \in \mathcal{E}_t : s \in \mathcal{U}_t^{\text{PIT}}\}|
+  }{
+    |\mathcal{E}_t|
+  }
+\]
+
+\subsection{Validaciones obligatorias (checks)}
+\label{sec:universe_qc:checks}
+
+\begin{itemize}
+  \item \textbf{Unicidad de clave}:
+  \[
+    \forall (t_1,s_1) \neq (t_2,s_2) \Rightarrow (t,s) \text{ único en } \texttt{df\_universe}.
+  \]
+  \item \textbf{Restricción temporal por listings}:
+  \[
+    \forall (t,s) \in \texttt{df\_universe}:
+    \mathtt{list\_date}(s) \leq t \leq \mathtt{delist\_date}(s) \vee \mathtt{delist\_date}(s) = \mathtt{null}
+  \]
+  \item \textbf{Campo no nulo}:
+  \[
+    \mathtt{is\_eligible} \in \{0,1\}, \quad \text{siempre no nulo.}
+  \]
+  \item \textbf{Consistencia de motivos de exclusión}:
+  \[
+    \mathtt{eligibility\_reason}(t,s) \text{ presente} \iff \mathtt{is\_eligible}(t,s) = 0
+  \]
+  \item \textbf{Cambio brusco de tamaño diario}:
+  \[
+    \texttt{turnover\_t} :=
+    \frac{
+      |\mathcal{U}_t \setminus \mathcal{U}_{t-1}| + |\mathcal{U}_{t-1} \setminus \mathcal{U}_t|
+    }{
+      |\mathcal{U}_{t-1} \cup \mathcal{U}_t|
+    }
+  \]
+  Si \(\texttt{turnover\_t} > \tau_{\text{jump}}\), se emite \texttt{WARNING}.
+  \item \textbf{Cobertura de delistings}:
+  \[
+    \texttt{delisted\_coverage\_ratio}(t) \text{ calculado por fecha; bajo } \gamma_{\min} \Rightarrow \text{WARNING}.
+  \]
+\end{itemize}
+
+\subsection{Gates de aceptación}
+\label{sec:universe_qc:gates}
+
+Sobre la salida de \texttt{universe\_qc}, se definen gates (configurables en \texttt{universe\_qc.yaml}):
+
+\begin{itemize}
+  \item \texttt{Gate 1} (violaciones PIT críticas):
+  \[
+    \text{si hay duplicados o ticker fuera de } \mathcal{W}_s \Rightarrow \text{FAIL}
+  \]
+  \item \texttt{Gate 2} (cobertura de delistings):
+  \[
+    \texttt{delisted\_coverage\_ratio\_mean} \geq 0.95
+  \]
+  Si no se cumple, \texttt{WARN} o \texttt{FAIL} según umbrales.
+  \item \texttt{Gate 3} (estabilidad de turnover):
+  \[
+    \texttt{pct\_days\_high\_turnover} \leq \tau_{\text{turnover}}
+  \]
+  donde
+  \[
+    \texttt{pct\_days\_high\_turnover} :=
+    \frac{
+      |\{t \in \mathcal{D} : \texttt{turnover\_t} > \tau_{\text{turnover}}\}|
+    }{
+      |\mathcal{D}|
+    }
+  \]
+\end{itemize}
+
+\[
+  \texttt{gate\_status} =
+  \begin{cases}
+    \texttt{pass}  & \text{no violaciones críticas ni anomalías severas.} \\
+    \texttt{warn}  & \text{anomalías moderadas de cobertura o estabilidad.} \\
+    \texttt{fail}  & \text{violaciones PIT o pérdida importante de cobertura de delistings.}
+  \end{cases}
+\]
+
+\subsection{Metodología de ejecución}
+\label{sec:universe_qc:methodology}
+
+\paragraph{Entradas}
+\label{par:universe_qc:inputs}
+\begin{itemize}
+  \item \texttt{universe\_history\_path}: \texttt{df\_universe} PIT.
+  \item \texttt{listings\_master\_path}: \(\mathcal{L}\) con \texttt{list\_date}, \texttt{delist\_date}.
+  \item \texttt{universe\_config\_path}: \texttt{config\_hash} y reglas de elegibilidad.
+  \item \texttt{run\_id}.
+\end{itemize}
+
+\paragraph{Flujo}
+\label{par:universe_qc:flow}
+\begin{enumerate}
+  \item \texttt{load\_universe\_history} y \texttt{load\_listings\_master}.
+  \item \textbf{Ejecutar checks PIT}:
+  \begin{itemize}
+    \item duplicados,
+    \item ventana de vida,
+    \item no nulos en \texttt{is\_eligible} y \texttt{eligibility\_reason}.
+  \end{itemize}
+  \item \textbf{Calcular métricas diarias}:
+  \[
+    \texttt{universe\_qc\_daily} := \{
+      t,
+      \texttt{n\_symbols\_daily},
+      \texttt{turnover\_daily},
+      \texttt{pct\_missing\_listing\_meta},
+      \texttt{delisted\_coverage\_ratio}(t)
+    \}
+  \]
+  \item \textbf{Detectar failures}:
+  \[
+    \texttt{universe\_qc\_failures} := \{
+      (t,s, \texttt{check\_type}, \texttt{flag\_reason})
+    \}
+  \]
+  \item \textbf{Computar summary}:
+  \[
+    \texttt{universe\_qc\_summary.json}
+  \]
+  \item \textbf{Persistir outputs}:
+  \[
+    \texttt{manifest.json} \text{ con } \texttt{run\_id}, \texttt{config\_hash}, \texttt{gate\_status}.
+  \end{enumerate}
+\]
+
+\subsection{Métricas de calidad recomendadas}
+\label{sec:universe_qc:metrics}
+
+\begin{itemize}
+  \item \texttt{n\_symbols\_daily}:
+  \[
+    N_t := |\mathcal{U}_t^{\text{PIT}}|
+  \]
+  \item \texttt{turnover\_daily} (como \texttt{turnover\_t} definido arriba).
+  \item \texttt{pct\_missing\_listing\_meta}:
+  \[
+    \frac{
+      |\{s \in \mathcal{U}_t^{\text{PIT}} : \text{ falta } \texttt{list\_date} \text{ o } \texttt{delist\_date}\}|
+    }{
+      N_t
+    }
+  \]
+  \item \texttt{delisted\_coverage\_ratio} (por fecha y agregado).
+\end{itemize}
+
+\subsection{Salidas y artefactos}
+\label{sec:universe_qc:outputs}
+
+\begin{itemize}
+  \item \texttt{data/universe/qc/\{run\_id\}/universe\_qc\_summary.json}:
+  \[
+    \{
+      \texttt{n\_symbols\_daily\_mean}, \texttt{turnover\_daily\_mean},
+      \texttt{delisted\_coverage\_ratio\_mean},
+      \texttt{pct\_missing\_listing\_meta},
+      \texttt{gate\_status}, \texttt{run\_id}, \texttt{config\_hash}
+    \}
+  \]
+  \item \texttt{data/universe/qc/\{run\_id\}/universe\_qc\_daily.parquet}:
+  \[
+    t \mapsto (N_t, \texttt{turnover\_t}, \texttt{pct\_missing\_listing\_meta}, \texttt{delisted\_coverage\_ratio}(t))
+  \]
+  \item \texttt{data/universe/qc/\{run\_id\}/universe\_qc\_failures.parquet}:
+  \[
+    \text{Conjunto de \texttt{(t,s, check\_type, flag\_reason)} con violaciones.}
+  \]
+  \item \texttt{data/universe/qc/\{run\_id\}/manifest.json}:
+  \[
+    \{\texttt{run\_id}, \texttt{config\_hash}, \texttt{start\_date}, \texttt{end\_date}, \texttt{n\_rows\_processed}\}
+  \]
+\end{itemize}
+
+\subsection{CLI y criterios de aceptación}
+\label{sec:universe_qc:cli}
+
+\paragraph{CLI suggerida}
+\label{par:universe_qc:cli}
+\begin{verbatim}
 python -m data.universe.universe_qc ^
   --universe-history-path data/universe/history ^
   --listings-master-path data/universe/source/listings.parquet ^
   --config-path configs/data/universe_qc.yaml ^
   --run-id universe_qc_20260305_001
+\end{verbatim}
 
-10) DoD
-- universo validado PIT
-- reporte diario y summary disponibles
-- gate consumible por pipeline
+\paragraph{Definition of Done}
+\label{par:universe_qc:dod}
+\begin{itemize}
+  \item El universo \(\mathcal{U}_t^{\text{PIT}}\) es \textbf{validado PIT} contra \(\mathcal{L}\) y reglas de elegibilidad.
+  \item Se generan \texttt{summary}, \texttt{daily} y \texttt{failures} trazables por \texttt{run\_id}.
+  \item Un \texttt{gate\_status} (\texttt{pass}/\texttt{warn}/\texttt{fail}) es consumible por el pipeline de \texttt{validation} y \texttt{backtest}.
+\end{itemize}

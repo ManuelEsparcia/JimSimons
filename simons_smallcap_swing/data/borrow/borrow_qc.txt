@@ -1,56 +1,285 @@
-Modulo: data/borrow/borrow_qc.py
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish]{babel}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage[margin=2.5cm]{geometry}
 
-1) Objetivo
-Auditar calidad de datos/proxies de borrow y locate para asegurar consistencia, cobertura y realismo en supuestos de shorting.
+\title{Módulo de Quality Control de Borrow: \texttt{data/borrow/borrow\_qc.py}}
+\author{}
+\date{}
 
-2) Alcance
-Incluye checks de rango, cobertura, estabilidad temporal y coherencia entre borrow_fee_proxy, availability y locate decisions.
+\begin{document}
+\maketitle
 
-3) Entradas
-- borrow_proxy_path
-- locate_filter_path
-- universe_path
-- qc_config_path
-- run_id
 
-4) Salidas
-- data/borrow/qc/{run_id}/borrow_qc_summary.json
-- data/borrow/qc/{run_id}/borrow_qc_daily.parquet
-- data/borrow/qc/{run_id}/borrow_qc_failures.parquet
-- data/borrow/qc/{run_id}/manifest.json
+\section{Objetivo del módulo}
+El módulo \texttt{data/borrow/borrow\_qc.py} realiza un \emph{audit de calidad} de los datos y proxies de \emph{borrow} y \emph{locate} para asegurar su consistencia, cobertura y realismo en supuestos de \emph{shorting} dentro de un sistema de trading cuantitativo industrial.  
 
-5) Checks obligatorios
-- borrow_fee_proxy no negativo
-- availability_score en [0,1]
-- cobertura minima diaria por universo
-- saltos extremos day-over-day flagged
-- coherencia locate: blocked cuando fee/availability exceden reglas
+El objetivo es garantizar que:
+\begin{itemize}
+  \item El \emph{borrow fee proxy} y el \emph{availability score} estén en rangos razonables y libres de outliers críticos.
+  \item La cobertura por universo y por fecha sea suficiente para backtest robustos.
+  \item El comportamiento temporal sea estable (sin saltos extremos día a día).
+  \item El sistema de \emph{locate} esté alineado con las reglas de borrow fee y disponibilidad (por ejemplo, bloquear cortos cuando el coste o la falta de inventario así lo dictan).
+\end{itemize}
 
-6) Gates
-- pass: capa borrow apta
-- warn: degradacion moderada de cobertura/calidad
-- fail: inconsistencias criticas o cobertura insuficiente
+Este auditor actúa como una \emph{capa de validación científica} antes de usar los proxies de borrow en estrategias de swing trading, similar a las prácticas de control de calidad de datos de securities finance y lending en la industria \cite{spg2023securitiesfinance, quantrocket2024borrowfees, neudata2025shortinterest}.
 
-7) Flujo
-1. Cargar datasets y config.
-2. Ejecutar checks por fecha/simbolo.
-3. Agregar metricas diarias.
-4. Emitir gate y reportes.
 
-8) Metricas
-- coverage_rate
-- blocked_share
-- avg_borrow_fee_daily
-- p95_borrow_fee_daily
-- inconsistency_count
+\section{Alcance del control de calidad}
+El módulo implementa:
+\begin{itemize}
+  \item \textbf{Checks de rango} para \texttt{borrow\_fee\_proxy} y \texttt{availability\_score}.
+  \item \textbf{Checks de cobertura}: por fecha y por universo.
+  \item \textbf{Checks de estabilidad temporal}: saltos extremos día a día en el borrow fee.
+  \item \textbf{Checks de coherencia} entre el proxy de borrow y el filtro de \texttt{locate} (qué activos se marcan como \emph{blocked} según el coste y la disponibilidad).
+\end{itemize}
 
-9) CLI
-python -m data.borrow.borrow_qc ^
-  --borrow-proxy-path data/borrow/proxy ^
-  --locate-path data/borrow/locate ^
-  --universe-path data/universe/history ^
-  --config-path configs/data/borrow_qc.yaml ^
-  --run-id borrow_qc_20260305_001
+La salida se estructura como:
+\begin{itemize}
+  \item Un \emph{summary} de QC por \texttt{run\_id}.
+  \item Un panel diario agregado.
+  \item Un registro de \emph{failures} (violaciones de reglas).
+  \item Un \texttt{manifest.json} para trazabilidad de metadatos.
+\end{itemize}
 
-10) DoD
-- gate de calidad borrow disponible para backtest/validation.
+
+\section{Entradas y arquitectura}
+Entradas utilizadas:
+\begin{itemize}
+  \item \texttt{borrow\_proxy\_path}: output de \texttt{borrow\_cost\_proxy.py} (por dia, simbolo).
+  \item \texttt{locate\_filter\_path}: flags de \emph{locate} (allowed/blocked) por símbolo/fecha.
+  \item \texttt{universe\_path}: universo de activos elegibles.
+  \item \texttt{qc\_config\_path}: umbrales de rango, cobertura mínima, umbrales de \emph{jump} y de coherencia locate.
+  \item \texttt{run\_id}: id único para el job de QC.
+\end{itemize}
+
+La arquitectura de datos sigue un esquema de fact table por símbolo/fecha:
+\[
+  \mathcal{D}_{t} = \{ (i, t, \widehat{B}_{i,t}, \alpha_{i,t}, L_{i,t}) \}_{i \in \mathcal{U}_t},
+\]
+donde:
+\begin{itemize}
+  \item $ \widehat{B}_{i,t} $: \emph{borrow fee proxy} anualizado.
+  \item $ \alpha_{i,t} \in [0,1] $: \emph{availability score}.
+  \item $ L_{i,t} \in \{0,1\} $: \emph{locate} habilitado (0 = bloqueado).
+\end{itemize}
+
+Sobre este conjunto se calculan métricas diarias y se generan alertas cuando se violan los checks.
+
+
+\section{Checks obligatorios}
+Los checks se diseñan como funciones de validación $ C_j $ sobre el conjunto diario $ \mathcal{D}_t $.  
+
+\subsection{Rango de borrow fee y availability}
+\begin{itemize}
+  \item \textbf{Non‑negativity}:
+  \[
+    C_{\text{fee}}(\mathcal{D}_t) = \mathbb{1}\left( \min_{i \in \mathcal{U}_t} \widehat{B}_{i,t} \geq 0 \right).
+  \]
+  Saltos negativos indican errores de estimación o transformación en el pipeline de \texttt{borrow\_cost\_proxy.py} \cite{hankins2018termstructure, guerrieri2025securitieslending}.
+  \item \textbf{Normalization de availability}:
+  \[
+    C_{\text{avail}}(\mathcal{D}_t) = \mathbb{1}\left( \alpha_{i,t} \in [0,1] \quad \forall i \in \mathcal{U}_t \right).
+  \]
+  Valores fuera de este rango sugieren problemas en el modelo de \emph{availability score} (por ejemplo, falta de saturación en transformaciones logísticas o no‑lineales).
+\end{itemize}
+
+\subsection{Cobertura mínima por universo}
+Sea $ N_t = |\mathcal{U}_t| $ el número de activos en el universo en $ t $, y $ N_t^{\text{qc}} \leq N_t $ el número de activos con borrow proxy y locate definidos.
+
+La \emph{coverage rate} diaria:
+\[
+  \psi_t = \frac{N_t^{\text{qc}}}{N_t}.
+\]
+
+El check de cobertura:
+\[
+  C_{\text{cov}}(\mathcal{D}_t) = \mathbb{1}\left( \psi_t \geq \theta_{\psi} \right),
+\]
+con $ \theta_{\psi} \in (0,1) $ ajustado según el universo y el objetivo de backtest (por ejemplo, 0.95 para carteras largas y 0.9 para estrategias concentradas) \cite{spg2023securitiesfinance, neudata2025shortinterest}.
+
+\subsection{Saltos extremos día a día}
+Para el borrow fee:
+\[
+  \Delta \widehat{B}_{i,t} = \frac{ \left| \widehat{B}_{i,t} - \widehat{B}_{i,t-1} \right| }{ \max\left( \widehat{B}_{i,t-1}, \epsilon \right) },
+\]
+con $ \epsilon $ un pequeño offset para evitar divisiones por cero.
+
+Un \textbf{jump flag}:
+\[
+  J_{i,t} = \mathbb{1}\left( \Delta \widehat{B}_{i,t} > \theta_{\text{jump}} \right).
+\]
+
+El módulo:
+\begin{itemize}
+  \item Cuenta el número de saltos extremos:
+  \[
+    J_t^{\text{count}} = \sum_{i \in \mathcal{U}_t} J_{i,t}.
+  \]
+  \item Emite una alerta cuando $ J_t^{\text{count}} $ supera un umbral de robustez (por ejemplo, \% de símbolos con saltos).  
+\end{itemize}
+
+Esto ayuda a identificar:
+\begin{itemize}
+  \item Cambios abruptos en feeds parciales de securities lending.
+  \item Cambios de bucket o umbrales en el modelo de \texttt{borrow\_cost\_proxy} \cite{hankins2018termstructure, guerrieri2025securitieslending}.
+\end{itemize}
+
+\subsection{Coherencia entre borrow y locate}
+El sistema de \emph{locate} debe bloquear cortos cuando el coste de préstamo o la falta de disponibilidad lo justifican.  
+
+Definimos:
+\begin{itemize}
+  \item \textbf{Regla de block por coste}:
+  \[
+    R_{B}(i,t) = \mathbb{1}\left( \widehat{B}_{i,t} > \theta_B^{\text{block}} \right).
+  \]
+  \item \textbf{Regla de block por disponibilidad}:
+  \[
+    R_{\alpha}(i,t) = \mathbb{1}\left( \alpha_{i,t} < \theta_{\alpha}^{\text{block}} \right).
+  \]
+\end{itemize}
+
+El \textbf{flag de bloqueo esperado}:
+\[
+  E_{i,t} = R_{B}(i,t) \vee R_{\alpha}(i,t).
+\]
+
+El \textbf{flag de bloqueo real}:
+\[
+  R_{i,t}^{(L)} = \mathbb{1}\left( L_{i,t} = 0 \right).
+\]
+
+El \textbf{inconsistency flag}:
+\[
+  I_{i,t} = \mathbb{1}\left( E_{i,t} \neq R_{i,t}^{(L)} \right).
+\]
+
+El número de inconsistencias diarias:
+\[
+  I_t^{\text{count}} = \sum_{i \in \mathcal{U}_t} I_{i,t}.
+\]
+
+El módulo debe:
+\begin{itemize}
+  \item Reportar $ I_t^{\text{count}} $ como \texttt{inconsistency\_count}.
+  \item Actuar como \textbf{feedback loop} para ajustar los umbrales $ \theta_B^{\text{block}}, \theta_{\alpha}^{\text{block}} $ en el sistema de locate.
+\end{itemize}
+
+Esto encaja en la literatura de \emph{securities lending data quality} y coherencia entre inventario y costes de prestación, que se aplica en plataformas de crédito y trading cuantitativo \cite{spg2023securitiesfinance, neudata2025shortinterest, quantrocket2024borrowfees}.
+
+
+\section{Gates de calidad (pass / warn / fail)}
+El módulo emite un \emph{gate} diario para la capa de borrow:
+
+\begin{itemize}
+  \item \textbf{pass}: todas las validaciones obligatorias cumplen y las métricas están dentro de umbrales de operación normal.
+  \item \textbf{warn}: degradación moderada de cobertura o de calidad (por ejemplo, cobertura baja durante cortos períodos, pocos saltos extremos, o consistencia locate cercana al límite).
+  \item \textbf{fail}: inconsistencias críticas (por ejemplo, borrow fee negativo, cobertura por debajo de un mínimo absoluto, gran número de inconsistencias locate, o saltos masivos en el borrow fee).
+\end{itemize}
+
+El gate puede definirse formalmente como:
+\[
+  \text{Gate}_t =
+  \begin{cases}
+    \text{fail}   & \text{si } C_{\text{fee}}(\mathcal{D}_t) = 0 \text{ o } C_{\text{avail}}(\mathcal{D}_t) = 0 \text{ o } \psi_t < \theta_{\psi}^{\text{hard}}, \\
+    \text{warn}  & \text{si } \psi_t \in [\theta_{\psi}^{\text{soft}}, \theta_{\psi}^{\text{hard}}) \text{ o } I_t^{\text{count}} > \theta_I^{\text{warn}}, \\
+    \text{pass}  & \text{en otro caso}.
+  \end{cases}
+\]
+
+Este tipo de gating es análogo a los sistemas de calidad de datos usados en supervisión financiera y en riesgo de datos (data quality gates) \cite{fsb2015globaldata, boe2025collateral, imf2025haircuts}.
+
+
+\section{Flujo de ejecución}
+El flujo del módulo es:
+
+1. \textbf{Carga de datos y config}.
+   \begin{itemize}
+     \item Cargar \texttt{borrow\_proxy}, \texttt{locate\_filter}, \texttt{universe}.
+     \item Cargar \texttt{qc\_config} (umbrales de rango, cobertura, jump, coherencia).
+   \end{itemize}
+
+2. \textbf{Ejecución de checks por símbolo/fecha}.
+   \begin{itemize}
+     \item Calcular flags de rango, cobertura, jump, inconsistencia.
+   \end{itemize}
+
+3. \textbf{Agregación diaria}.
+   \begin{itemize}
+     \item Métricas por fecha:
+     \[
+       \text{coverage\_rate}_t = \psi_t,
+       \quad
+       \text{blocked\_share}_t = \frac{1}{N_t} \sum_{i \in \mathcal{U}_t} \mathbb{1}\left( R_{i,t}^{(L)} = 1 \right),
+     \]
+     \[
+       \text{avg\_borrow\_fee\_daily}_t = \frac{1}{N_t^{\text{qc}}} \sum_{i \in \mathcal{U}_t} \widehat{b}_{i,t},
+       \quad
+       \text{p95\_borrow\_fee\_daily}_t = \text{percentil 95} \left( \widehat{b}_{i,t} \right),
+     \]
+     \[
+       \text{inconsistency\_count}_t = I_t^{\text{count}}.
+     \]
+   \end{itemize}
+
+4. \textbf{Emitir gate y reportes}.
+   \begin{itemize}
+     \item Persistir:
+     \begin{itemize}
+       \item \texttt{borrow\_qc\_summary.json}.
+       \item \texttt{borrow\_qc\_daily.parquet} (métricas diarias).
+       \item \texttt{borrow\_qc\_failures.parquet} (registros de violaciones).
+       \item \texttt{manifest.json} (metadatos de ejecución y umbrales).
+     \end{itemize}
+   \end{itemize}
+
+
+\section{Métricas de calidad de borrow}
+Las métricas clave a monitorizar son:
+
+\begin{itemize}
+  \item \textbf{coverage\_rate}: porcentaje de universo con datos de borrow y locate.
+  \item \textbf{blocked\_share}: porcentaje de activos bloqueados para shorting.
+  \item \textbf{avg\_borrow\_fee\_daily}: coste medio de préstamo diario.
+  \item \textbf{p95\_borrow\_fee\_daily}: refleja el sesgo hacia activos HTB en el universo.
+  \item \textbf{inconsistency\_count}: indicador de discrepancia entre proxies y reglas de locate.
+\end{itemize}
+
+Estas métricas permiten:
+\begin{itemize}
+  \item Monitorear la evolución temporal del \emph{borrow cost landscape} del universo.
+  \item Calibrar umbrales de locate y decisiones de cartera (por ejemplo, máximo \% de activos HTB aceptados).
+  \item Validar que el sistema de \emph{borrow\_cost\_proxy} no introduce \emph{data leakage} o comportamientos no razonables \cite{spg2023securitiesfinance, quantrocket2024borrowfees}.
+\end{itemize}
+
+
+\section{Uso en backtest y validación}
+El output del módulo se consume en:
+
+\begin{itemize}
+  \item \textbf{Pipeline de backtest}: el \texttt{gate} de calidad borrow se usa como precondición antes de ejecutar backtest de estrategias de \emph{shorting} y \emph{swing trading}.  
+  \item \textbf{Validación de estrategias}: se puede:
+  \begin{itemize}
+    \item Segmentar el histórico en periodos \texttt{pass/warn/fail} y analizar el \emph{alpha} y \emph{risk‑adjusted returns} separadamente.
+    \item Comparar el impacto del coste de prestamo neto cuando se usa el \texttt{borrow\_fee\_proxy} filtrado por QC.
+  \end{itemize}
+\end{itemize}
+
+Además, el módulo permite:
+\begin{itemize}
+  \item Controlar la exposición a activos HTB en el backtest, restringiendo la cartera cuando el \texttt{coverage\_rate} es bajo o el \texttt{gate} está en \texttt{warn/fail}.
+  \item Ajustar umbrales de \texttt{borrow\_fee} y \texttt{availability} en el sistema de \texttt{locate\_filter} según la calidad observada en el \texttt{borrow\_qc}.
+\end{itemize}
+
+El \textbf{Definition of Done} (DoD) es:
+\begin{itemize}
+  \item El \emph{gate de calidad borrow} está disponible y documentado para consumo en backtest y validación.
+  \item Los outputs de QC pueden ser visualizados y debuggeados (por ejemplo, gráficos de coverage, borrow fee medio, p95 de borrow fee y inconsistencias locate).
+  \item El sistema de \texttt{borrow\_qc} proporciona diagnóstico temprano de degradación de datos de securities lending y proxy de coste de préstamo, permitiendo una toma de decisiones robusta en el diseño de estrategias de shorting y swing trading industrial \cite{spg2023securitiesfinance, quantrocket2024borrowfees, neudata2025shortinterest}.
+\end{itemize}
+

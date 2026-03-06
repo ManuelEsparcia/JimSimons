@@ -1,230 +1,237 @@
-Modulo: labels/build_labels.py
+\section{Módulo: \texttt{labels/build\_labels.py}}
 
-1) Objetivo
-Construir labels forward point-in-time (PIT) para entrenamiento y evaluacion de modelos cross-sectional en small caps, netos de costes segun configuracion y sin leakage temporal.
+\subsection{Objetivo del módulo}
 
-2) Alcance
-Incluye:
-- Definicion y calculo de targets forward multi-horizonte.
-- Opcional neutralizacion de target (beta/sector/factores).
-- Aplicacion de decision lag y alineacion exacta con features.
-- Construccion de variantes de label (regresion, ranking, clasificacion).
-- Persistencia de label store + metadata + manifest.
+El objetivo de \texttt{labels/build\_labels.py} es construir un banco de \emph{labels forward, point‑in‑time (PIT)} para entrenamiento y evaluación de modelos \emph{cross‑sectional} en universos de small caps, garantizando que:
+\begin{itemize}
+  \item Los \emph{labels} son netos de costes conforme a la configuración (slippage, fees, borrow).
+  \item No existe \emph{temporal leakage} ni contaminación con información futura.
+  \item Se generan \emph{targets multi‑horizonte} consistentes con la estrategia de swing trading (e.g., 5d, 10d, 20d).
+\end{itemize}
+Este módulo ocupa la posición central en la \emph{label pipeline} de un sistema de \emph{quant research industrial}, donde la calidad del \emph{target} determina directamente el máximo rendimiento teórico alcanzable del modelo (Capítulo 8 de \cite{LopezdePrado2018}).
 
-No incluye:
-- Purged CV / embargo (labels/purged_splits.py).
-- Entrenamiento de modelos.
-- Backtest completo de ejecucion.
+\subsection{Marco matemático de los labels forward PIT}
 
-3) Dependencias aguas arriba y aguas abajo
-Upstream:
-- data/price/adjusted/... (close/returns ajustados)
-- data/universe/history/... (membresia PIT)
-- execution/cost_model outputs (si labels netas de costes)
-- risk/factor_model exposures (si neutralizacion por factores)
-- calendario de mercado
+Denotamos:
+\begin{itemize}
+  \item \( t \): fecha de decisión o de construcción de features.
+  \item \( \mathcal{U}_t \): universo de small caps elegibles en \( t \), i.e., \( \mathcal{U}_t = \{ i \in \mathcal{I} : \texttt{is\_eligible}(i,t) = 1 \} \).
+  \item \( h \in \mathcal{H} = \{h_1, h_2, \dots \} \): conjunto de horizontes forward (5d, 10d, 20d,…).
+  \item \( \text{lag} \in \{0,1\} \): \emph{decision lag} en días.
+  \item \( r_{i,t+\tau} \): retorno bruto del activo \( i \) entre \( t+\text{lag} \) y \( t+\text{lag}+\tau \).
+\end{itemize}
 
-Downstream:
-- labels/purged_splits.py
-- models/*/train_*.py
-- validation/leakage_audit.py
-- backtest/run_walkforward.py
+\subsubsection{Retorno forward bruto}
 
-4) Definicion de labels (familias)
-Regresion:
-- y_fwd_ret_{h}d: retorno forward en horizonte h dias.
-- y_fwd_ret_net_{h}d: retorno forward neto de costes (opcional).
+El retorno forward bruto para horizonte \( h \) en \( t \) se define como:
+\begin{equation}
+y^{\text{ret}}_{i,h}(t) = \frac{P_{i,t+\text{lag}+h}}{P_{i,t+\text{lag}}} - 1,
+\end{equation}
+donde \( P_{i,\cdot} \) es el precio ajustado (close o close/open ajustado según la configuración \texttt{return\_mode}). La elección de \texttt{return\_mode} (close‑to‑close, open‑to‑close, close‑to‑open) implica una mapeada directa a la convención de \emph{execution timing} y a la definición de \emph{signal horizon} en el backtest \cite{CampbellLoMackinlay1997,LoMacKinlay2001}.
 
-Ranking:
-- y_rank_{h}d: rank percentile cross-sectional del retorno forward por fecha.
+\subsubsection{Retorno forward neto de costes}
 
-Clasificacion:
-- y_cls_up_{h}d: 1 si retorno forward > umbral, 0 en otro caso.
-- y_cls_tail_{h}d: etiquetas de colas (top/bottom quantile).
+Si se activa \texttt{net\_of\_costs = true}, el label neto se construye como:
+\begin{equation}
+y^{\text{ret, net}}_{i,h}(t) = y^{\text{ret}}_{i,h}(t) - c^{\text{entry}}_{i,t} - c^{\text{exit}}_{i,t+h} - c^{\text{borrow}}_{i,t:t+h},
+\end{equation}
+donde \( c^{\bullet}_{i,\cdot} \) proviene de salida de \texttt{execution/cost\_model}. Este modelo de costes puede ser un modelo paramétrico (slippage proporcional al volumen, comisiones fijas, coste de financiación) o un modelo de impacto no lineal basado en \emph{transaction cost analysis} (TCA) \cite{Almgren2000,AlmgrenChun2001,Gatheral2010}.
 
-Configuracion recomendada inicial:
-- horizontes: 5d, 10d, 20d.
-- target principal de research: y_fwd_ret_net_10d.
+\subsubsection{Rank cross‑sectional}
 
-5) Contrato de entrada
-Entradas minimas:
-- prices_adjusted_path
-- universe_history_path
-- start_date, end_date
-- label_config_path
-- run_id
+El label de ranking se define como:
+\begin{equation}
+y^{\text{rank}}_{i,h}(t) = F_{t,h}\left( y^{\text{ret}}_{i,h}(t) \right),
+\end{equation}
+donde \( F_{t,h}(\cdot) \) es la función de distribución empírica cross‑sectional de retornos forward en \( t \) para el horizonte \( h \). Esto conecta directamente con la metodología de \emph{portfolio sorting} en \emph{cross‑sectional asset pricing} \cite{FamaFrench1993,HouMoPeng2013}.
 
-Opcionales:
-- costs_path (slippage/fees/borrow)
-- exposures_path (para neutralizacion)
-- events_blacklist_path (halt, suspensiones, eventos extremos)
+\subsubsection{Labels de clasificación}
 
-Campos minimos esperados:
-- prices: symbol, date, close_adj (y opcionalmente open_adj para timing)
-- universe: date, symbol, is_eligible
+Para clasificación binaria:
+\begin{equation}
+y^{\text{cls, up}}_{i,h}(t) = \mathbb{I}\left\{ y^{\text{ret}}_{i,h}(t) > \theta_h \right\},
+\end{equation}
+donde \( \theta_h \) es un umbral por horizonte (puede ser fijo, o calibrado dinámicamente vía percentiles históricos). Para colas top/bottom:
+\begin{equation}
+y^{\text{cls, tail}}_{i,h}(t) = 
+\begin{cases}
++1 & \text{si } y^{\text{ret}}_{i,h}(t) > \text{quant}_\alpha, \\
+-1 & \text{si } y^{\text{ret}}_{i,h}(t) < \text{quant}_{1-\alpha}, \\
+0 & \text{en otro caso},
+\end{cases}
+\end{equation}
+análogo a la literatura de \emph{quantile‑based labeling} y \emph{trend‑following} en horizontes múltiples \cite{LoMacKinlay2001,HarveyLiu2015}.
 
-Parametros clave de config:
-- horizons_days: [5,10,20,...]
-- decision_lag_days: 0/1
-- return_mode: close_to_close | open_to_close | close_to_open
-- net_of_costs: true/false
-- neutralization_mode: none | sector | beta | factor_model
-- winsor_target_limits
-- classification_thresholds / quantiles
+\subsubsection{Neutralización de target}
 
-6) Contrato de salida
-Salida principal:
-- labels/store/date={yyyy-mm-dd}/part-*.parquet
+Si se activa \texttt{neutralization\_mode} (\texttt{sector}, \texttt{beta} o \texttt{factor\_model}), el label se transforma vía regresión cross‑sectional:
+\begin{equation}
+\mathbf{y}_t = \mathbf{X}_t \boldsymbol{\beta}_t + \boldsymbol{\varepsilon}_t,
+\end{equation}
+donde \( \mathbf{y}_t \) es el vector de retornos forward en \( t \), \( \mathbf{X}_t \) contiene exposiciones factoriales (sector, beta de mercado, factores de estilo), y el residual \( \boldsymbol{\varepsilon}_t \) se usa como \emph{label neutralizado}:
+\begin{equation}
+y^{\text{neut}}_{i,h}(t) = \varepsilon_{i,t}.
+\end{equation}
+Esta aproximación está alineada con la \emph{factor‑neutral target construction} de la literatura de risk‑factor investing y alphas estandarizados \cite{GrinoldKahn2000,Brar2019}.
 
-Columnas base:
-- date
-- symbol
-- run_id
-- config_hash
+\subsection{Familias de labels y elección de target principal}
 
-Columnas de labels (ejemplo):
-- y_fwd_ret_5d
-- y_fwd_ret_10d
-- y_fwd_ret_20d
-- y_fwd_ret_net_10d (si net_of_costs=true)
-- y_rank_10d
-- y_cls_up_10d
-- label_valid_flag
-- label_exclusion_reason (nullable)
+El módulo soporta tres familias de labels:
+\begin{itemize}
+  \item \emph{Regresión}: \( y^{\text{ret}}_{h}(t) \), \( y^{\text{ret, net}}_{h}(t) \).
+  \item \emph{Ranking}: \( y^{\text{rank}}_{h}(t) \).
+  \item \emph{Clasificación}: \( y^{\text{cls, up}}_{h}(t) \), \( y^{\text{cls, tail}}_{h}(t) \).
+\end{itemize}
 
-Metadatos auxiliares:
-- labels/metadata/label_dictionary_{run_id}.json
-- labels/metadata/label_manifest_{run_id}.json
-- labels/metadata/label_coverage_{run_id}.parquet
+La recomendación inicial de configuración sugiere:
+\begin{itemize}
+  \item Horizontes \( \mathcal{H} = \{5,10,20\} \) días.
+  \item Target principal de investigación: \( y^{\text{ret, net}}_{10d} \).
+\end{itemize}
+Esto refleja un compromiso entre el \emph{information horizon} y la penalización por costes de transacción, típico en swing trading de small caps donde el \emph{cross‑sectional dispersion} es amplio \cite{MSCI2023_smallcap_dispersion}.
 
-7) Reglas PIT y anti-leakage
-- Label en fecha t usa precios de t+1..t+h segun timing configurado, nunca informacion anterior mal alineada.
-- decision_lag debe ser coherente con build_features (misma convencion operativa).
-- Excluir observaciones sin ventana forward completa.
-- No usar universe_current para filtrar historia.
-- Si se aplica neutralizacion, usar solo exposiciones disponibles en t (o t-1 si corresponde).
+\subsection{Flujo del proceso (alto nivel)}
 
-8) Definiciones/formulas base
-Retorno forward bruto:
-- y_fwd_ret_{h}d(t) = close_adj(t+h) / close_adj(t+lag) - 1
-  donde lag depende de timing (ejemplo lag=0 o 1).
+El flujo interno del módulo sigue:
+\begin{enumerate}
+  \item \texttt{load\_label\_config(...)}.  
+  \item \texttt{load\_prices\_adjusted(...)}.  
+  \item \texttt{load\_universe\_history(...)}.  
+  \item \texttt{compute\_forward\_returns(...)}.  
+  \item \texttt{apply\_cost\_adjustment(...)}.  
+  \item \texttt{apply\_target\_neutralization(...)}.  
+  \item \texttt{build\_rank\_and\_class\_labels(...)}.  
+  \item \texttt{apply\_label\_validity\_filters(...)}.  
+  \item \texttt{validate\_label\_store(...)}.  
+  \item \texttt{persist\_label\_outputs(...)}.  
+\end{enumerate}
 
-Retorno neto de costes (aprox):
-- y_fwd_ret_net = y_fwd_ret_bruto - cost_entry - cost_exit - borrow_cost_h
+Este diseño modular permite:
+\begin{itemize}
+  \item Combinar variantes de \emph{labeling} (multi‑horizonte, neto/bruto, rank/cls) en un único pipeline.
+  \item Reutilizar componentes en otros módulos de \texttt{labels} y \texttt{validation}.
+\end{itemize}
 
-Ranking:
-- y_rank_{h}d(t) = rank_percentile_cross_section(y_fwd_ret_{h}d en fecha t)
+\subsection{Reglas PIT y anti‑leakage}
 
-Clasificacion binaria:
-- y_cls_up_{h}d = 1{ y_fwd_ret_{h}d > thr_h }
+Las reglas de \emph{point‑in‑time} y \emph{anti‑leakage} son:
+\begin{itemize}
+  \item El label en \( t \) usa precios de \( t+1 \dots t+h \) según la convención de timing, nunca información anterior mal alineada.
+  \item El \texttt{decision\_lag} debe ser coherente con \texttt{build\_features} (misma convención de mantenimiento de posiciones).
+  \item Se excluyen observaciones sin ventana forward completa.
+  \item No se usa \texttt{universe\_current} para filtrar historia (solo \texttt{universe\_history}).
+  \item En neutralización, se usan solo exposiciones \emph{available in t} (o \( t-1 \) si corresponde).
+\end{itemize}
 
-Neutralizacion (opcional):
-- y_neut = residuo de regresion cross-sectional:
-  y = X_factors * b + e  -> label_final = e
+Estas reglas responden directamente a la literatura de \emph{look‑ahead bias} y \emph{PIT data} en research quantamental \cite{SPGlobal_quantamental_PIT,Nechvatalova2021}.
 
-9) Flujo del proceso (alto nivel)
-1. Cargar config y validar parametros.
-2. Cargar precios ajustados + universo PIT.
-3. Filtrar a simbolos elegibles por fecha.
-4. Calcular retornos forward por horizonte.
-5. Aplicar costes (si net_of_costs=true).
-6. Aplicar neutralizacion (si configurada).
-7. Derivar variantes rank/clasificacion.
-8. Aplicar validaciones y flags de exclusion.
-9. Persistir label store + metadata + manifest.
+\subsection{Política de exclusiones y flags de validez}
 
-10) Politica de exclusiones
-Excluir/flaggear cuando:
-- no existe ventana forward completa.
-- simbolo fuera de universo elegible en t.
-- precio invalido/no positivo en puntos de calculo.
-- evento corporativo extremo o suspension segun blacklist.
-- coste no disponible cuando net_of_costs=true y politica strict=true.
+El módulo produce:
+\begin{itemize}
+  \item \texttt{label\_valid\_flag}: booleano que indica si la etiqueta es válida.
+  \item \texttt{label\_exclusion\_reason}: código estandarizado de razón de exclusión.
+\end{itemize}
+Se excluyen/flagan cuando:
+\begin{itemize}
+  \item No existe ventana forward completa.
+  \item El símbolo está fuera de universo elegible en \( t \).
+  \item El precio es no positivo o no válido en los puntos de cálculo.
+  \item Existe un evento corporativo extremo o suspensión (según \texttt{events\_blacklist\_path}).
+  \item No hay costes disponibles cuando \texttt{net\_of\_costs = true} y se usa política estricta.
+\end{itemize}
 
-Campos:
-- label_valid_flag = bool
-- label_exclusion_reason = codigo estandarizado
+\subsection{Validaciones mínimas y reportes de cobertura}
 
-11) Validaciones minimas
-Integridad:
-- Sin duplicados en (date, symbol).
-- Labels dentro del rango de fechas solicitado.
-- Tipos numericos correctos.
+Las validaciones de integridad incluyen:
+\begin{itemize}
+  \item Sin duplicados en \( (date, symbol) \).
+  \item Labels dentro de \texttt{start\_date}–\texttt{end\_date}.
+  \item Tipos numéricos correctos.
+\end{itemize}
+Las validaciones de sanidad estadística:
+\begin{itemize}
+  \item Sin \( \pm \infty \).
+  \item Varianza positiva por fecha (salvo días excepcionales).
+  \item Proporción de clases razonable en labels binarios.
+\end{itemize}
 
-Sanidad estadistica:
-- Sin inf/-inf.
-- Distribucion por fecha con varianza > 0 (salvo dias excepcionales).
-- Proporcion de clases razonable en labels binarias.
+Los reportes de cobertura:
+\begin{itemize}
+  \item Tasa de cobertura por horizonte \( \geq \) umbral configurable.
+  \item Reporte de \( n_{\text{valid}} \) vs \( n_{\text{total}} \) por fecha.
+\end{itemize}
 
-Cobertura:
-- label_coverage_rate por horizonte >= umbral configurable.
-- reporte de n_valid vs n_total por fecha.
+Estos reportes conexos con el \emph{label coverage} y la calidad de datos en universos pequeños son críticos en un setting industrial \cite{Nechvatalova2021,HarveyLiu2015}.
 
-12) Observabilidad y trazabilidad
-Logging:
-- INFO: progreso por horizonte y fecha.
-- WARNING: cobertura baja, clases desbalanceadas, costes faltantes.
-- ERROR: fallos de schema/alineacion temporal.
+\subsection{Interfaz de ejecución CLI y persistencia}
 
-Metricas:
-- n_rows_labels
-- n_labels_valid
-- coverage_by_horizon
-- class_balance_by_horizon
-- pct_excluded_by_reason
-- run_duration_sec
-
-13) Interfaz de ejecucion (CLI sugerida)
-python -m labels.build_labels ^
-  --prices-adjusted-path data/price/adjusted/mode=dual_output ^
-  --universe-history-path data/universe/history ^
-  --costs-path execution/costs/latest.parquet ^
-  --exposures-path risk/factors/latest.parquet ^
-  --start-date 2014-01-01 ^
-  --end-date 2026-03-01 ^
-  --config-path configs/labels/base.yaml ^
+Ejemplo de interfaz CLI:
+\begin{verbatim}
+python -m labels.build_labels \
+  --prices-adjusted-path data/price/adjusted/mode=dual_output \
+  --universe-history-path data/universe/history \
+  --costs-path execution/costs/latest.parquet \
+  --exposures-path risk/factors/latest.parquet \
+  --start-date 2014-01-01 \
+  --end-date 2026-03-01 \
+  --config-path configs/labels/base.yaml \
   --run-id build_labels_20260305_001
+\end{verbatim}
 
-14) Estructura interna recomendada (funciones)
-- load_label_config(...)
-- load_prices_adjusted(...)
-- load_universe_history(...)
-- compute_forward_returns(df_prices, horizons, timing_cfg)
-- apply_cost_adjustment(df_labels, df_costs, cfg)
-- apply_target_neutralization(df_labels, df_exposures, cfg)
-- build_rank_and_class_labels(df_labels, cfg)
-- apply_label_validity_filters(df_labels, cfg)
-- validate_label_store(df_labels, cfg)
-- persist_label_outputs(df_labels, metadata, output_path, ...)
-- main()
+El output principal se guarda en:
+\begin{verbatim}
+labels/store/date={yyyy-mm-dd}/part-*.parquet
+\end{verbatim}
+con columnas como:
+\begin{itemize}
+  \item \texttt{y\_fwd\_ret\_5d}, \texttt{y\_fwd\_ret\_10d}, \texttt{y\_fwd\_ret\_20d}.
+  \item \texttt{y\_fwd\_ret\_net\_10d} (si \texttt{net\_of\_costs = true}).
+  \item \texttt{y\_rank\_10d}, \texttt{y\_cls\_up\_10d}.
+  \item \texttt{label\_valid\_flag}, \texttt{label\_exclusion\_reason}.
+\end{itemize}
 
-15) Criterios de aceptacion (Definition of Done)
-- Genera labels PIT sin leakage temporal.
-- Soporta multi-horizonte y variantes (reg/rank/cls).
-- Neutralizacion y net_of_costs funcionan por config.
-- Cobertura y calidad suficientes para entrenar.
-- Metadata/manifest trazables por run_id y config hash.
+Además, se generan:
+\begin{itemize}
+  \item \texttt{labels/metadata/label\_dictionary\_{run\_id}.json}.
+  \item \texttt{labels/metadata/label\_manifest\_{run\_id}.json}.
+  \item \texttt{labels/metadata/label\_coverage\_{run\_id}.parquet}.
+\end{itemize}
 
-16) Casos de prueba minimos (para tests/)
-- Retorno forward 5d/10d correcto en serie sintetica.
-- decision_lag alinea labels consistentemente con features.
-- Ultimos h dias del rango quedan invalidos por falta de forward window.
-- net_of_costs resta costes correctamente.
-- neutralizacion por factor devuelve residuales esperados.
-- clasificacion por umbral/quantil produce etiquetas correctas.
-- no duplicados en (date,symbol) y coverage report coherente.
+\subsection{Criterios de aceptación y casos de prueba}
 
-17) Riesgos y decisiones abiertas
-- Definir target principal para promocion (horizonte y neto/bruto).
-- Sensibilidad del label a costes estimados (ruido de modelado).
-- Desbalance de clases en regimenes de mercado extremos.
-- Posible inestabilidad de neutralizacion con cross-section pequena.
+Los criterios de aceptación (Definition of Done) incluyen:
+\begin{itemize}
+  \item Labels PIT sin leakage temporal.
+  \item Soporte multi‑horizonte y variantes (regresión, ranking, clasificación).
+  \item Funcionalidad de neutralización y \texttt{net\_of\_costs} según configuración.
+  \item Cobertura y calidad suficientes para entrenar modelos.
+  \item Metadata / manifest trazables por \texttt{run\_id} y \texttt{config\_hash}.
+\end{itemize}
 
-18) Checklist rapido de implementacion
-- [ ] Config de horizontes/timing versionada.
-- [ ] Calculo forward returns multi-horizonte.
-- [ ] Opcional net_of_costs y neutralizacion.
-- [ ] Variantes rank/clasificacion.
-- [ ] Flags de validez + razones de exclusion.
-- [ ] Metadata + manifest + coverage report.
-- [ ] Tests sinteticos de alineacion temporal y formulas.
+Casos de prueba mínimos:
+\begin{itemize}
+  \item Cálculo correcto de retornos forward 5d/10d en serie sintética.
+  \item Alineación coherente entre \texttt{decision\_lag} y features.
+  \item Últimos \( h \) días del rango quedan inválidos por falta de ventana forward.
+  \item Ajuste correcto de costes en \texttt{net\_of\_costs}.
+  \item Neutralización por factores devuelve residuales esperados.
+  \item Clasificación por umbral/quantil produce etiquetas correctas.
+  \item No hay duplicados en \( (date, symbol) \) y el reporte de cobertura es coherente.
+\end{itemize}
+
+\subsection{Riesgos y decisiones abiertas}
+
+\begin{itemize}
+  \item Elección del target principal a promover (horizonte y neto/bruto) condiciona el \emph{risk‑reward} de la estrategia.
+  \item Sensibilidad del label a costes estimados introduce ruido de modelado \cite{Almgren2000,AlmgrenChun2001}.
+  \item Desbalance de clases en regímenes de mercado extremos puede afectar al entrenamiento de modelos clasificadores.
+  \item Inestabilidad potencial de la neutralización con cross‑section pequeño o factores mal definidos.
+\end{itemize}
+
+\subsection{Bibliografía y referencias de estado del arte}
+
+\begin{itemize}
+  \item \cite{LopezdePrado2018}: \emph{Advances in Financial Machine Learning} (capítulo en construcción de labels y evitación de leakage).
+  \item \cite{FamaFrench1993,HouMoPeng2013}: \emph{Cross‑sectional asset pricing} y uso de \emph{portfolio sorting}.
+  \item

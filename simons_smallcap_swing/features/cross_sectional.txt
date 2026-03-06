@@ -1,54 +1,174 @@
-Modulo: features/cross_sectional.py
+\section{Módulo: \texttt{features/cross\_sectional.py}}
 
-1) Objetivo
-Construir transformaciones cross-sectional por fecha (ranks, zscores, neutralizaciones simples) para hacer comparables senales entre activos.
+\paragraph{Objetivo general}
+Este módulo implementa \textbf{transformaciones cross‑sectionales por fecha} sobre el conjunto de features base, para que las señales sean comparables entre activos y robustas frente a outliers, colas pesadas y diferencias de escala. El objetivo es producir una representación estandarizada \( Z_{t}^{(f)} \) para cada feature \( f \) en cada fecha \( t \), utilizable directamente en modelos de factor múltiple y sistemas de swing trading multi‑activo.
 
-2) Alcance
-Incluye:
-- rank/percentile transforms.
-- zscore robusto por fecha.
-- winsorizacion cross-sectional.
-- bucketizacion por quantiles.
+\subsection{Marco teórico y notación}
 
-3) Entradas
-- base_features_path
-- universe_history_path
-- cross_sectional_config_path
-- run_id
+Sea \( \mathcal{S}_t \) el universo de small caps elegibles en \( t \), y \( X_{t}^{(f)} \in \mathbb{R}^{|\mathcal{S}_t|} \) el vector de feature \( f \) antes de transformación.
 
-4) Salidas
-- features/cross_sectional/date={yyyy-mm-dd}/part-*.parquet
-- features/cross_sectional/summary_{run_id}.json
-- features/cross_sectional/manifest_{run_id}.json
+\paragraph{Transformaciones básicas}
+\begin{itemize}
+    \item \texttt{cs\_rank(feature)}:
+        \[
+        \text{rank}_t^{(f)}(s) = \text{rank} \big( X_{t}^{(f)}(s) \big) \big/ |\mathcal{S}_t|,
+        \]
+        que induce una distribución uniforme en \([0,1]\) sobre el universo de esa fecha. \cite{politis2015}
+    \item \texttt{cs\_zscore\_robust(feature)}:
+        \[
+        z_{t}^{(f)}(s) = \frac{X_{t}^{(f)}(s) - \text{med} \big( X_{t}^{(f)} \big)} {\text{MAD} \big( X_{t}^{(f)} \big)},
+        \]
+        donde MAD es la mediana del valor absoluto de las desviaciones respecto a la mediana; es robusto a colas pesadas y valores atípicos. \cite{huber2011}
+    \item \texttt{cs\_winsor(feature, p\_low, p\_high)}:
+        \[
+        X_{t}^{(f,\text{win})}(s) =
+        \begin{cases}
+            q_{t,p_{\min}}^{(f)}      & \text{si } X_{t}^{(f)}(s) \leq q_{t,p_{\min}}^{(f)}, \\
+            X_{t}^{(f)}(s)            & \text{si } q_{t,p_{\min}}^{(f)} < X_{t}^{(f)}(s) < q_{t,p_{\max}}^{(f)}, \\
+            q_{t,p_{\max}}^{(f)}      & \text{si } X_{t}^{(f)}(s) \geq q_{t,p_{\max}}^{(f)},
+        \end{cases}
+        \]
+        donde \( q_{t,p}^{(f)} \) es el percentil \( p \) de \( X_{t}^{(f)} \).
+    \item \texttt{cs\_quantile\_bucket(feature, q)}:
+        \[
+        \text{bucket}_t^{(f,q)}(s) = \text{floor} \big( q \cdot \text{rank}_t^{(f)}(s) \big),
+        \]
+        que asigna cada activo a un grupo de cuantil (por ejemplo, quintiles o deciles) para bucketing o análisis de agrupamiento.
+\end{itemize}
 
-5) Transformaciones clave
-- cs_rank(feature)
-- cs_zscore_robust(feature)
-- cs_quantile_bucket(feature, q)
-- cs_winsor(feature, p_low, p_high)
+\paragraph{Neutralización simple}
+Transformaciones adicionales pueden incluir:
+\begin{itemize}
+    \item Neutralización por industria o sector:
+        \[
+        X_{t}^{(f,\text{neut})}(s) = X_{t}^{(f)}(s) - \text{med} \big( X_{t}^{(f)}|g(s) \big),
+        \]
+        siendo \( g(s) \) el grupo de agrupación (industry/sector).
+\end{itemize}
 
-6) Reglas PIT
-- cada fecha transformada usando solo cross-section de esa fecha.
-- sin mezclar estadisticas entre dias.
+\subsection{Principios de diseño y reglas PIT}
 
-7) Flujo
-1. Cargar features base.
-2. Filtrar universo elegible por fecha.
-3. Aplicar transformaciones configuradas.
-4. Validar cobertura/rangos.
-5. Persistir outputs.
+\paragraph{PIT estricto cross‑sectional}
+- Cada fecha \( t \) se transforma usando \textbf{únicamente} el cross‑section de esa fecha: \( X_{t}^{(f)} \).
+- No se mezclan estadísticas (mediana, MAD, percentiles) entre días; esto previene \textit{data‑snooping} y \textit{leakage} temporal. \cite{lo1990}
 
-8) Validaciones
-- sin duplicados (date,symbol).
-- cobertura minima por fecha.
-- sin inf tras transformaciones.
+\paragraph{Robustez y reproducibilidad}
+- Uso de estadísticos robustos (mediana, rank, zscore robusto) para atenuar la influencia de outliers y colas pesadas en distribuciones de small caps.
+- El mismo conjunto de parámetros (percentiles, número de cuantiles, lag de decisión, run\_id) garantiza que la salida sea \textbf{reproducible} y que se pueda volver a computar el estado de features de cualquier fecha histórica.
 
-9) CLI
+\subsection{Entradas, salidas y contrato de interfaz}
+
+\paragraph{Entradas}
+\begin{itemize}
+    \item \texttt{base\_features\_path}: path a \texttt{features/store/date=...} con la feature matrix base.
+    \item \texttt{universe\_history\_path}: path a \texttt{data/universe/history} para filtrar por \texttt{is\_eligible} en \( t \).
+    \item \texttt{cross\_sectional\_config\_path}: archivo de configuración que define:
+        \begin{itemize}
+            \item Lista de features a transformar por familia.
+            \item Tipo de transformación (\texttt{cs\_rank}, \texttt{cs\_zscore\_robust}, \texttt{cs\_winsor}, \texttt{cs\_quantile\_bucket}).
+            \item Parámetros (percentiles, \texttt{p\_low}, \texttt{p\_high}, número de cuantiles \( q \)).
+            \item Reglas de neutralización si procede.
+        \end{itemize}
+    \item \texttt{run\_id}: identificador único del run, usado para persistir logs y metadatos.
+\end{itemize}
+
+\paragraph{Salidas principales}
+\begin{itemize}
+    \item \texttt{features/cross\_sectional/date=\{yyyy-mm-dd\}/part-*.parquet}:
+        \begin{itemize}
+            \item Columnas base: \texttt{date}, \texttt{symbol}, \texttt{is\_eligible}, \texttt{run\_id}.
+            \item Nuevas columnas de features:
+                \begin{itemize}
+                    \item \texttt{cs\_rank\_mom\_20d}, \texttt{cs\_zscore\_liquid\_20d}, \texttt{cs\_quantile\_bucket\_vol\_20d\_5}, etc.
+                \end{itemize}
+        \end{itemize}
+    \item \texttt{features/cross\_sectional/summary\_\{run\_id\}.json}:
+        \begin{itemize}
+            \item Métricas de cobertura y distribución (número de activos, % de nulos, percentiles, mediana por fecha).
+        \end{itemize}
+    \item \texttt{features/cross\_sectional/manifest\_\{run\_id\}.json}:
+        \begin{itemize}
+            \item Trazabilidad de qué transformaciones se aplicaron, qué percentiles, y qué features se procesaron.
+        \end{itemize}
+\end{itemize}
+
+\subsection{Flujo de procesamiento}
+
+\paragraph{Alto nivel}
+1. \texttt{load\_base\_features(base\_features\_path, universe\_path, config)}:
+    - Carga la matriz base de features y el universo PIT filtrando por \texttt{is\_eligible}.
+2. Para cada fecha \( t \in \mathcal{T} \):
+    \begin{itemize}
+        \item Filtrar \( \mathcal{S}_t \) por elegibilidad.
+        \item Aplicar transformaciones configuradas:
+            \begin{itemize}
+                \item \texttt{cs\_rank} para features de momentum, calidad, liquidez.
+                \item \texttt{cs\_zscore\_robust} para features de volatilidad y microestructura.
+                \item \texttt{cs\_winsor} en percentiles \texttt{[p\_low, p\_high]} para controlar colas.
+                \item \texttt{cs\_quantile\_bucket} para bucketing de volatilidad, tamaño, etc.
+            \end{itemize}
+    \end{itemize}
+3. Validación de cobertura y rangos:
+    \begin{itemize}
+        \item Comprobar que no hay duplicados en \texttt{(date, symbol)}.
+        \item Garantizar que la cobertura por fecha cumple con un umbral mínimo configurable.
+        \item Asegurar que no hay \texttt{inf} o \texttt{-inf} después de las transformaciones.
+    \end{itemize}
+4. Persistencia:
+    \begin{itemize}
+        \item Guardar la feature matrix transformada en Parquet.
+        \item Emitir \texttt{summary\_run\_id.json} y \texttt{manifest\_run\_id.json}.
+
+    \end{itemize}
+\end{itemize}
+
+\subsection{Validaciones y observabilidad}
+
+\paragraph{Validaciones mínimas}
+\begin{itemize}
+    \item \textbf{Integridad}: no hay duplicados en \texttt{(date, symbol)}.
+    \item \textbf{Cobertura}: por cada feature y fecha, la tasa de cobertura \( \text{pct\_non\_null} \geq \texttt{min\_coverage\_pct} \) (configurable).
+    \item \textbf{Rango numérico}: verificar que no hay \texttt{inf} o \texttt{-inf} tras las transformaciones, y que las distribuciones tienen forma razonable (por ejemplo, rank‑Gauss centradas en 0 con varianza 1 aproximadamente).
+\end{itemize}
+
+\paragraph{Métricas de observabilidad recomendadas}
+\begin{itemize}
+    \item \( n_{\text{features}} \), \( n_{\text{rows}} \).
+    \item \( \text{pct\_null\_global} \), \( \text{pct\_null\_per\_feature} \).
+    \item \( \text{pct\_features\_covered\_p50}, \text{p10} \) (porcentaje de fechas donde cobertura > 50\% ó 10\%).
+\end{itemize}
+
+\subsection{Ejemplo de CLI y uso en el sistema global}
+
+\paragraph{CLI recomendada}
+\begin{verbatim}
 python -m features.cross_sectional ^
   --base-features-path features/store ^
   --universe-path data/universe/history ^
   --config-path configs/features/cross_sectional.yaml ^
   --run-id cross_sectional_20260305_001
+\end{verbatim}
 
-10) DoD
-- transformaciones cross-sectional robustas y reproducibles.
+\paragraph{Uso downstream}
+Las salidas de este módulo alimentan:
+\begin{itemize}
+    \item \texttt{labels/build\_labels.py}: aplicación de estrategia de swing trading sobre features cross‑sectionales normalizadas (por ejemplo, long‑short en top/bottom de rank de momentum o calidad).
+    \item \texttt{models/*/train\_*.py}: entrenamiento de modelos de scoring de factores o de portfolios multi‑factor.
+    \item \texttt{backtest/run\_walkforward.py}: backtest history replay donde las señales son robustas e interpretadas consistentemente en cada fecha.
+\end{itemize}
+
+\subsection{Definición de término (Definition of Done)}
+
+\begin{itemize}
+    \item Transformaciones cross‑sectionales robustas y reproducibles: mismas entradas + misma configuración \(\Rightarrow\) misma salida.
+    \item Eliminación de escalas arbitrarias entre activos y between‑dates, garantizando que el modelo de scoring/PnL sea interpretado sobre señales comparables.
+    \item Integración limpia con el sistema de \texttt{feature\_qc.py} y \texttt{labels/build\_labels.py} sin necesidad de transformaciones adicionales en ese paso.
+\end{itemize}
+
+\subsection{Referencias clave}
+
+\begin{itemize}
+    \item Politis, Romano y Wolf (2015). \textit{Subsampling}. \cite{politis2015}
+    \item Huber y Ronchetti (2011). \textit{Robust Statistics}. \cite{huber2011}
+    \item Lo (1990). \textit{Maximum Likelihood Estimation for Long‑Memory Processes}. \cite{lo1990}
+\end{itemize}

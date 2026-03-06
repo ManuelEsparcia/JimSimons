@@ -1,59 +1,175 @@
-Modulo: models/gbdt/tune_hyperparams.py
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[spanish]{babel}
+\usepackage{amsmath, amssymb, bm, mathtools}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{longtable}
 
-1) Objetivo
-Optimizar hiperparametros de modelos GBDT (LGBM/XGB) usando validacion temporal purged para maximizar calidad OOS sin sobreajuste.
+\DeclareMathOperator{\E}{\mathbb{E}}
+\DeclareMathOperator{\Var}{Var}
+\DeclareMathOperator{\Cov}{Cov}
+\DeclareMathOperator{\Corr}{Corr}
+\DeclareMathOperator{\Prob}{\mathbb{P}}
+\DeclareMathOperator{\IC}{IC}
+\DeclareMathOperator{\AUC}{AUC}
+\DeclareMathOperator{\NDCG}{NDCG}
+\DeclareMathOperator{\RMSE}{RMSE}
+\DeclareMathOperator{\MAE}{MAE}
+\DeclareMathOperator{\LL}{LL}
+\DeclareMathOperator{\Gap}{Gap}
 
-2) Alcance
-Incluye definicion del search space, estrategia de busqueda (random/bayes), evaluacion por folds temporales y seleccion de configuracion ganadora.
+\title{Optimización de hiperparámetros GBDT con validación temporal purged \\ \texttt{models/gbdt/tune\_hyperparams.py}}
+\author{}
+\date{}
 
-3) Entradas
-- features_path
-- labels_path
-- splits_path
-- tuning_config_path
-- run_id
+\begin{document}
 
-4) Salidas
-- models/tuning/{run_id}/trials.parquet
-- models/tuning/{run_id}/best_params.json
-- models/tuning/{run_id}/tuning_summary.json
-- models/tuning/{run_id}/manifest.json
+\maketitle
 
-5) Reglas anti-leakage
-- usar solo folds train/valid purged.
-- test final fuera del tuning loop.
-- no reusar metrica de test para elegir params.
+\section{Objetivo y contexto de optimización}
 
-6) Parametros clave
-- algo: lgbm|xgb
-- search_method: random|bayes
-- n_trials
-- timeout_sec
-- objective_metric
-- early_stopping_rounds
-- seed
+El módulo \texttt{models/gbdt/tune\_hyperparams.py} optimiza los hiperparámetros de modelos \textbf{GBDT} (LightGBM y XGBoost) usando \textbf{validación temporal purged} para maximizar una métrica \texttt{OOS} sin overfitting, y producir una configuración \texttt{best\_params} rastreable y reutilizable en \texttt{train\_lgbm} y \texttt{train\_xgb}. [web:106][web:113]  
 
-7) Flujo
-1. Cargar config y datos.
-2. Definir search space.
-3. Ejecutar trials con CV temporal.
-4. Registrar metricas y overfit gap.
-5. Seleccionar best_params robustos.
-6. Persistir reportes.
+Sea \(\bm{\theta} \in \Theta\) el vector de hiperparámetros (por ejemplo, \texttt{learning\_rate}, \texttt{num\_leaves}, \texttt{max\_depth}, \texttt{reg\_lambda}, etc.) y sea \(\mathcal{L}(\bm{\theta})\) la pérdida esperada en el conjunto de validación correspondiente a esos parámetros. El problema de optimización es:
 
-8) Validaciones
-- cobertura minima de folds/trials
-- metricas sin NaN
-- reproducibilidad con seed fija
-- evitar configs no factibles
+\begin{equation}
+\bm{\theta}^* = \argmin_{\bm{\theta} \in \Theta}
+\E_{\text{OOS}} \left[ \mathcal{L}(\bm{\theta}) \right],
+\end{equation}
+\noindent aproximada mediante \textbf{CV temporal purged} con folds \(\{ \mathcal{D}_{\text{train}}^{(k)}, \mathcal{D}_{\text{valid}}^{(k)} \}_{k=1}^K\). [web:106][web:112]
 
-9) CLI
+\section{Estrategias de búsqueda disponibles}
+
+Según el parámetro \texttt{search\_method} el módulo soporta:
+
+\subsection{Search space y muestreo}
+
+Para cada hiperparámetro \(\theta_j\) se define un espacio \(\Theta_j\) continuo o discreto (por ejemplo, \(\texttt{learning\_rate} \in (0.01, 0.3)\), \(\texttt{num\_leaves} \in \{16,\dots,256\}\)). [web:110][web:113]  
+
+El \texttt{n\_trials} fija el número de muestras \(\bm{\theta}^{(1)}, \dots, \bm{\theta}^{(n)}\) sacadas del espacio \(\Theta = \prod_j \Theta_j\).
+
+\subsection{Búsqueda aleatoria (random)}
+
+La búsqueda aleatoria toma \(\bm{\theta}^{(i)} \sim \text{Uniform}(\Theta)\) y evalúa:
+
+\begin{equation}
+\hat{M}(\bm{\theta}^{(i)}) = \frac{1}{K} \sum_{k=1}^K M_k(\bm{\theta}^{(i)}),
+\end{equation}
+\noindent donde \(M_k(\bm{\theta}^{(i)})\) es la métrica de \texttt{objective\_metric} (por ejemplo, \(\IC\), \(\AUC\), \(\NDCG@k\), \(\RMSE\)) en el fold \texttt{valid\_k}. [web:105][web:107]
+
+\subsection{Optimización bayesiana (Bayesian optimization)}
+
+La optimización bayesiana construye un modelo probabilístico \(\pi(\bm{\theta})\) de la métrica \(\hat{M}(\bm{\theta})\) como:
+
+\begin{equation}
+\pi(\bm{\theta}) \sim \text{GP}(\mu(\bm{\theta}), \kappa(\bm{\theta}, \bm{\theta}')),
+\end{equation}
+\noindent donde \(\text{GP}\) es un proceso gaussiano con media \(\mu\) y kernel \(\kappa\). El siguiente punto \(\bm{\theta}'\) se selecciona maximizando una \textit{acquisition function}:
+
+\begin{equation}
+\bm{\theta}' = \argmax_{\bm{\theta} \in \Theta} \alpha(\bm{\theta} \mid \mathcal{D}_{\text{trials}}),
+\end{equation}
+\noindent donde \(\alpha\) puede ser \textit{Expected Improvement} (EI), \textit{Probability of Improvement} (PI) u otra. [web:107][web:113]
+
+Este enfoque tiende a encontrar configuraciones de alta calidad con menos \texttt{trials} que la búsqueda aleatoria, algo clave en entornos industriales con \texttt{timeout\_sec} limitado. [web:107][web:113]
+
+\section{Validación temporal purged y anti‑leakage}
+
+El tuning usa exclusivamente folds \texttt{train/valid} generados por \texttt{purged\_splits}:
+
+\begin{itemize}
+    \item No se usa \texttt{test} final en el bucle de optimización.
+    \item Cada \texttt{trial} evalúa \(\hat{M}(\bm{\theta}^{(i)})\) sobre \texttt{valid}, nunca sobre \texttt{test}.
+    \item Las métricas de \texttt{test} solo se usan \textit{post‑hoc} para validar robustez.
+\end{itemize}
+
+Formalmente, para cada fold \(k\):
+
+\begin{equation}
+t_i^{\text{train}} < t_j^{\text{valid}} \quad \forall i \in \mathcal{D}_{\text{train}}^{(k)}, j \in \mathcal{D}_{\text{valid}}^{(k)},
+\end{equation}
+\noindent lo que implementa \textbf{purged temporal CV} siguiendo estándares de backtesting financiero. [web:106][web:112]
+
+\section{Métricas de evaluación y robustez}
+
+Cada \texttt{trial} devuelve:
+
+\begin{itemize}
+    \item \(\hat{M}(\bm{\theta}^{(i)})\): valor de \texttt{objective\_metric} OOS (por ejemplo, \(\IC\), \(\AUC\), \(\NDCG@k\), \(\RMSE\)). [web:105][web:113]
+    \item \(\Gap(\bm{\theta}^{(i)}) = \LL_{\text{valid}} - \LL_{\text{train}}\): \textit{overfit gap} para detectar configs agresivas.
+    \item Varianza entre folds: \(\Var_k \left[ M_k(\bm{\theta}^{(i)}) \right]\).
+\end{itemize}
+
+Durante la selección de \texttt{best\_params} se puede penalizar:
+
+\begin{equation}
+\tilde{M}(\bm{\theta}) = \hat{M}(\bm{\theta}) - \beta \Gap(\bm{\theta}) - \gamma \Var_k \left[ M_k(\bm{\theta}) \right],
+\end{equation}
+\noindent donde \(\beta,\gamma\) son factores de penalización de overfitting e inestabilidad. [web:106][web:112]
+
+\section{Flujo de trabajo del módulo}
+
+El flujo a alto nivel es:
+
+\begin{enumerate}
+    \item Cargar \texttt{features\_path}, \texttt{labels\_path}, \texttt{splits\_path}, \texttt{tuning\_config\_path} y \texttt{run\_id}.
+    \item Definir \texttt{search\_space} según \texttt{algo} (\texttt{lgbm} o \texttt{xgb}).
+    \item Ejecutar \texttt{n\_trials} con CV temporal purged por fold:
+        \begin{itemize}
+            \item Para cada \(\bm{\theta}^{(i)}\), entrenar modelo por fold con \texttt{early\_stopping\_rounds}.
+            \item Registrar \texttt{trials.parquet} con \(\bm{\theta}\), \(\hat{M}(\bm{\theta})\), \(\Gap(\bm{\theta})\), \(\Var_k M_k\), \texttt{runtime\_sec}.
+        \end{itemize}
+    \item Seleccionar \texttt{best\_params} robustos según \texttt{objective\_metric} y penalizaciones de overfit/estabilidad.
+    \item Persistir:
+        \begin{itemize}
+            \item \texttt{best\_params.json}.
+            \item \texttt{tuning\_summary.json} con métricas agregadas y estadísticas de tuning.
+            \item \texttt{manifest.json} conteniendo \texttt{search\_method}, \texttt{seed}, \texttt{timeout\_sec}, hashes de datos, etc.
+        \end{itemize}
+\end{enumerate}
+
+Cada fila de \texttt{trials.parquet} incluye \(\bm{\theta}^{(i)}\), \(\hat{M}(\bm{\theta}^{(i)})\), \(\Gap(\bm{\theta}^{(i)})\), \(\Var_k M_k(\bm{\theta}^{(i)})\) y \texttt{fold\_coverage} para reproducibilidad. [web:106][web:113]
+
+\section{Validaciones y reproducibilidad}
+
+Durante el tuning se realizan validaciones:
+
+\begin{itemize}
+    \item Cobertura mínima de folds y \texttt{trials} exitosas (\texttt{n\_trials} de éxito \(\ge\) umbral).
+    \item No hay \texttt{NaN} en métricas ni en \texttt{Gap}.
+    \item Reproducibilidad total con \texttt{seed} fijo (mismo \texttt{seed} \(\Rightarrow\) misma secuencia de \(\bm{\theta}^{(i)}\) y mismo \texttt{best\_params} bajo mismos datos).
+    \item Se evitan configuraciones \textit{no factibles} (por ejemplo, \texttt{learning\_rate} demasiado grande, \texttt{num\_leaves} incompatible con \texttt{max\_depth} en LGBM, etc.).
+\end{itemize}
+
+Estas reglas siguen buenas prácticas de \textit{hyperparameter optimization} en entornos financieros, donde la estabilidad y la trazabilidad son críticas para la validación regulatoria y operativa. [web:105][web:106]
+
+\section{Interfaz de línea de comandos}
+
+Ejemplo de \texttt{CLI}:
+
+\begin{verbatim}
 python -m models.gbdt.tune_hyperparams ^
   --features-path features/store ^
   --labels-path labels/store ^
   --splits-path labels/splits/purged_splits_latest.parquet ^
   --config-path configs/models/tune_gbdt.yaml ^
   --run-id tune_gbdt_20260305_001
+\end{verbatim}
 
-10) DoD
-- best_params trazables y listos para train_lgbm/train_xgb.
+Este comando genera un experimento versionado en \texttt{models/tuning/\{run\_id\}} cuyo \texttt{best\_params.json} puede usarse directamente en \texttt{train\_lgbm} y \texttt{train\_xgb} sin reentrenar el tuning, manteniendo la integridad de los splits temporales y del protocolo de calibración. [web:110][web:113]
+
+\section{Definición de “Done” (DoD)}
+
+El módulo considera completado el tuning cuando:
+
+\begin{itemize}
+    \item Se han completado \texttt{n\_trials} válidas (o se ha agotado \texttt{timeout\_sec}) con cobertura mínima de folds.
+    \item El \texttt{best\_params} está trazado y se almacena en \texttt{best\_params.json}.
+    \item El \texttt{tuning\_summary.json} contiene métricas de OOS, \textit{overfit gap} medio y varianza entre folds, suficientes para decidir si avanzar a \texttt{train\_lgbm} o \texttt{train\_xgb}.
+    \item Todos los artefactos (\texttt{trials.parquet}, \texttt{best\_params.json}, \texttt{tuning\_summary.json}, \texttt{manifest.json}) son reproducibles con el \texttt{seed} y los datos de entrada.
+\end{itemize}
+
+Esta especificación encaja con estándares de \textit{MLOps cuantitativo} donde el tuning es un “experimento de alto valor” que debe ser versionado, revisable y auditado, a la altura de cualquier componente de backtest. [web:105][web:106]
+
+\end{document}

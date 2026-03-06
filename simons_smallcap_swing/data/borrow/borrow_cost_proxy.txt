@@ -1,63 +1,230 @@
-Modulo: data/borrow/borrow_cost_proxy.py
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish]{babel}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage[margin=2.5cm]{geometry}
 
-1) Objetivo
-Estimar un proxy diario de coste de prestamo (borrow fee) y disponibilidad para posiciones cortas cuando no hay feed completo de securities lending.
+\title{Modelo de Proxy de Coste de Préstamo para \texttt{data/borrow/borrow\_cost\_proxy.py}}
+\author{}
+\date{}
 
-2) Alcance
-Incluye construccion de borrow_cost_proxy por simbolo/fecha usando senales de liquidez, short interest, price action y hard-to-borrow heuristics.
+\begin{document}
+\maketitle
 
-3) Entradas
-- universe_path
-- market_data_path (precio/volumen)
-- short_interest_path (opcional)
-- borrow_feed_partial_path (opcional)
-- config_path
-- run_id
 
-4) Salidas
-- data/borrow/proxy/date={yyyy-mm-dd}/part-*.parquet
-- data/borrow/proxy/borrow_proxy_summary_{run_id}.json
-- data/borrow/proxy/manifest_{run_id}.json
+\section{Objetivo del módulo}
+El módulo \texttt{data/borrow/borrow\_cost\_proxy.py} estima un proxy diario de \emph{borrow fee} (coste de préstamo de acciones) y de la \emph{disponibilidad} de posiciones cortas para un universo de símbolos cuando no existe un feed completo de datos de \emph{securities lending}. 
+Este proxy permite:
+\begin{itemize}
+  \item Ajustar retornos netos de costes de préstamo en estrategias de \emph{short selling} y \emph{swing trading cuantitativo}.
+  \item Filtrar o penalizar activos con coste de préstamo elevado o escasa disponibilidad.
+  \item Construir factores de riesgo basados en el coste implícito de acceso a acciones prestables, alineados con la literatura de \emph{shorting premium} y \emph{borrow cost anomalies} \cite{davolio2012shorting, hankins2018termstructure, guerrieri2025securitieslending}.
+\end{itemize}
 
-5) Campos minimos
-- date
-- symbol
-- borrow_fee_proxy_annualized
-- borrow_fee_proxy_daily
-- borrow_availability_score (0-1)
-- hard_to_borrow_flag
-- proxy_confidence
-- run_id
 
-6) Metodologia sugerida
-- Modelo por buckets (liquidez/market cap/short interest).
-- Ajustes por:
-  - ADV bajo
-  - short_interest elevado
-  - microcap/volatilidad alta
-  - evidencia HTB de fuentes parciales
-- Fallback conservador cuando faltan datos.
+\section{Alcance del modelo}
+El modelo construye un \emph{borrow cost proxy} por símbolo $ i $ y fecha $ t $, utilizando:
+\begin{itemize}
+  \item \textbf{Liquidez} (volumen, capitalización, rotación).
+  \item \textbf{Short interest} (cuando está disponible).
+  \item \textbf{Price action} (volatilidad, atractividad relativa para cortos).
+  \item \textbf{Heurísticas HTB} (\emph{hard-to-borrow}) a partir de feeds parciales de securities lending.
+\end{itemize}
+El output se diseña para ser consumido por:
+\begin{itemize}
+  \item Módulos de \emph{labels} ajustados por costes netos.
+  \item Sistemas de backtest cuantitativo a nivel de cartera.
+\end{itemize}
+La estructura por buckets (liquidez, market cap, short interest) se inspira en la literatura de \emph{bucketing} de costes de préstamo por segmentos de capitalización y volatilidad \cite{hankins2018termstructure, guerrieri2025securitieslending}.
 
-7) Flujo
-1. Cargar inputs y config.
-2. Construir features proxy por simbolo/fecha.
-3. Estimar borrow_fee_proxy y availability_score.
-4. Aplicar caps/floors.
-5. Persistir outputs y resumen.
 
-8) Validaciones
-- borrow_fee_proxy >= 0
-- availability_score en [0,1]
-- hard_to_borrow_flag coherente con thresholds
-- cobertura por universo reportada
+\section{Notación y definiciones básicas}
+Sea:
+\begin{itemize}
+  \item $ \mathcal{U}_t $: universo de símbolos en fecha $ t $.
+  \item $ S_{i,t} $: precio de cierre del símbolo $ i $ en fecha $ t $.
+  \item $ V_{i,t} $: volumen negociado.
+  \item $ MC_{i,t} $: market cap (capitalización bursátil).
+  \item $ ADV_{i,t} $: \emph{Average Daily Volume} a ventana de $ n $ días.
+  \item $ SI_{i,t} $: short interest (número de acciones cortas o ratio sobre flotante, si disponible).
+  \item $ ADV_{i,t}^{GC} $: volumen diario de \emph{general collateral} (si se dispone).
+  \item $ ADV_{i,t}^{EB} $: volumen diario de \emph{easy-to-borrow}.
+  \item $ ADV_{i,t}^{HTB} $: volumen diario de \emph{hard-to-borrow}.
+\end{itemize}
 
-9) CLI
-python -m data.borrow.borrow_cost_proxy ^
-  --universe-path data/universe/history ^
-  --market-data-path data/price/adjusted/mode=dual_output ^
-  --short-interest-path data/borrow/source/short_interest.parquet ^
-  --config-path configs/data/borrow_cost_proxy.yaml ^
-  --run-id borrow_cost_proxy_20260305_001
+Definimos:
+\begin{itemize}
+  \item $ B_{i,t} \in \mathbb{R}_{\geq 0} $: \emph{borrow fee} anualizado real (en porcentaje anual).
+  \item $ \widehat{B}_{i,t} \in \mathbb{R}_{\geq 0} $: \emph{proxy} anualizado estimado.
+  \item $ \widehat{b}_{i,t} = \frac{\widehat{B}_{i,t}}{365} $: \emph{proxy} diario.
+  \item $ \alpha_{i,t} \in [0,1] $: \emph{borrow availability score}.
+  \item $ H_{i,t} \in \{0,1\} $: \emph{hard-to-borrow flag}.
+\end{itemize}
 
-10) DoD
-- proxy diario usable por labels net_of_costs y backtest.
+
+\section{Relación teórica con securities lending y shorting}
+La literatura muestra que el coste de préstamo de acciones:
+\begin{itemize}
+  \item Aumenta con la \emph{short interest} normalizada frente a la oferta prestable \cite{davolio2012shorting, guerrieri2025securitieslending}.
+  \item Disminuye con la liquidez y la capitalización \cite{hankins2018termstructure}.
+  \item Presenta estructuras por segmentos (buckets) de capitalización y volatilidad, con \emph{HTB} en el rango de cientos de porcentaje anualizados \cite{hankins2018termstructure, guerrieri2025securitieslending}.
+\end{itemize}
+Un proxy empírico clásico para el coste implícito de préstamo es:
+\[
+  \text{SIRIO}_{i,t} = \frac{SI_{i,t}/\text{float}_{i,t}}{\text{institutional\_ownership}_{i,t}/\text{total\_shares}_{i,t}},
+\]
+donde un valor elevado se asocia a mayores \emph{borrow fees} \cite{davolio2012shorting}.  
+Este tipo de ratio se puede usar como entrada de un modelo de calibración para $ \widehat{B}_{i,t} $ cuando se cuenta con short interest parcial.  
+
+Cuando el feed de securities lending es parcial, el mercado efectivo se puede aproximar como:
+\[
+  \text{Effective borrow fee} \approx \lambda_{HTB} \cdot \mathbb{1}(\text{HTB}) + \lambda_{EB} \cdot \mathbb{1}(\text{EB}),
+\]
+ajustando $ \lambda_{HTB} \gg \lambda_{EB} $ según la literatura de HTB \cite{hankins2018termstructure, guerrieri2025securitieslending}.
+
+
+\section{Estructura del modelo por buckets}
+El modelo se organiza en buckets definidos por:
+\begin{itemize}
+  \item \textbf{Liquidez}: $ \log ADV_{i,t} $ y $ \log MC_{i,t} $.
+  \item \textbf{Volatilidad}: volatilidad histórica $ \sigma_{i,t} $.
+  \item \textbf{Short interest}: $ SI_{i,t} $ o un ratio de short interest.
+\end{itemize}
+
+Para cada combinación de bucket $ (l, m, s) $, se calibra un mapping:
+\[
+  \widehat{B}_{i,t}^{(l,m,s)} = f_{l,m,s}\big( ADV_{i,t}, SI_{i,t}, \sigma_{i,t}, \text{HTB flags} \big),
+\]
+donde:
+\begin{itemize}
+  \item Para buckets de alta liquidez y baja short interest, $ \widehat{B}_{i,t}^{(l,m,s)} \approx \text{risk-free rate} - \text{rebate} \approx 0.5\% $ anual típico \cite{hankins2018termstructure}.
+  \item Para buckets de baja liquidez y alta short interest, $ \widehat{B}_{i,t}^{(l,m,s)} $ se escala hacia 10\%–100\%+ anual, consistentes con HTB observados en la literatura \cite{hankins2018termstructure, guerrieri2025securitieslending}.
+\end{itemize}
+
+La función $ f_{l,m,s} $ puede ser:
+\begin{itemize}
+  \item Un modelo paramétrico (por ejemplo, regresión lineal logarítmica en buckets).
+  \item Un modelo no lineal (Random Forest, XGBoost) entrenado sobre datos de securities lending reales \cite{quantrocket2024borrowfees}.
+  \item O una regla simple heurística basada en umbrales:
+  \[
+    \widehat{B}_{i,t} =
+    \begin{cases}
+      b_0 & \text{si } ADV_{i,t}^{GC} > \theta_1 \text{ y } SI_{i,t} < \theta_2, \\
+      b_1 & \text{si } ADV_{i,t}^{EB} > \theta_3 \text{ y } SI_{i,t} < \theta_4, \\
+      b_2 & \text{si } ADV_{i,t}^{HTB} > \theta_5 \text{ y } SI_{i,t} > \theta_6,
+    \end{cases}
+  \]
+  con $ b_0 \ll b_1 \ll b_2 $, ajustados a datos de mercado.
+\end{itemize}
+
+
+\section{Indicadores de disponibilidad y HTB}
+Además de la fee, el modelo estima:
+\begin{itemize}
+  \item \textbf{Borrow availability score} $ \alpha_{i,t} $, que mide la probabilidad de encontrar inventario prestable.  
+  \item \textbf{Hard‑to‑borrow flag} $ H_{i,t} $, que se activa cuando:
+  \begin{itemize}
+    \item Short interest relativa es muy alta.
+    \item ADV bajo respecto a market cap.
+    \item Volatilidad alta y/o microcap.
+    \item Feed parcial indica HTB recurrente.
+  \end{itemize}
+\end{itemize}
+
+Modelos de referencia:
+\begin{itemize}
+  \item Un modelo logístico para $ \alpha_{i,t} $:
+  \[
+    \alpha_{i,t} = \frac{1}{1 + \exp\big( -\beta_0 - \beta_1 \log ADV_{i,t} - \beta_2 SI_{i,t} - \beta_3 \log MC_{i,t} \big)}.
+  \]
+  \item Un umbral global para $ H_{i,t} $:
+  \[
+    H_{i,t} = \mathbb{1} \big( \widehat{B}_{i,t} > \theta_B \big),
+  \]
+  con $ \theta_B $ en el rango de 10\%–20\% anual, clásico en HTB \cite{hankins2018termstructure}.
+\end{itemize}
+
+
+\section{Cap/Floor y reglas de saneamiento}
+Para evitar extrapolaciones extremas, se imponen:
+\begin{itemize}
+  \item $ \widehat{B}_{i,t} \geq 0 $.
+  \item $ \widehat{b}_{i,t} \in [0, 1) $ (por ejemplo, ceiling a 500\% anual).
+  \item $ \alpha_{i,t} \in [0,1] $.
+  \item $ |\alpha_{i,t} - \alpha_{i,t-1}| \leq \Delta_{\max} $ para evitar saltos no razonables.
+\end{itemize}
+
+Cuando faltan datos (short interest, securities lending feed), el modelo aplica:
+\begin{itemize}
+  \item Un fallback conservador: 
+  \[
+    \widehat{B}_{i,t}^{\text{fallback}} = 
+    \begin{cases}
+      b_{\min} & \text{si ADV alta y MC grande}, \\
+      b_{\max} & \text{si microcap o ADV muy baja}.
+    \end{cases}
+  \]
+  \item Un pseudo‑\emph{HTB} flag basado solo en ADV, volatilidad y market cap, según umbrales ajustados a la literatura de microcaps y acciones de bajo volumen \cite{hankins2018termstructure, guerrieri2025securitieslending}.
+\end{itemize}
+
+
+\section{Uso en labels y backtest}
+El proxy se consume en:
+\begin{itemize}
+  \item \textbf{Labels net of costs}: 
+  \[
+    r_{i,t}^{\text{net}} = r_{i,t}^{\text{raw}} - \widehat{b}_{i,t} \cdot \text{sign}(\text{short/long position}),
+  \]
+  donde:
+  \begin{itemize}
+    \item Para posiciones cortas, el retorno se reduce por el coste de préstamo.
+    \item Para posiciones largas con short al descubierto, el retorno se ajusta por el crédito negativo.
+  \end{itemize}
+  \item \textbf{Filtrado de universo}: se descartan activos con $ \alpha_{i,t} < \theta_{\alpha} $ o $ H_{i,t} = 1 $, siguiendo estrategias de \emph{shorting with borrow constraint} \cite{davolio2012shorting, quantrocket2024borrowfees}.
+\end{itemize}
+
+En backtest, el sistema puede:
+\begin{itemize}
+  \item Ponderar posiciones cortas por $ 1 - \alpha_{i,t} $.
+  \item Ajustar tamaño máximo de corto por $ \alpha_{i,t} \cdot \text{capital disponible} $.
+  \item Calibrar estrategias de \emph{swing trading} shorts usando $ \widehat{B}_{i,t} $ como factor de riesgo.
+\end{itemize}
+
+
+\section{Validaciones y DoD}
+Las validaciones implementadas deberían garantizar:
+\begin{itemize}
+  \item $ \widehat{B}_{i,t} \geq 0 $.
+  \item $ \alpha_{i,t} \in [0,1] $.
+  \item Coherencia de $ H_{i,t} $ con thresholds de $ \widehat{B}_{i,t} $ e indicadores HTB.
+  \item Cobertura por universo reportada en el resumen \texttt{borrow\_proxy\_summary\_*.json}.
+\end{itemize}
+
+El \emph{Definition of Done} (DoD) es:
+\begin{itemize}
+  \item El proxy diario es \textbf{usable para labels net of costs y backtest}.
+  \item El modelo es robusto frente a datos parciales de securities lending.
+  \item La estructura de outputs se integra en el flujo de pipelines de \texttt{data/borrow/proxy/}.
+\end{itemize}
+
+
+\section{Libros y papers de referencia}
+Algunos referentes clave para el diseño industrial de este tipo de proxy son:
+\begin{itemize}
+  \item \textbf{Davolio~(2012)}. \emph{The Shorting Premium and Asset Pricing Anomalies}. Muestra que el coste de préstamo puede explicar anomalías de retorno y provee proxies como SIRIO \cite{davolio2012shorting}.
+  \item \textbf{Hankins~(2018)}. \emph{The Term Structure of Securities Lending Fees}. Analiza la estructura temporal de fees por segmentos (easy vs hard to borrow) y provee rangos empíricos por buckets \cite{hankins2018termstructure}.
+  \item \textbf{Guerrieri et al.~(2025)}. \emph{Inefficiencies in the Securities Lending Market}. Documenta el aumento de costes en activos de alta demanda y microcaps, justificando la necesidad de modelos de borrow cost \cite{guerrieri2025securitieslending}.
+  \item \textbf{BCG / State Street / S\&P Global}. Artículos de mercado sobre \emph{securities lending} y \emph{borrow dynamics} que describen la relación entre short interest, disponibilidad y fees \cite{statestreet2018lend, sgp2021gamestop, equilend2026reading}.
+\end{itemize}
+
+Un sistema de swing trading de nivel research industrial puede calibrar los parámetros de buckets y thresholds directamente contra series de datos de \emph{securities lending} y short interest, integrando este modelo como componente de riesgo de coste de préstamo \cite{quantrocket2024borrowfees}.
+
+
+\bibliographystyle{plain}
+\bibliography{borrow_cost_proxy_refs}
+
+
+\end{document}

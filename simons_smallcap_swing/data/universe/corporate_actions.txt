@@ -1,53 +1,255 @@
-Modulo: data/universe/corporate_actions.py
+\section{Módulo: \texttt{data/universe/corporate\_actions.py}}
+\label{sec:corporate_actions}
 
-1) Objetivo
-Construir un dataset PIT de acciones corporativas (splits, dividends, ticker changes, mergers) para ajuste de precios y continuidad historica del universo.
+\subsection{Objetivo y filosofía de diseño}
+\label{sec:corporate_actions:objective}
 
-2) Alcance
-Incluye ingestion de eventos, normalizacion de schema, deduplicacion y versionado por run.
+El módulo \texttt{corporate\_actions.py} construye un \textbf{dataset PIT de acciones corporativas} para:
 
-3) Entradas
-- provider_events_path/api
-- ticker_mapping_path
-- config_path
-- run_id
+\begin{itemize}
+  \item \textbf{Ajustar precios} (splits, dividendos) de forma consistente con el tratamiento de índices institucionales (\textit{e.g.} MSCI, FTSE Russell) \cite{msci2023, lseg2024}.
+  \item \textbf{Garantizar continuidad histórica} del universo frente a cambios de ticker, \textit{mergers} y \textit{spin‑offs}.
+  \item \textbf{Soportar versionado} por \texttt{run\_id} y auditoría de eventos faltantes o conflictivos.
+\end{itemize}
 
-4) Salidas
-- data/universe/corporate_actions/history.parquet
-- data/universe/corporate_actions/current.parquet
-- data/universe/corporate_actions/manifest_{run_id}.json
-- data/universe/corporate_actions/failures_{run_id}.parquet
+La filosofía de diseño sigue estándares de \textit{corporate actions} en data providers institucionales (Bloomberg, LSEG, Optiver, etc.) \cite{databento2025, lseg2025, optiver2024, eulerpool2025}. En particular:
 
-5) Campos minimos
-- symbol
-- event_type
-- ex_date
-- effective_date (si aplica)
-- split_from/split_to (splits)
-- dividend_cash (dividendos)
-- old_symbol/new_symbol (ticker changes)
-- source, run_id, ingest_ts_utc
+\begin{itemize}
+  \item \textbf{Schema canónico}: todos los proveedores se mapean a un \texttt{schema} común comprensible por \texttt{adjust\_prices} y \texttt{build\_universe}.
+  \item \textbf{Deduplicación robusta}: evita ajustes múltiples por el mismo evento.
+  \item \textbf{Timestamp PIT}: fechas de \texttt{ex\_date} y \texttt{effective\_date} se usan únicamente con información disponible hasta esa fecha.
+\end{itemize}
 
-6) Checks obligatorios
-- fechas parseables y en rango
-- dedupe por clave de evento
-- eventos conflictivos same-day flagged
-- mapping ticker coherente
+\subsection{Definición formal del conjunto de acciones corporativas}
+\label{sec:corporate_actions:formal}
 
-7) Flujo
-1. Cargar eventos fuente.
-2. Normalizar schema canonico.
-3. Enriquecer con mappings.
-4. Validar y deduplicar.
-5. Persistir history/current + manifest.
+Sea \(\mathcal{E}_{\text{ca}}\) el conjunto de eventos corporativos sobre \(\mathcal{T}\) (ticker universe) en el periodo \(\mathcal{D} = [t_0, t_1]\).
 
-8) CLI
+\paragraph{Entradas}
+\label{par:corporate_actions:inputs}
+\begin{itemize}
+  \item \(\mathcal{D} = [t_0, t_1]\): rango de fechas de sesión.
+  \item \(\mathcal{A}_{\text{raw}}\): set de eventos corporativos \textit{raw} desde uno o varios proveedores (\texttt{provider\_events\_path} o API).
+  \item \(\mathcal{M}_{\text{ticker}}\): mapping \texttt{old\_symbol} \(\leftrightarrow\) \texttt{new\_symbol} estable por \texttt{FIGI/CIK}.
+  \item \texttt{config\_path}: reglas de normalización, mapeo de tipos de evento y políticas de conflicto same‑day.
+  \item \texttt{run\_id}: versión de ejecución.
+\end{itemize}
+
+\paragraph{Tipos de evento}
+\label{par:corporate_actions:types}
+Cada evento \(a \in \mathcal{A}_{\text{raw}}\) se categoriza en un \texttt{event\_type} canónico:
+\begin{itemize}
+  \item \texttt{split}: \texttt{split\_from}, \texttt{split\_to} (\textit{e.g.} 2:1, 1:10).
+  \item \texttt{dividend\_cash}: \texttt{dividend\_cash} (USD por share).
+  \item \texttt{ticker\_change}: \texttt{old\_symbol}, \texttt{new\_symbol}.
+  \item \texttt{merger}, \texttt{spinoff}, \texttt{rights\_issue}, etc.\ (extensible).
+\end{itemize}
+
+\paragraph{Schema canónico}
+\label{par:corporate_actions:schema}
+Tras normalización, cada evento \(a\) cumple:
+\[
+  a \in \mathcal{A}_{\text{ca}}
+  := \{(a_{\text{id}}, \mathtt{symbol}, \mathtt{event\_type}, \mathtt{ex\_date}, \mathtt{effective\_date}, \dots, \mathtt{source}, \mathtt{run\_id}, \mathtt{ingest\_ts\_utc})\}
+\]
+Donde:
+\begin{itemize}
+  \item \texttt{event\_type} \(\in \Omega_{\text{ca}}\): enum de tipos de acción corporativa soportados.
+  \item \texttt{ex\_date}: fecha de registro para \textit{split} o \textit{dividend}.
+  \item \texttt{effective\_date} (si aplica): fecha en que el ajuste se aplica.
+  \item \texttt{split\_from}, \texttt{split\_to} para \texttt{split}.
+  \item \texttt{dividend\_cash} para \texttt{dividend\_cash}.
+  \item \texttt{old\_symbol}, \texttt{new\_symbol} para \texttt{ticker\_change}.
+\end{itemize}
+
+\subsection{Transformaciones matemáticas clave para ajuste de precios}
+\label{sec:corporate_actions:pricing}
+
+\paragraph{Split de acciones}
+\label{par:corporate_actions:split}
+Sea un split \(s\) con:
+\begin{itemize}
+  \item \texttt{split\_from} = \(A\),
+  \item \texttt{split\_to} = \(B\).
+\end{itemize}
+El \textbf{split factor}:
+\[
+  f_{\text{split}} = \frac{B}{A}
+\]
+\begin{itemize}
+  \item \textbf{Precio ajustado} antes de \(t_{\text{split}}\):
+  \[
+    p_{t}^{\text{adj}} = p_{t}^{\text{raw}} \cdot f_{\text{split}}
+  \]
+  \item \textbf{Volumen ajustado} antes de \(t_{\text{split}}\):
+  \[
+    v_{t}^{\text{adj}} = v_{t}^{\text{raw}} \cdot \frac{1}{f_{\text{split}}}
+  \]
+\end{itemize}
+Este enfoque es consistente con el usado en metodologías de índices de mercado cap‑weighted \cite{msci2023, lseg2024}.
+
+\paragraph{Dividendos en efectivo}
+\label{par:corporate_actions:dividend}
+Sea un dividendo \(d\) con:
+\begin{itemize}
+  \item \texttt{dividend\_cash} = \(d_{\text{cash}}\).
+\end{itemize}
+El \textbf{factor de ajuste} de precio:
+\[
+  f_{\text{div}} = 1 - \frac{d_{\text{cash}}}{p_{t_{\text{ex}}-1}}
+\]
+\begin{itemize}
+  \item \textbf{Precio ajustado} para \(t \leq t_{\text{ex}}\):
+  \[
+    p_{t}^{\text{adj}} =
+    \begin{cases}
+      p_{t}^{\text{raw}} \cdot f_{\text{div}}^{-1} & \text{si } t \leq t_{\text{ex}} \\
+      p_{t}^{\text{raw}}                          & \text{si } t > t_{\text{ex}}
+    \end{cases}
+  \]
+\end{itemize}
+En índices de capitalización de mercado, se ajusta el price divisor y el número de shares para mantener el \textit{market cap} inalterado \cite{msci2023, lseg2024}.
+
+\paragraph{Cambio de ticker / Mergers}
+\label{par:corporate_actions:ticker_merger}
+Para \texttt{ticker\_change} o \texttt{merger}, se usa un \texttt{FIGI} o \texttt{CIK} estable \(i\) como identificador de instrumento:
+\[
+  \mathtt{symbol}(i,t) :=
+  \begin{cases}
+    \mathtt{old\_symbol} & \text{si } t < t_{\text{change}} \\
+    \mathtt{new\_symbol} & \text{si } t \geq t_{\text{change}}
+  \end{cases}
+\]
+De forma que el historial de precios se “pega” por \texttt{FIGI} y el universo \(\mathcal{U}_t\) mantiene trazabilidad de la continuidad.
+
+\subsection{Ingesta y normalización de eventos}
+\label{sec:corporate_actions:ingest}
+
+\paragraph{Flujo de procesamiento}
+\label{par:corporate_actions:flow}
+\begin{enumerate}
+  \item \textbf{Cargar eventos fuente}:
+  \[
+    \mathcal{A}_{\text{raw}} \leftarrow \text{source}( \texttt{source\_path} \text{ o } \texttt{API}, \mathcal{D} )
+  \]
+  \item \textbf{Normalizar a schema canónico}:
+  \[
+    \mathcal{A}_{\text{raw}} \stackrel{\phi}{\longrightarrow} \mathcal{A}_{\text{ca}}
+  \]
+  donde \(\phi\) aplica:
+  \begin{itemize}
+    \item mapeo de tipo de evento,
+    \item conversión de campos específicos de proveedor,
+    \item reglas de tratamiento de fechas y valores nulos.
+  \end{itemize}
+  \item \textbf{Enriquecer con mappings}:
+  \[
+    \mathcal{A}_{\text{ca}} \leftarrow \mathcal{A}_{\text{ca}} 
+    \text{ join } \mathcal{M}_{\text{ticker}} \text{ on } \text{old\_symbol} / \text{new\_symbol}
+  \]
+  \item \textbf{Validar y deduplicar}:
+  \[
+    \mathcal{A}_{\text{clean}} := \texttt{dedup\_by\_key}(\mathcal{A}_{\text{ca}}, \texttt{event\_id\_key})
+  \]
+  donde \texttt{event\_id\_key} puede ser \((\mathtt{symbol}, \mathtt{event\_type}, \mathtt{ex\_date}, \texttt{extra\_fields})\).
+  \item \textbf{Detectar conflictos same‑day}:
+  \[
+    a, a' \in \mathcal{A}_{\text{clean}}:
+    \mathtt{symbol}(a) = \mathtt{symbol}(a'), \mathtt{ex\_date}(a) = \mathtt{ex\_date}(a'), \mathtt{event\_type}(a) = \mathtt{event\_type}(a')
+    \Rightarrow \texttt{flag\_conflict}(a,a')
+  \]
+  \item \textbf{Persistir salidas}:
+  \[
+    \texttt{history.parquet}, \texttt{current.parquet}, \texttt{manifest\_*.json}, \texttt{failures\_*.parquet}
+  \]
+\end{enumerate}
+
+\subsection{Validaciones y controles de calidad}
+\label{sec:corporate_actions:checks}
+
+\paragraph{Checks obligatorios}
+\label{par:corporate_actions:checks}
+\begin{itemize}
+  \item \textbf{Fechas parseables y en rango}:
+  \[
+    \forall a \in \mathcal{A}_{\text{clean}}: \mathtt{ex\_date}(a) \in \mathcal{D}
+  \]
+  \item \textbf{Deduplicación por clave de evento}:
+  \[
+    \text{no duplicados en } \texttt{event\_id\_key} := (\mathtt{symbol}, \mathtt{event\_type}, \mathtt{ex\_date})
+  \]
+  \item \textbf{Eventos conflictivos mismo día}:
+  \[
+    \{a,a'\} \text{ same } \mathtt{symbol}, \mathtt{event\_type}, \mathtt{ex\_date} \Rightarrow \texttt{flag} = 1 \text{ en ambos}
+  \]
+  \item \textbf{Mapping de ticker coherente}:
+  \[
+    \text{Si } \mathtt{old\_symbol}(a) \text{ mapea a } \mathtt{new\_symbol}(a) \text{ mediante } i = \mathtt{FIGI},
+    \text{ entonces } \mathtt{symbol}(i) \text{ es estable.}
+  \]
+\end{itemize}
+
+\paragraph{Calidad de cobertura}
+\label{par:corporate_actions:coverage}
+Finalizadas las validaciones, se genera un \texttt{manifest} que reporta:
+\begin{itemize}
+  \item conteo de eventos por \texttt{event\_type},
+  \item porcentaje de eventos resueltos vs faltantes,
+  \item \texttt{run\_duration\_sec}, \texttt{run\_id}, \texttt{config\_hash}.
+\end{itemize}
+
+\subsection{Interfaz de ejecución y salida de archivos}
+\label{sec:corporate_actions:cli}
+
+\paragraph{CLI}
+\label{par:corporate_actions:cli}
+\begin{verbatim}
 python -m data.universe.corporate_actions ^
   --source-path data/universe/source/corp_actions.parquet ^
   --mapping-path data/universe/source/ticker_map.parquet ^
   --config-path configs/data/corporate_actions.yaml ^
   --run-id corp_actions_20260305_001
+\end{verbatim}
 
-9) DoD
-- dataset PIT utilizable por adjust_prices y universe
-- cobertura de eventos y errores reportada
+\paragraph{Outputs}
+\label{par:corporate_actions:outputs}
+\begin{itemize}
+  \item \texttt{data/universe/corporate\_actions/history.parquet}:
+  \[
+    \mathcal{A}_{\text{clean}} \text{ con historial completo}
+  \]
+  \item \texttt{data/universe/corporate\_actions/current.parquet}:
+  \[
+    \mathcal{A}_{\text{current}} := \{(a \in \mathcal{A}_{\text{clean}} \mid t \leq t_{\max})\}
+  \]
+  \item \texttt{data/universe/corporate\_actions/manifest\_\{run\_id\}.json}:
+  \[
+    \{(\texttt{event\_type}, \texttt{count}), \texttt{success\_rate}, \texttt{run\_duration\_sec}\}
+  \]
+  \item \texttt{data/universe/corporate\_actions/failures\_\{run\_id\}.parquet}:
+  \[
+    \texttt{a} \in \mathcal{A}_{\text{raw}} \text{ que no se pudieron normalizar}
+  \]
+\end{itemize}
+
+\subsection{Definition of Done y alineación con el sistema}
+\label{sec:corporate_actions:dod}
+
+El módulo cumple su \textbf{Definition of Done} cuando:
+\begin{itemize}
+  \item El dataset \texttt{history.parquet} es:
+  \[
+    \text{PIT, deduplicado y con mapeo estable por \texttt{FIGI/CIK}.}
+  \]
+  \item Es directamente usable por:
+  \begin{itemize}
+    \item \texttt{data/price/adjust\_prices.py} para ajustar \texttt{split} y \texttt{dividend\_cash}.
+    \item \texttt{data/universe/build\_universe.py} para mantener continuidad de \texttt{symbol} ante \texttt{ticker\_change} y \texttt{merger}.
+  \end{itemize}
+  \item Existe \texttt{manifest} y \texttt{failures} que permiten:
+  \[
+    \text{auditoría de cobertura y errores en el pipeline de datos.}
+  \]
+\end{itemize}
+
+Esto lo convierte en un \textbf{pilar de bajo nivel** del sistema de trading industrial, reduciendo el riesgo de \textit{look‑ahead} y rupturas de continuidad de ticker en el backtest \cite{quantjourney2025, atlasquant2025}.

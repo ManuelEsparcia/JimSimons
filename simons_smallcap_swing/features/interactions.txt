@@ -1,54 +1,181 @@
-Modulo: features/interactions.py
+\section{Módulo: \texttt{features/interactions.py}}
 
-1) Objetivo
-Construir features de interaccion entre familias de senales para capturar efectos no lineales y dependencias contextuales.
+\paragraph{Objetivo general}
+Este módulo construye \textbf{features de interacción} entre familias de señales (precio, liquidez, volatilidad, calidad, valor, tamaño, etc.) para capturar efectos no lineales y dependencias contextuales, como \textit{momentum que depende de liquidez}, \textit{calidad modulada por volatilidad}, o \textit{valor que depende de régimen de mercado}. El objetivo es enriquecer el modelo de factores sin explotar \textit{multiple testing} ni introducir colinealidad estructural, manteniendo PIT estricto y escala controlada.
 
-2) Alcance
-Incluye combinaciones controladas de features (producto, ratio, gated interactions) con regularizacion de complejidad.
+\subsection{Marco teórico y notación}
 
-3) Entradas
-- base_features_path (price/liquidity/fundamental/microstructure)
-- interactions_config_path
-- run_id
+Sea \( \mathcal{S}_t \) el universo elegible en fecha \( t \), y \( \mathcal{F}^{(a)}, \mathcal{F}^{(b)} \) subconjuntos de features de diferentes familias (por ejemplo, \texttt{momentum} y \texttt{liquidity}). Se definen interacciones:
 
-4) Salidas
-- features/interactions/date={yyyy-mm-dd}/part-*.parquet
-- features/interactions/summary_{run_id}.json
-- features/interactions/manifest_{run_id}.json
+\subsubsection{Producto escalar}
+\begin{itemize}
+    \item \texttt{int\_mom\_x\_liq}:
+        \[
+        X_{t}^{(\text{mom}\times\text{liq})}(s) = 
+        X_{t}^{(f_{\text{mom}})}(s) \odot X_{t}^{(f_{\text{liq}})}(s),
+        \]
+        donde \( \odot \) es producto elemento a elemento entre señales estandarizadas POS‑PIT (e.g., rank–Gauss o zscore robusto).
+\end{itemize}
 
-5) Interacciones sugeridas
-- int_mom_x_liq
-- int_quality_x_vol
-- int_value_x_regime
-- int_micro_x_turnover
-- int_growth_x_size
+\subsubsection{Ratio de señales}
+\begin{itemize}
+    \item \texttt{int\_quality\_x\_vol} (ratio):
+        \[
+        X_{t}^{(\text{quality}/\text{vol})}(s) = 
+        \frac{X_{t}^{(f_{\text{quality}})}(s)}{X_{t}^{(f_{\text{vol}})}(s) + \epsilon},
+        \]
+        con \( \epsilon \) para evitar división por cero.
+\end{itemize}
 
-6) Reglas
-- limitar numero de interacciones para evitar multiple testing.
-- usar solo features con coverage adecuada.
-- aplicar estandarizacion posterior.
+\subsubsection{Interacciones con gating}
+\begin{itemize}
+    \item \texttt{int\_value\_x\_regime}:
+        \[
+        X_{t}^{(\text{value}\times\text{regime})}(s) = 
+        X_{t}^{(f_{\text{value}})}(s) \cdot \mathbb{I} \big( R_{t}^{(\text{regime})} \in \mathcal{R} \big),
+        \]
+        donde \( R_{t}^{(\text{regime})} \) es una variable de régimen de mercado y \( \mathcal{R} \) el conjunto de regímenes activos.
+\end{itemize}
 
-7) Reglas PIT
-- interacciones solo entre features ya PIT-safe en la misma fecha.
-- sin introducir info futura en gating variables.
+\subsection{Interacciones sugeridas}
 
-8) Flujo
-1. Cargar set base de features.
-2. Seleccionar pares/grupos segun config.
-3. Calcular interacciones.
-4. Aplicar clipping y validaciones.
-5. Persistir outputs.
+\begin{itemize}
+    \item \texttt{int\_mom\_x\_liq}: momentum modulado por liquidez (efecto de \textit{momentum liquidez} o \textit{risk–adjusted momentum}).
+    \item \texttt{int\_quality\_x\_vol}: relación calidad–volatilidad, capturando que la calidad debe ser robuste a alta volatilidad. \cite{novy2013}
+    \item \texttt{int\_value\_x\_regime}: valor condicional a régimen de mercado (bull/bear).
+    \item \texttt{int\_micro\_x\_turnover}: microestructura × giro de volumen, capturando \textit{quality of flow} y \textit{low impact} momentum.
+    \item \texttt{int\_growth\_x\_size}: crecimiento × tamaño, explotando el efecto de \textit{small cap growth} y \textit{size–growth premium} en small caps. \cite{fama2015}
+\end{itemize}
 
-9) Validaciones
-- sin explosiones de escala (outliers extremos).
-- cobertura minima por interaccion.
-- colinealidad excesiva flagged.
+\subsection{Reglas de diseño y control de complejidad}
 
-10) CLI
+\paragraph{Limitación de número de interacciones}
+\begin{itemize}
+    \item \texttt{max\_interactions} por config, para evitar \textit{multiple testing} agresivo.
+    \item Explicación basada en literatura de \textit{data mining} y \textit{overfitting} (Harvey et al., 2017). \cite{harvey2017}
+\end{itemize}
+
+\paragraph{Filtrado de cobertura}
+\begin{itemize}
+    \item Solo se combinan features con \texttt{coverage\_rate} \(\geq \texttt{min\_coverage}\).
+    \item Esto reduce el riesgo de interacciones con alta varianza de estimación.
+\end{itemize}
+
+\subsubsection{Estandarización posterior}
+\begin{itemize}
+    \item Luego de calcular la interacción, se aplica:
+        \[
+        \tilde{X}^{(f)}_{t} = \text{zscore\_robust} \big( X^{(f)}_{t} \big),
+        \]
+        o \texttt{rank\_gauss} por fecha, para estandarizar la escala.
+\end{itemize}
+
+\subsection{Reglas PIT y seguridad temporal}
+
+\paragraph{Construcción de interacciones}
+\begin{itemize}
+    \item Solo se interactúan \textbf{features que ya están en PIT} y disponibles en \( t \).
+    \item No se introduce información futura en variables de \textit{gating} (por ejemplo, \texttt{regime} debe ser calculado con información \(\leq t\)).
+\end{itemize}
+
+\paragraph{Ejemplo de variable de régimen}
+\begin{itemize}
+    \item \texttt{regime\_bull\_bear} se define con EMA cruzada \(( \text{EMA}_{20} - \text{EMA}_{200} \)) de índice de mercado, usando precios \(\leq t\).
+\end{itemize}
+
+\subsection{Flujo de procesamiento}
+
+\paragraph{Alto nivel}
+1. \texttt{load\_base\_features(base\_features\_path, config)}:
+    - Carga \texttt{features/store/date=...} y filtra por \texttt{is\_eligible}.
+2. \texttt{select\_interaction\_pairs(...)}:
+    - Lee \texttt{interactions\_config\_path} para definir pares/grupos de features.
+3. \texttt{compute\_interactions(...)}:
+    - Calcula productos, ratios y interacciones con gating.
+4. \texttt{apply\_clipping\_validations(...)}:
+    - Aplica clipping a extremos y valida cobertura y colinealidad.
+5. \texttt{persist\_interactions(...)}:
+    - Guarda \texttt{features/interactions/date=...} junto con \texttt{summary\_run\_id.json} y \texttt{manifest\_run\_id.json}.
+
+\subsection{Validaciones de calidad y estabilidad}
+
+\paragraph{Escalabilidad y outliers}
+\begin{itemize}
+    \item \textbf{Sin explosiones de escala}:
+        \[
+        \max_{s} \big| X_{t}^{(\text{interact})}(s) \big| < \texttt{max\_threshold},
+        \]
+        donde el umbral se establece en configuración (por ejemplo, 100).
+    \item Aplicar winsorización o clipping si se superan cotas.
+\end{itemize}
+
+\paragraph{Cobertura mínima}
+\begin{itemize}
+    \item \texttt{coverage\_rate} global por interacción:
+        \[
+        \rho_{\text{cov}}^{(f_{\text{int}})} \geq \texttt{min\_coverage\_int}.
+        \]
+\end{itemize}
+
+\paragraph{Colinealidad}
+\begin{itemize}
+    \item \texttt{pairwise\_correlation} \( |\rho_{ij,t}| > 0.98 \) para pares de \texttt{int\_*} dispara \texttt{flag}.
+    \item VIF aproximado para bloques de interacciones para detectar redundancia.
+\end{itemize}
+
+\subsection{Salidas y estructura de almacenamiento}
+
+\paragraph{Outputs principales}
+\begin{itemize}
+    \item \texttt{features/interactions/date=\{yyyy-mm-dd\}/part-*.parquet}:
+        \begin{itemize}
+            \item \texttt{date}, \texttt{symbol}, \texttt{run\_id}.
+            \item Interacciones:
+                \begin{itemize}
+                    \item \texttt{int\_mom\_x\_liq}, \texttt{int\_quality\_x\_vol},
+                    \texttt{int\_value\_x\_regime}, \texttt{int\_micro\_x\_turnover},
+                    \texttt{int\_growth\_x\_size}.
+                \end{itemize}
+        \end{itemize}
+    \item \texttt{features/interactions/summary\_\{run\_id\}.json}:
+        \begin{itemize}
+            \item \texttt{n\_interactions}, \texttt{coverage\_p50/p10}, \texttt{outlier\_rate}, \texttt{correlation\_warns}.
+        \end{itemize}
+    \item \texttt{features/interactions/manifest\_\{run\_id\}.json}:
+        \begin{itemize}
+            \item \texttt{run\_id}, \texttt{interactions\_config\_hash}, \texttt{base\_features\_hash}.
+        \end{itemize}
+\end{itemize}
+
+\subsection{CLI y uso en el pipeline global}
+
+\paragraph{CLI recomendada}
+\begin{verbatim}
 python -m features.interactions ^
   --base-features-path features/store ^
   --config-path configs/features/interactions.yaml ^
   --run-id interactions_20260305_001
+\end{verbatim}
 
-11) DoD
-- interacciones utiles y controladas listas para modelado.
+\paragraph{Uso downstream}
+\begin{itemize}
+    \item \texttt{features/build\_features.py}: integra \texttt{int\_*} como nuevas familias de señales.
+    \item \texttt{models/*/train\_*.py}: alimenta \textit{factor models} con interacciones de calidad–liquidez, valor–regime, etc.
+    \item \texttt{backtest/run\_walkforward.py}: explora \textit{long–short} portfolios basados en interacciones contextuales (por ejemplo, momentum líquido en regímenes de alta volatilidad).
+\end{itemize}
+
+\subsection{Definition of Done}
+
+\begin{itemize}
+    \item \textbf{Interacciones útiles y controladas} listas para estandarización y modelado.
+    \item Construcción sin \textit{leakage} y con límites explícitos de complejidad.
+    \item Salidas almacenadas con metadatos completos para \texttt{feature\_qc} y \texttt{cross\_sectional}.
+\end{itemize}
+
+\subsection{Referencias de referencia}
+
+\begin{itemize}
+    \item Novy‑Marx, R. (2013). \textit{The Other Side of Value: The Gross Profitability Premium}. \cite{novy2013}
+    \item Fama, French, y otros. \textit{Factor Investing} y \textit{Quality–Growth} en small caps. \cite{fama2015}
+    \item Harvey, C. R. (2017). \textit{“Dealing with the Multiple Testing Problem”}. \cite{harvey2017}
+\end{itemize}

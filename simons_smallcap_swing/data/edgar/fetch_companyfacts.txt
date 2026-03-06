@@ -1,50 +1,222 @@
-Modulo: data/edgar/fetch_companyfacts.py
+\section{Módulo: \texttt{data/edgar/fetch\_companyfacts.py}}
 
-1) Objetivo
-Descargar companyfacts de EDGAR por CIK para construir series fundamentales PIT (US-GAAP facts) con versionado reproducible.
+\subsection{Objetivo general del módulo}
 
-2) Alcance
-Incluye ingestion de JSON companyfacts, parseo de taxonomias/unidades, persistencia raw y tracking de cobertura.
+El módulo \texttt{fetch\_companyfacts.py} descarga los \emph{company facts} de la API de EDGAR de la SEC para una lista de CIK y los convierte en una serie temporal de hechos financieros fundamentales en formato \emph{point‑in‑time} (PIT), específicamente bajo la taxonomía US‑GAAP. El objetivo es:
 
-3) Entradas
-- cik_list_path
-- taxonomy_filter (opcional)
-- config_path
-- run_id
+\begin{itemize}
+  \item construir una base de datos de facts financieros estructurados,
+  \item con versionado reproducible mediante \texttt{run\_id},
+  \item preparada para ser consumida por módulos de \texttt{parse\_xbrl} y \texttt{point\_in\_time} en un pipeline de trading cuantitativo.
+\end{itemize}
 
-4) Salidas
-- data/edgar/raw/companyfacts/date={asof}/part-*.parquet
-- data/edgar/raw/companyfacts_failures_{run_id}.parquet
-- data/edgar/raw/companyfacts_manifest_{run_id}.json
+Matemáticamente, el módulo implementa una función de \emph{ingestión}:
+\[
+  \mathcal{I}: \mathcal{C} \longrightarrow \mathcal{F},
+\]
+donde:
+\begin{itemize}
+  \item \(\mathcal{C}\) es el conjunto de CIKs de entrada,
+  \item \(\mathcal{F}\) es el espacio de datos de facts en formato tabular PIT, con campos \texttt{cik}, \texttt{taxonomy}, \texttt{tag}, \texttt{unit}, \texttt{end\_date}, \texttt{filed\_date}, \texttt{value}, \texttt{accession\_number} y \texttt{run\_id}.
+\end{itemize}
+Esta función se materializa mediante llamadas a la API \texttt{https://data.sec.gov/api/xbrl/companyfacts/CIK{}.json}\cite{SECEDGARAPI}, que expone los facts en formato JSON estructurado por concepto XBRL\cite{SECXBRLGuide}.
 
-5) Campos minimos
-- cik
-- taxonomy
-- tag
-- unit
-- end_date
-- filed_date
-- value
-- accession_number (si disponible)
-- run_id
+\subsection{Alcance del módulo}
 
-6) Checks
-- value numerico parseable
-- filed_date valida
-- unit coherente por tag
-- dedupe por (cik,tag,unit,end_date,filed_date)
+El alcance del módulo incluye:
 
-7) Flujo
-1. Cargar CIKs.
-2. Descargar companyfacts con retries/rate-limit.
-3. Parsear facts a formato tabular.
-4. Persistir raw + failures + manifest.
+\begin{itemize}
+  \item \textbf{Ingestión} de datos desde la API de company facts de EDGAR,
+  \item \textbf{Parséo} de taxonomías y unidades (por ejemplo, USD, shares, PER‑share),
+  \item \textbf{Persistencia raw} en formato Parquet particionado por fecha \texttt{asof},
+  \item \textbf{Tracking de cobertura} de CIKs y contabilización de fallos de descarga.
+\end{itemize}
 
-8) CLI
+El módulo actúa como \emph{capa de entrada} del pipeline de datos fundamentales, análoga a un \emph{data ingestion layer} en una arquitectura de \emph{data mesh} para finanzas cuantitativas\cite{WorldbankDataQuality, SECDataQualityGuidelines}. Su correcta implementación es crítica para evitar sesgos de selección en el universo de empresas y para garantizar que los datos PIT no contengan \emph{look‑ahead bias}.
+
+\subsection{Entradas del módulo}
+
+Las entradas del módulo son:
+
+\begin{itemize}
+  \item \texttt{cik\_list\_path}: ruta a un archivo \texttt{.parquet} que contiene el universo de CIKs/tickers a procesar.
+  \item \texttt{taxonomy\_filter} (opcional): filtro de taxonomías a extraer (por ejemplo, \texttt{us-gaap} o \texttt{dei}).
+  \item \texttt{config\_path}: ruta a un archivo YAML de configuración con parámetros de rate‑limit, retries, y filtros.
+  \item \texttt{run\_id}: identificador único de la ejecución para replicabilidad y trazabilidad.
+\end{itemize}
+
+En términos formales, denotamos el conjunto de entradas como:
+\[
+  \mathcal{I} = \{ \mathcal{C}, \mathcal{T}, \theta_{\text{ingest}}, r \},
+\]
+donde:
+\begin{itemize}
+  \item \(\mathcal{C}\) es el conjunto de CIKs,
+  \item \(\mathcal{T}\) es el conjunto de taxonomías seleccionadas,
+  \item \(\theta_{\text{ingest}}\) agrupa parámetros de ingesta (retries, concurrency, chunking),
+  \item \(r\) es el \texttt{run\_id}.
+\end{itemize}
+
+\subsection{Salidas y artefactos}
+
+El módulo genera tres artefactos clave:
+
+\begin{itemize}
+  \item \texttt{data/edgar/raw/companyfacts/date=\{asof\}/part-*.parquet}: datos raw de company facts en formato columnar, particionado por fecha de corte \texttt{asof}.
+  \item \texttt{data/edgar/raw/companyfacts\_failures\_\{run\_id\}.parquet}: registro de CIKs o tags que fallaron en la descarga o parseo.
+  \item \texttt{data/edgar/raw/companyfacts\_manifest\_\{run\_id\}.json}: metadatos de la ejecución (número de CIKs procesados, tasa de éxito, versiones, timestamps, etc.).
+\end{itemize}
+
+Estos artefactos permiten:
+\begin{itemize}
+  \item reconstruir exactamente la misma versión de datos a partir de un \texttt{run\_id},
+  \item monitorizar la cobertura de CIKs a lo largo del tiempo,
+  \item depurar problemas de red, rate‑limiting o cambios en la API.
+\end{itemize}
+
+En el flujo de datos cuantitativos, \texttt{companyfacts} raw sirven como input inmediato para módulos de \texttt{parse\_xbrl} y \texttt{point\_in\_time}, que aplican reglas de consolidación e interpolación para construir features de fondos para backtesting\cite{CampbellEtAl2001, Chan2009QuantitativeTrading}.
+
+\subsection{Modelo de datos y campos mínimos}
+
+El módulo asegura que cada fila de facts incluya al menos los siguientes campos:
+
+\begin{itemize}
+  \item \texttt{cik}: clave de identificación de la entidad.
+  \item \texttt{taxonomy}: taxonomía XBRL (por ejemplo, \texttt{us-gaap}).
+  \item \texttt{tag}: concepto XBRL (por ejemplo, \texttt{AccountsPayableCurrent}).
+  \item \texttt{unit}: unidad de medida (por ejemplo, \texttt{USD}, \texttt{shares}).
+  \item \texttt{end\_date}: fecha de término del período de informe.
+  \item \texttt{filed\_date}: fecha de presentación del filing que contiene el hecho.
+  \item \texttt{value}: valor numérico del hecho.
+  \item \texttt{accession\_number} (si está disponible): identificador único del archivo EDGAR.
+  \item \texttt{run\_id}: identificador de la ejecución de ingesta.
+\end{itemize}
+
+En notación matemática, cada hecho se representa como una tupla:
+\[
+  f = (c, t, \tau, u, e, f_d, v, a, r),
+\]
+donde:
+\begin{itemize}
+  \item \(c \in \mathcal{C}\) es el CIK,
+  \item \(t\) es el tag XBRL,
+  \item \(\tau\) es la taxonomía,
+  \item \(u\) es la unidad,
+  \item \(e\) es \texttt{end\_date},
+  \item \(f_d\) es \texttt{filed\_date},
+  \item \(v \in \mathbb{R}\) es el valor numérico,
+  \item \(a\) es el accession\_number,
+  \item \(r\) es el \texttt{run\_id}.
+\end{itemize}
+Esta estructura se alinea con el esquema \texttt{CompanyFact} y \texttt{FactValue} de la API de company facts de EDGAR\cite{SECEDGARAPI, EdgarToolsAPI}.
+
+\subsection{Checks de calidad implementados}
+
+Durante el parseo, el módulo aplica varios checks de calidad:
+
+\begin{itemize}
+  \item \textbf{Valor numérico parseable}:
+    \[
+      v \in \mathbb{R} \cup \{ \text{NaN} \},
+    \]
+    es decir, el valor debe ser un número válido o falta explícita. Valores no numéricos resultan en filas marcadas o descartadas, según el modo de configuración.
+
+  \item \textbf{Fecha de presentación válida}:
+    \[
+      f_d \in \mathcal{T},
+    \]
+    donde \(\mathcal{T}\) es el conjunto de timestamps válidos con formato ISO. Fecha mal formadas se registran como errores.
+
+  \item \textbf{Unidad coherente por tag}:
+    Para cada \((t, u)\) se verifica que la combinación esté permitida por la taxonomía; por ejemplo, un tag \texttt{Revenue} debe estar en \texttt{USD} y no en \texttt{shares} a menos que el schema XBRL lo permita explícitamente. Esto se puede modelar como una relación de dominio:
+    \[
+      u \in U(t),
+    \]
+    donde \(U(t)\) es el conjunto de unidades permitidas para el tag \(t\).
+
+  \item \textbf{Deduplicación}:
+    Se aplica dedupe por clave:
+    \[
+      k = (c, t, u, e, f_d),
+    \]
+    es decir, si existen múltiples registros idénticos con la misma clave, se conserva solo uno (por ejemplo, el de mayor \texttt{filed\_date} o el primero según una regla de \emph{tie‑breaking}).
+\end{itemize}
+
+Estos checks se alinean con las prácticas de \emph{data quality} para APIs financieras, donde la consistencia de tipo y unidad es crítica para evitar errores de cálculo en ratios fundamentales (por ejemplo, EV/EBITDA, earnings per share, etc.)\cite{SECDataQualityGuidelines, WorldbankDataQuality}.
+
+\subsection{Flujo de ejecución}
+
+El flujo del módulo se puede descomponer en cuatro pasos:
+
+\begin{enumerate}
+  \item \textbf{Carga de CIKs}: se lee el archivo \texttt{cik\_list\_path} y se obtiene el universo \(\mathcal{C}\).
+
+  \item \textbf{Descarga de company facts con retries y rate‑limit}:
+    Para cada CIK \(c \in \mathcal{C}\), se realiza la llamada:
+    \[
+      \texttt{GET } \texttt{https://data.sec.gov/api/xbrl/companyfacts/CIK{c:010}.json},
+    \]
+    gestionando:
+    \begin{itemize}
+      \item timeouts,
+      \item retries exponenciales,
+      \item rate‑limiting según el límite de la API (por ejemplo, \texttt{60 req/min} recomendado por la SEC).
+    \end{itemize}
+
+  \item \textbf{Parseo de facts a formato tabular}:
+    Se transforma el JSON anidado de la API en un esquema tabular con los campos mínimos descritos, aplicando los filtros de taxonomía y unidades definidos en \texttt{qc\_config}.
+
+  \item \textbf{Persistencia raw + failures + manifest}:
+    \begin{itemize}
+      \item Los facts válidos se escriben en \texttt{data/edgar/raw/companyfacts/date=\{asof\}} usando formato Parquet.
+      \item Los registros con errores se escriben en \texttt{companyfacts\_failures\_\{run\_id\}.parquet}.
+      \item Se genera un manifest JSON con resumen de ejecución.
+    \end{itemize}
+\end{enumerate}
+
+Este flujo reproduce un patrón estándar de \emph{ETL batch} para datos regulatorios, donde la descarga y el parseo se separan claramente de la transformación posterior a series PIT\cite{CampbellEtAl2001, DePrado2018Advances}.
+
+\subsection{CLI y uso operativo}
+
+El módulo se invoca mediante la línea de comandos:
+
+\begin{verbatim}
 python -m data.edgar.fetch_companyfacts ^
   --cik-list-path data/edgar/mappings/ticker_cik_current.parquet ^
   --config-path configs/data/edgar_fetch_companyfacts.yaml ^
   --run-id fetch_companyfacts_20260305_001
+\end{verbatim}
 
-9) DoD
-- facts descargados y listos para parse_xbrl/point_in_time.
+Esto permite:
+\begin{itemize}
+  \item integrar el módulo en pipelines CI/CD,
+  \item ejecutarlo periódicamente (por ejemplo, diariamente) para actualizar la base de datos de facts,
+  \item mantener versiones reproducibles de datos mediante \texttt{run\_id}.
+\end{itemize}
+
+\subsection{Definición de término (DoD)}
+
+La definición de término del módulo establece que:
+
+\begin{itemize}
+  \item Los \texttt{companyfacts} deben estar descargados, persistidos en formato raw y accesibles para los módulos downstream.
+  \item En particular, los datos deben estar listos para ser consumidos por:
+    \begin{itemize}
+      \item \texttt{parse\_xbrl}: que aplicará reglas de agregación por taxonomía y tag,
+      \item \texttt{point\_in\_time}: que construirá la vista PIT con \texttt{asof} y \texttt{acceptance\_ts}.
+    \end{itemize}
+  \item Si la tasa de éxito de descarga cae por debajo de un umbral crítico, el módulo debe marcar el \texttt{run\_id} como \texttt{warn} o \texttt{fail} y registrar el detalle en \texttt{failures} y \texttt{manifest}.
+\end{itemize}
+
+\subsection{Conexión con estado del arte y literatura}
+
+El diseño de \texttt{fetch\_companyfacts.py} se alinea con:
+
+\begin{itemize}
+  \item \textbf{API de company facts de EDGAR}: la API devuelve todos los concepts XBRL para un CIK en un solo endpoint, simplificando la construcción de series históricas de line items financieros\cite{SECEDGARAPI, EdgarToolsAPI}.
+  \item \textbf{Ingestión de datos fundamentales}: enfoques similares se usan en librerías como \texttt{edgartools}\cite{EdgarTools} y en pipelines de datos ABIERTOS para finanzas cuantitativas\cite{KaggleEDGARNotebook}.
+  \item \textbf{Gestión de taxa y unidades}: el uso de taxonomía + tag + unidad es consistente con la literatura de XBRL y taxonomías de reporting financiero\cite{SECXBRLGuide, WhichTaxonomiesSupported}.
+  \item \textbf{Replicabilidad y versionado}: el uso de \texttt{run\_id} y metadatos de manifest se alinea con mejores prácticas de \emph{reproducible research} y \emph{data lineage} en sistemas cuantitativos\cite{DePrado2018Advances, CampbellEtAl2001}.
+\end{itemize}
+
+En resumen, \texttt{fetch\_companyfacts.py} es la base de datos fundamental de un sistema de swing trading cuantitativo: conecta el universo regulado de la SEC con un esquema tabular estructurado, listo para ser transformado en features PIT y posteriormente utilizados en modelos de selección de activos y backtests estadísticamente rigurosos.

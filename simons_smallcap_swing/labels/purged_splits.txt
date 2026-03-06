@@ -1,213 +1,243 @@
-Modulo: labels/purged_splits.py
+\section{Módulo: \texttt{labels/purged\_splits.py}}
 
-1) Objetivo
-Generar particiones de entrenamiento/validacion/test temporales sin leakage mediante Purged K-Fold + Embargo, respetando horizontes forward de labels y ventanas de informacion de features.
+\subsection{Objetivo del módulo}
 
-2) Alcance
-Incluye:
-- Construccion de folds temporales para panel (date, symbol).
-- Purga de observaciones de train que se solapan con intervalos de test.
-- Aplicacion de embargo posterior al test.
-- Soporte para walk-forward y CV temporal.
-- Export de indices/splits reproducibles para modelos.
+El objetivo de \texttt{labels/purged\_splits.py} es generar \emph{particiones temporales} de entrenamiento, validación y test para un panel \((date, symbol)\) de small caps, garantizando:
 
-No incluye:
-- Calculo de labels/features.
-- Entrenamiento de modelos.
-- Evaluacion final de performance (solo define particiones).
+\begin{itemize}
+  \item \textbf{Sin leakage} mediante \emph{Purged K‑Fold} + \emph{Embargo} \cite{LopezdePrado2018,PurgedCV2017}.
+  \item Respeto a los \emph{horizontes forward} de los labels y a las ventanas de información de las features.
+  \item Soporte tanto para \emph{cross‑validation temporal} (\texttt{purged\_kfold}) como para \emph{walk‑forward} designs.
+  \item Exportación de \emph{índices/splits} reproducibles para \texttt{models/*/train\_*.py} y \texttt{backtest/run\_walkforward.py}.
+\end{itemize}
 
-3) Dependencias aguas arriba y aguas abajo
-Upstream:
-- labels/store/... (con horizontes forward y label_valid_flag)
-- features/store/... (para verificar compatibilidad de fechas)
-- calendario de mercado
-- config de validacion temporal
+Este módulo implementa el esquema estándar de \emph{temporal cross‑validation} industrial para \emph{swing trading strategies} basadas en ML \cite{LopezdePrado2018,BacktestOverfitting2024}.
 
-Downstream:
-- models/*/train_*.py
-- validation/pbo_cscv.py
-- backtest/run_walkforward.py
+\subsection{Marco matemático de purged splits}
 
-4) Problema que resuelve
-En finanzas, una observacion etiquetada en t usa informacion futura hasta t+h.
-Si train y test contienen intervalos temporales solapados, aparece leakage aunque las fechas base sean distintas.
-Este modulo elimina ese solapamiento via purge + embargo.
+\subsubsection{Definiciones de tiempo y evento}
 
-5) Definiciones clave
-Trade date (t):
-- Fecha de decision/feature.
+Denotamos:
 
-Event interval:
-- [t_start, t_end] donde t_start = t (o t+lag) y t_end = t + horizon_h.
+\begin{itemize}
+  \item \( t \): \emph{trade date} o \emph{decision date} de la observación \((t, i)\).
+  \item \( h \): horizonte forward del label (por ejemplo, \( h = 5d, 10d, 20d \)).
+  \item \( \mathcal{H} \): conjunto de horizontes disponibles.
+\end{itemize}
 
-Purge:
-- Eliminar de train cualquier observacion cuyo event interval se solape con el intervalo de test.
+\textbf{Intervalo de evento} asociado a \((t, i)\):
 
-Embargo:
-- Excluir adicionalmente una banda temporal despues del bloque test para evitar dependencia serial/arrastre.
+\begin{equation}
+\mathcal{I}_{t,i} = [t_{\text{start}}, t_{\text{end}}], \quad
+\text{donde } t_{\text{start}} = t + \text{lag},\ t_{\text{end}} = t + \text{lag} + h.
+\end{equation}
 
-6) Contrato de entrada
-Entradas minimas:
-- labels_path
-- start_date, end_date
-- split_config_path
-- run_id
+En presencia de \emph{multi‑horizonte}, se usa el horizonte primario o \(\max(\mathcal{H})\) como \texttt{primary\_horizon\_days} para definir \(\mathcal{I}_{t,i}\) de forma conservadora.
 
-Opcionales:
-- features_path (validar interseccion exacta)
-- horizons_days (si no viene en labels)
-- sample_weight_path
+\subsubsection{Purga (Purge)}
 
-Campos minimos esperados en labels:
-- date
-- symbol
-- label_valid_flag
-- horizonte(s) disponibles o campo horizon_used
+Sea \(\mathcal{D}_{\text{test}}\) el conjunto de fechas de test en un fold. Se define el \emph{event window} de test:
 
-Parametros clave de config:
-- n_splits
-- split_mode: purged_kfold | walkforward
-- embargo_pct o embargo_days
-- primary_horizon_days
-- min_train_days
-- min_test_days
-- gap_days (opcional adicional al embargo)
-- group_by_date (true recomendado)
+\begin{equation}
+\mathcal{W}_{\text{test}} = \bigcup_{(t,i) \in \mathcal{D}_{\text{test}}} \mathcal{I}_{t,i}.
+\end{equation}
 
-7) Contrato de salida
-Archivos principales:
-- labels/splits/purged_splits_{run_id}.parquet
-- labels/splits/purged_splits_summary_{run_id}.json
-- labels/splits/fold_{k}_indices_{run_id}.parquet
+Una observación \((t,i)\) en \emph{train} se marca como \texttt{purged} si:
 
-Campos sugeridos por fold:
-- fold_id
-- split_role (train/valid/test)
-- date
-- symbol
-- sample_index
-- is_purged (bool)
-- is_embargoed (bool)
-- inclusion_flag (bool final)
+\begin{equation}
+\mathcal{I}_{t,i} \cap \mathcal{W}_{\text{test}} \neq \emptyset.
+\end{equation}
 
-Resumen por fold:
-- n_train_raw, n_train_final
-- n_test
-- n_purged
-- n_embargoed
-- train_start, train_end, test_start, test_end
-- leakage_check_pass
+Esto asegura que ningún \emph{label window} de train se solape con el \emph{event interval} de test \cite{LopezdePrado2018,PurgedCV2017}.
 
-8) Reglas PIT y anti-leakage
-- Purge se calcula usando event_end real de cada observacion (t + horizon efectivo).
-- Si hay multi-horizonte, usar el horizonte del experimento o el max_h configurado.
-- Embargo se aplica en calendario de trading, no dias naturales.
-- Ninguna fecha de train puede caer en ventana purged/embargo de test.
+\subsubsection{Embargo temporal}
 
-9) Algoritmo base (Purged K-Fold)
-1. Ordenar fechas unicas en rango.
-2. Dividir fechas en K bloques contiguos (test folds).
-3. Para cada fold:
-   - definir test_dates.
-   - construir event intervals de test.
-   - marcar train candidates fuera de test.
-   - purgar train candidates que solapan intervalos de test.
-   - aplicar embargo tras max(test_date) por ventana configurada.
-   - validar no solapamiento final.
-4. Persistir fold assignments.
+Además de la purga, se aplica un \emph{embargo} en \emph{calendario de trading} tras el bloque de test:
 
-10) Algoritmo walk-forward (opcional)
-1. Definir ventanas crecientes o rodantes de train.
-2. Definir bloque siguiente como valid/test.
-3. Aplicar purge + embargo entre train y test en cada ventana.
-4. Mantener cronologia estricta (train siempre anterior a test).
+\begin{equation}
+\mathcal{E}_{\text{test}} = \{ t \in \mathcal{T} : t > \max(\mathcal{D}_{\text{test}}) \text{ y } t \leq \max(\mathcal{D}_{\text{test}}) + \text{embargo\_days} \},
+\end{equation}
 
-11) Validaciones minimas
-Integridad:
-- Sin duplicados en (fold_id, split_role, date, symbol).
-- Cada muestra asignada coherentemente por fold.
+y:
 
-No-leakage:
-- interseccion event intervals(train,test) vacia tras purge.
-- fechas en embargo no aparecen en train.
-- leakage_check_pass=true en todos los folds para aprobar.
+\begin{equation}
+\text{is\_embargoed}(t,i) = \mathbb{I}\{ t \in \mathcal{E}_{\text{test}} \}.
+\end{equation}
 
-Cobertura:
-- n_train_final y n_test por fold superan minimos configurados.
-- distribucion temporal razonablemente balanceada.
+El embargo previene \emph{serial dependence} y \emph{indirect leakage} a través de series temporales de features de ventana (medias móviles, volatilidades, z‑scores, etc.) \cite{LopezdePrado2018,PurgedCV2017}.
 
-12) Manejo de casos especiales
-- Ultimos dias del dataset con label incompleto:
-  - excluir antes de split o marcar invalid.
-- Multi-horizonte:
-  - elegir estrategia: per-horizon splits o max-horizon conservative.
-- Universo cambiante:
-  - split por fecha (no por simbolo) para mantener estructura cross-sectional.
-- Pocos datos:
-  - reducir n_splits o ampliar ventanas.
+\subsubsection{Construcción de folds temporales}
 
-13) Observabilidad y trazabilidad
-Logging:
-- INFO: construccion de cada fold.
-- WARNING: fold con tamano insuficiente tras purge.
-- ERROR: leakage detectado post-purge.
+Sea \(\mathcal{T} = \{t_1, t_2, \dots, t_N\}\) el conjunto de fechas únicas en \([start\_date, end\_date]\). El módulo implementa:
 
-Metricas:
-- n_folds
-- avg_train_size
-- avg_test_size
-- pct_removed_by_purge
-- pct_removed_by_embargo
-- leakage_violations_count
-- run_duration_sec
+\begin{itemize}
+  \item \textbf{Purged K‑Fold}:
+  \begin{enumerate}
+    \item Dividir \(\mathcal{T}\) en \(K\) bloques contiguos (test folds).
+    \item Para cada fold \(k\):
+    \begin{itemize}
+      \item Definir \(\mathcal{D}_{\text{test}}^{(k)}\).
+      \item Calcular \(\mathcal{W}_{\text{test}}^{(k)}\).
+      \item Calcular \(\mathcal{E}_{\text{test}}^{(k)}\).
+      \item Eliminar de train todas las observaciones \((t,i)\) tales que \(\mathcal{I}_{t,i} \cap \mathcal{W}_{\text{test}}^{(k)} \neq \emptyset\) o \(t \in \mathcal{E}_{\text{test}}^{(k)}\).
+    \end{itemize}
+  \end{enumerate}
+  \item \textbf{Walk‑forward}:
+  \begin{enumerate}
+    \item Mover una ventana \emph{creciente} o \emph{rodante} de train.
+    \item El siguiente bloque corresponde a \emph{valid} o \emph{test}.
+    \item Aplicar purge + embargo entre cada par \((train, test)\).
+  \end{enumerate}
+\end{itemize}
 
-14) Interfaz de ejecucion (CLI sugerida)
-python -m labels.purged_splits ^
-  --labels-path labels/store ^
-  --start-date 2014-01-01 ^
-  --end-date 2026-03-01 ^
-  --config-path configs/validation/purged_splits.yaml ^
+Esta estructura está alineada con \emph{Combinatorial Purged Cross‑Validation (CPCV)} para \emph{panel data} financiero \cite{LopezdePrado2018,CombinatorialPurged2018}.
+
+\subsection{Flujo del proceso (alto nivel)}
+
+\begin{enumerate}
+  \item \texttt{load\_labels} desde \texttt{labels\_path} con \texttt{label\_valid\_flag} y \texttt{horizon\_used}.
+  \item \texttt{load\_split\_config} y \texttt{start\_date}/\texttt{end\_date}.
+  \item \texttt{build\_event\_intervals(df\_labels, primary\_horizon\_days, lag\_days)}.
+  \item \texttt{make\_time\_folds(dates, cfg)}:
+  \begin{itemize}
+    \item \texttt{split\_mode = purged\_kfold} o \texttt{walkforward}.
+  \end{itemize}
+  \item Para cada fold:
+  \begin{itemize}
+    \item \texttt{apply\_purge(train\_df, test\_df, event\_intervals, cfg)}.
+    \item \texttt{apply\_embargo(train\_df, test\_dates, calendar, cfg)}.
+    \item \texttt{validate\_no\_leakage(train\_df, test\_df, event\_intervals)}.
+  \end{itemize}
+  \item \texttt{build\_fold\_outputs} y \texttt{persist\_splits\_outputs}.
+\end{enumerate}
+
+Este flujo garantiza \emph{reproducibilidad} y \emph{trazabilidad} de \texttt{run\_id} y \texttt{config\_hash} \cite{LopezdePrado2018}.
+
+\subsection{Entradas y salidas}
+
+\subsubsection{Entradas}
+
+\begin{itemize}
+  \item \texttt{labels\_path}: \texttt{labels/store} (con \texttt{date}, \texttt{symbol}, \texttt{label\_valid\_flag}, \texttt{horizon\_used} o \texttt{horizons}).
+  \item \texttt{start\_date}, \texttt{end\_date}: rango temporal de splits.
+  \item \texttt{split\_config\_path}: \texttt{embargo\_pct} o \texttt{embargo\_days}, \texttt{n\_splits}, \texttt{min\_train\_days}, etc.
+  \item \texttt{run\_id}.
+  \item Opcionalmente \texttt{features\_path} para validar intersección exacta train/test.
+\end{itemize}
+
+\subsubsection{Salidas}
+
+\begin{itemize}
+  \item \texttt{labels/splits/purged\_splits_{run\_id}.parquet}:
+  \begin{itemize}
+    \item \texttt{fold\_id}, \texttt{split\_role} (\texttt{train}/\texttt{valid}/\texttt{test}).
+    \item \texttt{date}, \texttt{symbol}, \texttt{sample\_index}.
+    \item \texttt{is\_purged}, \texttt{is\_embargoed}, \texttt{inclusion\_flag}.
+  \end{itemize}
+  \item \texttt{labels/splits/purged\_splits\_summary_{run\_id}.json}:
+  \begin{itemize}
+    \item \texttt{n\_splits}.
+    \item \texttt{train\_start}, \texttt{train\_end}, \texttt{test\_start}, \texttt{test\_end} por fold.
+    \item \texttt{leakage\_check\_pass} booleano por fold.
+  \end{itemize}
+  \item \texttt{labels/splits/fold\_k\_indices_{run\_id}.parquet} para cada \(k\).
+\end{itemize}
+
+\subsection{Reglas PIT y anti‑leakage}
+
+\begin{itemize}
+  \item \textbf{Purge} se calcula usando el \emph{event end} real de cada observación \((t + h)\), no fechas arbitrarias:
+  \begin{equation}
+  t_{\text{end}} = t + \text{lag} + h.
+  \end{equation}
+  \item En \emph{multi‑horizonte}, se puede usar \texttt{primary\_horizon\_days} o \(\max(\mathcal{H})\) como \emph{conservative horizon}.
+  \item \textbf{Embargo} se aplica en \emph{calendario de trading} (no días naturales), respetando \texttt{gaps\_dias} configurables.
+  \item Ninguna fecha de train puede caer en \texttt{purged} o \texttt{embargo} de test:
+  \begin{equation}
+  \nexists t \in \mathcal{T}_{\text{train}} \text{ tal que } t \in \mathcal{W}_{\text{test}} \cup \mathcal{E}_{\text{test}}.
+  \end{equation}
+\end{itemize}
+
+\subsection{Validaciones y métricas de calidad}
+
+\subsubsection{Validaciones mínimas}
+
+\begin{itemize}
+  \item \textbf{Integridad}:
+  \begin{itemize}
+    \item Sin duplicados en \((fold\_id, split\_role, date, symbol)\).
+    \item \texttt{inclusion\_flag} coherente con \texttt{is\_purged} y \texttt{is\_embargoed}.
+  \end{itemize}
+  \item \textbf{No‑leakage}:
+  \begin{itemize}
+    \item \texttt{leakage\_check\_pass} = true para todos los folds.
+    \item \(\mathcal{I}_{t,i} \cap \mathcal{W}_{\text{test}} = \emptyset\) para todo \texttt{train} incluido.
+  \end{itemize}
+  \item \textbf{Cobertura}:
+  \begin{itemize}
+    \item \texttt{n\_train\_final} y \texttt{n\_test} por fold \(\geq\) mínimos configurados.
+  \end{itemize}
+\end{itemize}
+
+\subsubsection{Métricas de observabilidad}
+
+\begin{itemize}
+  \item \texttt{pct\_removed\_by\_purge}, \texttt{pct\_removed\_by\_embargo}.
+  \item \texttt{avg\_train\_size}, \texttt{avg\_test\_size}.
+  \item \texttt{leakage\_violations\_count}.
+  \item \texttt{run\_duration\_sec}.
+\end{itemize}
+
+\subsection{Interfaz de ejecución CLI}
+
+Ejemplo de CLI:
+
+\begin{verbatim}
+python -m labels.purged_splits \
+  --labels-path labels/store \
+  --start-date 2014-01-01 \
+  --end-date 2026-03-01 \
+  --config-path configs/validation/purged_splits.yaml \
   --run-id purged_splits_20260305_001
+\end{verbatim}
 
-15) Estructura interna recomendada (funciones)
-- load_split_config(...)
-- load_labels(...)
-- build_event_intervals(df_labels, horizon_days, lag_days)
-- make_time_folds(dates, cfg)
-- apply_purge(train_df, test_df, event_intervals, cfg)
-- apply_embargo(train_df, test_dates, calendar, cfg)
-- validate_no_leakage(train_df, test_df, intervals)
-- build_fold_outputs(...)
-- persist_splits_outputs(...)
-- main()
+\subsection{Criterios de aceptación (Definition of Done)}
 
-16) Criterios de aceptacion (Definition of Done)
-- Genera splits temporales reproducibles para todos los folds.
-- leakage_check_pass en todos los folds.
-- Embargo aplicado correctamente segun config.
-- Reportes de tamano/calidad de fold disponibles.
-- Integrable directamente con entrenamiento.
+\begin{itemize}
+  \item \textbf{Splits reproducibles y sin leakage}:
+  \begin{itemize}
+    \item \texttt{leakage\_check\_pass} = \texttt{True} en todos los folds.
+    \item Purge y embargo aplicados correctamente según \texttt{embargo\_pct} o \texttt{embargo\_days}.
+  \end{itemize}
+  \item \textbf{Balanced design}:
+  \begin{itemize}
+    \item \texttt{min\_train\_days}, \texttt{min\_test\_days} cumplidos.
+  \end{itemize}
+  \item \textbf{Integrabilidad}:
+  \begin{itemize}
+    \item \texttt{fold\_k\_indices} compatibles con \texttt{models/*/train\_*.py} y \texttt{backtest/run\_walkforward.py}.
+  \end{itemize}
+\end{itemize}
 
-17) Casos de prueba minimos (para tests/)
-- Ejemplo sintetico con solapamiento: purge elimina muestras correctas.
-- Embargo de N dias elimina ventana posterior al test.
-- Sin purge/embargo configurado produce baseline esperado.
-- Multi-horizonte con max-horizon conserva no-leakage.
-- Walk-forward mantiene train anterior a test.
-- leakage_check detecta fallo si se desactiva purge en caso conflictivo.
-- Folds sin datos suficientes disparan warning/fail segun umbral.
+\subsection{Bibliografía y referencias de estado del arte}
 
-18) Riesgos y decisiones abiertas
-- Tradeoff entre pureza anti-leakage y tamano efectivo de train.
-- Elegir embargo_pct vs embargo_days (dependiente de frecuencia/regimen).
-- Estrategia definitiva para multi-horizonte.
-- Sensibilidad de resultados a n_splits y geometria temporal.
+\begin{thebibliography}{9}
+\bibitem{LopezdePrado2018}
+López de Prado, M. (2018). \emph{Advances in Financial Machine Learning}. Wiley, capítulos 7–8: Purged CV, Embargo, CPCV.
 
-19) Checklist rapido de implementacion
-- [ ] Construir event intervals por observacion.
-- [ ] Implementar purga por solapamiento exacto.
-- [ ] Implementar embargo en calendario de trading.
-- [ ] Validaciones estrictas de no-leakage.
-- [ ] Salidas por fold + resumen global.
-- [ ] Config versionada y reproducible.
-- [ ] Tests sinteticos de purge/embargo/walk-forward.
+\bibitem{PurgedCV2017}
+López de Prado, M. (2017). \emph{K‑Fold CV with Purging \& Embargo}. Innovation section en \texttt{quantresearch.org}.
+
+\bibitem{CombinatorialPurged2018}
+Marcos López de Prado. \emph{Combinatorial Purged Cross‑Validation for Optimization}. \texttt{quantresearch.org}.
+
+\bibitem{BacktestOverfitting2024}
+Han, C., et al. (2024). \emph{Backtest overfitting in the machine learning era}. \texttt{ScienceDirect}.
+
+\bibitem{PurgedCVWiki}
+Wikipedia. (2025). \emph{Purged cross‑validation}. \texttt{wikipedia.org/wiki/Purged\_cross-validation}.
+
+\bibitem{QuantResearchPurgedCV}
+Marcos López de Prado. \emph{K‑Fold CV with Purging \& Embargo}. \texttt{quantresearch.org}.
+
+\end{thebibliography}

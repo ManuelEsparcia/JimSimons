@@ -1,222 +1,220 @@
-Modulo: models/gbdt/train_lgbm.py
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[spanish]{babel}
+\usepackage{amsmath, amssymb, bm, mathtools}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{longtable}
 
-1) Objetivo
-Entrenar modelos LightGBM para prediccion cross-sectional de retornos/labels en small caps, usando splits temporales purged, controles anti-overfitting y trazabilidad completa de experimentos.
+\DeclareMathOperator{\E}{\mathbb{E}}
+\DeclareMathOperator{\Var}{Var}
+\DeclareMathOperator{\Bias}{Bias}
+\DeclareMathOperator{\Cov}{Cov}
+\DeclareMathOperator{\Corr}{Corr}
+\DeclareMathOperator{\Prob}{\mathbb{P}}
+\DeclareMathOperator{\IC}{IC}
+\DeclareMathOperator{\AUC}{AUC}
+\DeclareMathOperator{\NDCG}{NDCG}
+\DeclareMathOperator{\RMSE}{RMSE}
+\DeclareMathOperator{\MAE}{MAE}
+\DeclareMathOperator{\LL}{LL}
+\DeclareMathOperator{\Hit}{Hit}
 
-2) Alcance
-Incluye:
-- Carga de features + labels + splits purged.
-- Entrenamiento LGBM (regresion y/o clasificacion).
-- Validacion temporal por fold y agregacion de metricas OOS.
-- Early stopping, control de regularizacion y class/weight handling.
-- Persistencia de modelos, predicciones OOF/OOS y reportes.
+\title{Entrenamiento de modelos LightGBM cross‑sectional \\ \texttt{models/gbdt/train\_lgbm.py}}
+\author{}
+\date{}
 
-No incluye:
-- Generacion de features/labels.
-- Optimizacion masiva de hiperparametros (tune_hyperparams.py).
-- Blending/stacking final (models/ensemble/*).
+\begin{document}
 
-3) Dependencias aguas arriba y aguas abajo
-Upstream:
-- features/store/... + feature_qc pass
-- labels/store/... + label_valid_flag
-- labels/splits/purged_splits...
-- configs/model/lgbm.yaml
+\maketitle
 
-Downstream:
-- models/inference/predict.py
-- models/inference/model_registry.py
-- models/ensemble/blender.py
-- backtest/run_walkforward.py
+\section{Objetivo y contexto de inversión cross‑sectional}
 
-4) Tareas que debe resolver el modulo
-- Construir datasets train/valid/test por fold sin leakage.
-- Entrenar modelo con objetivo configurado (regresion/ranking/clasificacion).
-- Medir performance OOS consistente en tiempo.
-- Guardar artefactos suficientes para reproducir e inferir.
+El módulo \texttt{models/gbdt/train\_lgbm.py} entrena modelos \textbf{LightGBM} para predecir retornos y/o etiquetas en un universo de \textbf{small caps}, usando una formulación \textbf{cross‑sectional por fecha} con \textbf{split temporal purged y embargo}, controles de \textit{overfitting} y trazabilidad industrial completa de experimentos. [web:78][web:80]  
 
-5) Contrato de entrada
-Entradas minimas:
-- features_path
-- labels_path
-- splits_path (purged/embargo ya aplicados)
-- config_path
-- run_id
+Formalmente, sea \(\mathcal{U}_t\) el universo de símbolos en fecha \(t\), y sea \(\bm{x}_{i,t} \in \mathbb{R}^d\) el vector de features de acción \(i\) en fecha \(t\). El modelo busca una función \(\hat{f}: \mathcal{X} \rightarrow \mathbb{R}\) tal que:
 
-Opcionales:
-- sample_weights_path
-- group_info_path (si objetivo ranking)
-- base_model_path (warm start opcional)
+\begin{equation}
+\hat{y}_{i,t} = \hat{f}(\bm{x}_{i,t}) \approx \E[y_{i,t} \mid \bm{x}_{i,t}],
+\end{equation}
+\noindent donde \(y_{i,t}\) puede ser un retorno bruto/neto \textit{forward} (regresión) o un binario indicando movimiento alcista/estructural (clasificación/ordenación). [web:79][web:81]
 
-Campos minimos esperados:
-- keys: date, symbol
-- features numericas
-- target principal (ej. y_fwd_ret_net_10d o y_cls_up_10d)
-- split metadata: fold_id, split_role, inclusion_flag
+La tubería está diseñada para integrarse en un flujo de \textit{walk‑forward} en el que se entrena sobre ventanas históricas y se evalúa sobre periodos OOS, característicos de sistemas de trading sistemático de alta calidad. [web:78][web:85]
 
-Parametros clave de config:
-- objective: regression | binary | lambdarank
-- metric: rmse/mae/auc/ndcg@k/ic
-- boosting_type: gbdt | dart
-- num_leaves
-- max_depth
-- learning_rate
-- n_estimators / num_boost_round
-- min_data_in_leaf
-- feature_fraction
-- bagging_fraction, bagging_freq
-- lambda_l1, lambda_l2
-- early_stopping_rounds
-- monotone_constraints (opcional)
+\section{Splits temporales purged y embargo}
 
-6) Contrato de salida
-Modelos:
-- models/artifacts/lgbm/{run_id}/fold_{k}/model.txt
-- models/artifacts/lgbm/{run_id}/fold_{k}/model_meta.json
+Para evitar fuga de información en series temporales financieras, el módulo usa \textbf{splits purged con embargo} generados previamente en \texttt{labels/splits/purged\_splits...}. [web:78][web:80]  
 
-Predicciones:
-- models/predictions/lgbm/{run_id}/oof.parquet
-- models/predictions/lgbm/{run_id}/fold_{k}_test_pred.parquet
-- models/predictions/lgbm/{run_id}/latest_scores.parquet
+En terminología de De Prado, cada rótulo \texttt{label} se asocia a un \textit{event time} y un \textit{trade time}. La operación de \textbf{embargo} elimina observaciones cercanas en tiempo entre folds de entrenamiento y validación, mientras que la \textbf{purged} elimina aquellas para las que el tiempo de evento cruza la frontera de folds. [web:78][web:80]  
 
-Reportes:
-- models/reports/lgbm/{run_id}/metrics_by_fold.parquet
-- models/reports/lgbm/{run_id}/metrics_summary.json
-- models/reports/lgbm/{run_id}/feature_importance.parquet
-- models/reports/lgbm/{run_id}/training_manifest.json
+Dado un conjunto \(\mathcal{D} = \{(t_i, \text{fold\_id}_i, \text{split\_role}_i)\}\), el entrenamiento se restringe a:
 
-Campos minimos de predicciones:
-- date, symbol, fold_id
-- y_true
-- y_pred
-- split_role
-- run_id
+\begin{equation}
+\mathcal{D}_{\text{train},k} = \left\{ i \in \mathcal{D} \mid \text{split\_role}_i = \text{train} \land \text{inclusion\_flag}_i = \text{True} \land \text{fold\_id} = k \right\},
+\end{equation}
+\noindent y la validación/test a:
 
-7) Reglas PIT y anti-leakage
-- Entrenar solo con muestras train inclusion_flag=true.
-- Validar/testear solo en segmentos temporales posteriores segun split.
-- Prohibido re-fit usando test fold para tuning manual dentro de la misma corrida.
-- Features y labels deben compartir misma convencion decision_lag.
-- Si hay calibracion, usar solo valid fold (nunca test final).
+\begin{equation}
+\mathcal{D}_{\text{valid/test},k} = \left\{ i \in \mathcal{D} \mid \text{split\_role}_i \in \{\text{valid}, \text{test}\} \land t_i > \max t_j \text{ for } j \in \mathcal{D}_{\text{train},k} \right\},
+\end{equation}
+\noindent garantizando que el modelo nunca ve información futura ni data ruidosa en la frontera de fold. [web:78][web:85]
 
-8) Flujo del proceso (alto nivel)
-1. Cargar config, features, labels, splits.
-2. Unir por (date, symbol) y filtrar label_valid_flag.
-3. Construir matrices por fold (train/valid/test).
-4. Aplicar prechecks (nulos, columnas constantes, shape minima).
-5. Entrenar LGBM con early stopping sobre valid.
-6. Generar predicciones valid/test por fold.
-7. Calcular metricas por fold y agregadas OOS.
-8. Guardar artefactos, importancias y manifest.
-9. Emitir veredicto de gates de modelo (pass/warn/fail).
+\section{Formulación matemática de LightGBM}
 
-9) Metricas recomendadas
-Regresion:
-- IC Spearman por fecha y promedio.
-- RMSE / MAE OOS.
-- hit ratio signo(y_pred * y_true > 0).
+Sea \(\mathcal{T} = \{T_1, \dots, T_L\}\) la colección de árboles bosqueados, LightGBM minimiza una versión regularizada de la pérdida \(\mathcal{L}\) sobre el conjunto de entrenamiento:
 
-Clasificacion:
-- AUC ROC / PR AUC.
-- logloss.
-- calibration error (ECE/Brier).
+\begin{equation}
+\min_{\bm{\theta}} \mathcal{L}(\bm{\theta}) = \sum_{i=1}^n \ell(y_i, f(\bm{x}_i; \bm{\theta})) + \Omega(f),
+\end{equation}
+\noindent donde \(\bm{\theta}\) codifica la estructura de los árboles y \(\Omega\) es la penalización de complejidad, por ejemplo:
 
-Portafolio proxy (offline):
-- top-bottom spread simulado (sin costes y con costes basicos).
-- turnover proxy si hay scores diarios.
+\begin{equation}
+\Omega(f) = \gamma L + \frac{1}{2} \lambda \sum_{l=1}^L w_{l}^2,
+\end{equation}
+\noindent donde \(L\) es el número de hojas, \(\gamma\) regula el número de hojas y \(\lambda\) la penalización L2 sobre los pesos de hoja \(w_l\). [web:77][web:79]
 
-Estabilidad:
-- varianza de metricas entre folds.
-- degradacion train->valid (overfit gap).
+En el modo \texttt{gbdt} (Gradient Boosting Decision Trees), los parámetros \texttt{num\_leaves}, \texttt{max\_depth}, \texttt{lambda\_l1}, \texttt{lambda\_l2}, \texttt{min\_data\_in\_leaf} y \texttt{feature\_fraction} controlan directamente la capacidad de representación del modelo, permitiendo sintonizar el trade‑off bias‑variance. [web:77][web:79]
 
-10) Gates de aceptacion (ejemplo configurable)
-- Gate 1: metrica principal OOS >= umbral minimo.
-- Gate 2: overfit_gap <= umbral.
-- Gate 3: estabilidad entre folds (std <= umbral).
-- Gate 4: cobertura de predicciones >= umbral.
-- Gate 5: no leakage flags criticos.
+\section{Objetivos de modelado y métricas}
 
-Resultado:
-- pass / warn / fail con razones codificadas.
+El módulo soporta tres objetivos principales:
 
-11) Manejo de pesos y desbalance
-Regresion:
-- sample_weight opcional por liquidez/calidad.
+\subsection{Regresión de retornos}
 
-Clasificacion:
-- class_weight balanced o peso custom.
-- threshold de decision separado de entrenamiento.
+Objetivo \texttt{regression} con loss tipo MAE o RMSE:
 
-Ranking:
-- group por fecha (cross-sectional ranking diario) si se usa lambdarank.
+\begin{align}
+\LL_{\text{MAE}} &= \frac{1}{n} \sum_{i=1}^n |y_i - \hat{y}_i|, \\
+\LL_{\text{RMSE}} &= \sqrt{\frac{1}{n} \sum_{i=1}^n (y_i - \hat{y}_i)^2}.
+\end{align}
 
-12) Manejo de features
-- Eliminar columnas no numericas/sin varianza.
-- Opcional: drop features con null_rate > umbral.
-- Usar misma lista de features entre folds para comparabilidad.
-- Guardar feature_list_final en manifest.
+Para estrategias de small caps cross‑sectional, la métrica central es el \textbf{Information Coefficient} (IC) Spearman por fecha:
 
-13) Observabilidad y trazabilidad
-Logging:
-- INFO: avance por fold y mejor iteracion.
-- WARNING: fold pequeno, metricas inestables, drift de distribucion.
-- ERROR: fallo de entrenamiento o fuga detectada.
+\begin{equation}
+\IC_t^{\text{Spearman}} = \Corr\left(
+\rank(\hat{y}_{i,t}), \rank(y_{i,t})
+\right),
+\end{equation}
+\noindent que mide la consistencia del ranking inducido por el modelo respecto al retorno real. [web:81][web:86]  
 
-Metricas operativas:
-- n_folds_trained
-- best_iteration_por_fold
-- train_rows/valid_rows/test_rows
-- runtime_por_fold
-- total_runtime_sec
+Adicionalmente, se computa el \textbf{hit ratio}:
 
-14) Interfaz de ejecucion (CLI sugerida)
-python -m models.gbdt.train_lgbm ^
-  --features-path features/store ^
-  --labels-path labels/store ^
-  --splits-path labels/splits/purged_splits_latest.parquet ^
-  --config-path configs/models/lgbm_base.yaml ^
-  --run-id train_lgbm_20260305_001
+\begin{equation}
+\Hit\text{-ratio} = \frac{1}{n} \sum_{i=1}^n \mathbf{1}(y_{i,t} \cdot \hat{y}_{i,t} > 0),
+\end{equation}
+\noindent que evalúa el acierto direccional en muestras OOS. [web:79]
 
-15) Estructura interna recomendada (funciones)
-- load_training_config(...)
-- load_features(...)
-- load_labels(...)
-- load_splits(...)
-- build_fold_dataset(df_feat, df_lab, df_splits, fold_id, cfg)
-- prepare_lgbm_datasets(train_df, valid_df, feature_cols, target_col, weights)
-- train_one_fold_lgbm(train_set, valid_set, params, cfg)
-- predict_one_fold(model, df_fold, feature_cols)
-- compute_fold_metrics(df_pred, cfg)
-- aggregate_metrics(all_fold_metrics)
-- export_artifacts_and_reports(...)
-- main()
+\subsection{Clasificación}
 
-16) Criterios de aceptacion (Definition of Done)
-- Entrena todos los folds sin leakage ni fallos criticos.
-- Produce metricas OOS y OOF reproducibles.
-- Guarda modelos y manifest listos para inferencia.
-- Gates de promocion calculados y reportados.
+Para targets binarios \texttt{y\_cls\_up\_10d \(\in \{0,1\}\)}, el objetivo \texttt{binary} usa cross‑entropy:
 
-17) Casos de prueba minimos (para tests/)
-- Entrenamiento basico en dataset sintetico (regresion).
-- Clasificacion con desbalance y class_weight.
-- Split con fold vacio dispara warning/fail controlado.
-- Early stopping selecciona best_iteration valida.
-- OOF pred cubre exactamente indices valid de cada fold.
-- Falla controlada si faltan columnas de target/features.
-- Reproducibilidad con seed fija (metricas/model hash estable dentro de tolerancia).
+\begin{equation}
+\LL_{\text{CE}} = -\frac{1}{n} \sum_{i=1}^n \left[ y_i \log \hat{p}_i + (1-y_i) \log(1 - \hat{p}_i) \right].
+\end{equation}
 
-18) Riesgos y decisiones abiertas
-- Objetivo final (regresion vs ranking vs clasificacion) por estrategia.
-- Sensibilidad a ruido en labels netos de costes.
-- Riesgo de sobreajuste por hiperparametros agresivos.
-- Tradeoff interpretabilidad vs performance.
+Las métricas estándar son:
 
-19) Checklist rapido de implementacion
-- [ ] Carga/merge robusto de features+labels+splits.
-- [ ] Pipeline por fold con early stopping.
-- [ ] Metricas OOS + OOF por objetivo.
-- [ ] Export de modelos/predicciones/reportes.
-- [ ] Gates pass/warn/fail.
-- [ ] Manifest completo (params, seeds, feature_list, hashes).
-- [ ] Tests sinteticos de integridad y leakage.
+\begin{itemize}
+    \item \(\AUC\text{ROC}\): área bajo la curva ROC.
+    \item \(\AUC\text{PR}\): área bajo la curva precision‑recall.
+    \item \(\LL\): logloss.
+    \item \(\text{ECE}\): Expected Calibration Error.
+\end{itemize}
+[web:64][web:67]
+
+En universos desbalanceados, se pueden usar \texttt{class\_weight} o \texttt{sample\_weights} para ajustar el sesgo:
+
+\begin{equation}
+\LL_{\text{weighted}} = -\frac{1}{n} \sum_{i=1}^n w_i \left[ y_i \log \hat{p}_i + (1-y_i) \log(1 - \hat{p}_i) \right].
+\end{equation}
+
+\subsection{Ranking lambdarank}
+
+Para problemas de tipo \texttt{ranking}, el objetivo \texttt{lambdarank} optimiza métricas de ranking como \(\NDCG@k\) usando funciones de pérdida list‑wise. [web:82][web:87]  
+
+Sea \(\mathcal{Q}_t\) el conjunto de acciones en fecha \(t\), y sea \(\bm{p}_t\) un ranking generado por \(\hat{f}\). El NDCG normalizado se define como:
+
+\begin{equation}
+\NDCG@k(\bm{p}_t) = \frac{\DCG@k(\bm{p}_t)}{\DCG@k(\bm{p}_t^*)},
+\end{equation}
+\noindent donde \(\DCG@k\) es el discounted cumulative gain de los top‑\(k\) elementos y \(\bm{p}_t^*\) es el ranking óptimo perfecto. [web:82][web:87]  
+
+LightGBM implementa \texttt{lambdarank} a través de \textbf{lambda gradients} derivados de la sensibilidad de \(\NDCG\) respecto a cambios en el score de cada item:
+
+\begin{equation}
+\lambda_{ij} = \Delta\NDCG@k \cdot \frac{\partial \NDCG}{\partial s_i},
+\end{equation}
+\noindent que actúan como pesos de gradiente en cada iteración del boosting. [web:82][web:87]
+
+\section{Controles anti‑leakage y estabilidad temporal}
+
+El módulo incorpora varias reglas de reglas anti‑leakage:
+
+\begin{itemize}
+    \item Solo se entrenan muestras con \texttt{inclusion\_flag=True} en \texttt{train}.
+    \item Validación y test se limitan a fechas posteriores a la última fecha de entrenamiento del fold.
+    \item No se permite retrainar usando \texttt{test} en la misma ejecución, ni usar métricas de test en el \texttt{early stopping}.
+    \item Calibración, si se aplica, se entrena solo sobre \texttt{valid}, nunca sobre \texttt{test} final.
+\end{itemize}
+
+Estas prácticas siguen los estándares de CV temporal en finanzas discutidos en trabajos recientes sobre \textit{purged CV} y \textit{era‑wise} cross‑validation, donde la separación estricta temporal es condición necesaria para que el backtest refleje el riesgo futuro. [web:78][web:85][web:88]
+
+\section{Early stopping, regularización y gates de modelo}
+
+El entrenamiento por fold usa:
+
+\begin{itemize}
+    \item \textbf{Early stopping}: se monitorea una métrica en \texttt{valid} (por ejemplo, RMSE o \texttt{NDCG@k}) y se detiene el entrenamiento tras \texttt{early\_stopping\_rounds} iteraciones sin mejora.
+    \item \textbf{Regularización}: \texttt{lambda\_l1}, \texttt{lambda\_l2}, \texttt{min\_data\_in\_leaf}, \texttt{feature\_fraction}, \texttt{bagging\_fraction}, \texttt{bagging\_freq} controlan el overfitting.
+\end{itemize}
+
+Tras el entrenamiento se definen \textbf{gates de aceptación}:
+
+\begin{enumerate}
+    \item \textbf{Gate 1}: la métrica principal OOS (por ejemplo, \(\IC\text{-Mediana}\) o \(\AUC\)) debe superar un umbral mínimo.
+    \item \textbf{Gate 2}: el \textit{overfit gap} entre \(\LL_{\text{train}}\) y \(\LL_{\text{valid}}\) es limitado:
+        \begin{equation}
+        \text{Overfit gap} = \LL_{\text{valid}} - \LL_{\text{train}} \le \epsilon.
+        \end{equation}
+    \item \textbf{Gate 3}: la desviación estándar de métricas entre folds está por debajo de un umbral de estabilidad.
+    \item \textbf{Gate 4}: el porcentaje de filas cubiertas por \texttt{predictions} es \(\ge \tau\).
+    \item \textbf{Gate 5}: flags de fuga critica (por ejemplo, fechas inválidas, labels nulas, etc.) deben estar en \(0\).
+\end{enumerate}
+
+Este tipo de disciplina de \textit{model gates} se alinea con estándares de risk labs y quants industriales, donde ningún modelo avanza a producción sin cumplir un conjunto codificado de umbrales. [web:84][web:85]
+
+\section{Flujo de trabajo del módulo}
+
+A alto nivel, el módulo sigue:
+
+\begin{enumerate}
+    \item Cargar \texttt{config\_path}, \texttt{features\_path}, \texttt{labels\_path}, \texttt{splits\_path} y \texttt{run\_id}.
+    \item Unir por \texttt{(date, symbol)} y filtrar por \texttt{label\_valid\_flag}.
+    \item Construir datasets por fold \texttt{(train, valid, test)} usando \texttt{fold\_id} y \texttt{split\_role}.
+    \item Aplicar prechecks: nulos, columnas constantes, tamaño mínimo de muestra.
+    \item Entrenar \texttt{LGBM} con \texttt{early\_stopping} sobre \texttt{valid} para cada fold.
+    \item Generar \texttt{oof.parquet}, \texttt{fold\_k\_test\_pred.parquet} y \texttt{latest\_scores.parquet}.
+    \item Calcular métricas por fold y agregadas OOS; guardar \texttt{metrics\_by\_fold.parquet} y \texttt{metrics\_summary.json}.
+    \item Exportar \texttt{feature\_importance.parquet}.
+    \item Serializar metadata en \texttt{training\_manifest.json} y \texttt{model\_meta.json} por fold.
+    \item Emitir veredicto \texttt{pass/warn/fail} basado en los gates definidos.
+\end{enumerate}
+
+Cada modelo se guarda en \texttt{models/artifacts/lgbm/\{run\_id\}/fold\_k/model.txt}, y las predicciones OOF y OOS en \texttt{models/predictions/lgbm/\{run\_id\}} con campos mínimos \texttt{date, symbol, fold\_id, y\_true, y\_pred, split\_role, run\_id}. [web:79][web:84]
+
+\section{Manejo de features y pesos}
+
+El módulo realiza:
+
+\begin{itemize}
+    \item Filtrado de columnas no numéricas y sin varianza.
+    \item Opcionalmente, eliminación de features con \texttt{null\_rate > umbral}.
+    \item Uso de la misma lista de features \texttt{feature\_list\_final} en todos los folds, almacenada en \texttt{manifest} para comparabilidad.
+\end{itemize}
+
+Los pesos de muestra se introducen de forma natural en la función de pérdida, como por ejemplo mediante \texttt{sample\_weights} para reflejar liquidez o calidad de datos, o \texttt{group\_info} cuando el objetivo es ranking cross‑sectional por fecha. [web:79][web:82]
+
+\section{Estado del arte y referencias de diseño}
+
+El diseño de \texttt{train\_lgbm.py} se inspira en:
+

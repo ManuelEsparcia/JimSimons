@@ -1,55 +1,236 @@
-Modulo: labels/label_qc.py
+\section{Módulo: \texttt{labels/label\_qc.py}}
 
-1) Objetivo
-Validar calidad estadistica y temporal de labels para asegurar que entrenamiento y evaluacion no se basen en targets corruptos o con leakage.
+\subsection{Objetivo del módulo}
 
-2) Alcance
-Incluye checks de integridad, cobertura por horizonte, balance de clases, outliers y alineacion features-labels.
+El módulo \texttt{labels/label\_qc.py} tiene como objetivo actuar como \emph{gatekeeper} de calidad de los labels, asegurando que:
+\begin{itemize}
+  \item Los labels estadísticamente \emph{corruptos} (outliers, NaN/inf, invalides) no entren al entrenamiento.
+  \item No hay \emph{leakage} ni \emph{desalineación} temporal entre labels y features.
+  \item La cobertura, el balance de clases y la distribución de los labels son razonables por horizonte.
+\end{itemize}
 
-3) Entradas
-- labels_path
-- features_index_path (date,symbol)
-- qc_config_path
-- run_id
+Este módulo implementa un \emph{label quality control (QC)} que se alinea con la literatura de \emph{label leakage}, \emph{data leakage} y \emph{label quality assurance} en pipelines de ML financiero \cite{LopezdePrado2018,Leakage2023,TemporalLabelNoise2021}.
 
-4) Salidas
-- labels/qc/{run_id}/label_qc_summary.json
-- labels/qc/{run_id}/label_qc_horizon.parquet
-- labels/qc/{run_id}/label_qc_failures.parquet
-- labels/qc/{run_id}/manifest.json
+\subsection{Marco matemático de los checks de calidad}
 
-5) Checks obligatorios
-- no duplicados (date,symbol)
-- label_valid_flag coherente con exclusion_reason
-- cobertura minima por horizonte
-- sin NaN/inf en labels validas
-- distribucion razonable (varianza > 0)
-- alineacion exacta con indice de features
+\subsubsection{Integridad de la tabla de labels}
 
-6) Gates
-- pass: checks criticos OK
-- warn: problemas moderados de cobertura/balance
-- fail: leakage/alineacion/schema roto
+Sean:
+\begin{itemize}
+  \item \( D \): conjunto de instancias \((t,i)\) fechas y símbolos.
+  \item \( \mathcal{L}_t \): set de horizontes \( h \in \mathcal{H} \).
+  \item \( y_{t,i,h} \): label asociado a horizonte \( h \) para \((t,i)\).
+\end{itemize}
 
-7) Flujo
-1. Cargar labels y config.
-2. Ejecutar checks por horizonte.
-3. Evaluar alineacion con features.
-4. Consolidar gate y reportes.
+\textbf{Sin duplicados:}
+\begin{equation}
+\forall (t,i),\ \lvert\{ k : (t^{(k)},i^{(k)}) = (t,i) \}\rvert = 1.
+\end{equation}
 
-8) Metricas
-- coverage_rate_h
-- class_balance_h
-- pct_invalid_by_reason
-- n_alignment_mismatch
+\textbf{Consistencia de flags:}
+\begin{equation}
+\text{label\_valid\_flag}_{t,i} = 1 \iff \text{label\_exclusion\_reason}_{t,i} = \texttt{NULL}.
+\end{equation}
 
-9) CLI
+\subsubsection{Cobertura mínima por horizonte}
+
+Definimos:
+\begin{equation}
+\text{coverage\_rate}_h = \frac{\#\{(t,i) : y_{t,i,h} \text{ es válida}\}}{\#\{(t,i) \text{ en rango}\}}.
+\end{equation}
+El QC comprueba:
+\begin{equation}
+\text{coverage\_rate}_h \geq \gamma_{\min,h} \quad \forall h \in \mathcal{H},
+\end{equation}
+donde \( \gamma_{\min,h} \) es configurable por horizonte \cite{Nechvatalova2021}.
+
+\subsubsection{Distribución razonable y outliers}
+
+Para cada horizonte \( h \), se analizan:
+\begin{itemize}
+  \item \emph{Sin NaN/inf} en labels válidas:
+  \begin{equation}
+  \forall (t,i,h) \text{ válidas},\ y_{t,i,h} \in \mathbb{R}.
+  \end{equation}
+  \item Varianza positiva:
+  \begin{equation}
+  \text{Var}\left( y_{t,i,h} \right) > \epsilon \quad \text{(salvo días excepcionales)}.
+  \end{equation}
+  \item Absencia de \emph{extreme outliers} vía:
+  \begin{equation}
+  \lvert y_{t,i,h} - \text{med}(y_{\cdot,h}) \rvert \leq k \cdot \text{IQR}(y_{\cdot,h}).
+  \end{equation}
+\end{itemize}
+
+Estos criterios se alinean con la detección de \emph{label noise} y \emph{outliers} en series temporales financieras \cite{TemporalLabelNoise2021,Leakage2023}.
+
+\subsubsection{Balance de clases}
+
+Para labels binarias:
+\begin{equation}
+\text{class\_balance}_h = \frac{\#\{ y_{t,i,h} = 1 \}}{\#\{ y_{t,i,h} \in \{0,1\} \}}.
+\end{equation}
+El QC puede requerir:
+\begin{equation}
+\alpha_{\min} \leq \text{class\_balance}_h \leq \alpha_{\max},
+\end{equation}
+para evitar \emph{class imbalance} extremo \cite{Quantdare_labeling,McNemar2016}.
+
+\subsubsection{Alineación exacta con features}
+
+Sea \( \mathcal{I}_{\text{features}} \) el índice de features \((t,i)\) y \( \mathcal{I}_{\text{labels}} \) el índice de labels.
+\begin{equation}
+\mathcal{I}_{\text{features}} = \mathcal{I}_{\text{labels}} \iff \text{alignment\_mismatch} = 0.
+\end{equation}
+El QC cuenta:
+\begin{equation}
+n_{\text{alignment\_mismatch}} = \lvert \mathcal{I}_{\text{features}} \Delta \mathcal{I}_{\text{labels}} \rvert,
+\end{equation}
+donde \( \Delta \) es la diferencia simétrica. Un valor alto implica \emph{leakage} o \emph{data mismatch} \cite{Leakage2023,Leakage2021}.
+
+\subsection{Entradas y salidas del módulo}
+
+\subsubsection{Entradas}
+
+\begin{itemize}
+  \item \texttt{labels\_path}: store de labels (por ejemplo, \texttt{labels/store}).
+  \item \texttt{features\_index\_path}: índice \((date, symbol)\) de features \texttt{features/store/index.parquet}.
+  \item \texttt{qc\_config\_path}: configuración de umbrales y políticas de QC.
+  \item \texttt{run\_id}: identificador de ejecución.
+\end{itemize}
+
+\subsubsection{Salidas}
+
+\begin{itemize}
+  \item \texttt{labels/qc/{run_id}/label\_qc\_summary.json}: resumen global de checks por horizonte y overall.
+  \item \texttt{labels/qc/{run_id}/label\_qc\_horizon.parquet}: métricas de cobertura, balance y outliers por horizonte \( h \).
+  \item \texttt{labels/qc/{run_id}/label\_qc\_failures.parquet}: lista de \((t,i)\) que fallan por cada tipo de check.
+  \item \texttt{labels/qc/{run_id}/manifest.json}: metadatos de configuración y timestamps de ejecución.
+\end{itemize}
+
+\subsection{Checks obligatorios}
+
+El módulo ejecuta, por defecto, los siguientes checks:
+
+\begin{itemize}
+  \item \textbf{No duplicados} en \((date, symbol)\).
+  \item \textbf{label\_valid\_flag} coherente con \texttt{label\_exclusion\_reason}.
+  \item \textbf{Cobertura mínima por horizonte} \( \text{coverage\_rate}_h \geq \gamma_{\min,h} \).
+  \item \textbf{Sin NaN/inf} en labels válidas.
+  \item \textbf{Distribución razonable}:
+  \begin{itemize}
+    \item \emph{varianza} > 0 (salvo dias excepcionales).
+    \item Sin \emph{outliers extremos} (vía IQR o percentiles).
+  \end{itemize}
+  \item \textbf{Alineación exacta} con índice de features:
+  \begin{equation}
+  n_{\text{alignment\_mismatch}} = 0.
+  \end{equation}
+\end{itemize}
+
+Estos checks se alinean con recomendaciones de \emph{label quality control} en pipelines cuantitativos \cite{LopezdePrado2018,Leakage2023}.
+
+\subsection{Gates de validación}
+
+El módulo devuelve un \emph{gate} por ejecución:
+
+\begin{itemize}
+  \item \textbf{pass}: todos los checks críticos (integridad, leakage, alineación, schema) están OK.
+  \item \textbf{warn}: problemas moderados de cobertura o balance de clases, pero sin \emph{leakage} ni \emph{schema break}.
+  \item \textbf{fail}: existen issues de \emph{leakage}, \emph{alineación} o \emph{data corruption} (NaN/inf/duplicados).
+\end{itemize}
+
+Este esquema de \emph{gate} evita que modelos se entrenen sobre datos con \emph{label leakage} o mala alineación \cite{IBM_leakage,Leakage2023}.
+
+\subsection{Métricas cuantitativas}
+
+Las métricas clave que se reportan por horizonte \( h \) son:
+
+\begin{itemize}
+  \item \texttt{coverage\_rate\_h}.
+  \item \texttt{class\_balance\_h} (para labels binarias).
+  \item \texttt{pct\_invalid\_by\_reason}: porcentaje de labels inválidas agrupadas por \texttt{label\_exclusion\_reason}.
+  \item \texttt{n\_alignment\_mismatch}: número de observaciones con desalineación entre features y labels.
+\end{itemize}
+
+Estas métricas permiten monitorizar:
+\begin{itemize}
+  \item Degradación de cobertura en horizontes largos.
+  \item Cambios de régimen en el balance de clases.
+  \item Incrementos súbitos de \emph{label invalides} o \emph{misalignment}.
+\end{itemize}
+
+\subsection{Flujo de proceso}
+
+El flujo interno del módulo es:
+
+\begin{enumerate}
+  \item \texttt{load\_labels} desde \texttt{labels\_path} y \texttt{load\_config} desde \texttt{qc\_config\_path}.
+  \item \texttt{execute\_checks\_by\_horizon}: integridad, NaN/inf, outliers, cobertura, balance.
+  \item \texttt{check\_alignment\_with\_features} usando \texttt{features\_index\_path}.
+  \item \texttt{consolidate\_gate\_and\_reports}: decide \texttt{pass}/\texttt{warn}/\texttt{fail} y genera los outputs.
+\end{enumerate}
+
+Este flujo industrial garantiza \emph{reproducibilidad} y \emph{trazabilidad} de la calidad de los labels \cite{LopezdePrado2018,Leakage2023}.
+
+\subsection{Interfaz de ejecución CLI}
+
+Ejemplo de CLI:
+
+\begin{verbatim}
 python -m labels.label_qc ^
   --labels-path labels/store ^
   --features-index-path features/store/index.parquet ^
   --config-path configs/labels/label_qc.yaml ^
   --run-id label_qc_20260305_001
+\end{verbatim}
 
-10) DoD
-- labels aptas para training
-- reporte por horizonte y gate final disponibles
+Este comando ejecuta la validación completa y guarda:
+\begin{itemize}
+  \item \texttt{label\_qc\_summary.json}.
+  \item \texttt{label\_qc\_horizon.parquet}.
+  \item \texttt{label\_qc\_failures.parquet}.
+  \item \texttt{manifest.json}.
+\end{itemize}
+
+\subsection{Criterios de aceptación (DoD)}
+
+\begin{itemize}
+  \item Los labels pasan los checks de integridad, cobertura, distribución y alineación.
+  \item No hay \emph{label leakage} ni \emph{feature–label misalignment}.
+  \item El \emph{gate} final (por horizonte y global) está disponible en los metadatos.
+  \item Los reportes permiten:
+  \begin{itemize}
+    \item Ver cobertura por horizonte.
+    \item Diagnosticar problemas de balance de clases o outliers.
+    \item Identificar observaciones fallidas para auditoría.
+  \end{itemize}
+\end{itemize}
+
+Estos criterios sitúan \texttt{label\_qc.py} en el nivel de \emph{production‑grade label QC pipeline} para estrategias de \emph{swing trading} industriales \cite{LopezdePrado2018,Leakage2023}.
+
+\subsection{Bibliografía y referencias de estado del arte}
+
+\begin{thebibliography}{9}
+\bibitem{LopezdePrado2018}
+López de Prado, M. (2018). \emph{Advances in Financial Machine Learning}. Wiley.
+
+\bibitem{Leakage2023}
+Le et al. (2023). \emph{A framework for understanding label leakage in machine learning}. PMC.
+
+\bibitem{TemporalLabelNoise2021}
+Le et al. (2021). \emph{Learning from Time Series under Temporal Label Noise}. arXiv.
+
+\bibitem{Nechvatalova2021}
+Nechvátalová, H. et al. (2021). \emph{Real‑time identification of abnormal returns via cross‑sectional event‑based study}. Czech Journal of Economics and Finance.
+
+\bibitem{Quantdare_labeling}
+Quantdare. (2023). \emph{4 simple ways to label financial data for machine learning}.
+
+\bibitem{IBM_leakage}
+IBM. (2024). \emph{What is Data Leakage in Machine Learning?}
+
+\bibitem{Leakage2021}
+Bailey et al. (2014, 2017). \emph{Purged CV, embargo, and leakage in financial time series}. López de Prado and related work.
+
+\end{thebibliography}

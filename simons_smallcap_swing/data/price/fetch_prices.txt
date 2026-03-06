@@ -1,193 +1,283 @@
-Modulo: data/price/fetch_prices.py
+% -----------------------------
+% TEXTO LaTeX PARA fetch_prices.py
+% -----------------------------
+\section{Modulo: \texttt{data/price/fetch\_prices.py}}
 
-1) Objetivo
-Este modulo descarga y normaliza precios diarios OHLCV (y campos auxiliares disponibles) para el universo de small caps de EE. UU. en un rango temporal definido, garantizando trazabilidad, reproducibilidad y consistencia temporal (point-in-time) para etapas posteriores (ajustes, features, labels, backtest).
+\subsection{Objetivo y contexto de mercado}
 
-2) Alcance
-Incluye:
-- Descarga incremental por simbolo y rango de fechas.
-- Estandarizacion de esquema de columnas.
-- Validaciones basicas de integridad en ingestion.
-- Persistencia en formato canonico (parquet) con metadatos de run.
-- Registro de cobertura y fallos por ticker.
+El modulo \texttt{data/price/fetch\_prices.py} descarga y normaliza precios diarios OHLCV (open, high, low, close, volumen, y campos adicionales) para el \textbf{universo de small caps de EE. UU.} en un rango temporal definido, garantizando:
 
-No incluye:
-- Ajustes corporativos finales (split/dividend adjustment): lo hara adjust_prices.py.
-- QC estadistico profundo: lo hara qc_prices.py.
-- Construccion del universo: lo hara data/universe/*.
+\begin{itemize}
+  \item \textbf{Trazabilidad}: cada dato se asocia explícitamente a un proveedor, run\_id y fecha de ingesta.
+  \item \textbf{Reproducibilidad}: el mismo \texttt{run\_id} + \texttt{config} debe generar exactamente el mismo dataset raw.
+  \item \textbf{Consistencia temporal PIT} (point–in–time) para que el backtest posterior no use información futura. [web:56][web:62]
+\end{itemize}
 
-3) Dependencias aguas arriba y aguas abajo
-Upstream:
-- Universo de tickers PIT (lista efectiva por fecha o snapshot de trabajo).
-- Calendario de mercado (sesiones).
-- Configuracion de proveedor de datos.
+Este módulo es la \textbf{capa de ingestión primaria} sobre la que se construyen ajustes corporativos, features, labels y backtest, y por tanto debe ser robusto, observable y resiliente a fallos parciales.
 
-Downstream:
-- data/price/adjust_prices.py
-- data/price/qc_prices.py
-- features/build_features.py
-- labels/build_labels.py
+\subsection{Marco de datos y convenciones de esquema}
 
-4) Contrato de entrada
-Entrada minima requerida:
-- tickers: lista de simbolos (string) o ruta a dataset de universo.
-- start_date: fecha inicio (YYYY-MM-DD).
-- end_date: fecha fin (YYYY-MM-DD).
-- provider: identificador de proveedor ("polygon", "tiingo", "stooq", etc; configurable).
-- frequency: "1d" (en esta fase solo diario).
-- force_full_refresh: bool (opcional, default false).
-- run_id: identificador unico de corrida.
+El universo de small caps de EE. UU. se define aguas arriba en \texttt{data/universe/*}, y el módulo asume una lista de tickers efectiva por fecha. [web:56]
 
-Parametros opcionales:
-- chunk_size_tickers: tamano de lote para peticiones.
-- request_timeout_sec
-- max_retries
-- backoff_base_sec
-- rate_limit_qps
-- exchange_filter (si aplica)
+El esquema de salida canonico es:
 
-5) Contrato de salida
-Dataset principal (raw prices canonical):
-Ruta sugerida:
-- data/price/raw/provider={provider}/freq=1d/date={asof_date}/part-*.parquet
+\begin{align}
+  &\texttt{symbol}        && \in \text{string} \\
+  &\texttt{date}          && \in \text{date, timezone-naive (sesión de mercado)} \\
+  &\texttt{open, high, low, close} && \in \mathbb{R}_{>0} \\
+  &\texttt{volume}        && \in \mathbb{R}_{\geq 0} \text{ o } \mathbb{N} \\
+  &\texttt{vwap}          && \in \mathbb{R}_{>0} \text{ (nullable)} \\
+  &\texttt{trades\_count} && \in \mathbb{N} \text{ (nullable)} \\
+  &\texttt{source\_provider} && \in \text{string} \\
+  &\texttt{ingest\_ts\_utc} && \in \text{timestamp} \\
+  &\texttt{run\_id}       && \in \text{string}
+\end{align}
 
-Columnas minimas esperadas:
-- symbol (string)
-- date (date, timezone-naive en calendario de mercado)
-- open (float64)
-- high (float64)
-- low (float64)
-- close (float64)
-- volume (float64 o int64 segun proveedor)
-- vwap (float64, nullable)
-- trades_count (int64, nullable)
-- source_provider (string)
-- ingest_ts_utc (timestamp)
-- run_id (string)
+La clave primaria lógica es:
 
-Constraints:
-- PK logica: (symbol, date, source_provider)
-- Sin duplicados por PK logica.
-- date dentro de [start_date, end_date].
-- Tipos consistentes con schema central.
+\[
+\text{PK} = (\texttt{symbol}, \texttt{date}, \texttt{source\_provider}),
+\]
 
-Artefactos auxiliares:
-- coverage_report.{json|parquet}: cobertura por ticker (dias esperados vs recibidos).
-- failures_report.{json|parquet}: errores por ticker/codigo HTTP/mensaje.
-- run_manifest.json: parametros, version de codigo, hash de config, conteos.
+y se exige ausencia de duplicados por esta clave. [web:56]
 
-6) Reglas de negocio
-- No usar informacion futura: solo barras historicas publicadas para cada date.
-- Si el proveedor entrega timestamps intradia, agregarlos/normalizarlos a sesion diaria oficial.
-- Normalizar simbolos a un formato canonico (uppercase, trim).
-- Mantener datos faltantes como null cuando aplique; no imputar aqui.
-- Reintentos solo para errores transitorios (timeouts, 429, 5xx).
-- Errores permanentes (404, simbolo invalido) se reportan y se continua.
+\subsection{Politicas de fetch e incrementalidad}
 
-7) Flujo del proceso (alto nivel)
-1. Cargar config y validar argumentos.
-2. Resolver lista efectiva de tickers.
-3. Particionar tickers por lotes.
-4. Para cada ticker:
-   - Resolver rango incremental (si existe historico local).
-   - Solicitar datos al proveedor con retries y rate limit.
-   - Parsear respuesta al schema canonico.
-   - Aplicar validaciones de ingestion (campos obligatorios y tipos).
-5. Concatenar resultados y eliminar duplicados por PK logica.
-6. Persistir parquet particionado.
-7. Generar reportes de cobertura/fallos.
-8. Emitir metricas de run (filas, tickers ok, tickers fail, latencia, etc).
+El módulo soporta:
 
-8) Validaciones minimas en ingestion
-Por fila:
-- high >= max(open, close, low) cuando todos no-null.
-- low <= min(open, close, high) cuando todos no-null.
-- volume >= 0.
-- date parseable y dentro de rango.
+\begin{itemize}
+  \item \texttt{force\_full\_refresh = False}: fetch incremental detectando la última fecha disponible por ticker y descargando solo desde:
+    \[
+    t_{\min} = \max(\text{max\_local\_date} + 1, \texttt{start\_date}).
+    \]
+  \item \texttt{force\_full\_refresh = True}: reingestión completa del rango [\texttt{start\_date}, \texttt{end\_date}].
+\end{itemize}
 
-Por ticker:
-- Fechas monotonicas ascendentes.
-- Sin duplicados de date.
-- Porcentaje de dias faltantes reportado (no necesariamente bloqueante).
+Esto se alinea con pipelines de ingestión bulk descritos en la literatura cuantitativa, donde:
 
-9) Estrategia incremental
-- Si force_full_refresh=false:
-  - Detectar ultima fecha disponible local por ticker.
-  - Descargar solo desde max(local_date + 1, start_date).
-- Si force_full_refresh=true:
-  - Reingestar rango completo solicitado.
-- Nunca sobrescribir silenciosamente sin versionado de run.
+\begin{itemize}
+  \item Se backfill completan los históricos una vez.
+  \item Se ejecutan runs diarios incrementales optimizando costos y latencia. [web:56][web:62]
+\end{itemize}
 
-10) Manejo de errores y observabilidad
-Errores recuperables:
-- timeout, 429, 5xx -> retry con backoff exponencial y jitter.
+\subsection{Estrategia de retry y rate limit}
 
-Errores no recuperables:
-- simbolo inexistente/formato invalido.
-- credenciales invalidas (fallo global).
-- schema incompatible del proveedor (fail-fast configurable).
+Para cada ticker, la función \texttt{fetch\_symbol\_prices} encapsula:
 
-Logging estructurado:
-- nivel INFO: progreso por lote.
-- nivel WARNING: gaps/cobertura baja.
-- nivel ERROR: ticker fallido con causa.
+\begin{itemize}
+  \item Retries configurables para errores transitorios:
+    \begin{itemize}
+      \item time–out.
+      \item 429 (rate limiting).
+      \item 5xx (servidor proveedor).
+    \end{itemize}
+  \item Backoff exponencial con jitter:
+    \[
+    \text{delay}_k = \text{backoff\_base\_sec} \cdot \alpha^k \cdot \text{random\_jitter},
+    \]
+    con \(\alpha > 1\).
+  \item Rate limit global por provider, independiente de la lógica de negocio. [web:53][web:54]
+\end{itemize}
 
-Metricas recomendadas:
-- total_tickers, tickers_ok, tickers_failed
-- rows_ingested
-- pct_missing_sessions_avg
-- provider_http_error_rate
-- run_duration_sec
+Esto es estándar en pipelines de datos financieros que usan APIs de proveedores como Polygon, Tiingo, Stooq, etc. [web:51][web:54][web:60]
 
-11) Interfaz de ejecucion (CLI sugerida)
-python -m data.price.fetch_prices ^
-  --provider polygon ^
-  --start-date 2014-01-01 ^
-  --end-date 2026-03-01 ^
-  --universe-path data/universe/current.parquet ^
-  --frequency 1d ^
+\subsection{Validaciones de integridad en ingestión}
+
+El módulo implementa validaciones mínimas para garantizar que el dataset crudo es coherente antes de pasar a \texttt{adjust\_prices.py}.
+
+\subsubsection{Por fila}
+
+\begin{itemize}
+  \item \textbf{Ordenamiento de OHLC} (cuando todos no nulos):
+    \begin{align}
+      \texttt{high} &\geq \max(\texttt{open}, \texttt{close}, \texttt{low}), \\
+      \texttt{low}  &\leq \min(\texttt{open}, \texttt{close}, \texttt{high}).
+    \end{align}
+  \item \texttt{volume} \(\geq 0\).
+  \item \texttt{date} parseable y dentro de \([\texttt{start\_date}, \texttt{end\_date}]\).
+\end{itemize}
+
+\subsubsection{Por ticker}
+
+\begin{itemize}
+  \item Fechas \texttt{date} crecientes (sin reversión).
+  \item No duplicados en \texttt{date} (por \texttt{symbol}).
+  \item Porcentaje de días faltantes frente al calendario de sesiones de mercado, registrado en \texttt{coverage\_report}.
+\end{itemize}
+
+Estas reglas se alinean con buenas prácticas de chequeo de calidad de datos en backtest, donde se exige que el OHLC mantenga la relación lógica derivada de la definición de vela. [web:41][web:62]
+
+\subsection{Normalización de esquema y proveedor}
+
+El flujo por ticker es:
+
+\begin{equation*}
+\texttt{fetch\_symbol\_prices} \xrightarrow{\text{parseo}} \texttt{normalize\_provider\_frame}(\cdot, \texttt{provider}) \xrightarrow{\text{validación}} \texttt{validate\_ingestion\_frame}.
+\end{equation*}
+
+La función \texttt{normalize\_provider\_frame}:
+
+\begin{itemize}
+  \item Mapea campos de proveedor (\texttt{open, close, \dots}) al esquema canonico.
+  \item Normaliza símbolos a \texttt{uppercase} y trim.
+  \item Ensaya tipificación fuerte: \texttt{open, high, \dots} como \texttt{float64}, \texttt{volume} como \texttt{float64/int64}, etc.
+\end{itemize}
+
+Esta capa de normalización asegura que múltiples proveedores (Polygon, Tiingo, Stooq, etc.) alimenten el mismo esquema de datos usado por el resto del pipeline de investigación cuantitativa. [web:54][web:58]
+
+\subsection{Reportes de cobertura y fallos}
+
+Además del dataset principal en Parquet, se generan:
+
+\begin{itemize}
+  \item \texttt{coverage\_report}: indica por ticker:
+    \[
+    \texttt{pct\_missing\_sessions} = \frac{ \#\text{sesiones esperadas} - \#\text{sesiones recibidas} }{ \#\text{sesiones esperadas} }.
+    \]
+  \item \texttt{failures\_report}: por ticker / código de error / mensaje, para que \texttt{qc\_prices.py} pueda decidir politicas de exclusion de small caps ilíquidos o con datos escasos.
+  \item \texttt{run\_manifest.json}: con parámetros de entrada, versión de código, hash de la config, y contadores de filas/tickers procesados.
+\end{itemize}
+
+Esto encaja con el paradigma de \textit{Data Quality} en sistemas de backtest, donde se documenta explícitamente la cobertura de datos por activo y fecha. [web:41][web:62]
+
+\subsection{Interfaz de ejecución y configuración}
+
+CLI sugerida:
+
+\begin{verbatim}
+python -m data.price.fetch_prices                \
+  --provider polygon                               \
+  --start-date 2014-01-01                          \
+  --end-date 2026-03-01                            \
+  --universe-path data/universe/current.parquet    \
+  --frequency 1d                                   \
   --run-id fetch_prices_20260305_001
+\end{verbatim}
 
-12) Estructura interna recomendada (funciones)
-- load_config(...)
-- load_universe_tickers(...)
-- get_incremental_window(symbol, start_date, end_date, ...)
-- fetch_symbol_prices(symbol, start_date, end_date, provider_client, ...)
-- normalize_provider_frame(df_raw, provider)
-- validate_ingestion_frame(df_symbol)
-- persist_prices(df_all, output_path, partition_cols)
-- build_coverage_report(df_all, expected_calendar, tickers)
-- build_failures_report(errors)
-- main()
+Los parámetros clave son:
 
-13) Criterios de aceptacion (Definition of Done)
-- Ejecuta end-to-end sin caidas por errores de uno o pocos tickers.
-- Genera dataset parquet con schema canonico y sin duplicados de PK.
-- Produce reportes de cobertura y errores consumibles por QC.
-- Soporta modo incremental y full refresh.
-- Logs y metricas suficientes para auditar una corrida.
-- Reproducible por run_id + config hash.
+\begin{itemize}
+  \item \texttt{provider}: “polygon”, “tiingo”, “stooq”, etc.
+  \item \texttt{start\_date, end\_date}: ventana de tiempo.
+  \item \texttt{run\_id}: identificador único de ejecución para trazabilidad y replay.
+  \item \texttt{frequency}: en esta fase solo \texttt{"1d"}.
+  \item \texttt{chunk\_size\_tickers}: lote de símbolos por ejecución (para limitar memory/RAM).
+\end{itemize}
 
-14) Casos de prueba minimos (para tests/)
-- Caso feliz: 3 tickers, rango corto, salida con columnas correctas.
-- Retry: proveedor responde 429/5xx y luego exito.
-- Error permanente: ticker invalido queda en failures_report.
-- Incremental: segunda corrida solo trae fechas nuevas.
-- Duplicados en respuesta proveedor: deduplica correctamente.
-- Schema drift: columna inesperada/ausente segun politica configurada.
+\subsection{Dependencias aguas arriba y aguas abajo}
 
-15) Riesgos y decisiones abiertas
-- Definir proveedor primario y fallback (coste/licencia/cobertura).
-- Politica exacta de dias faltantes para ticker iliquido.
-- Convencion final de timezone/date cuando proveedor usa UTC timestamp.
-- Regla de versionado de datasets (particion por run vs overwrite controlado).
+El módulo se sitúa en el eje central:
 
-16) Checklist rapido de implementacion
-- [ ] Cliente de proveedor desacoplado por interfaz.
-- [ ] Rate limit centralizado.
-- [ ] Retries con backoff y jitter.
-- [ ] Normalizacion de schema.
-- [ ] Validaciones de ingestion.
-- [ ] Persistencia parquet + manifest.
-- [ ] Coverage/failures report.
-- [ ] CLI con argumentos y defaults en config.
+\begin{itemize}
+  \item \textbf{Upstream}:
+    \begin{itemize}
+      \item Lista de tickers PIT del universo de small caps.
+      \item Calendario de sesiones de mercado (NYSE/NASDAQ).
+      \item Configuración de proveedor de datos.
+    \end{itemize}
+  \item \textbf{Downstream}:
+    \begin{itemize}
+      \item \texttt{data/price/adjust\_prices.py}.
+      \item \texttt{data/price/qc\_prices.py}.
+      \item \texttt{features/build\_features.py}.
+      \item \texttt{labels/build\_labels.py}.
+    \end{itemize}
+\end{itemize}
+
+\texttt{fetch\_prices.py} asegura que el resto de módulos trabajen sobre un dataset raw homogeneizado, sin decisiones de normalización diseminadas en el pipeline. [web:56][web:62]
+
+\subsection{Reglas de negocio de diseño de sistema}
+
+Entre las reglas de negocio están:
+
+\begin{itemize}
+  \item \textbf{No usar información futura}: el proveedor devuelve únicamente barras historicas \textit{publicadas} para cada \texttt{date}.
+  \item \textbf{No imputar datos faltantes}: se mantienen como \texttt{null} y se delega cualquier imputación al módulo de QC o features, si procede.
+  \item \textbf{Reintentos solo para errores transitorios}: 429, time–out, 5xx; se excluyen errores permanentes (404, símbolo inválido).
+  \item \textbf{Hash/versionado de config y datasets}: para garantizar que el mismo \texttt{run\_id} + \texttt{config} produzcan exáctamente el mismo dataset raw.
+\end{itemize}
+
+Estas políticas son estándar en pipelines de datos cuantitativos donde la \textbf{auditoría de backtest} es crítica y el error de data es mucho más difícil de detectar que el error de código. [web:56][web:62]
+
+\subsection{Estructura de funciones recomendada}
+
+El módulo está organizado en capas lógicas:
+
+\begin{itemize}
+  \item \texttt{load\_config(...)}, \texttt{load\_universe\_tickers(...)}.
+  \item \texttt{get\_incremental\_window(...)}: decide el rango a descargar por ticker.
+  \item \texttt{fetch\_symbol\_prices(..., provider\_client)}: capa de negocio sobre el cliente de proveedor.
+  \item \texttt{normalize\_provider\_frame(...)}, \texttt{validate\_ingestion\_frame(...)}.
+  \item \texttt{persist\_prices(...)}: escritura Parquet particionada por \texttt{provider}, \texttt{freq}, \texttt{date}.
+  \item \texttt{build\_coverage\_report(...)}, \texttt{build\_failures\_report(...)}.
+  \item \texttt{main()} que orquesta todo el flujo.
+\end{itemize}
+
+Esta arquitectura permite:
+
+\begin{itemize}
+  \item Desacoplar el cliente del proveedor hacia una interfaz (\texttt{provider\_client}).
+  \item Reutilizar la misma lógica de fetch tanto para backfill histórico como para ejecuciones diarias incrementales.
+\end{itemize}
+
+\subsection{Criterios de aceptación (Definition of Done)}
+
+El módulo cumple la definición de terminado si:
+
+\begin{itemize}
+  \item Ejecuta \textbf{end‑to‑end} sin caer por el fallo de uno o pocos tickers.
+  \item Genera un dataset Parquet con esquema canonico y sin duplicados por PK lógica.
+  \item Produce \texttt{coverage\_report} y \texttt{failures\_report} consumibles por QC.
+  \item Soporta modo \texttt{incremental} y \texttt{full\_refresh}.
+  \item Provee logs y métricas suficientes para auditar una corrida:
+    \begin{itemize}
+      \item \texttt{total\_tickers, tickers\_ok, tickers\_failed}.
+      \item \texttt{rows\_ingested}.
+      \item \texttt{pct\_missing\_sessions\_avg}.
+      \item \texttt{provider\_http\_error\_rate}.
+      \item \texttt{run\_duration\_sec}.
+    \end{itemize}
+  \item Es \textbf{reproducible} por \texttt{run\_id} + hash de la configuración.
+\end{itemize}
+
+\subsection{Casos de prueba mínimos recomendados}
+
+Los tests unitarios e integrados deben cubrir:
+
+\begin{itemize}
+  \item \textbf{Caso feliz}: 3 tickers, rango corto, salida con todas las columnas correctas, sin duplicados, OHLC coherente.
+  \item \textbf{Retry}: proveedor responde 429/5xx en la primera petición, y luego exito.
+  \item \textbf{Error permanente}: ticker inválido queda en \texttt{failures\_report} pero no aborta el pipeline.
+  \item \textbf{Incremental}: segunda corrida solo trae fechas nuevas.
+  \item \textbf{Duplicados en respuesta del proveedor}: se deduplican correctamente por PK lógica.
+  \item \textbf{Schema drift}: columna inesperada/ausente según la política de \texttt{normalize\_provider\_frame} y \texttt{validate\_ingestion\_frame}.
+\end{itemize}
+
+\subsection{Riesgos, decisiones abiertas y checklist}
+
+Entre los riesgos:
+
+\begin{itemize}
+  \item Coste y licencia de proveedor primario y posible fallback.
+  \item Política de días faltantes aceptables para small caps ilíquidos.
+  \item Regla de versionado: partición por \texttt{run} vs. \texttt{overwrite} controlado.
+  \item Convención final de \texttt{timezone/date} cuando el proveedor usa \texttt{UTC timestamp} en lugar de calendario nativo.
+\end{itemize}
+
+\textbf{Checklist rápido de implementación:}
+
+\begin{itemize}
+  \item [ ] Cliente de proveedor desacoplado por interfaz.
+  \item [ ] Rate limit centralizado.
+  \item [ ] Retries con backoff exponencial y jitter.
+  \item [ ] Normalización de esquema por proveedor.
+  \item [ ] Validaciones básicas de ingestión.
+  \item [ ] Persistencia Parquet + particiones + manifest.
+  \item [ ] Reportes de cobertura y fallos.
+  \item [ ] CLI con argumentos y valores por defecto en config.
+\end{itemize}
+
+Este módulo configura así la base sólida de datos raw para todo el sistema de swing trading, asegurando que el backtest industrial que construiréis en \texttt{backtest/engine.py} se base en un dataset \textbf{limpio, reproducible y sin leakage}. [web:56][web:62]
+% -----------------------------
+% FIN DEL TEXTO PARA .TXT
+% -----------------------------

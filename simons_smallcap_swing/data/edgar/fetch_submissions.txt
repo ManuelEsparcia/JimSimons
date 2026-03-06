@@ -1,50 +1,220 @@
-Modulo: data/edgar/fetch_submissions.py
+\section{Módulo: \texttt{data/edgar/fetch\_submissions.py}}
 
-1) Objetivo
-Descargar y almacenar submissions de EDGAR por CIK de forma incremental, con retries, rate-limit y trazabilidad por corrida.
+\subsection{Objetivo general del módulo}
 
-2) Alcance
-Incluye descarga JSON submissions, parseo minimo de metadata de filings, persistencia raw y reporte de cobertura/fallos.
+El módulo \texttt{fetch\_submissions.py} descarga y almacena \emph{submissions} de EDGAR por CIK de forma \emph{incremental}, gestionando:
+\begin{itemize}
+  \item retries ante fallos de red y errores 429/5xx,
+  \item rate‑limiting para cumplir con los límites de la API de EDGAR,
+  \item y trazabilidad explícita por \texttt{run\_id} para auditoría.
+\end{itemize}
 
-3) Entradas
-- cik_list_path
-- start_date/end_date (filtro opcional)
-- config_path
-- run_id
+Su objetivo es construir una base de datos de \emph{filing metadata} que permita reconstruir la historia de presentaciones regulatorias de un CIK, necesaria para:
+\begin{itemize}
+  \item construir vistas \emph{point‑in‑time} (PIT),
+  \item enlazar company facts con documentos originales,
+  \item y evitar look‑ahead bias en pipelines de trading cuantitativo.
+\end{itemize}
 
-4) Salidas
-- data/edgar/raw/submissions/date={asof}/part-*.parquet
-- data/edgar/raw/submissions_failures_{run_id}.parquet
-- data/edgar/raw/submissions_manifest_{run_id}.json
+Matemáticamente, el módulo implementa una función de \emph{ingestión incremental}:
+\[
+  \mathcal{I}_{\text{sub}}: \mathcal{C} \times \mathcal{T} \times \Theta \longrightarrow \mathcal{S},
+\]
+donde:
+\begin{itemize}
+  \item \(\mathcal{C}\) es el conjunto de CIKs de entrada,
+  \item \(\mathcal{T} = [t_{\text{start}}, t_{\text{end}}]\) es el rango de tiempo opcional de filtrado,
+  \item \(\Theta\) son los parámetros de configuración (rate‑limit, retries, formato de salida),
+  \item \(\mathcal{S}\) es el conjunto de submissions en formato tabular, particionado por \texttt{asof}.
+\end{itemize}
 
-5) Campos minimos
-- cik
-- accession_number
-- form_type
-- filing_date
-- report_date
-- acceptance_datetime
-- primary_doc
-- source_url
-- run_id
+\subsection{Alcance del módulo}
 
-6) Checks
-- accession parseable y unico por CIK
-- filing_date valida
-- form_type no nulo
-- retries en 429/5xx
+El alcance del módulo incluye:
 
-7) Flujo
-1. Cargar lista de CIK.
-2. Descargar submissions con control de rate.
-3. Parsear filings basicos.
-4. Persistir raw + failures + manifest.
+\begin{itemize}
+  \item \textbf{Descarga} de submissions en formato JSON vía API EDGAR.
+  \item \textbf{Parseo mínimo} de metadata de filings (por ejemplo, \texttt{form\_type}, \texttt{filing\_date}, \texttt{acceptance\_datetime}).
+  \item \textbf{Persistencia raw} en formato Parquet, particionado por \texttt{asof}.
+  \item \textbf{Reporte de cobertura y fallos}: se lleva registro de qué CIKs/fechas se procesaron con éxito y qué llamadas fallaron.
+\end{itemize}
 
-8) CLI
+Este módulo actúa como \emph{capa de entrada de metadata de filings} en el pipeline de datos fundamentales, similar a una capa de \emph{data ingestion} en arquitecturas de \emph{data mesh} financieras\cite{WorldbankDataQuality, SECDataQualityGuidelines}. Su correcta implementación es clave para garantizar que el sistema de swing trading tenga acceso a una historia auditada de presentaciones regulatorias.
+
+\subsection{Entradas del módulo}
+
+Las entradas del módulo son:
+
+\begin{itemize}
+  \item \texttt{cik\_list\_path}: ruta a un archivo \texttt{.parquet} que contiene el universo de CIKs a procesar.
+  \item \texttt{start\_date/end\_date} (opcional): filtros de tiempo para restringir el periodo de submissions a descargar.
+  \item \texttt{config\_path}: ruta a un archivo YAML de configuración con parámetros de rate‑limit, retries, chunking, etc.
+  \item \texttt{run\_id}: identificador único de la ejecución para replicabilidad y trazabilidad.
+\end{itemize}
+
+En notación formal, el conjunto de entradas es:
+\[
+  \mathcal{I} = \{ \mathcal{C}, \mathcal{T}, \theta_{\text{sub}}, r \},
+\]
+donde:
+\begin{itemize}
+  \item \(\mathcal{C}\) es el conjunto de CIKs,
+  \item \(\mathcal{T}\) es el rango de tiempo,
+  \item \(\theta_{\text{sub}}\) agrupa parámetros de ingesta (retries, concurrency, chunk size),
+  \item \(r\) es el \texttt{run\_id}.
+\end{itemize}
+
+\subsection{Salidas y artefactos}
+
+El módulo genera tres artefactos críticos:
+
+\begin{itemize}
+  \item \texttt{data/edgar/raw/submissions/date=\{asof\}/part-*.parquet}: datos raw de submissions, con metadata de filings estructurados en columnas.
+  \item \texttt{data/edgar/raw/submissions\_failures\_\{run\_id\}.parquet}: registro de llamadas o CIKs que fallaron durante la descarga o parseo.
+  \item \texttt{data/edgar/raw/submissions\_manifest\_\{run\_id\}.json}: metadatos de la ejecución (número de submissions procesados, tasa de éxito, timestamps, versiones, etc.).
+\end{itemize}
+
+Estos artefactos permiten:
+\begin{itemize}
+  \item reconstruir exactamente la misma versión de datos a partir de \texttt{run\_id},
+  \item monitorizar la cobertura de submissions por CIK y por periodo de tiempo,
+  \item reintentar descargas de CIKs con fallos en ejecuciones posteriores.
+\end{itemize}
+
+En el contexto de trading cuantitativo, \texttt{submissions} raw se usan para:
+\begin{itemize}
+  \item sincronizar la fecha de corte \texttt{asof} con el \texttt{acceptance\_datetime},
+  \item construir features de frecuencia de reporting y timeliness de datos,
+  \item y detectar períodos de no presentación o cambios de formato de informes.
+\end{itemize}
+
+\subsection{Modelo de datos y campos mínimos}
+
+El módulo asegura que cada fila de submissions contenga al menos los siguientes campos:
+
+\begin{itemize}
+  \item \texttt{cik}: clave de identificación de la entidad.
+  \item \texttt{accession\_number}: identificador único del archivo de presentación en EDGAR.
+  \item \texttt{form\_type}: tipo de formulario (por ejemplo, \texttt{10-K}, \texttt{10-Q}, \texttt{8-K}).
+  \item \texttt{filing\_date}: fecha de presentación del filing.
+  \item \texttt{report\_date}: fecha de informe (si está disponible).
+  \item \texttt{acceptance\_datetime}: timestamp de aceptación en el sistema de la SEC.
+  \item \texttt{primary\_doc}: enlace al documento primario (por ejemplo, el archivo \texttt{.html} o \texttt{.txt}).
+  \item \texttt{source\_url}: URL completa del filing en EDGAR.
+  \item \texttt{run\_id}: identificador de la ejecución de ingesta.
+\end{itemize}
+
+En notación matemática, cada submission se representa como:
+\[
+  s = (c, a, f, f_d, r_d, \alpha, p_d, s_u, r),
+\]
+donde:
+\begin{itemize}
+  \item \(c \in \mathcal{C}\) es el CIK,
+  \item \(a\) es el \texttt{accession\_number},
+  \item \(f\) es el \texttt{form\_type},
+  \item \(f_d\) es \texttt{filing\_date},
+  \item \(r_d\) es \texttt{report\_date},
+  \item \(\alpha\) es \texttt{acceptance\_datetime},
+  \item \(p_d\) es \texttt{primary\_doc},
+  \item \(s_u\) es \texttt{source\_url},
+  \item \(r\) es el \texttt{run\_id}.
+\end{itemize}
+
+\subsection{Checks de calidad implementados}
+
+El módulo aplica varios checks de calidad durante la descarga y el parseo:
+
+\begin{itemize}
+  \item \textbf{Accession parseable y único por CIK}:
+    \[
+      a \text{ es un string no vacío},
+    \]
+    y se verifica que no existan duplicados de \((c, a)\) en el conjunto de submissions procesados, asegurando unicidad de identificación por presentación.
+
+  \item \textbf{Fecha de presentación válida}:
+    \[
+      f_d \in \mathcal{T},
+    \]
+    donde \(\mathcal{T}\) es el conjunto de timestamps válidos con formato ISO. Fechas mal formadas se marcan como errores.
+
+  \item \textbf{Form type no nulo}:
+    \[
+      f \neq \emptyset,
+    \]
+    es decir, el campo \texttt{form\_type} debe estar presente; de lo contrario, el registro se considera inconsistente.
+
+  \item \textbf{Retries en 429/5xx}:
+    El módulo implementa una estrategia de reintentos exponenciales para errores de rate‑limit (429) y errores de servidor (5xx), según la recomendación de la SEC de no sobrecargar la API\cite{SECEDGARAPI}.
+\end{itemize}
+
+Estos checks se alinean con las \emph{Data Quality Assurance Guidelines} de la SEC\cite{SECDataQualityGuidelines}, que exigen integridad, consistencia y disponibilidad de datos regulatorios para su uso en sistemas de análisis financiero.
+
+\subsection{Flujo de ejecución}
+
+El flujo del módulo se puede descomponer en cuatro pasos:
+
+\begin{enumerate}
+  \item \textbf{Carga de CIKs}: se lee el archivo \texttt{cik\_list\_path} y se obtiene el universo \(\mathcal{C}\).
+
+  \item \textbf{Descarga de submissions con control de rate}:
+    Para cada CIK \(c \in \mathcal{C}\), y dentro del rango \(\mathcal{T}\) opcional, se realiza la llamada a la API EDGAR para obtener los submissions correspondientes. Se gestionan:
+    \begin{itemize}
+      \item timeouts,
+      \item retries exponenciales,
+      \item rate‑limiting según el límite de \texttt{60 req/min} recomendado por la SEC.
+    \end{itemize}
+
+  \item \textbf{Parseo de filings básicos}:
+    Se transforma el JSON de submissions en un esquema tabular con los campos mínimos definidos, filtrando por \texttt{start\_date/end\_date} si está configurado.
+
+  \item \textbf{Persistencia raw + failures + manifest}:
+    \begin{itemize}
+      \item Los submissions válidos se escriben en \texttt{data/edgar/raw/submissions/date=\{asof\}} en formato Parquet.
+      \item Los registros con errores se escriben en \texttt{submissions\_failures\_\{run\_id\}.parquet}.
+      \item Se genera un manifest JSON con resumen de ejecución.
+    \end{itemize}
+\end{enumerate}
+
+Este flujo implementa un patrón de \emph{ETL batch incremental} para metadata de filings, donde cada \texttt{run\_id} apunta a un subconjunto de cambios en la base de datos de submissions, facilitando el mantenimiento y la auditoría\cite{CampbellEtAl2001, DePrado2018Advances}.
+
+\subsection{CLI y uso operativo}
+
+El módulo se invoca mediante la línea de comandos:
+
+\begin{verbatim}
 python -m data.edgar.fetch_submissions ^
   --cik-list-path data/edgar/mappings/ticker_cik_current.parquet ^
   --config-path configs/data/edgar_fetch_submissions.yaml ^
   --run-id fetch_submissions_20260305_001
+\end{verbatim}
 
-9) DoD
-- submissions descargadas de forma incremental y auditada.
+Esto permite:
+\begin{itemize}
+  \item integrar el módulo en pipelines CI/CD,
+  \item ejecutarlo periódicamente (por ejemplo, diariamente) para actualizar la base de datos de submissions,
+  \item mantener versiones reproducibles de datos mediante \texttt{run\_id}.
+\end{itemize}
+
+\subsection{Definición de término (DoD)}
+
+La definición de término del módulo establece que:
+
+\begin{itemize}
+  \item Las submissions deben estar descargadas de forma incremental, es decir, el módulo debe poder reanudar ejecuciones desde el último \texttt{asof} procesado sin sobrescribir datos previos.
+  \item Los datos deben estar almacenados en formato raw y estructurado, listos para ser consumidos por módulos de \texttt{parse\_xbrl} y \texttt{point\_in\_time}.
+  \item Debe existir un registro auditado de fallos y cobertura en los artefactos \texttt{submissions\_failures\_\{run\_id\}.parquet} y \texttt{submissions\_manifest\_\{run\_id\}.json}.
+\end{itemize}
+
+\subsection{Conexión con estado del arte y literatura}
+
+El diseño de \texttt{fetch\_submissions.py} se alinea con:
+
+\begin{itemize}
+  \item \textbf{API de submissions de EDGAR}: la API de EDGAR expone los submissions de forma estructurada, permitiendo descargar la historia de presentaciones de un CIK en un solo endpoint, con timestamps de aceptación y links a documentos\cite{SECEDGARAPI, EdgarToolsAPI}.
+  \item \textbf{Ingestión de metadata de filings}: enfoques similares se usan en librerías como \texttt{edgartools}\cite{EdgarTools} y en pipelines de datos para análisis cuantitativo de datos regulatorios\cite{KaggleEDGARNotebook}.
+  \item \textbf{Gestión de retries y rate‑limit}: las prácticas de reintentos exponenciales y control de rate‑limit se alinean con recomendaciones de la SEC para consume sostenible de la API\cite{SECEDGARAPI}.
+  \item \textbf{Incrementalidad y auditabilidad}: el uso de \texttt{run\_id} y metadatos de manifest se alinea con mejores prácticas de \emph{reproducible research} y \emph{data lineage} en sistemas cuantitativos\cite{DePrado2018Advances, CampbellEtAl2001}.
+\end{itemize}
+
+En resumen, \texttt{fetch\_submissions.py} es la base de datos de metadata de filings de un sistema de swing trading cuantitativo: conecta el universo regulado de la SEC con un esquema tabular estructurado, listo para ser transformado en features de frecuencia de reporting, timeliness y estructura de riesgo de datos, y posteriormente utilizados en modelos de selección de activos y backtests estadísticamente rigurosos.

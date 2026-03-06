@@ -1,161 +1,312 @@
-Modulo: execution/fills_simulator.py
+\section{Módulo: execution/fills\_simulator.py}
 
-1) Objetivo
-Simular ejecucion de ordenes en condiciones de mercado realistas (fills completos/parciales, latencia y slippage), generando trazas auditables para backtest y analisis de ejecucion.
+\subsection{Objetivo y contexto de simulación de fills}
+\label{sec:fills-simulator-objective}
 
-2) Alcance
-Incluye:
-- Simulacion por orden y por fecha.
-- Fill probability/capacity segun liquidez y participation.
-- Ejecucion parcial y remanente.
-- Precio de fill segun execution model + impacto/slippage.
-- Manejo de ordenes no ejecutadas/canceladas.
+El objetivo de \texttt{execution/fills\_simulator.py} es \textbf{simular la ejecución de órdenes} en un entorno de mercado realista, generando:
+\begin{itemize}
+    \item \textbf{Fills completos y parciales}.
+    \item \textbf{Latencia y slippage} implícitos en el precio de fill.
+    \item \textbf{Trazas auditables} para backtest y análisis de calidad de ejecución.
+\end{itemize}
 
-No incluye:
-- Envio real a broker.
-- Smart order routing multi-venue real.
+El diseño se enmarca en el paradigma de \textit{virtual execution} usado en sistemas de trading cuantitativo industrial, donde se evita el envío real a broker pero se mantiene consistencia con políticas de \textit{implementation shortfall} y \textit{PIT leakage} (Almgren et al., 2005; De Prado, 2018).\footnote{%
+    Almgren, R., et al. (2005). “Optimal Execution of Portfolio Transactions.”\\
+    De Prado, M. (2018). “ADVANCED RISK AND PORTFOLIO MANAGEMENT.”}
 
-3) Dependencias
-Upstream:
-- rebalance_orders
-- prices intradia/proxy (open/vwap/high/low/close)
-- liquidity context (ADV, spread)
-- impact_model outputs
+\subsection{Alcance y límites del módulo}
+\label{sec:fills-simulator-scope}
 
-Downstream:
-- execution/cost_model
-- backtest/engine accounting
-- reportes de calidad de ejecucion
+\subsubsection{Funcionalidades incluidas}
 
-4) Contrato de entrada
-Entradas minimas:
-- orders_path
-- market_data_path
-- impact_path (opcional si se integra dentro)
-- fills_config_path
-- run_id
+\begin{itemize}
+    \item \textbf{Simulación por orden y fecha}: cada orden se simula en el contexto de su día de ejecución.
+    \item \textbf{Fill probability/capacidad}: el fill máximo por símbolo y día depende de la liquidez y \textit{participation rate}.
+    \item \textbf{Ejecución parcial y remanente}: órdenes se pueden partir; el remanente puede pasarse al día siguiente según política.
+    \item \textbf{Precio de fill}: el precio de ejecución se construye a partir de un modelo de ejecución más slippage/impacto.
+    \item \textbf{Manejo de órdenes no ejecutadas/canceladas}: se registran como \texttt{unfilled} o \texttt{cancelled} con trazabilidad.
+\end{itemize}
 
-Campos minimos de orden:
-- date, symbol, order_id
-- side, delta_shares (o notional)
-- tif, priority (opcional)
+\subsubsection{Funcionalidades no incluidas}
 
-5) Contrato de salida
-- execution/fills/{run_id}/fills.parquet
-- execution/fills/{run_id}/unfilled_orders.parquet
-- execution/fills/{run_id}/fills_summary.json
-- execution/fills/{run_id}/manifest.json
+\begin{itemize}
+    \item \textbf{Envío real a broker o exchange}.
+    \item \textbf{Smart order routing multi‑venue} en tiempo real (por ejemplo, IDS, MOM, MOO/LOO).
+\end{itemize}
 
-Campos minimos fills:
-- date, symbol, order_id
-- fill_id
-- fill_shares
-- fill_price
-- fill_notional
-- fill_ratio
-- remaining_shares
-- fill_status (full/partial/none)
-- exec_model
+Esto permite que el módulo se enfoque en \textbf{simulación de ejecución virtual} y no en la lógica de routing o co​​nnectividad.
 
-6) Modos de simulacion recomendados
-Simple:
-- full_fill_next_open.
+\subsection{Dependencias upstream y downstream}
+\label{sec:fills-simulator-deps}
 
-Liquidity capped:
-- max_fill_shares = participation_cap * ADV_shares.
-- fill parcial si orden > max_fill_shares.
+\textbf{Upstream:}
+\begin{itemize}
+    \item \texttt{portfolio/rebalance}:
+        \begin{itemize}
+            \item \texttt{rebalance\_orders} generadas por el motor de estrategia.
+        \end{itemize}
+    \item \texttt{data/price}:
+        \begin{itemize}
+            \item \texttt{open, vwap, high, low, close} intradía o proxy.
+        \end{itemize}
+    \item \texttt{data/liquidity}:
+        \begin{itemize}
+            \item \texttt{ADV}, spread proxy y metadatos de profundidad de mercado.
+        \end{itemize}
+    \item \texttt{execution/impact}:
+        \begin{itemize}
+            \item \texttt{impact\_per\_order.parquet} con estimaciones de impacto por orden.
+        \end{itemize}
+\end{itemize}
 
-VWAP proxy:
-- fill_price basado en vwap proxy + impacto/slippage.
+\textbf{Downstream:}
+\begin{itemize}
+    \item \texttt{execution/cost\_model}:
+        \begin{itemize}
+            \item Uso de \texttt{fills.parquet} para calcular costes de ejecución.
+        \end{itemize}
+    \item \texttt{backtest/engine}:
+        \begin{itemize}
+            \item Integración de \texttt{fills.parquet} en el accounting de P\&L.
+        \end{itemize}
+    \item \texttt{reports/execution\_quality}:
+        \begin{itemize}
+            \item Métricas de \texttt{fill\_rate}, \texttt{avg\_fill\_slippage\_bps}, etc.
+        \end{itemize}
+\end{itemize}
 
-7) Parametros clave
-- execution_price_model
-- participation_cap
-- min_fill_lot
-- allow_partial_fills
-- carry_unfilled_to_next_day
-- max_carry_days
-- random_seed (si hay componente estocastico)
+\subsection{Contrato de entrada}
+\label{sec:fills-simulator-inputs}
 
-8) Flujo del proceso
-1. Cargar ordenes y contexto de mercado.
-2. Determinar capacidad de fill por simbolo/dia.
-3. Asignar fill_qty segun politica.
-4. Calcular fill_price incorporando slippage/impacto.
-5. Generar registros fills y remanentes.
-6. Si aplica, arrastrar no ejecutadas a siguiente sesion.
-7. Persistir resultados y resumen.
+\subsubsection{Entradas mínimas}
 
-9) Reglas PIT y anti-leakage
-- Precio de fill debe provenir de ventana permitida por decision_time.
-- No usar datos de fin de dia si execution model especifica next_open.
-- Remanentes solo usan informacion futura cuando llega esa fecha.
+\begin{itemize}
+    \item \texttt{orders\_path}:
+        \begin{itemize}
+            \item \texttt{rebalance\_orders.parquet} con campos mínimos:
+                \begin{itemize}
+                    \item \texttt{date, symbol, order\_id}.
+                    \item \texttt{side, delta\_shares} (o \texttt{notional}).
+                \end{itemize}
+        \end{itemize}
+    \item \texttt{market\_data\_path}:
+        \begin{itemize}
+            \item Precios y liquidez por símbolo y día.
+        \end{itemize}
+    \item \texttt{impact\_path} (opcional, si se integra el modelo de impacto dentro del módulo).
+    \item \texttt{fills\_config\_path}:
+        \begin{itemize}
+            \item \texttt{execution\_price\_model}, \texttt{participation\_cap}, etc.
+        \end{itemize}
+    \item \texttt{run\_id}:
+        \begin{itemize}
+            \item Identificador del run de backtest.
+        \end{itemize}
+\end{itemize}
 
-10) Validaciones minimas
-- 0 <= fill_ratio <= 1.
-- fill_shares <= order_shares absoluto.
-- remaining_shares consistente.
-- fill_price > 0.
-- no duplicados en (order_id, fill_id).
+\subsubsection{Campos de orden mínimos}
 
-11) Manejo de casos especiales
-- halt/suspension:
-  - no fill ese dia, orden pasa a pending/cancel segun policy.
-- missing market data:
-  - fallback conservador o cancel con motivo.
-- orden pequena bajo min_fill_lot:
-  - ejecutar/omitir segun config.
-- expiracion TIF:
-  - cancelar remanente al vencer.
+\begin{itemize}
+    \item \texttt{date, symbol, order\_id}.
+    \item \texttt{side, delta\_shares} (o \texttt{notional}).
+    \item \texttt{tif} (Time In Force) y \texttt{priority} (opcional, usado en políticas de_FILL\_MODEL}.
+\end{itemize}
 
-12) Observabilidad
-Logging:
-- INFO: n ordenes, fill_rate diario.
-- WARNING: alta tasa de no fill.
-- ERROR: inconsistencias de orden/fill.
+\subsection{Contrato de salida}
+\label{sec:fills-simulator-outputs}
 
-Metricas:
-- fill_rate
-- partial_fill_rate
-- avg_fill_slippage_bps
-- avg_carry_days
-- pct_orders_cancelled
+\textbf{Archivos generados por \texttt{run\_id}:}
+\begin{itemize}
+    \item \texttt{execution/fills/\{run\_id\}/fills.parquet}:
+        \begin{itemize}
+            \item \texttt{date, symbol, order\_id}.
+            \item \texttt{fill\_id, fill\_shares, fill\_price, fill\_notional}.
+            \item \texttt{fill\_ratio, remaining\_shares}.
+            \item \texttt{fill\_status} (\texttt{full/partial/none}).
+            \item \texttt{exec\_model} (por ejemplo, \texttt{next\_open}, \texttt{vwap\_proxy}).
+        \end{itemize}
+    \item \texttt{execution/fills/\{run\_id\}/unfilled\_orders.parquet}:
+        \begin{itemize}
+            \item Órdenes que no se ejecutaron en absoluto o dejaron remanente pendiente.
+        \end{itemize}
+    \item \texttt{execution/fills/\{run\_id\}/fills\_summary.json}:
+        \begin{itemize}
+            \item Métricas de fill rate, avg slippage, etc.
+        \end{itemize}
+    \item \texttt{execution/fills/\{run\_id\}/manifest.json}:
+        \begin{itemize}
+            \item Metadatos de ejecución y trazabilidad de inputs/outputs.
+        \end{itemize}
+\end{itemize}
 
-13) CLI sugerida
+\subsection{Modelo matemático de simulación de fills}
+\label{sec:fills-simulator-math}
+
+Sea:
+\begin{itemize}
+    \item \( t \in \{1,\dots,T\} \): tiempo (días de backtest).
+    \item \( i \in \{1,\dots,N\} \): conjunto de símbolos.
+    \item \( j \in \{1,\dots,M\} \): conjunto de órdenes.
+    \item \( q_{jit}^{\text{order}} \): \texttt{delta\_shares} requeridos por la orden \( j \) del símbolo \( i \) en el día \( t \).
+    \item \( q_{jit}^{\text{fill}} \): \texttt{fill\_shares} simulados.
+    \item \( q_{jit}^{\text{rem}} \): \texttt{remaining\_shares} tras la ejecución.
+    \item \( p_{it}^{\text{price\_ref}} \): precio de referencia (por ejemplo, \texttt{open} o \texttt{vwap}).
+    \item \( V_{it}^{\text{ADV}} \): \texttt{ADV} (average daily volume) del símbolo \( i \) en el día \( t \).
+    \item \( \rho_{jit} = \frac{\lvert q_{jit}^{\text{order}} \rvert}{V_{it}^{\text{ADV}}} \): \textit{participation rate}.
+    \item \( \nu_{it} \): volatilidad del símbolo \( i \) en el día \( t \).
+\end{itemize}
+
+\subsubsection{Capacidad de fill y ejecución parcial}
+\label{sec:fills-capacity}
+
+El modelo define una \textit{capacity} máxima de fill por orden:
+
+\begin{equation}
+    q_{jit}^{\text{cap}} 
+    = 
+    \texttt{participation\_cap} 
+    \cdot 
+    V_{it}^{\text{ADV}}.
+\end{equation}
+
+Si la orden supera esta capacidad, se ejecuta de forma parcial:
+
+\begin{equation}
+    q_{jit}^{\text{fill}} 
+    = 
+    \min\{
+        q_{jit}^{\text{order}}, 
+        q_{jit}^{\text{cap}}
+    \},
+\end{equation}
+y el remanente es:
+
+\begin{equation}
+    q_{jit}^{\text{rem}} 
+    = 
+    q_{jit}^{\text{order}} 
+    - 
+    q_{jit}^{\text{fill}}.
+\end{equation}
+
+Si el parámetro \texttt{carry\_unfilled\_to\_next\_day} está activado, el remanente puede pasarse al día \( t+1 \) hasta un máximo de \texttt{max\_carry\_days}.
+
+\subsubsection{Precio de fill según modelo de ejecución}
+\label{sec:fills-price-model}
+
+Sea \( p_{it}^{\text{model}} \) el precio de referencia del modelo de ejecución (por ejemplo, \texttt{next\_open} o \texttt{vwap\_proxy}). El precio de fill se construye como:
+
+\begin{equation}
+    p_{jit}^{\text{fill}} 
+    = 
+    p_{it}^{\text{model}} 
+    + 
+    \underbrace{\texttt{slippage}_{jit}}_{\text{explícito}}
+    + 
+    \underbrace{\texttt{impact\_bps}_{jit} \cdot 10^{-4} \cdot p_{it}^{\text{model}}}_{\text{implícito}}.
+\end{equation}
+
+Donde \texttt{slippage} puede ser determinista (por ejemplo, \texttt{half\_spread}) o estocástico, y \texttt{impact\_bps} proviene de \texttt{impact\_model} o se calcula internamente usando una función no lineal de \(\rho_{jit}\) y \(\nu_{it}\) como:
+
+\begin{equation}
+    \texttt{impact\_bps}_{jit} 
+    = 
+    \alpha \rho_{jit}^{\beta} \nu_{it}^{\gamma}.
+\end{equation}
+
+\subsubsection{Régimen de ejecución simple (full\_fill\_next\_open)}
+\label{sec:fills-simple-mode}
+
+En el modo \texttt{full\_fill\_next\_open}:
+\begin{itemize}
+    \item Todas las órdenes se ejecutan \textbf{full} en el próximo día hábil.
+    \item El precio de fill es simplemente el \texttt{open} del día siguiente.
+    \item No hay \textit{remanente} ni \textit{carry}.
+\end{itemize}
+
+Este régimen corresponde a un \textit{baseline} de ejecución idealizado, útil para aislar el efecto de slippage/impacto en análisis comparativos.\footnote{%
+    De Prado, M. (2018). “ADVANCED RISK AND PORTFOLIO MANAGEMENT.”}
+
+\subsubsection{Régimen de VWAP proxy}
+\label{sec:fills-vwap-mode}
+
+En el modo \texttt{vwap\_proxy}:
+\begin{itemize}
+    \item El precio de referencia es un \texttt{vwap} intradía simulado o proxy.
+    \item Se añade \textit{slippage} y \textit{impacto} según el modelo descrito arriba.
+\end{itemize}
+
+Este régimen aproxima la política de ejecución VWAP de la industria de asset management, donde se busca minimizar el impacto de grandes bloques de órdenes.\footnote{%
+    Donier, J., et al. (2015). “A fully consistent, minimal model for non-linear market impact.”}
+
+\subsection{Manejo de TIF, halt y missing data}
+\label{sec:fills-special-cases}
+
+\subsubsection{Halt/suspensión de cotización}
+\begin{itemize}
+    \item Si el símbolo \texttt{halt} ese día, no se ejecuta orden.
+    \item La orden pasa a \texttt{pending} o \texttt{cancelled} según la política de \texttt{TIF} y \texttt{fills\_config}.
+\end{itemize}
+
+\subsubsection{Datos de mercado faltantes}
+\begin{itemize}
+    \item Si faltan \texttt{prices} o \texttt{ADV} para el símbolo, se aplica \textit{fallback conservador} o se cancela la orden con motivo.
+\end{itemize}
+
+\subsubsection{Tamaño de orden menor que \texttt{min\_fill\_lot}}
+\begin{itemize}
+    \item Se puede \texttt{omitir} o \texttt{ejecutar} según parámetro de configuración.
+\end{itemize}
+
+\subsubsection{Expiración de TIF}
+\begin{itemize}
+    \item Si el \texttt{TIF} vence en el día de intento de ejecución, el remanente se cancela y se registra como \texttt{cancelled}.
+\end{itemize}
+
+\subsection{Validaciones mínimas de consistencia}
+\label{sec:fills-validations}
+
+\begin{itemize}
+    \item \( 0 \leq \texttt{fill\_ratio} \leq 1 \).
+    \item \texttt{fill\_shares} \( \leq \left\lvert \texttt{order\_shares} \right\rvert \).
+    \item \texttt{remaining\_shares} coherente con \texttt{order\_shares} y \texttt{fill\_shares}.
+    \item \texttt{fill\_price} > 0.
+    \item No hay duplicados en la llave \((\texttt{order\_id}, \texttt{fill\_id})\).
+\end{itemize}
+
+\subsection{Observabilidad y métricas de calidad de ejecución}
+\label{sec:fills-observability}
+
+\subsubsection{Logging}
+
+\begin{itemize}
+    \item \texttt{INFO}: número de órdenes, \texttt{fill\_rate} diario, número de remanentes.
+    \item \texttt{WARNING}: alta tasa de \texttt{unfilled} o \texttt{partial\_fills}.
+    \item \texttt{ERROR}: inconsistencias de \texttt{shares}, precios negativos, duplicados de \texttt{fill\_id}.
+\end{itemize}
+
+\subsubsection{Métricas principales}
+
+\begin{itemize}
+    \item \texttt{fill\_rate} = \(\frac{\text{n fills completos}}{\text{n total órdenes}}\).
+    \item \texttt{partial\_fill\_rate} = \(\frac{\text{n órdenes con fill parcial}}{\text{n total órdenes}}\).
+    \item \texttt{avg\_fill\_slippage\_bps} = media de \(\texttt{slippage\_bps}\) por fill.
+    \item \texttt{avg\_carry\_days} = días promedio que una orden remanente pasa a sesiones futuras.
+    \item \texttt{pct\_orders\_cancelled} = porcentaje de órdenes canceladas.
+\end{itemize}
+
+\subsection{CLI sugerida}
+\label{sec:fills-cli}
+
+Ejemplo de ejecución típica:
+
+\begin{verbatim}
 python -m execution.fills_simulator ^
   --orders-path portfolio/rebalance/run_latest/rebalance_orders.parquet ^
   --market-data-path data/price/adjusted/mode=dual_output ^
   --impact-path execution/impact/run_latest/impact_per_order.parquet ^
   --config-path configs/execution/fills_simulator.yaml ^
   --run-id fills_20260305_001
+\end{verbatim}
 
-14) Estructura interna recomendada
-- load_fills_config(...)
-- load_orders(...)
-- load_market_data(...)
-- load_impact_estimates(...)
-- compute_fill_capacity(...)
-- simulate_order_fill(...)
-- apply_carry_and_expiry(...)
-- validate_fills(...)
-- persist_fills_outputs(...)
-- main()
-
-15) Criterios de aceptacion
-- Simulacion de fills consistente y reproducible.
-- Integracion correcta con cost_model/backtest.
-- Soporta full/partial/cancel con trazabilidad.
-
-16) Casos de prueba minimos
-- full fill baseline next_open.
-- fill parcial por participation cap.
-- orden no ejecutada por halt.
-- carry over funciona y respeta max_carry_days.
-- validaciones detectan inconsistencia shares.
-
-17) Checklist rapido
-- [ ] Modos de fill (full/partial/vwap).
-- [ ] Capacidad por liquidez/participation.
-- [ ] Remanentes y expiracion TIF.
-- [ ] Outputs fills/unfilled + resumen.
-- [ ] Tests de edge cases.
+\subsection{Estructura interna recomendada}

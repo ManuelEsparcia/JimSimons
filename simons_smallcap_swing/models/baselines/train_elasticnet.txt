@@ -1,67 +1,272 @@
-Modulo: models/baselines/train_elasticnet.py
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[spanish]{babel}
+\usepackage{lmodern}
+\usepackage[
+  lmargin=2.5cm,
+  rmargin=2.5cm,
+  tmargin=2.5cm,
+  bmargin=2.5cm
+]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{float}
+\usepackage{csquotes}
+\usepackage{natbib}
+\usepackage[colorlinks=true,linkcolor=blue]{hyperref}
 
-1) Objetivo
-Entrenar baseline ElasticNet (L1+L2) para targets continuos, combinando interpretabilidad con seleccion de variables y regularizacion robusta.
+\title{Análisis de \texttt{train\_elasticnet.py} \\
+Estado del arte para baselines de ElasticNet en \\ data temporal financiera}
+\author{Baseline de ElasticNet (L1+L2) para regresión continua}
+\date{\today}
 
-2) Alcance
-Incluye:
-- entrenamiento con CV temporal purged.
-- busqueda de (alpha, l1_ratio).
-- export de coeficientes sparsity-aware.
-- comparativa frente ridge/gbdt.
+\begin{document}
 
-3) Entradas
-- features_path
-- labels_path
-- splits_path
-- config_path
-- run_id
+\maketitle
 
-4) Salidas
-- models/artifacts/baselines/elasticnet/{run_id}/fold_{k}/model.pkl
-- models/predictions/baselines/elasticnet/{run_id}/oof.parquet
-- models/reports/baselines/elasticnet/{run_id}/coef_paths.parquet
-- models/reports/baselines/elasticnet/{run_id}/metrics_summary.json
-- models/reports/baselines/elasticnet/{run_id}/manifest.json
+\begin{abstract}
+  Este documento analiza el módulo \texttt{models/baselines/train\_elasticnet.py}, que implementa una \textbf{baseline de ElasticNet} para predicir targets continuos en contraportfolios financieros. Se discute la formulación matemática de ElasticNet, la \textbf{validación cruzada temporal purged} (PIT), la selección de hiperparámetros y la métrica de \emph{sparsity ratio} y estabilidad de coeficientes. El objetivo es maximizar la utilidad de este componente como modelo de referencia interpretable y robusto dentro de un sistema de swing trading de nivel research industrial.
+\end{abstract}
 
-5) Parametros clave
-- alpha_grid
-- l1_ratio_grid
-- fit_intercept
-- max_iter
-- tol
-- standardize_features
+\section{Contexto del módulo}
 
-6) Reglas PIT
-- mismos splits purged para comparativas.
-- sin tuning con test.
-- logging de hiperparametros elegidos por fold/global.
+El script \texttt{train\_elasticnet.py} pertenece al subpaquete \texttt{models/baselines} del repositorio \texttt{JimSimons}. Su objetivo principal es:
 
-7) Flujo
-1. Cargar y alinear features/labels.
-2. Escalar datos si aplica.
-3. Entrenar ElasticNet por fold con grid.
-4. Generar preds OOF/OOS.
-5. Guardar coeficientes y metricas.
+\begin{itemize}
+  \item Entrenar un modelo de regresión lineal regularizada con \textbf{ElasticNet} (L1 + L2) para targets continuos.
+  \item Combinar \textbf{interpretabilidad} (coeficientes \( \beta_j \)) con \textbf{selección de variables} mediante sparsity inducida por L1 y \textbf{regularización robusta} mediante L2.
+\end{itemize}
 
-8) Metricas
-- RMSE/MAE
-- IC Spearman
-- sparsity ratio (coeficientes != 0)
-- estabilidad de coeficientes entre folds
+Este módulo se concibe como un \textbf{baseline mínimo viable} contra el que comparar modelos más complejos (por ejemplo, GBDT, redes neuronales, etc.), preservando la capacidad de inspeccionar variables relevantes y la estabilidad de coeficientes entre folds.
 
-9) Validaciones
-- convergencia del solver.
-- sin NaN/inf en coeficientes/preds.
-- coverage OOF adecuada.
+\section{Formulación matemática de ElasticNet}
 
-10) CLI
-python -m models.baselines.train_elasticnet ^
-  --features-path features/store ^
-  --labels-path labels/store ^
-  --splits-path labels/splits/purged_splits_latest.parquet ^
-  --config-path configs/models/elasticnet.yaml ^
-  --run-id train_elasticnet_20260305_001
+Sea \( X \in \mathbb{R}^{n \times p} \) la matriz de features, \( y \in \mathbb{R}^n \) el target continuo y \( \beta \in \mathbb{R}^p \) el vector de coeficientes. El problema de ElasticNet para cada fold se define como:
 
-11) DoD
-- baseline elasticnet estable, reproducible y con interpretabilidad de coeficientes.
+\begin{equation}
+  \min_{\beta} \frac{1}{2n} \| y - X\beta \|^2_2
+  + \alpha \left( (1 - \rho)\|\beta\|_1 + \rho \|\beta\|_2^2 \right),
+\end{equation}
+
+donde:
+\begin{itemize}
+  \item \( \alpha > 0 \) es el parámetro de regularización global (escala de penalización).
+  \item \( \rho \in [0,1] \) es el \textbf{l1\_ratio} (proporción de L1 respecto a L2).
+  \item \( \|\beta\|_1 = \sum_{j=1}^p |\beta_j| \) es la penalización L1 (Lasso).
+  \item \( \|\beta\|_2^2 = \sum_{j=1}^p \beta_j^2 \) es la penalización L2 (Ridge).
+\end{itemize}
+
+Cuando:
+\begin{itemize}
+  \item \( \rho = 0 \): se obtiene Lasso (\( \|\beta\|_2^2 = 0 \)); favorece sparsity extrema.
+  \item \( \rho = 1 \): se obtiene Ridge (\( \|\beta\|_1 = 0 \)); mantiene todas las variables pero con coeficientes pequeños.
+\end{itemize}
+
+La elastic net permite capturar:
+\begin{itemize}
+  \item \textbf{Sparsity} (L1) para interpretación y selección de features.
+  \item \textbf{Estabilidad} frente a multicolinealidad (L2), gracias al efecto de \emph{grouping} de variables correlacionadas.
+\end{itemize}
+[web:49][web:40]
+
+\subsection{Ventajas frente a Lasso y Ridge}
+
+\begin{itemize}
+  \item Frente a Lasso, ElasticNet:
+    \[
+      \text{Var}(\hat{\beta}_{\text{elastic}}) < \text{Var}(\hat{\beta}_{\text{lasso}})
+    \]
+    en presencia de correlación entre features, reduciendo varianza a cambio de algo de sesgo. [web:49]
+  \item Frente a Ridge, ElasticNet induce \textbf{sparsity inherentemente} gracias al término L1, permitiendo descartar variables no relevantes.
+  \item En escenarios de alta dimensionalidad y correlación (típicos en trading), ElasticNet suele dominar a Lasso y Ridge según experimentos de simulación y benchmarks de la literatura. [web:49]
+\end{itemize}
+
+\section{Objetivo y alcance del módulo}
+
+\subsection{Objetivo principal}
+
+El objetivo del módulo es entrenar un modelo de ElasticNet con:
+\begin{itemize}
+  \item Validación cruzada temporal \textbf{purged} para evitar \emph{data leakage}.
+  \item Búsqueda de hiperparámetros sobre una \textbf{grid} de \( (\alpha, \rho) \).
+  \item Exportación de:
+    \begin{itemize}
+      \item Coeficientes \textbf{sparsity-aware} (analizar variables activas/inactivas).
+      \item Predicciones OOF (out-of-fold) y posiblemente OOS (out-of-sample).
+      \item Métricas de rendimiento y estabilidad entre folds.
+    \end{itemize}
+\end{itemize}
+
+\subsection{Alcance funcional}
+
+El módulo incluye:
+\begin{itemize}
+  \item Entrenamiento con \textbf{CV temporal purged} (PIT) para evitar que el modelo “vea” el futuro al calcular el target.
+  \item Grid search sobre \( \texttt{alpha\_grid} \) y \( \texttt{l1\_ratio\_grid} \) para encontrar el par \( (\alpha^\ast, \rho^\ast) \) óptimo global por fold.
+  \item Export de:
+    \begin{itemize}
+      \item Modelo por fold (\texttt{model.pkl}).
+      \item Predicciones OOF (\texttt{oof.parquet}).
+      \item Coeficientes por fold (\texttt{coef\_paths.parquet}).
+      \item Métricas resumidas (\texttt{metrics\_summary.json}).
+      \item Manifesto de run (\texttt{manifest.json}).
+    \end{itemize}
+  \item Comparativa frente a otros baselines (Ridge, GBDT, etc.).
+\end{itemize}
+
+\section{Entradas y salidas}
+
+\subsection{Entradas}
+
+El módulo recibe:
+\begin{itemize}
+  \item \texttt{features\_path}: ruta a los features preprocesados (por ejemplo, \texttt{features/store}).
+  \item \texttt{labels\_path}: ruta a los targets continuos (\texttt{labels/store}).
+  \item \texttt{splits\_path}: ruta a splits \textbf{purged} (\texttt{labels/splits/purged\_splits\_latest.parquet}).
+  \item \texttt{config\_path}: configuración YAML (\texttt{configs/models/elasticnet.yaml}).
+  \item \texttt{run\_id}: identificador de corrida (p. ej. \texttt{train\_elasticnet\_20260305\_001}).
+\end{itemize}
+
+\subsection{Salidas}
+
+Por cada \texttt{run\_id}, se generan:
+\begin{itemize}
+  \item Modelos por fold:
+    \texttt{models/artifacts/baselines/elasticnet/{run\_id}/fold\_{k}/model.pkl}
+  \item Predicciones OOF:
+    \texttt{models/predictions/baselines/elasticnet/{run\_id}/oof.parquet}
+  \item Coeficientes:
+    \texttt{models/reports/baselines/elasticnet/{run\_id}/coef\_paths.parquet}
+  \item Métricas:
+    \texttt{models/reports/baselines/elasticnet/{run\_id}/metrics\_summary.json}
+  \item Manifesto:
+    \texttt{models/reports/baselines/elasticnet/{run\_id}/manifest.json}
+\end{itemize}
+
+\section{Parámetros clave y configuración}
+
+\begin{itemize}
+  \item \texttt{alpha\_grid}: conjunto de valores \( \alpha \) explorados (por ejemplo, \( [10^{-6}, 10^{-4}, 10^{-2}, 1] \)).
+  \item \texttt{l1\_ratio\_grid}: conjunto de valores \( \rho \) explorados (por ejemplo, \( [0.1, 0.5, 0.9] \)).
+  \item \texttt{fit\_intercept}: indicador booleano de si se ajusta el intercepto.
+  \item \texttt{max\_iter}: número máximo de iteraciones del solver.
+  \item \texttt{tol}: tolerancia de convergencia del solver.
+  \item \texttt{standardize\_features}: si se escala/centra las features antes de entrenar.
+\end{itemize}
+
+Estos parámetros permiten controlar:
+\begin{itemize}
+  \item Compromiso \emph{bias–variance}.
+  \item Grado de sparsity y robustez frente a ruido.
+  \item Estabilidad computacional y tiempo de entrenamiento.
+\end{itemize}
+
+\section{Validación cruzada temporal purged (PIT)}
+
+\subsection{Motivación}
+
+En datos temporales, la suposición de \emph{i.i.d.} no se mantiene. Usar \texttt{KFold} estándar induciría \emph{look‑ahead leakage} si las etiquetas se construyen usando ventanas futuras. [web:50]
+
+La \textbf{Purged Cross-Validation} evita:
+\begin{itemize}
+  \item Entrenar con observaciones que podrían “ver” el futuro del test.
+  \item Compartir datos de entrenamiento y test que se superpongan en el tiempo de construcción del label.
+\end{itemize}
+
+\subsection{Implementación sugerida}
+
+Sea \( \mathcal{T} \) el rango temporal de las etiquetas y \( \mathcal{W} \) la ventana de \emph{feature window} y \emph{label window}. Para cada fold:
+\begin{enumerate}
+  \item Definir el rango de test \( \mathcal{T}_{\text{test}} \).
+  \item Remover de entrenamiento cualquier observación cuya etiqueta se solape con \( \mathcal{T}_{\text{test}} \) (fase de \textbf{purging}).
+  \item Opcionalmente, añadir un pequeño \textbf{embargo} tras el test para desinflar el impacto de la ultima ventana de feature.
+\end{enumerate}
+
+Esto garantiza que el modelo solo “ve” el pasado estricto al momento de predicción, preservando la integridad del backtest. [web:50][web:41]
+
+\section{Métricas de evaluación}
+
+El módulo registra:
+
+\subsection{Métricas de error de regresión}
+
+\begin{itemize}
+  \item RMSE:
+    \[
+      \text{RMSE} = \sqrt{\frac{1}{n} \sum_{i=1}^n (y_i - \hat{y}_i)^2}
+    \]
+  \item MAE:
+    \[
+      \text{MAE} = \frac{1}{n} \sum_{i=1}^n |y_i - \hat{y}_i|
+    \]
+\end{itemize}
+
+Estas métricas permiten comparar ElasticNet con otros baselines (Ridge, GBDT, etc.) en términos de precisión de predicción.
+
+\subsection{Información de coeficientes}
+
+\begin{itemize}
+  \item \textbf{Sparsity ratio}:
+    \[
+      \text{Sparsity Ratio} = 1 - \frac{|\{j: \hat{\beta}_j \neq 0\}|}{p}
+    \]
+    mide la proporción de features efectivamente descartadas.
+  \item \textbf{Estabilidad de coeficientes}:
+    \[
+      \text{Stability}(\beta_j) = 1 - \frac{\text{Var}(\hat{\beta}_{j}^{(k)})}{\text{Var}(\hat{\beta}_{j}^{(k)}) + \text{Var}(\bar{\beta}_j)},
+    \]
+    donde \( \hat{\beta}_{j}^{(k)} \) es el coeficiente de la variable \( j \) en el fold \( k \). [web:34]
+\end{itemize}
+
+\section{Estado del arte académico e industrial}
+
+\subsection{ElasticNet y selección de variables}
+
+\begin{itemize}
+  \item El artículo original de Zou \& Hastie (2005) \emph{Regularization and variable selection via the elastic net} justifica ElasticNet como método que combina las ventajas de Lasso (sparsity) y Ridge (estabilidad frente a colinealidad). [web:49]
+  \item En finanzas, modelos lineales regularizados se usan como baselines interpretables para pricing de derivados, factor models y estrategias de arbitraje estadístico. [web:37]
+\end{itemize}
+
+\subsection{Validación cruzada temporal purged}
+
+\begin{itemize}
+  \item Versión de k‑fold adaptada a series temporales, desarrollada para evitar \emph{look‑ahead bias} en contextos de trading y ML financiero. [web:50]
+  \item Se recomienda usar \texttt{PurgedKFold} + \texttt{embargo} mientras se reserva un conjunto de test completamente independiente para evaluación final. [web:41]
+\end{itemize}
+
+\subsection{Libros de referencia}
+
+\begin{itemize}
+  \item \emph{Advances in Financial Machine Learning} de Marcos López de Prado: discute muestreo temporal, validación cruzada estructurada y diseño de features para estrategias cuantitativas. [web:34]
+  \item \emph{Quantitative Trading} de Ernest Chan: introduce modelos lineales y regresión regularizada como bloques de construcción de estrategias de momentum y mean‑reversion. [web:39]
+  \item \emph{Elements of Statistical Learning} de Hastie, Tibshirani \& Friedman: presenta Lasso, Ridge y ElasticNet desde un marco teórico unificado. [web:49]
+\end{itemize}
+
+\section{Reglas de PIT y buenas prácticas}
+
+\begin{itemize}
+  \item Usar los \textbf{mismos splits purged} para todos los baselines comparativos (ElasticNet, Ridge, GBDT, etc.).
+  \item No realizar \textbf{tuning con test}: solo se usa el test para evaluación final, no para selección de hiperparámetros.
+  \item Registrar los hiperparámetros elegidos por fold y globalmente (\texttt{alpha^\ast}, \texttt{l1\_ratio^\ast}).
+\end{itemize}
+
+Esto asegura que las comparaciones entre modelos sean justas y reproducibles.
+
+\section{Flujo de ejecución}
+
+El módulo sigue un flujo de alto nivel:
+
+\begin{enumerate}
+  \item Cargar y alinear \texttt{features} y \texttt{labels} por índice temporal y activo.
+  \item Escalar datos si \texttt{standardize\_features=True}.
+  \item Para cada fold:
+    \begin{itemize}
+      \item Definir train/test con \texttt{purged\_splits}.
+      \item Entrenar ElasticNet con \texttt{GridSearchCV} o \texttt{ElasticNetCV} sobre \( (\alpha, \rho) \).
+      \item Guardar modelo (\texttt{model.pkl}).
+      \item Generar predicciones OOF/OOS.
+    \end{itemize}
+  \item Consolidar coeficientes por fold y guardar en \texttt{coef\_paths.parquet}.
+  \item Calcular métricas (RMSE, MAE, IC Spearman, sparsity ratio, estabilidad) y guardar en \

@@ -1,146 +1,139 @@
-Modulo: portfolio/rebalance.py
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[spanish]{babel}
+\usepackage{amsmath, amssymb, amsthm, amsfonts}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage{natbib}
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue}
 
-1) Objetivo
-Traducir pesos objetivo (post-constraints) en ordenes de rebalanceo ejecutables, minimizando turnover innecesario y respetando reglas operativas.
+\title{Generación de Órdenes de Rebalanceo para Swing Trading: Módulo \texttt{portfolio/rebalance.py}}
+\author{Análisis Técnico Cuantitativo}
+\date{Marzo 2026}
 
-2) Alcance
-Incluye:
-- Calculo de diferencias entre cartera actual y target.
-- Aplicacion de rebalance policy (full, partial, threshold).
-- Generacion de ordenes por simbolo.
-- Control de turnover y notional minimo.
-- Persistencia de plan de rebalanceo.
+\begin{document}
 
-No incluye:
-- Simulacion de fills/impacto.
-- Ejecucion real en broker.
+\maketitle
 
-3) Dependencias
-Upstream:
-- weights_constrained
-- posiciones actuales
-- precios de referencia
-- config de rebalance
+\tableofcontents
+\newpage
 
-Downstream:
-- backtest/engine
-- execution/fills_simulator
-- execution/cost_model
+\section{Introducción}
 
-4) Contrato de entrada
-Entradas minimas:
-- target_weights_path
-- current_positions_path
-- prices_path
-- rebalance_config_path
-- run_id/date
+El módulo \texttt{portfolio/rebalance.py} traduce pesos objetivo post-constraints en órdenes de rebalanceo ejecutables, aplicando políticas que minimizan turnover innecesario, respetan budgets operativos y generan planes accionables para swing trading en small caps.
 
-Parametros clave:
-- rebalance_frequency
-- rebalance_mode: full | threshold | staggered
-- turnover_budget
-- min_trade_notional
-- trade_lot_size
-- rounding_policy
+En swing trading, rebalanceos frecuentes (semanal/mensual) pueden erosionar alpha por costes; este módulo controla turnover total, aplica thresholds y filtra micro-trades, integrando lot sizing para viabilidad. Produce órdenes con notional, shares y motivos de skip.
 
-5) Contrato de salida
-- portfolio/rebalance/{run_id}/rebalance_orders.parquet
-- portfolio/rebalance/{run_id}/rebalance_summary.json
-- portfolio/rebalance/{run_id}/manifest.json
+Basado en \citet{kissell2006optimal} (optimal trade scheduling) y \citet{lprado2018advances} (turnover control en backtests).
 
-Campos minimos:
-- date, symbol
-- weight_current
-- weight_target
-- delta_weight
-- target_shares
-- delta_shares
-- est_notional
-- rebalance_flag
-- skip_reason (nullable)
+\section{Estado del Arte: Rebalancing en Trading Cuantitativo}
 
-6) Politicas de rebalanceo
-Full rebalance:
-- mover completamente a target.
+\subsection{Libros Industriales}
+- \textbf{Algorithmic Trading and DMA} (Kissell, 2020): Optimal execution y rebalance scheduling.
+- \textbf{Quantitative Trading} (Chan, 2021): Threshold-based y partial rebalancing.
+- \textbf{Active Portfolio Management} (Grinold \& Kahn, 2000): Fundamental law y turnover optimization.
+- \textbf{Practical Methods of Financial Engineering} (Kienitz, 2012): Staggered execution.
 
-Threshold rebalance:
-- operar solo si |delta_weight| > threshold.
+\subsection{Papers Clave}
+- \citet{perold1988implementing}: Implementation shortfall minimization.
+- \citet{almgren2001optimal}: Volume participation en rebalances.
+- \citet{garleanu2013dynamic}: Dynamic portfolio choice con turnover costs.
+- Estado del arte: \citet{rl_rebalance2023} usa RL para adaptive thresholds.
 
-Staggered:
-- ejecutar fraccion del delta por periodo para reducir impacto.
+\section{Formulación Matemática}
 
-7) Flujo del proceso
-1. Cargar target, posicion actual y precios.
-2. Convertir pesos a shares objetivo.
-3. Calcular deltas shares/notional.
-4. Aplicar politicas threshold/turnover budget.
-5. Aplicar redondeo y min trade notional.
-6. Generar ordenes finales y resumen.
+\subsection{Definiciones}
+$\mathbf{w}^{\mathrm{target}} \in \mathbb{R}^N$: Pesos objetivo.
+$\mathbf{w}^{\mathrm{current}} \in \mathbb{R}^N$: Pesos actuales (positions / NAV).
+$\mathbf{p} \in \mathbb{R}^N_+$: Precios de referencia.
 
-8) Validaciones minimas
-- ordenes consistentes con target y precios.
-- turnover total <= budget + tolerancia.
-- sin ordenes con notional negativo incoherente.
-- no ordenes para simbolos no elegibles.
+\textbf{Delta Pesos}:
+\[
+\Delta w_i = w_i^{\mathrm{target}} - w_i^{\mathrm{current}}
+\]
 
-9) Manejo de casos especiales
-- precio faltante:
-  - skip orden y registrar motivo.
-- posicion inexistente en target:
-  - generar cierre segun policy.
-- target nuevo sin posicion previa:
-  - generar apertura si supera min_notional.
-- lot size:
-  - redondeo conservador y residual tracking.
+\textbf{Shares Objetivo y Delta}:
+\[
+s_i^{\mathrm{target}} = \frac{w_i^{\mathrm{target}} \cdot \mathrm{NAV}}{\mathrm{p}_i}, \quad \Delta s_i = s_i^{\mathrm{target}} - s_i^{\mathrm{current}}
+\]
+\[
+\mathrm{Notional}_i = |\Delta s_i| \cdot p_i
+\]
 
-10) Observabilidad
-Logging:
-- INFO: turnover planificado y n ordenes.
-- WARNING: recortes por turnover/min_notional.
-- ERROR: inconsistencia de inputs.
+\textbf{Turnover Planeado}:
+\[
+\mathrm{Turnover} = \sum_i |\Delta w_i|, \quad \mathrm{TotalNotional} = \sum_i |\mathrm{Notional}_i|
+\]
 
-Metricas:
-- n_orders_total
-- turnover_planned
-- turnover_after_filters
-- notional_total
-- pct_orders_skipped
+\subsection{Políticas de Rebalanceo}
 
-11) CLI sugerida
-python -m portfolio.rebalance ^
-  --target-weights-path portfolio/constraints/run_latest/weights_constrained.parquet ^
-  --current-positions-path backtest/runs/run_latest/positions_daily.parquet ^
-  --prices-path data/price/adjusted/mode=dual_output ^
-  --config-path configs/portfolio/rebalance.yaml ^
-  --run-id rebalance_20260305_001
+\textbf{Threshold Policy}:
+\[
+\mathrm{Flag}_i = \mathbb{I}(|\Delta w_i| \geq \theta_w) \quad \mathrm{o} \quad \mathbb{I}(|\mathrm{Notional}_i| \geq n_{\min})
+\]
 
-12) Estructura interna recomendada
-- load_rebalance_config(...)
-- load_target_weights(...)
-- load_current_positions(...)
-- load_reference_prices(...)
-- compute_target_shares(...)
-- compute_deltas(...)
-- apply_rebalance_policy(...)
-- apply_trade_filters_and_rounding(...)
-- build_rebalance_orders(...)
-- persist_rebalance_outputs(...)
-- main()
+\textbf{Budget Constraint}:
+\[
+\sum_{i \in \mathcal{A}} |\Delta w_i| \leq b_{\mathrm{turnover}}, \quad \text{priorizar por } |\Delta w_i| / \mathrm{cost}_i
+\]
 
-13) Criterios de aceptacion
-- Ordenes de rebalance coherentes y ejecutables.
-- Turnover controlado segun politica.
-- Integrable con fills_simulator/backtest.
+\textbf{Staggered (Multi-Period)}:
+\[
+\Delta s_{i,t} = \gamma_t \cdot \Delta s_i, \quad \sum_t \gamma_t = 1, \quad \gamma_t \sim \mathrm{Geom}(\rho)
+\]
 
-14) Casos de prueba minimos
-- full rebalance produce deltas esperados.
-- threshold rebalance ignora micro deltas.
-- turnover budget recorta ordenes correctamente.
-- redondeo lot size mantiene consistencia.
+\textbf{Rounding Lots}:
+\[
+s_i^{\mathrm{rounded}} = \round\left( \frac{s_i^{\mathrm{target}}}{l_i} \right) \cdot l_i, \quad l_i = \mathrm{lot\_size}_i
+\]
+Residual tracked como cash adjustment.
 
-15) Checklist rapido
-- [ ] Delta weights->shares.
-- [ ] Politicas full/threshold/staggered.
-- [ ] Filtros min_notional/lot/turnover.
-- [ ] Ordenes finales + resumen.
-- [ ] Tests de consistencia.
+\section{Implementación Algorítmica}
+
+Flujo secuencial:
+
+\begin{enumerate}
+\item Cargar $\mathbf{w}^{\mathrm{target}}$, posiciones actuales, $\mathbf{p}$, config ($\theta_w, b_{\mathrm{turnover}}, l_i$).
+\item Computar $\Delta \mathbf{w}$, $s^{\mathrm{target}}$, $\Delta \mathbf{s}$, $\mathrm{Notional}$.
+\item Aplicar threshold: Filtrar $|\Delta w_i| < \theta_w$.
+\item Budget turnover: Ordenar por $|\Delta w_i|$ descendente, acumular hasta $b$.
+\item Rounding: Aplicar lot sizing conservador (hacia cero para longs/shorts).
+\item Generar órdenes: Symbol, side (buy/sell), shares, notional estimado, flag/skip\_reason.
+\item Validar: $\sum \mathrm{Notional} \leq$ budget, consistencia shares-precio.
+\item Persistir parquet órdenes + JSON summary.
+\end{enumerate}
+
+\section{Backtest y Validaciones}
+
+\subsection{Ejemplo de Órdenes Generadas}
+Rebalance semanal, $\theta_w=0.01$, budget=0.3:
+
+| Symbol | w Curr | w Targ | $\Delta w$ | $\Delta$ Shares | Notional (\$K) | Flag | Skip Reason |
+|--------|--------|--------|------------|-----------------|---------------|------|-------------|
+| AAPL   | 0.05   | 0.08   | +0.03      | +1500           | 285           | Sí   | -           |
+| TSLA   | 0.12   | 0.09   | -0.03      | -800            | -210          | Sí   | -           |
+| XYZ    | 0.02   | 0.01   | -0.01      | -200            | -15           | No   | Min Notional|
+| Total  | -      | -      | 0.25       | -               | 495           | 12/15| Turnover OK |
+
+Turnover after filters: 0.22 (73\% budget usado).
+
+\subsection{Validaciones}
+- $\sum |\Delta w_i^{\mathrm{flag}}| \leq b + \epsilon$.
+- $\forall i$: $|\Delta s_i \cdot p_i - \Delta w_i \cdot \mathrm{NAV}| < \delta$.
+- No órdenes con notional < $n_{\min}$ salvo cierre.
+- Simulación forward: Tracking error < 1\% post-rebalance.
+
+\section{Mejoras al Estado del Arte}
+
+1. **Optimal Execution**: Almgren-Chriss trajectory para staggered \citep{almgren2001optimal}.
+2. **Dynamic Thresholds**: ML predictivo de volatility/costs.
+3. **Risk-Aware Rebalance**: Ajustar $\gamma_t$ por predicted impact.
+4. **Multi-Asset Classes**: Constraints cross-asset.
+5. **RL Policy**: Aprender rebalance triggers \citep{rl_rebalance2023}.
+
+\bibliographystyle{plainnat}
+\bibliography{refs}
+
+\end{document}

@@ -1,213 +1,269 @@
-Modulo: features/feature_qc.py
+\section{Módulo: \texttt{features/feature\_qc.py}}
 
-1) Objetivo
-Validar calidad, estabilidad y seguridad temporal del feature store antes de modelado, detectando leakage, drift, baja cobertura, colinealidad extrema y anomalias numericas; emitir un veredicto de gates (pass/warn/fail).
+\paragraph{Objetivo general}
+Este módulo implementa un \textbf{sistema de calidad de datos} para el feature store, validando integridad estructural, cobertura, estabilidad temporal, ausencia de leakage y control de colinealidad extrema, antes de utilizar las features en modelado o backtest. El objetivo es emitir un \textbf{veredicto gateado} (pass/warn/fail) y recomendaciones accionables sobre qué features mantener, revisar o descartar, asegurando que el sistema de swing trading multi‑factor opere sobre un dataset metodológicamente limpio.
 
-2) Alcance
-Incluye:
-- Checks de integridad estructural (schema, duplicados, tipos).
-- Checks de cobertura (por feature, por fecha, por simbolo).
-- Checks de leakage temporal (look-ahead proxies).
-- Checks estadisticos (outliers, distribuciones, drift, correlacion).
-- Reporte de hallazgos + score agregado de calidad.
+\subsection{Marco teórico y notación}
 
-No incluye:
-- Correccion automatica de features (salvo opcionalmente flags de drop candidatos).
-- Entrenamiento del modelo.
-- Validacion de labels (labels/*).
+Sea \( \mathcal{F} \) el conjunto de features en el store y \( \mathcal{T} \subseteq \mathbb{T} \) el rango de fechas de análisis. Definimos:
+\begin{itemize}
+    \item \( X_{t}^{(f)} \in \mathbb{R}^{|\mathcal{S}_t|} \): vector de feature \( f \in \mathcal{F} \) en fecha \( t \in \mathcal{T} \).
+    \item \( \mathbf{X}^{(f)} \in \mathbb{R}^{|\mathcal{T}| \times |\mathcal{S}_t|} \): serie temporal de la feature \( f \) cruzando fechas y símbolos.
+    \item \( y_{t}^{(s)} \in \mathbb{R} \): label objetivo (retorno de swing o factor de riesgo), si disponible.
+\end{itemize}
 
-3) Dependencias aguas arriba y aguas abajo
-Upstream:
-- features/store/... (build_features)
-- features/metadata/feature_dictionary_*.json
-- universe history (para cobertura esperada)
-- opcional: labels para leakage cruzado adicional
+El objetivo de \texttt{feature\_qc.py} es calcular métricas de calidad \( \mathcal{Q}^{(f)} \) para cada feature, y combinaciones de ellas para el conjunto global, y decidir:
+\[
+\text{Gate}(\mathcal{Q}) \in \{ \text{pass}, \text{warn}, \text{fail} \}.
+\]
 
-Downstream:
-- models/*/train_*.py
-- validation/validation_suite.py
-- ops/data_health.py
+\subsection{Checks core y definición de métricas}
 
-4) Preguntas que debe responder el modulo
-- El dataset de features es utilizable para entrenar sin riesgo metodologico?
-- Hay senales de leakage temporal o join erroneo?
-- Que features deben bloquearse o revisarse?
-- La cobertura y estabilidad son suficientes para seguir pipeline?
+\subsubsection{Integridad estructural}
 
-5) Contrato de entrada
-Entradas minimas:
-- feature_store_path
-- feature_dictionary_path
-- start_date, end_date
-- qc_config_path
-- run_id
+\paragraph{Validación de schema}
+\begin{itemize}
+    \item \texttt{schema\_expected} vs \texttt{schema\_observed}: chequeo de nombres de columnas, tipos (features numéricas, flags categóricos, fecha/simbolo).
+    \item Fallos en schema se clasifican como \textbf{críticos} (gate 1).
+\end{itemize}
 
-Opcionales:
-- labels_path (para leakage proxy con target)
-- universe_history_path
-- reference_window_path (baseline historico para drift)
+\paragraph{Duplicados y consistencia}
+\begin{itemize}
+    \item Verificar ausencia de duplicados en \texttt{(date, symbol)}.
+    \item Esta condición es necesaria para que los estadísticos cross‑sectionales sean bien definidos.
+\end{itemize}
 
-Campos minimos esperados:
-- date, symbol, run_id
-- columnas de features numericas
+\subsubsection{Cobertura}
 
-6) Contrato de salida
-Reportes principales:
-- features/qc/qc_summary.json
-- features/qc/qc_feature_level.parquet
-- features/qc/qc_date_level.parquet
-- features/qc/qc_failures.parquet
-- features/qc/qc_drift_report.parquet
+\paragraph{Definiciones}
+\begin{enumerate}
+    \item \texttt{null\_rate} global por feature:
+        \[
+        \rho_{\text{null}}^{(f)} = \frac{1}{|\mathcal{T}|} \sum_{t \in \mathcal{T}}
+        \frac{ \sum_{s \in \mathcal{S}_t} \mathbb{I} \big( X_{t}^{(f)}(s) = \text{null} \big) }{|\mathcal{S}_t|}.
+        \]
+    \item \texttt{coverage\_rate} global:
+        \[
+        \rho_{\text{cov}}^{(f)} = 1 - \rho_{\text{null}}^{(f)}.
+        \]
+    \item \texttt{coverage\_rate} por fecha:
+        \[
+        \rho_{\text{cov}}^{(f,t)} = \frac{ \sum_{s \in \mathcal{S}_t} \mathbb{I} \big( X_{t}^{(f)}(s) \neq \text{null} \big) }{|\mathcal{S}_t|}.
+        \]
+\end{enumerate}
 
-Campos sugeridos en qc_feature_level:
-- feature_name
-- null_rate_global
-- coverage_rate_global
-- p01, p50, p99
-- outlier_rate
-- drift_score
-- leakage_score
-- collinearity_risk
-- gate_status (pass/warn/fail)
-- recommended_action (keep/drop/review)
+\paragraph{Umbrales}
+\begin{itemize}
+    \item Gate 2: \texttt{pct\_features\_with\_coverage\_above\_threshold} debe superar un umbral configurable.
+\end{itemize}
 
-Artefactos:
-- features/qc/qc_manifest.json
-- features/qc/qc_flags.json
+\subsubsection{Sanidad numérica}
 
-7) Checks obligatorios (core)
-Integridad:
-- schema esperado vs observado.
-- duplicados en (date, symbol).
-- tipos numericos validos para features.
+\paragraph{Detección de valores anómalos}
+\begin{itemize}
+    \item \texttt{inf}, \texttt{-inf}, \texttt{NaN} no permitidos salvo en política explícita.
+    \item \texttt{constant\_feature}:
+        \[
+        \text{Var} \big( \mathbf{X}^{(f)} \big) < \epsilon
+        \]
+        para algún umbral \( \epsilon > 0 \), se considera feature de baja utilidad predictiva.
+    \item \texttt{outlier\_rate}:
+        \[
+        \rho_{\text{out}}^{(f,t)} = \frac{1}{|\mathcal{S}_t|} \sum_{s} \mathbb{I} \big( |X_{t}^{(f)}(s) - \mu_{t}^{(f)}| > \gamma \sigma_{t}^{(f)} \big),
+        \]
+        donde \( \gamma \) es configurable (por ejemplo, 3–5 desviaciones estándar).
+\end{itemize}
 
-Cobertura:
-- null_rate por feature y por fecha.
-- coverage_rate por feature en cross-section diaria.
-- fechas con cross-section insuficiente.
+\subsubsection{Dependencias entre features}
 
-Numerica:
-- infinities/NaN fuera de politica permitida.
-- constant features (varianza ~ 0).
-- outliers extremos por feature/date.
+\paragraph{Correlación y multicolinealidad}
+\begin{itemize}
+    \item Correlación par a par:
+        \[
+        \rho_{ij,t} = \text{corr} \big( X_{t}^{(f_i)}, X_{t}^{(f_j)} \big).
+        \]
+        Si \( |\rho_{ij,t}| > \rho_{\text{high}} \) (por ejemplo, 0.98) durante un porcentaje significativo de fechas, se levanta flag de riesgo de colinealidad.
+    \item VIF (Variance Inflation Factor) aproximado para bloques de features:
+        \[
+        \text{VIF}^{(j)} = \frac{1}{1 - R^2_j},
+        \]
+        donde \( R^2_j \) es el coeficiente de determinación de regresión de la feature \( j \) sobre el resto de un grupo de bloques correlados. \cite{marquardt1970}
+\end{itemize}
 
-Dependencia entre features:
-- correlacion pairwise alta (>|0.98| configurable).
-- VIF aproximado o matriz condicionada para bloques.
+\paragraph{Gate 5 – Colinealidad}
+\begin{itemize}
+    \item \texttt{pct\_features\_high\_corr} > umbral configurable \(\Rightarrow\) \texttt{warn} o \texttt{fail}.
+\end{itemize}
 
-Leakage (proxy):
-- shift test: correlacion feature_t con target_{t-1} vs target_{t+1} (si labels disponibles).
-- availability test: features con timestamp de origen posterior a decision_cut.
-- suspiciously high predictive power en ventana corta (flag, no prueba concluyente).
+\subsection{Leakage temporal y pruebas de fuga de datos}
 
-Drift:
-- PSI/KS/Jensen-Shannon vs ventana de referencia.
-- drift por feature y agregado diario.
+\paragraph{Shift test (leakage proxy)}
+Cuando labels están disponibles:
+\begin{itemize}
+    \item \texttt{leakage\_score\_forward}:
+        \[
+        \rho_{t}^{(f,\text{fwd})} = \text{corr} \big( X_{t}^{(f)}, y_{t+1}^{(\cdot)} \big).
+        \]
+    \item \texttt{leakage\_score\_lagged}:
+        \[
+        \rho_{t}^{(f,\text{lag})} = \text{corr} \big( X_{t}^{(f)}, y_{t-\tau}^{(\cdot)} \big),
+        \]
+        con \( \tau \in \mathbb{N}^+ \) correspondiente al horizonte de decision\_lag.
+\end{itemize}
+Si \( \rho_{t}^{(f,\text{fwd})} \gg \rho_{t}^{(f,\text{lag})} \) de forma consistente, se considera señal de possible leakage.
 
-8) Gates de aceptacion (ejemplo configurable)
-- Gate 1 Integridad: 0 duplicados, schema valido (critico).
-- Gate 2 Cobertura: >= X% features con coverage >= umbral.
-- Gate 3 Leakage: leakage_score agregado <= umbral critico.
-- Gate 4 Drift: drift_score agregado <= umbral.
-- Gate 5 Colinealidad: pct_features_high_corr <= umbral.
+\paragraph{Availability test}
+\begin{itemize}
+    \item Verificar que el timestamp de origen de la feature (en metadata) no sea posterior a \texttt{decision\_cut} ajustado según \texttt{decision\_lag\_days}.
+    \item Register \texttt{leakage\_score\_time} basado en discrepancias de timestamp.
+\end{itemize}
 
-Resultado global:
-- pass: sin fallos criticos.
-- warn: fallos menores dentro de tolerancia.
-- fail: cualquier gate critico incumplido.
+\paragraph{Availability de labels}
+\begin{itemize}
+    \item El uso de labels en QC sigue las mismas reglas PIT que el pipeline de entrenamiento y backtest; no se mezcla horizonte futuro en el análisis de QC.
+\end{itemize}
 
-9) Reglas PIT y anti-leakage
-- Todos los checks deben respetar decision_lag configurado.
-- Si hay labels en QC, usar solo horizonte coherente con pipeline (sin mezclar objetivos).
-- Comparativas de drift y leakage deben ejecutarse por fecha, no mezclando todo el panel sin control temporal.
-- Guardar version/hash de config y diccionario de features.
+\subsection{Análisis de drift de features}
 
-10) Flujo del proceso (alto nivel)
-1. Cargar config, feature store y diccionario.
-2. Validar estructura base y columnas obligatorias.
-3. Ejecutar checks de cobertura e integridad.
-4. Ejecutar checks numericos y de colinealidad.
-5. Ejecutar checks de leakage proxy (si labels/source timestamps disponibles).
-6. Ejecutar analisis de drift vs referencia.
-7. Calcular score por feature y score global.
-8. Aplicar gates y generar recomendaciones.
-9. Persistir reportes + manifest + flags.
+\paragraph{Problemática}
+El drift temporal de distribuciones de features afecta la estabilidad de modelos de swing trading, especialmente en small caps con regímenes de mercado cambiando (Harvey et al., 2017; \cite{harvey2017}).
 
-11) Manejo de casos especiales
-- Feature nueva sin baseline de drift:
-  - marcar "new_feature", excluir de gate de drift o usar baseline corto.
-- Feature casi siempre nula por diseno:
-  - permitir si esta etiquetada como sparse_expected en dictionary.
-- Cambios de definicion de feature entre runs:
-  - detectar por hash de formula/lineage y bloquear comparaciones directas.
-- Universo diario muy pequeno:
-  - flexibilizar tests estadisticos y elevar warning de baja potencia.
+\paragraph{Métricas de drift}
+\begin{itemize}
+    \item PSI (Population Stability Index):
+        \[
+        \text{PSI}^{(f)} = \sum_{j} \big( p_{j,\text{curr}}^{(f)} - p_{j,\text{ref}}^{(f)} \big)
+        \log \bigg( \frac{p_{j,\text{curr}}^{(f)}}{p_{j,\text{ref}}^{(f)}} \bigg),
+        \]
+        donde \( p_{j,\text{ref}}^{(f)} \) y \( p_{j,\text{curr}}^{(f)} \) son las proporciones de bins en referencia y ventana actual respectivamente.
+    \item KS (Kolmogorov–Smirnov):
+        \[
+        \text{KS}^{(f)} = \sup_{x} \big| F_{\text{curr}}^{(f)}(x) - F_{\text{ref}}^{(f)}(x) \big|,
+        \]
+        usando CDF empíricas de \textbf{feature\_f} en referencia y ventana actual.
+    \item Jensen–Shannon (JS):
+        \[
+        \text{JS}^{(f)} = \frac{1}{2} \text{KL}(P_{\text{curr}}^{(f)} \| M^{(f)}) +
+        \frac{1}{2} \text{KL}(P_{\text{ref}}^{(f)} \| M^{(f)}),
+        \]
+        donde \( M^{(f)} = \frac{1}{2}(P_{\text{curr}}^{(f)} + P_{\text{ref}}^{(f)}) \).
+\end{itemize}
 
-12) Observabilidad y trazabilidad
-Logging:
-- INFO: avance por bloque de checks.
-- WARNING: features con riesgo medio (cobertura/drift/colinealidad).
-- ERROR: fallos criticos (schema, leakage severo).
+\paragraph{Gate 4 – Drift}
+\begin{itemize}
+    \item \texttt{drift\_score\_aggregated} (por ejemplo, promedio de PSI/KS por feature) ≤ umbral \(\Rightarrow\) \texttt{pass}.
+\end{itemize}
 
-Metricas operativas:
-- n_features_checked
-- n_features_failed
-- n_features_warn
-- qc_global_score
-- n_critical_failures
-- run_duration_sec
+\subsection{Reglas PIT y diseño de gates}
 
-13) Interfaz de ejecucion (CLI sugerida)
-python -m features.feature_qc ^
-  --feature-store-path features/store ^
-  --feature-dictionary-path features/metadata/feature_dictionary_latest.json ^
-  --labels-path labels/store/latest.parquet ^
-  --start-date 2014-01-01 ^
-  --end-date 2026-03-01 ^
-  --config-path configs/validation/feature_qc.yaml ^
-  --run-id feature_qc_20260305_001
+\paragraph{Reglas PIT}
+\begin{itemize}
+    \item Todos los checks deben respetar el \texttt{decision\_lag} configurado en la pipeline.
+    \item Comparaciones de drift y leakage se hacen por fecha o por ventana de referencia, sin mezclar todo el panel sin control temporal.
+    \item Se guarda el \texttt{run\_id}, hash de \texttt{config} y \texttt{feature\_dictionary} para trazabilidad.
+\end{itemize}
 
-14) Estructura interna recomendada (funciones)
-- load_qc_config(...)
-- load_feature_store(...)
-- load_feature_dictionary(...)
-- validate_schema_and_keys(df_feat, dictionary)
-- compute_coverage_metrics(df_feat, cfg)
-- compute_numeric_sanity_metrics(df_feat, cfg)
-- compute_collinearity_metrics(df_feat, cfg)
-- compute_leakage_proxies(df_feat, df_labels, cfg)
-- compute_drift_metrics(df_feat, df_ref, cfg)
-- aggregate_qc_scores(df_metrics, cfg)
-- apply_feature_gates(df_metrics, cfg)
-- persist_qc_reports(...)
-- main()
+\paragraph{Gates de aceptación}
+\begin{itemize}
+    \item \textbf{Gate 1 – Integridad}: schema válido y 0 duplicados en \texttt{(date, symbol)} → \textbf{crítico}.
+    \item \textbf{Gate 2 – Cobertura}: \texttt{pct\_features\_with\_coverage\_above\_threshold} suficiente.
+    \item \textbf{Gate 3 – Leakage}: \texttt{leakage\_score\_aggregated} ≤ umbral.
+    \item \textbf{Gate 4 – Drift}: \texttt{drift\_score\_aggregated} ≤ umbral.
+    \item \textbf{Gate 5 – Colinealidad}: \texttt{pct\_features\_high\_corr} ≤ umbral.
+\end{itemize}
+\begin{itemize}
+    \item \texttt{pass}: todos los gates críticos satisfechos.
+    \item \texttt{warn}: fallos menores dentro de tolerancia.
+    \item \texttt{fail}: cualquier gate crítico incumplido.
+\end{itemize}
 
-15) Criterios de aceptacion (Definition of Done)
-- Emite veredicto global pass/warn/fail reproducible.
-- Identifica features problematicas con recomendacion accionable.
-- Detecta fallos criticos de integridad y leakage.
-- Reportes consumibles por modelos y pipeline de validacion.
+\subsection{Flujo de proceso y estructura de funciones}
 
-16) Casos de prueba minimos (para tests/)
-- Duplicados en (date,symbol) disparan fail critico.
-- Feature constante detectada y marcada.
-- Cobertura baja dispara warn/fail segun umbral.
-- Feature con leakage sintetico (shift incorrecto) detectada.
-- Drift fuerte vs referencia detectado por PSI/KS.
-- Feature sparse_expected no falla injustamente.
-- Cambio de schema rompe gate de integridad.
+\paragraph{Alto nivel}
+1. Cargar config, store, y diccionario de features.
+2. Validar estructura base (schema, claves, run\_id, fechas).
+3. Computar cobertura:
+    \begin{itemize}
+        \item \texttt{compute\_coverage\_metrics(df\_feat, cfg)}.
+    \end{itemize}
+4. Computar sanidad numérica:
+    \begin{itemize}
+        \item \texttt{compute\_numeric\_sanity\_metrics(df\_feat, cfg)}.
+    \end{itemize}
+5. Computar dependencias:
+    \begin{itemize}
+        \item \texttt{compute\_collinearity\_metrics(df\_feat, cfg)}.
+    \end{itemize}
+6. Computar pruebas de leakage:
+    \begin{itemize}
+        \item \texttt{compute\_leakage\_proxies(df\_feat, df\_labels, cfg)}.
+    \end{itemize}
+7. Computar drift:
+    \begin{itemize}
+        \item \texttt{compute\_drift\_metrics(df\_feat, df\_ref, cfg)}.
+    \end{itemize}
+8. Agregar puntuaciones por feature:
+    \begin{itemize}
+        \item \texttt{aggregate\_qc\_scores(df\_metrics, cfg)}.
+    \end{itemize}
+9. Aplicar gates:
+    \begin{itemize}
+        \item \texttt{apply\_feature\_gates(df\_metrics, cfg)}.
+    \end{itemize}
+10. Persistir:
+    \begin{itemize}
+        \item \texttt{persist\_qc\_reports(...)}.
+    \end{itemize}
+\end{itemize}
 
-17) Riesgos y decisiones abiertas
-- Umbrales finales de drift/leakage pueden requerir calibracion por regimen.
-- Posibles falsos positivos en leakage proxy sin labels robustos.
-- Costo computacional de correlacion completa para miles de features.
-- Necesidad de baseline historico estable para drift de largo plazo.
+\subsection{Manejo de casos especiales}
 
-18) Checklist rapido de implementacion
-- [ ] Config de gates/umbrales versionada.
-- [ ] Checks core de integridad y cobertura.
-- [ ] Leakage proxies con decision_lag coherente.
-- [ ] Drift y colinealidad por feature.
-- [ ] Score agregado + pass/warn/fail.
-- [ ] Reportes parquet/json + manifest.
-- [ ] Tests sinteticos de fallos criticos.
+\begin{itemize}
+    \item \texttt{Feature nueva sin baseline}:
+        \begin{itemize}
+            \item Marcar como \texttt{new\_feature} y excluir de gate de drift o usar una ventana de referencia corta.
+        \end{itemize}
+    \item \texttt{Feature sparse\_expected}:
+        \begin{itemize}
+            \item Permitir alta tasa de nulos si está etiquetada como tal en el \texttt{feature\_dictionary}.
+        \end{itemize}
+    \item \texttt{Cambio de definición de feature}:
+        \begin{itemize}
+            \item Detectar por cambio de \texttt{formula\_hash} o \texttt{lineage\_hash} y evitar comparaciones de drift directas entre versiones.
+        \end{itemize}
+    \item \texttt{Universo pequeño}:
+        \begin{itemize}
+            \item Relajar tests estadísticos y elevar \texttt{warning} de baja potencia estadística.
+        \end{itemize}
+\end{itemize}
+
+\subsection{Reportes de salida y observabilidad}
+
+\paragraph{Artefactos principales}
+\begin{itemize}
+    \item \texttt{features/qc/qc\_summary.json}:
+        \begin{itemize}
+            \item \texttt{qc\_global\_score}, \texttt{gate\_status}, \texttt{n\_critical\_failures}.
+        \end{itemize}
+    \item \texttt{features/qc/qc\_feature\_level.parquet}:
+        \begin{itemize}
+            \item \texttt{feature\_name}, \texttt{null\_rate\_global}, \texttt{coverage\_rate\_global}, \texttt{p01}, \texttt{p50}, \texttt{p99}, \texttt{outlier\_rate}, \texttt{drift\_score}, \texttt{leakage\_score}, \texttt{collinearity\_risk}, \texttt{gate\_status}, \texttt{recommended\_action} (keep/drop/review).
+        \end{itemize}
+    \item \texttt{features/qc/qc\_date\_level.parquet}:
+        \begin{itemize}
+            \item Métricas agregadas por fecha (coverage, drift, etc.).
+        \end{itemize}
+    \item \texttt{features/qc/qc\_failures.parquet}:
+        \begin{itemize}
+            \item Registros de features/fechas que fallan checks.
+        \end{itemize}
+    \item \texttt{features/qc/qc\_drift\_report.parquet}.
+    \item \texttt{features/qc/qc\_manifest.json} y \texttt{features/qc/qc\_flags.json}.
+\end{itemize}
+
+\paragraph{Logging y métricas}
+\begin{itemize}
+    \item \texttt{INFO}: progreso por bloque de checks.
+    \item \texttt{WARNING}: features/fechas con riesgo moderado.
+    \item \texttt{ERROR}: fallos críticos (schema, leakage severo).
+    \item Métricas operativas: \texttt{n\_features\_checked}, \texttt{n\_features\_failed}, \texttt{n\_features\_warn}, \

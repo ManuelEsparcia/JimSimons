@@ -1,63 +1,192 @@
-Modulo: models/gbdt/train_xgb.py
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[spanish]{babel}
+\usepackage{amsmath, amssymb, bm, mathtools}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{longtable}
 
-1) Objetivo
-Entrenar modelos XGBoost para tareas de regresion/clasificacion/ranking con validacion temporal purged y artefactos reproducibles para inferencia.
+\DeclareMathOperator{\E}{\mathbb{E}}
+\DeclareMathOperator{\Var}{Var}
+\DeclareMathOperator{\Cov}{Cov}
+\DeclareMathOperator{\Corr}{Corr}
+\DeclareMathOperator{\Prob}{\mathbb{P}}
+\DeclareMathOperator{\IC}{IC}
+\DeclareMathOperator{\AUC}{AUC}
+\DeclareMathOperator{\NDCG}{NDCG}
+\DeclareMathOperator{\RMSE}{RMSE}
+\DeclareMathOperator{\MAE}{MAE}
+\DeclareMathOperator{\LL}{LL}
+\DeclareMathOperator{\Hit}{Hit}
 
-2) Alcance
-Incluye pipeline por fold, early stopping, metricas OOS, export de modelo/predicciones/importancias y gates de calidad.
+\title{Entrenamiento de modelos XGBoost con validación temporal purged \\ \texttt{models/gbdt/train\_xgb.py}}
+\author{}
+\date{}
 
-3) Entradas
-- features_path
-- labels_path
-- splits_path
-- config_path
-- run_id
+\begin{document}
 
-4) Salidas
-- models/artifacts/xgb/{run_id}/fold_{k}/model.json
-- models/predictions/xgb/{run_id}/oof.parquet
-- models/reports/xgb/{run_id}/metrics_by_fold.parquet
-- models/reports/xgb/{run_id}/metrics_summary.json
-- models/reports/xgb/{run_id}/training_manifest.json
+\maketitle
 
-5) Parametros clave
-- objective (reg:squarederror, binary:logistic, rank:ndcg)
-- eval_metric
-- eta
-- max_depth
-- min_child_weight
-- subsample
-- colsample_bytree
-- reg_alpha/reg_lambda
-- n_estimators
-- early_stopping_rounds
+\section{Objetivo y contexto de uso industrial}
 
-6) Reglas PIT
-- train/valid segun splits purged.
-- test no usado para tuning.
-- features/labels alineados con decision_lag.
+El módulo \texttt{models/gbdt/train\_xgb.py} entrena modelos \textbf{XGBoost} para tareas de \textbf{regresión}, \textbf{clasificación} y \textbf{ranking} en un entorno de inversión, usando \textbf{validación temporal purged} y generando \textbf{artefactos reproducibles} para inferencia y ensemble. [web:89][web:100]  
 
-7) Flujo
-1. Cargar y unir datasets.
-2. Construir DMatrix por fold.
-3. Entrenar XGB con early stopping.
-4. Generar OOF/OOS preds.
-5. Calcular metricas por fold y agregadas.
-6. Persistir artefactos/reportes.
+Dado un conjunto de datos con features \(\bm{x}_i \in \mathbb{R}^d\), etiquetas \(y_i\) y una partición \texttt{purged\_splits} por fecha, el objetivo es aprender una función \(\hat{f}(\cdot; \bm{\theta})\) tal que las predicciones \(\hat{y}_i = \hat{f}(\bm{x}_i; \bm{\theta})\) sean óptimas en métricas OOS mientras se preserva la cronología temporal y se minimiza el riesgo de fuga de información. [web:89][web:101]
 
-8) Validaciones
-- sin columnas faltantes criticas
-- fold con tamano minimo
-- predicciones cubren indices esperados
-- estabilidad entre folds
+\section{Objetivos soportados en XGBoost}
 
-9) CLI
+El módulo soporta varios objetivos XGBoost, que se configuran vía \texttt{objective}:
+
+\subsection{Regresión: reg:squarederror}
+
+Para variables continuas (por ejemplo, retornos \textit{forward} netos):
+
+\begin{equation}
+\LL_{\text{reg}} = \sum_{i=1}^n \left(y_i - \hat{y}_i\right)^2,
+\end{equation}
+\noindent donde \(\hat{y}_i = \sum_{k=1}^K f_k(\bm{x}_i)\) y \(f_k\) son árboles de decisión. [web:89][web:92]
+
+XGBoost añade una penalización de complejidad sobre los árboles:
+
+\begin{equation}
+\Omega(f_k) = \gamma T_k + \frac{1}{2} \lambda \| \bm{w}_k \|_2^2,
+\end{equation}
+\noindent donde \(T_k\) es el número de hojas, \(\bm{w}_k\) sus pesos y \(\lambda\) el parámetro \texttt{reg\_lambda}. [web:92][web:96]
+
+\subsection{Clasificación: binary:logistic}
+
+Para etiquetas binarias \(y_i \in \{0,1\}\):
+
+\begin{equation}
+\LL_{\text{bin}} = \sum_{i=1}^n \left[
+y_i \log \hat{p}_i + (1-y_i) \log(1 - \hat{p}_i)
+\right],
+\end{equation}
+\noindent donde \(\hat{p}_i = \sigma(\hat{y}_i)\) es la probabilidad calibrada. [web:93][web:96]
+
+Métricas típicas OOS:
+
+\begin{align}
+\AUC\text{ROC} &= \text{Área bajo la curva ROC}, \\
+\AUC\text{PR}  &= \text{Área bajo la curva precision‑recall}, \\
+\text{Logloss} &= \LL_{\text{bin}} / n.
+\end{align}
+[web:99][web:96]
+
+\subsection{Ranking: rank:ndcg}
+
+Para tareas de tipo \texttt{ranking} (por ejemplo, ordenar acciones por retorno esperado):
+
+\begin{equation}
+\text{Objective} = \texttt{rank:ndcg},
+\end{equation}
+\noindent que corresponde a un algortimo inspirado en \textbf{LambdaMART}, donde los gradientes se ajustan según la sensibilidad de \(\NDCG@k\) respecto a cambios en el score de cada elemento:
+
+\begin{equation}
+\lambda_{ij} = \Delta\NDCG@k \cdot \frac{\partial \NDCG}{\partial \hat{y}_i}.
+\end{equation}
+
+La función \(\NDCG@k\) se define como:
+
+\begin{equation}
+\NDCG@k(\bm{p}) = \frac{1}{Z_k} \sum_{i=1}^k \frac{2^{r_i} - 1}{\log_2(i+1)},
+\end{equation}
+\noindent donde \(r_i\) es la relevancia del ítem en posición \(i\) y \(Z_k\) normaliza al ranking óptimo. [web:97][web:101]
+
+\section{Splits temporales purged y embargo}
+
+El modelo se entrena con \texttt{features/store}, \texttt{labels/store} y \texttt{labels/splits/purged\_splits\_latest.parquet}, donde los folds han sido construidos con \textbf{purged cross‑validation} y \textbf{embargo}. [web:78][web:83]  
+
+Cada observación \(i\) está etiquetada con \texttt{fold\_id} y \texttt{split\_role} (\texttt{train}, \texttt{valid}, \texttt{test}). La regla general es:
+
+\begin{equation}
+t_i^{\text{train}} < t_j^{\text{valid/test}} \quad \text{siempre que } i \in \text{train}, j \in \text{valid/test para el mismo fold}.
+\end{equation}
+
+Además, \textbf{features} y \textbf{labels} comparten la misma convención \texttt{decision\_lag}, de modo que ninguna variable incorpora informació de futuro respecto al tiempo de decisión. [web:78][web:100]
+
+\section{DMatrix, early stopping y regularización}
+
+XGBoost recibe los datos como \texttt{DMatrix} y permite configurar:
+
+\begin{itemize}
+    \item \texttt{eta} (\(\eta\)): learning rate.
+    \item \texttt{max\_depth}.
+    \item \texttt{min\_child\_weight} (mínimo \(\sum w_i\) por hoja).
+    \item \texttt{subsample} y \texttt{colsample\_bytree} (bagging y feature sampling).
+    \item \texttt{reg\_alpha}, \texttt{reg\_lambda}: L1 y L2 en los pesos de hoja.
+    \item \texttt{n\_estimators} y \texttt{early\_stopping\_rounds}.
+\end{itemize}
+[web:93][web:96]
+
+La función objetivo total es:
+
+\begin{equation}
+\mathcal{L}(\bm{\theta}) = \sum_{i=1}^n \ell(y_i, \hat{y}_i) + \Omega(f),
+\end{equation}
+\noindent donde \(\ell\) es la función de pérdida asociada al \texttt{objective} y \(\Omega\) la penalización de árboles. [web:92][web:96]
+
+El \texttt{early stopping} se realiza sobre la métrica \texttt{eval\_metric} en el conjunto \texttt{valid}, deteniendo el entrenamiento tras \texttt{early\_stopping\_rounds} iteraciones sin mejora. [web:89][web:94]
+
+\section{Flujo de trabajo por fold}
+
+A nivel de alto nivel, el módulo ejecuta:
+
+\begin{enumerate}
+    \item Cargar \texttt{features\_path}, \texttt{labels\_path}, \texttt{splits\_path}, \texttt{config\_path} y \texttt{run\_id}.
+    \item Unir por \texttt{(date, symbol)} y aplicar \texttt{label\_valid\_flag}.
+    \item Construir \texttt{DMatrix} por \texttt{fold} para \texttt{train} y \texttt{valid}.
+    \item Entrenar XGBoost con \texttt{early\_stopping} y \texttt{eval\_metric}.
+    \item Generar:
+        \begin{itemize}
+            \item \texttt{models/predictions/xgb/\{run\_id\}/oof.parquet}.
+            \item \texttt{fold\_k\_test\_pred.parquet} si \texttt{test} está disponible.
+        \end{itemize}
+    \item Calcular \texttt{metrics\_by\_fold.parquet} y \texttt{metrics\_summary.json} agregadas OOS.
+    \item Guardar \texttt{models/artifacts/xgb/\{run\_id\}/fold\_k/model.json} y \texttt{training\_manifest.json}.
+\end{enumerate}
+
+Cada predicción incluye \texttt{date, symbol, fold\_id, y\_true, y\_pred, split\_role, run\_id} para reproducibilidad en backtest y sistemas de inferencia. [web:89][web:101]
+
+\section{Validaciones y estabilidad de modelos}
+
+Durante el entrenamiento se realizan validaciones:
+
+\begin{itemize}
+    \item No falta ninguna columna crítica de \texttt{features} o \texttt{target}.
+    \item Cada fold tiene número mínimo de muestras para evitar alta varianza en las métricas.
+    \item Las predicciones \texttt{oof.parquet} cubren \textit{exactamente} los índices esperados por fold.
+    \item La desviación estándar de las métricas entre folds está por debajo de un umbral de \textit{estabilidad}.
+\end{itemize}
+
+Estas comprobaciones siguen estándares de \textit{model risk management} y \textit{purged CV} en finanzas cuantitativas, donde la varianza entre folds y la consistencia de ranking son tan importantes como el valor medio de la métrica. [web:78][web:89]
+
+\section{Interfaz de línea de comandos}
+
+Ejemplo de \texttt{CLI}:
+
+\begin{verbatim}
 python -m models.gbdt.train_xgb ^
   --features-path features/store ^
   --labels-path labels/store ^
   --splits-path labels/splits/purged_splits_latest.parquet ^
   --config-path configs/models/xgb_base.yaml ^
   --run-id train_xgb_20260305_001
+\end{verbatim}
 
-10) DoD
-- entrenamiento XGB OOS reproducible y utilizable por inference/ensemble.
+Este comando genera un experimento versionado donde los modelos y predicciones se pueden integrar directamente en \texttt{models/inference/predict.py} y \texttt{models/ensemble/blender.py} para sistemas de trading industrial. [web:89][web:101]
+
+\section{Criterio de aceptación (DoD)}
+
+El módulo considera completado el entrenamiento cuando:
+
+\begin{itemize}
+    \item Todos los folds se entrenan sin errores o con errores de formato controlados.
+    \item El modelo XGBoost y sus métricas OOS son \textbf{reproducibles} (mismos seeds y orden de datos).
+    \item Los artefactos \texttt{model.json}, \texttt{oof.parquet}, \texttt{metrics\_summary.json} y \texttt{training\_manifest.json} están disponibles y consistentes.
+    \item El modelo es listo para ser usado en \texttt{inference} y \texttt{ensemble} sin reentrenarlo, respetando el protocolo de split temporal purged.
+\end{itemize}
+
+Esta especificación encaja con prácticas de \textit{MLOps cuantitativo} en donde la trazabilidad de datos,_splits y parámetros es obligatoria para la validación regulatoria y operativa. [web:89][web:90]
+
+\end{document}

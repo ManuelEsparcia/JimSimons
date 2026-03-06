@@ -1,182 +1,202 @@
-Modulo: features/build_features.py
+\section{Módulo: \texttt{features/build\_features.py}}
 
-1) Objetivo
-Construir el dataset de features point-in-time (PIT) para modelado cross-sectional de small caps, transformando datos de precios/fundamentales/microestructura en senales limpias, estandarizadas y reproducibles, sin leakage temporal.
+\paragraph{Objetivo general}
+Este módulo implementa la construcción de un \textbf{dataset de features point‑in‑time (PIT)} para modelado cross‑sectional de small caps, transformando datos de precios, fundamentales y microestructura en señales limpias, estandarizadas y reproducibles, estrictamente libres de \textit{temporal leakage}. El objetivo estratégico es alimentar un sistema de \textbf{swing trading multi‑factor} que combine momentum, reversión, volatilidad, liquidez y calidad fundamental, con gestión de riesgo integrada y robustez estadística industrial.
 
-2) Alcance
-Incluye:
-- Carga y alineacion temporal de fuentes (precios ajustados, universo, fundamentales PIT, borrow proxy).
-- Ingenieria de features por familias (momentum, reversal, volatilidad, liquidez, calidad de flujo, fundamentales, interacciones).
-- Estandarizacion cross-sectional por fecha.
-- Winsorizacion/clipping robusto.
-- Persistencia de feature matrix + metadata del run.
+\paragraph{Contexto de investigación}
+El diseño de sets de features PIT para small caps se alinea con la literatura de \textit{quantamental} y \textit{factor investing} moderna, donde:
+\begin{itemize}
+    \item Jensen, Fama y French (1992, 2015) establecen la base de factores de riesgo y selección de valores basada en características observables. \cite{fama1992, fama2015}
+    \item Asness et al. (2013) y otros trabajos sobre momentum y reversión a corto plazo muestran la persistencia de premios de retorno cross‑sectional asociados a factores de retorno y liquidez. \cite{asness2013}
+    \item Roll (1984), Glosten y Milgrom (1985) y trabajos recientes sobre microestructura (No. 44, 49) motivan el uso de proxies de liquidez y spreads como componentes estructurales del modelo de retorno. \cite{roll1984, glosten1985, nber30917, novy2023}
+\end{itemize}
+Para small caps, la alta asimetría de información y costes de transacción hacen crítico:
+\begin{itemize}
+    \item Uso estricto de \textit{point‑in‑time} (PIT) para fundamentales y borros/availability. \cite{spglobal_pit}
+    \item Control de \textit{multiple testing} y \textit{overfitting} mediante regularización y selección de factores explícitos. \cite{harvey2017}
+\end{itemize}
 
-No incluye:
-- QC final de features (feature_qc.py).
-- Generacion de labels (labels/build_labels.py).
-- Entrenamiento de modelos.
+\subsection{Marco teórico y notación}
 
-3) Dependencias aguas arriba y aguas abajo
-Upstream:
-- data/price/adjusted/... (OHLCV ajustado)
-- data/universe/history/... (membresia PIT)
-- data/edgar/point_in_time... (fundamentales PIT)
-- data/borrow/... (coste/availability proxy)
-- calendario de mercado
+Sea \( \mathcal{S} \) el conjunto de símbolos de small caps, y \( \mathcal{T} \subseteq \mathbb{T} \) el rango de fechas de trading. Definimos el espacio de observaciones:
 
-Downstream:
-- features/feature_qc.py
-- labels/build_labels.py
-- models/*/train_*.py
-- backtest/run_walkforward.py
+\paragraph{Variables base}
+\begin{itemize}
+    \item \( p_{t}^{(s)} \in \mathbb{R}_{>0} \): precio ajustado de cierre del activo \( s \in \mathcal{S} \) en fecha \( t \in \mathcal{T} \).
+    \item \( v_{t}^{(s)} \in \mathbb{R}_{\geq 0} \): volumen ajustado.
+    \item \( r_{t}^{(s)} = \log p_{t}^{(s)} - \log p_{t-1}^{(s)} \): retorno logarítmico.
+    \item \( f_{t,k}^{(s)} \in \mathbb{R} \): fundamental PIT (por ejemplo, margen, acumulaciones, leverage) disponible con fecha de corte \( a_{t,k}^{(s)} \leq t \) (lag de divulgación).
+    \item \( b_{t}^{(s)} \in \mathbb{R}_{\geq 0} \): proxy de costo/borrow (borrow fee o availability proxy).
+    \item \( u_{t}^{(s)} \in \{0,1\} \): indicador de elegibilidad en universo PIT.
+\end{itemize}
 
-4) Principios de diseno
-- PIT estricto: feature en fecha t solo usa info disponible hasta t (o t-1 segun decision timing).
-- Determinismo: mismas entradas + mismo config => misma salida.
-- Modularidad: cada familia de features desacoplada y versionable.
-- Trazabilidad: cada columna de feature debe tener definicion y dependencia explicita.
+El objetivo es construir una \textbf{feature matrix} \( X \in \mathbb{R}^{|\mathcal{T}| \times |\mathcal{S}| \times F} \) tal que:
+\[
+X_{t,s}^{(f)} = \phi^{(f)}_t \big( \{ p_{\tau}^{(s)} \}_{\tau \leq t - \delta}, \{ v_{\tau}^{(s)} \}_{\tau \leq t - \delta}, \{ f_{\tau,k}^{(s)} \}_{\tau \leq t - \delta}, b_{t}^{(s)} , u_{t}^{(s)} ; \theta^{(f)} \big),
+\]
+donde:
+\begin{itemize}
+    \item \( \delta \in \{0,1\} \) es el \texttt{decision\_lag\_days} (regla PIT estricta).
+    \item \( \phi^{(f)}_t \) es la función de feature específica para familia \( f \in \mathcal{F} \).
+    \item \( \theta^{(f)} \) son hiperparámetros de ventana, lookback, winsorización, etc.
+\end{itemize}
 
-5) Contrato de entrada
-Entradas minimas:
-- universe_history_path
-- prices_adjusted_path
-- fundamentals_pit_path (opcional segun familia activada)
-- borrow_proxy_path (opcional)
-- start_date, end_date
-- feature_config_path
-- run_id
+\subsection{Familias de features y estructura de modelos}
 
-Campos minimos esperados:
-- universe: date, symbol, is_eligible
-- prices: symbol, date, open_adj, high_adj, low_adj, close_adj, volume_adj
-- fundamentales PIT: symbol, asof_date, metricas financieras
+El módulo organiza las features en familias cross‑sectionales, cada una con un modelo estadístico semi‑paramétrico asociado:
 
-Parametros clave de config:
-- feature_families_enabled
-- lookbacks (5, 10, 20, 63, 126, 252, etc)
-- winsor_limits
-- standardization_mode (zscore/robust rank)
-- min_history_per_symbol
-- min_cross_section_size
-- decision_lag_days (0 o 1)
+\subsubsection{Momentum y reversión}
 
-6) Contrato de salida
-Salida principal:
-- features/store/date={yyyy-mm-dd}/part-*.parquet
+\paragraph{Momentum multi‑horizonte}
+Para un activo \( s \) y horizonte \( h \in \{5, 10, 20, 63, 126, 252\} \), se define el retorno acumulado:
+\[
+R_{t,h}^{(s)} = \sum_{i=1}^{h} r_{t-i+1}^{(s)}.
+\]
+El momentum se normaliza cross‑sectionalmente por fecha:
+\[
+z_{t,h}^{(s)} = \frac{R_{t,h}^{(s)} - \mu_{t,h}}{\sigma_{t,h}},
+\]
+donde \( \mu_{t,h} \), \( \sigma_{t,h} \) son la media y desviación típica de \( R_{t,h}^{(\cdot)} \) sobre el universo \( \mathcal{S}_t \) en \( t \). Alternativamente, se puede usar:
+\begin{itemize}
+    \item Rank‑normalización: \( q_{t,h}^{(s)} = \text{rank} \big( R_{t,h}^{(s)} \big) \big/ |\mathcal{S}_t| \).
+    \item Transformación normal inversa (rank‑Gauss): \( \Phi^{-1}(q_{t,h}^{(s)}) \).
+\end{itemize}
 
-Columnas base requeridas:
-- date
-- symbol
-- is_eligible
-- run_id
-- config_hash
+\paragraph{Reversión a corto plazo}
+Para horizonte corto \( h \in \{5\} \), se puede definir:
+\[
+\text{rev}_{t,h}^{(s)} = - R_{t,h}^{(s)},
+\]
+capturando la reacción de los precios a shocks de liquidez o información (Roll, 1984; Novy‑Marx et al., 2023). \cite{roll1984, novy2023}
 
-Columnas de features:
-- prefijo por familia, por ejemplo:
-  - mom_ret_20d, mom_ret_63d
-  - rev_ret_5d
-  - vol_realized_20d
-  - liq_adv20_usd, liq_turnover_20d
-  - micro_spread_proxy, micro_gap_open
-  - fund_profit_margin_ttm, fund_accruals
-  - int_mom_x_liq
+\subsubsection{Volatilidad y microestructura}
 
-Metadatos auxiliares:
-- features/metadata/feature_dictionary_{run_id}.json
-- features/metadata/feature_lineage_{run_id}.parquet
-- features/metadata/build_manifest_{run_id}.json
+\paragraph{Volatilidad realizada}
+\[
+\sigma_{t,h}^{(s)} = \sqrt{ \frac{1}{h-1} \sum_{i=1}^{h} \big( r_{t-i+1}^{(s)} - \bar{r}_{t,h}^{(s)} \big)^2 },
+\]
+donde \( \bar{r}_{t,h}^{(s)} \) es el retorno medio del periodo. Se normaliza en cross‑section como:
+\[
+z_{t,h}^{(s,\text{vol})} = \frac{\sigma_{t,h}^{(s)} - \mu_{t,h}^{\text{vol}}}{\sigma_{t,h}^{\text{vol}}},
+\]
+ó mediante rank‑Gauss.
 
-7) Familias de features sugeridas
-Precio/retornos:
-- momentum multi-horizonte
-- reversal corto plazo
-- volatilidad realizada y rango intradia
+\paragraph{Spread proxy y microestructura}
+Se pueden definir proxies basados en:
+\begin{itemize}
+    \item Amplitud de rango intradía: \( \text{range}_{t}^{(s)} = \log \big( \text{high\_adj}_t^{(s)} / \text{low\_adj}_t^{(s)} \big) \).
+    \item Gap overnight: \( \text{gap}_t^{(s)} = p_t^{(s)} - p_{t-1}^{(s)} \).
+    \item Ratio de turnover o ADV (average daily volume en USD).
+\end{itemize}
+Estos proxies se relacionan con el spread bid‑ask implícito y el coste de liquidez (Roll, 1984). \cite{roll1984}
 
-Liquidez/microestructura:
-- ADV en USD
-- turnover
-- Amihud proxy
-- gap overnight y range ratios
+\subsubsection{Fundamentales PIT y calidad de flujo}
 
-Fundamentales PIT:
-- growth, quality, profitability, leverage
-- deltas QoQ/YoY PIT-safe
+\paragraph{Definición de variables}
+Para un campo fundamental \( k \) (por ejemplo, margen de beneficio, acumulaciones, leverage), se asume:
+\[
+f_{t,k}^{(s)} = g_k \big( \textit{financials}, \text{asof\_date} \leq t \big).
+\]
+La corrección PIT asegura que:
+\[
+\forall s \in \mathcal{S}, \quad \text{asof\_date}_{t,k}^{(s)} \leq t - \delta.
+\]
 
-Borrow/crowding:
-- borrow fee proxy
-- availability proxy
+\paragraph{Deltas PIT‑safe}
+Para modelar crecimiento y cambios de calidad:
+\[
+\Delta f_{t,k}^{(s)} = f_{t,k}^{(s)} - f_{t-l,k}^{(s)},
+\]
+con \( l \) un lag de periodo (QoQ o YoY) compatible con el calendario de reporting de small caps. \cite{spglobal_pit}
 
-Interacciones:
-- momentum x liquidez
-- quality x volatility
+\subsubsection{Borrow / crowding y interacciones}
 
-8) Reglas PIT y anti-leakage
-- Features de ventana usan solo observaciones <= date - decision_lag.
-- Fundamentales usan asof_date/filing availability, nunca fiscal period future-backfilled.
-- No forward fill ilimitado:
-  - usar horizon maxima por campo (ej. 90/180 dias), luego null.
-- No usar universe_current en fechas historicas.
-- Guardar en manifest el "asof cut" de cada fuente.
+\paragraph{Borrow proxy}
+\[
+b_{t}^{(s)} \in \mathbb{R}_{\geq 0}
+\]
+puede ser transformado en una feature monótona:
+\[
+z_{t}^{(s,\text{borrow})} = \text{rank} \big( b_{t}^{(s)} \big) / |\mathcal{S}_t|,
+\]
+o en su signo negativo, si se espera que mayor coste de borrado penalice la estrategia de borro.
 
-9) Flujo del proceso (alto nivel)
-1. Cargar config y validar.
-2. Cargar universo PIT y filtrar is_eligible.
-3. Cargar fuentes y alinear (date, symbol).
-4. Construir features por familia (funciones separadas).
-5. Aplicar decision lag global.
-6. Winsorizar/clipear por fecha.
-7. Estandarizar cross-sectional por fecha.
-8. Aplicar mascara de historial minimo.
-9. Persistir feature matrix + metadata + manifest.
+\paragraph{Interacciones factoriales}
+Se construyen features de interacción:
+\[
+X_{t}^{(f_1 \times f_2)} = \phi_{t}^{(f_1)} \odot \phi_{t}^{(f_2)},
+\]
+por ejemplo:
+\[
+\text{mom\_x\_liq}_t^{(s)} = z_{t,20}^{(s,\text{mom})} \cdot z_{t,20}^{(s,\text{liq})}.
+\]
+Estas interacciones capturan efectos no lineales entre factores (Harvey, 2017). \cite{harvey2017}
 
-10) Estandarizacion y transformaciones
-Opciones recomendadas:
-- rank_gauss por fecha para colas pesadas.
-- zscore robusto con mediana/MAD.
-- clipping a percentiles [1, 99] o configurable.
+\subsection{Procesamiento PIT y contratos de interfaz}
 
-Reglas:
-- No mezclar estadisticas entre fechas.
-- Si cross-section del dia < min_cross_section_size: marcar fecha como baja_confianza.
-- Mantener columnas raw opcionales para auditoria.
+\subsubsection{PIT estricto y antileakage}
 
-11) Manejo de nulos
-- Nulos estructurales permitidos (ej. fundamentales no reportados).
-- Definir politica por familia:
-  - keep_null (modelo maneja missing)
-  - impute_cross_section_median (solo si configurado)
-- Registrar null_rate por feature/date para QC.
+El módulo impone:
+\[
+\text{Feature en } (t,s) \text{ solo usa info } \leq t - \delta,
+\]
+donde \( \delta = \texttt{decision\_lag\_days} \in \{0,1\} \). \cite{spglobal_pit}
 
-12) Validaciones minimas
-Integridad:
-- Sin duplicados en (date, symbol).
-- Fecha dentro de rango solicitado.
-- Solo simbolos en universo elegible del dia.
+\paragraph{Reglas clave}
+\begin{itemize}
+    \item No usar universo corriente en fechas históricas; solo \( u_{t}^{(s)} \) disponible en \( t \).
+    \item No forward‑fill ilimitado de fundamentales: máximo horizonte (por ejemplo, 90 o 180 días) tras el cual se pasa a NaN.
+    \item Guardar en el manifest el \texttt{asof\_cut} de cada fuente para trazabilidad.
+\end{itemize}
 
-Sanidad numerica:
-- Sin inf/-inf.
-- Distribuciones razonables por feature (flags si outliers extremos).
-- Correlacion perfecta entre features distintas reportada como warning.
+\subsubsection{Estandarización y robustez estadística}
 
-Cobertura:
-- feature_coverage_rate por columna >= umbral minimo configurable.
-- cross_section_count diario reportado.
+Para cada fecha \( t \), se aplica estandarización cross‑sectional:
+\begin{itemize}
+    \item Z‑score robusto:
+        \[
+        \tilde{X}_{t}^{(f)} = \frac{X_{t}^{(f)} - \text{med}(X_{t}^{(f)})}{\text{MAD}(X_{t}^{(f)})},
+        \]
+        donde MAD es la mediana del valor absoluto de las desviaciones respecto a la mediana.
+    \item Rank‑Gauss: \( \Phi^{-1} \big( \text{rank}(X_{t}^{(f)}) / |\mathcal{S}_t| \big) \).
+    \item Clipping (winsorización) en percentiles \( [p_{\min}, p_{\max}] \) configurable.
+\end{itemize}
+Si \( |\mathcal{S}_t| < \texttt{min\_cross\_section\_size} \), se marca la fecha como de baja confianza.
 
-13) Observabilidad y trazabilidad
-Logging:
-- INFO: progreso por familia/fecha.
-- WARNING: alta tasa de nulos, cobertura baja, drift de distribucion.
-- ERROR: schema mismatch o joins criticos.
+\subsubsection{Manejo de nulos}
 
-Metricas:
-- n_features_total
-- n_rows_output
-- pct_null_global
-- feature_coverage_p50/p10
-- n_dates_low_confidence
-- run_duration_sec
+\begin{itemize}
+    \item Nulos estructurales permitidos (fundamentales no reportados).
+    \item Políticas por familia:
+        \begin{itemize}
+            \item \texttt{keep\_null}: el modelo downstream maneja missing.
+            \item \texttt{impute\_cross\_section\_median}: imputación local por fecha.
+        \end{itemize}
+    \item Registro de \texttt{null\_rate} por feature y fecha para control de calidad.
+\end{itemize}
 
-14) Interfaz de ejecucion (CLI sugerida)
+\subsection{Validaciones, observable y trazabilidad}
+
+\paragraph{Validaciones mínimas}
+\begin{itemize}
+    \item Integridad: no duplicados en \texttt{(date, symbol)}.
+    \item Rango de fechas: \( t \in [\texttt{start\_date}, \texttt{end\_date}] \).
+    \item Solo símbolos en universo elegible en \( t \).
+    \item Sanidad numérica: sin \texttt{inf, -inf} y distribuciones “razonables” (flags de outliers extremos).
+\end{itemize}
+
+\paragraph{Métricas de observabilidad}
+\begin{itemize}
+    \item \( n_{\text{features}} \), \( n_{\text{rows}} \).
+    \item \( \text{pct\_null\_global} \).
+    \item \( \text{feature\_coverage\_p50}, \text{p10} \).
+    \item \( n_{\text{dates\_low\_confidence}} \).
+\end{itemize}
+
+\subsection{Estructura de ejecución y CLI}
+
+\paragraph{Interfaz de CLI (ejemplo)}
+\begin{verbatim}
 python -m features.build_features ^
   --universe-history-path data/universe/history ^
   --prices-adjusted-path data/price/adjusted/mode=dual_output ^
@@ -186,50 +206,30 @@ python -m features.build_features ^
   --end-date 2026-03-01 ^
   --config-path configs/features/base.yaml ^
   --run-id build_features_20260305_001
+\end{verbatim}
 
-15) Estructura interna recomendada (funciones)
-- load_feature_config(...)
-- load_universe_history(...)
-- load_prices_adjusted(...)
-- load_fundamentals_pit(...)
-- build_price_features(df_prices, cfg)
-- build_liquidity_features(df_prices, cfg)
-- build_microstructure_features(df_prices, cfg)
-- build_fundamental_features(df_fund, cfg)
-- build_borrow_features(df_borrow, cfg)
-- build_interaction_features(df_feat, cfg)
-- apply_decision_lag(df_feat, lag_days)
-- standardize_cross_section(df_feat, cfg)
-- persist_feature_store(df_feat, metadata, output_path, ...)
-- main()
+\paragraph{Funciones internas recomendadas}
+\begin{itemize}
+    \item \texttt{load\_feature\_config}, \texttt{load\_universe\_history}, \texttt{load\_prices\_adjusted}, \texttt{load\_fundamentals\_pit}.
+    \item Constructores de family‑builders: \texttt{build\_price\_features}, \texttt{build\_liquidity\_features}, \texttt{build\_microstructure\_features}, \texttt{build\_fundamental\_features}, \texttt{build\_borrow\_features}, \texttt{build\_interaction\_features}.
+    \item \texttt{apply\_decision\_lag}, \texttt{standardize\_cross\_section}, \texttt{persist\_feature\_store}.
+    \item \texttt{main()} con run\_id y metadata asociados.
+\end{itemize}
 
-16) Criterios de aceptacion (Definition of Done)
-- Produce feature matrix PIT sin leakage verificable.
-- Todas las features tienen diccionario y lineage trazable.
-- Soporta ejecucion reproducible por config/run_id.
-- Cobertura y calidad suficientes para pasar feature_qc.
-- Integracion directa con labels/modelos sin transformaciones ad-hoc adicionales.
+\subsection{Definición de término (Definition of Done) y enlace con el sistema global}
 
-17) Casos de prueba minimos (para tests/)
-- Ventanas de retorno calculadas correctamente (20d/63d) en serie sintetica.
-- decision_lag=1 desplaza features sin fuga temporal.
-- Fundamental con asof tardio no aparece antes de disponibilidad.
-- Winsorizacion y zscore por fecha correctos.
-- No duplicados tras merges multi-fuente.
-- Politica de nulos aplicada segun config.
-- Simbolos fuera de universo del dia no aparecen en salida.
+\paragraph{Criterios de aceptación}
+\begin{itemize}
+    \item Producción de feature matrix PIT sin leakage verificable.
+    \item Diccionario de features y lineage trazable en Parquet/JSON.
+    \item Ejecución reproducible por \texttt{config/run\_id}.
+    \item Cobertura y calidad suficientes para pasar \texttt{feature\_qc.py}.
+    \item Integración directa con \texttt{labels/build\_labels.py} y modelos sin transformaciones ad‑hoc.
+\end{itemize}
 
-18) Riesgos y decisiones abiertas
-- Numero final de features vs riesgo de multiple testing.
-- Politica de imputacion de nulos por familia/modelo.
-- Costo computacional de features complejas en universo grande.
-- Dependencia de calidad PIT de fundamentales/borrrow.
-
-19) Checklist rapido de implementacion
-- [ ] Config de features y lookbacks versionada.
-- [ ] Builders por familia desacoplados.
-- [ ] Alineacion temporal PIT con decision_lag.
-- [ ] Estandarizacion cross-sectional robusta.
-- [ ] Metadata (dictionary + lineage + manifest).
-- [ ] Metricas de cobertura/nulos por feature.
-- [ ] Tests de leakage y formulas base.
+\paragraph{Casos de prueba mínimos}
+\begin{itemize}
+    \item Ventanas de retorno correctas (20d, 63d) en serie sintética.
+    \item \texttt{decision\_lag} = 1 aplicado sin fuga.
+    \item Fundamentales con \texttt{asof} tardío no aparecen antes de disponibilidad.
+    \item Winsorización y zscore por fecha correct

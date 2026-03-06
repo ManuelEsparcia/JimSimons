@@ -1,208 +1,303 @@
-Modulo: data/universe/survivorship.py
+\section{Módulo: \texttt{data/universe/survivorship.py}}
+\label{sec:survivorship}
 
-1) Objetivo
-Auditar, cuantificar y mitigar survivorship bias en el universo de acciones small cap de EE. UU., verificando que la membresia historica sea verdaderamente point-in-time y que delistings, quiebras, mergers y ticker changes esten correctamente representados.
+\subsection{Objetivo y filosofía de diseño}
+\label{sec:survivorship:objective}
 
-2) Alcance
-Incluye:
-- Diagnostico de survivorship bias sobre universo historico.
-- Comparativa entre universo PIT vs universo "vivo hoy" (naive) para medir sesgo.
-- Deteccion de omisiones de delisted symbols en ventanas historicas.
-- Reportes de impacto en coverage, retornos y dispersion.
-- Emision de flags/gates para bloquear corridas contaminadas.
+El módulo \texttt{survivorship.py} audita, cuantifica y mitiga el \textbf{survivorship bias} en el universo de \textit{small caps} de EE.\ UU., verificando que:
 
-No incluye:
-- Construccion primaria del universo (build_universe.py).
-- Correcciones manuales de mappings complejos (se reportan para remediation).
-- Backtest completo (solo metricas de sesgo y checks).
+\begin{itemize}
+  \item La membresía histórica sea verdaderamente \textbf{point‑in‑time (PIT)}.
+  \item \textbf{Delistings, quiebras, mergers y cambios de ticker} estén correctamente representados en el universo PIT.
+  \item El universo PIT no se vea contaminado por \textit{look‑ahead} inherente al universo \textit{naive} (vivo hoy).
+\end{itemize}
 
-3) Dependencias aguas arriba y aguas abajo
-Upstream:
-- data/universe/history/... (universo PIT construido)
-- data/universe/current.parquet (snapshot actual)
-- maestro de listados con list_date/delist_date
-- precios historicos (para metricas de impacto opcionales)
+La filosofía de diseño sigue la lógica de \textit{survivorship bias} en literatura de indices y hedge funds \cite{carpenter1999, kinlay2023, bookmap2024}, aplicada a un universo de acciones small caps en vez de fondos mutuos:
 
-Downstream:
-- validation/leakage_audit.py
-- backtest/run_walkforward.py (gate previo)
-- docs/reporting de calidad de datos
+\begin{itemize}
+  \item \textbf{Definir universo \textit{naive}} y compararlo con el universo \textit{PIT} para medir sesgo de inclusión.
+  \item \textbf{Cuantificar \textit{gaps} de delistings} mediante \textit{delisted coverage ratio}.
+  \item \textbf{Traducir sesgo a métricas de impacto en retorno} cuando haya precios disponibles.
+\end{itemize}
 
-4) Preguntas que debe responder el modulo
-- Estamos excluyendo delisted symbols historicos por error?
-- El universo historico se parece demasiado al universo actual (indicador de sesgo)?
-- Cual es el impacto potencial del survivorship bias en metricas de performance?
-- Hay periodos con caidas sospechosas de cobertura de delistings?
+\subsection{Definiciones formales clave}
+\label{sec:survivorship:definitions}
 
-5) Contrato de entrada
-Entradas minimas:
-- universe_history_path
-- universe_current_path
-- listings_master_path
-- start_date, end_date
-- run_id
+\paragraph{Símbolo, ticker y universo}
+\label{par:survivorship:universe_def}
+Sea \(\mathcal{S}\) el conjunto de \textit{tickers} legales en EE.\ UU. según el maestro de listados \(\mathcal{L}\).
 
-Opcionales:
-- prices_adjusted_path (para estimar impacto en retornos)
-- min_history_days_for_symbol
-- thresholds_path (gates de aceptacion)
-- use_identifier_mapping (bool)
+\begin{itemize}
+  \item \(\mathcal{U}_t^{\text{PIT}}\): universo \textit{eligible} en fecha \(t\) usando solo datos disponibles hasta \(t\).
+  \item \(\mathcal{U}_t^{\text{naive}}\): universo construido tomando \(\mathcal{U}_{\text{current}}\) (simbolos vivos hoy) y proyectando hacia atrás sin delistings.
+  \item \(\mathcal{D}\): rango de fechas \([t_0, t_1]\).
+\end{itemize}
 
-Campos minimos esperados:
-- universe_history: date, symbol, is_eligible
-- universe_current: symbol
-- listings: symbol, list_date, delist_date, status
+\paragraph{Ventana de vida esperada}
+\label{par:survivorship:life_window}
+Dado \(\mathcal{L}\) con \(\mathtt{list\_date}(s)\) y \(\mathtt{delist\_date}(s)\) para cada \(s \in \mathcal{S}\), definimos la ventana esperada:
 
-6) Contrato de salida
-Reportes principales:
-- data/universe/audit/survivorship_summary.json
-- data/universe/audit/survivorship_daily.parquet
-- data/universe/audit/missing_delisted_symbols.parquet
-- data/universe/audit/naive_vs_pit_comparison.parquet
+\[
+  \mathcal{W}_s := [t_{\text{list}}(s), t_{\text{delist}}(s)],
+  \quad
+  \text{con } t_{\text{delist}}(s) = \infty \text{ si } \texttt{delist\_date}(s) = \mathtt{null}.
+\]
 
-Campos sugeridos en survivorship_daily:
-- date
-- n_symbols_pit
-- n_symbols_naive
-- overlap_ratio
-- n_delisted_expected_active_in_history
-- n_delisted_present
-- delisted_coverage_ratio
-- survivorship_risk_score
-- gate_status (pass/warn/fail)
+\paragraph{Survivorship gap}
+\label{par:survivorship:gap}
+\[
+  \texttt{survivorship\_gap}(s,t) :=
+  \mathbb{I}\{
+    s \text{ debería estar en historia según } \mathcal{W}_s \text{ pero } s \notin \mathcal{U}_t^{\text{PIT}}
+  \}
+\]
 
-Artefactos:
-- survivorship_manifest.json
-- survivorship_flags.json
+\paragraph{Delisted coverage ratio}
+\label{par:survivorship:coverage}
+Tomando \(\mathcal{S}_{\text{delisted}} \subseteq \mathcal{S}\) como los \textit{delisted symbols} con \(\mathtt{delist\_date}(s) \in \mathcal{D}\):
 
-7) Definiciones clave
-Universo PIT:
-- Conjunto de simbolos elegibles en fecha t usando solo informacion disponible hasta t.
+\[
+  \mathcal{E}_t := \{
+    s \in \mathcal{S}_{\text{delisted}} :
+    t \in \mathcal{W}_s \text{ y } s \text{ no es excluido por regla de \texttt{security\_type}, etc.}
+  \}
+\]
 
-Universo naive:
-- Conjunto de simbolos vivos en la fecha de corrida (look-ahead), proyectado hacia atras.
+\[
+  \texttt{delisted\_coverage\_ratio}(t) :=
+  \frac{
+    |\{s \in \mathcal{E}_t : s \in \mathcal{U}_t^{\text{PIT}}\}|
+  }{
+    |\mathcal{E}_t|
+  }
+\]
 
-Survivorship gap:
-- Simbolos que deberian existir historicamente segun listings/delist windows pero no aparecen en universo PIT.
+\subsection{Métricas de auditoría diarias}
+\label{sec:survivorship:metrics}
 
-Delisted coverage ratio:
-- n_delisted_present / n_delisted_expected_active_in_history
+\paragraph{Tamaño de universo y overlap}
+\label{par:survivorship:size_overlap}
+Para cada \(t \in \mathcal{D}\):
 
-8) Metodologia de auditoria
-1. Cargar universo historico PIT y snapshot current.
-2. Construir universo naive historico (reutilizando solo simbolos actuales).
-3. Cruce con listings para obtener "esperado historico" de vida de cada simbolo.
-4. Medir por fecha:
-   - tamano PIT vs naive
-   - overlap PIT-naive
-   - cobertura de delisted
-5. Identificar faltantes estructurales (simbolos/periodos).
-6. Calcular score agregado de riesgo de survivorship.
-7. Aplicar gates y emitir pass/warn/fail.
+\begin{itemize}
+  \item Tamaño universo PIT:
+  \[
+    N_t^{\text{PIT}} := |\mathcal{U}_t^{\text{PIT}}|
+  \]
+  \item Tamaño universo naive:
+  \[
+    N_t^{\text{naive}} := |\mathcal{U}_t^{\text{naive}}|
+  \]
+  \item Overlap ratio:
+  \[
+    \texttt{overlap\_ratio}(t) :=
+    \frac{
+      |\mathcal{U}_t^{\text{PIT}} \cap \mathcal{U}_t^{\text{naive}}|
+    }{
+      |\mathcal{U}_t^{\text{PIT}} \cup \mathcal{U}_t^{\text{naive}}|
+    }
+  \]
+\end{itemize}
 
-9) Metricas recomendadas
-Basicas:
-- overlap_ratio_mean
-- overlap_ratio_p95
-- delisted_coverage_ratio_mean
-- pct_days_low_delisted_coverage
-- n_missing_delisted_symbols_total
+\paragraph{Cobertura de delistings}
+\label{par:survivorship:delisted_coverage}
+\[
+  \texttt{delisted\_coverage\_ratio\_mean} :=
+  \frac{1}{|\mathcal{D}|} \sum_{t \in \mathcal{D}} \texttt{delisted\_coverage\_ratio}(t)
+\]
 
-Impacto (si hay precios):
-- return_diff_pit_vs_naive (CAGR, Sharpe, drawdown proxy)
-- hit_rate_diff_pit_vs_naive
-- tail_loss_diff
+\[
+  \texttt{pct\_days\_low\_delisted\_coverage} :=
+  \frac{
+    |\{t \in \mathcal{D} : \texttt{delisted\_coverage\_ratio}(t) < \gamma_{\min}\}|
+  }{
+    |\mathcal{D}|
+  }
+\]
 
-Score sintetico:
-- survivorship_risk_score en [0, 100], donde 100 es peor.
+\paragraph{Survivorship risk score}
+\label{par:survivorship:risk_score}
+Un score sintético \(\texttt{survivorship\_risk\_score} \in [0,100]\) puede definirse como una combinación lineal ponderada de:
 
-10) Gates de aceptacion (ejemplo configurable)
-- Gate 1: delisted_coverage_ratio_mean >= 0.95
-- Gate 2: pct_days_low_delisted_coverage <= 5%
-- Gate 3: n_missing_delisted_symbols_total <= umbral absoluto
-- Gate 4: |CAGR_diff_pit_vs_naive| <= umbral (si aplica)
+\begin{itemize}
+  \item bajo overlap\_ratio,
+  \item baja delisted\_coverage\_ratio,
+  \item alto número de missing\_delisted\_symbols,
+  \item alto \texttt{pct\_days\_low\_delisted\_coverage}.
+\end{itemize}
 
-Resultado:
-- pass: todos los gates cumplen
-- warn: incumplimiento leve en 1 gate no critico
-- fail: incumplimiento severo o multiple
+\[
+  \texttt{survivorship\_risk\_score} := \sum_{i} w_i \cdot z_i,
+\]
+donde cada \(z_i\) es una variable estándarizada de cada métrica.
 
-11) Reglas PIT y anti-leakage
-- Auditoria se calcula con snapshots versionados de run_id.
-- Prohibido usar arreglos manuales no versionados en medio de la corrida.
-- Fechas de list/delist deben respetar timezone/calendario de mercado canonico.
-- Todo ajuste de mapping debe registrarse en manifest.
+\subsection{Impacto potencial en métricas de performance}
+\label{sec:survivorship:impact}
 
-12) Manejo de casos especiales
-- Cambios de ticker con mismo emisor:
-  - usar identificador estable (issuer_id/figi/cusip) cuando exista.
-- Fusiones/adquisiciones:
-  - no contar desaparicion como missing si hay evento corporativo valido.
-- Quiebras OTC:
-  - mantener historia hasta delist efectiva; luego exclusion valida.
-- Datos incompletos de listings:
-  - marcar baja confianza y elevar warning en gate.
+Si se dispone de \(\mathcal{P}\) (precios ajustados PIT), se puede estimar el impacto de survivorship bias:
 
-13) Observabilidad y trazabilidad
-Logging:
-- INFO: progreso por etapa y ventana temporal.
-- WARNING: periodos con cobertura baja de delisted.
-- ERROR: inconsistencias severas de schema/fechas.
+\begin{itemize}
+  \item \textbf{Retorno diferencial}:
+  \[
+    \Delta r(t) := r_t^{\text{naive}} - r_t^{\text{PIT}}
+  \]
+  donde:
+  \[
+    r_t^{\text{PIT}} \propto \sum_{s \in \mathcal{U}_t^{\text{PIT}}} w_{t,s} \cdot r_{t,s},
+    \quad
+    r_t^{\text{naive}} \propto \sum_{s \in \mathcal{U}_t^{\text{naive}}} w_{t,s} \cdot r_{t,s}
+  \]
+  Una comparativa de \texttt{CAGR}, \texttt{Sharpe} y \texttt{drawdown} entre universo \textit{PIT} y \textit{naive} permite cuantificar el sesgo en rentabilidad y riesgo.
 
-Metricas operativas:
-- rows_history_processed
-- n_symbols_current
-- n_symbols_delisted_expected
-- n_symbols_delisted_found
-- run_duration_sec
+  \item \textbf{Hit rate}:
+  \[
+    \texttt{hit\_rate\_diff} := \texttt{hit\_rate}^{\text{PIT}} - \texttt{hit\_rate}^{\text{naive}}
+  \]
+  donde \texttt{hit\_rate} mide la fracción de días con retorno positivo.
+\end{itemize}
 
-14) Interfaz de ejecucion (CLI sugerida)
-python -m data.universe.survivorship ^
-  --universe-history-path data/universe/history ^
-  --universe-current-path data/universe/current.parquet ^
-  --listings-master-path data/universe/source/listings.parquet ^
-  --start-date 2014-01-01 ^
-  --end-date 2026-03-01 ^
-  --thresholds-path configs/validation/survivorship.yaml ^
-  --run-id survivorship_20260305_001
+\subsection{Metodología de auditoría}
+\label{sec:survivorship:methodology}
 
-15) Estructura interna recomendada (funciones)
-- load_universe_history(...)
-- load_universe_current(...)
-- load_listings_master(...)
-- build_naive_historical_universe(df_current, calendar, ...)
-- compute_expected_historical_presence(df_listings, calendar, ...)
-- compute_daily_survivorship_metrics(df_pit, df_naive, df_expected)
-- detect_missing_delisted(df_pit, df_expected, ...)
-- compute_survivorship_risk_score(df_daily, ...)
-- apply_survivorship_gates(df_daily, thresholds)
-- persist_survivorship_reports(...)
-- main()
+\paragraph{Entradas}
+\label{par:survivorship:inputs}
+\begin{itemize}
+  \item \texttt{universe\_history\_path}: \(\mathcal{U}_t^{\text{PIT}}\) por fecha.
+  \item \texttt{universe\_current\_path}: \(\mathcal{U}_{\text{current}}\).
+  \item \texttt{listings\_master\_path}: \(\mathcal{L}\) con \(\mathtt{list\_date}, \mathtt{delist\_date}\).
+  \item \texttt{start\_date}, \texttt{end\_date}, \texttt{run\_id}.
+  \item \texttt{prices\_adjusted\_path} (opcional).
+  \item \texttt{thresholds\_path}: umbrales de gates.
+\end{itemize}
 
-16) Criterios de aceptacion (Definition of Done)
-- Detecta y reporta de forma reproducible faltantes de delisted symbols.
-- Entrega metricas diarias y resumen ejecutivo de sesgo.
-- Emite gate pass/warn/fail consumible por pipeline de validacion.
-- Reportes trazables por run_id y config hash.
+\paragraph{Flujo de auditoría}
+\label{par:survivorship:flow}
+\begin{enumerate}
+  \item \textbf{Cargar universos}:
+  \[
+    \texttt{df\_pit}, \texttt{df\_current} \leftarrow \texttt{load\_universe\_history}, \texttt{load\_universe\_current}
+  \]
+  \item \textbf{Construir universo \textit{naive} histórico}:
+  \[
+    \mathcal{U}_t^{\text{naive}} := \mathcal{U}_{\text{current}} \text{ limitado a } t \in \mathcal{D}
+  \]
+  sin reglas de delist ni \texttt{security\_type} históricas.
+  \item \textbf{Computar presencia esperada}:
+  \[
+    \texttt{df\_expected} := \texttt{compute\_expected\_historical\_presence}(\mathcal{L}, \mathcal{D})
+  \]
+  \item \textbf{Metricas diarias}:
+  \[
+    \texttt{df\_daily} := \texttt{compute\_daily\_survivorship\_metrics}(\texttt{df\_pit}, \texttt{df\_naive}, \texttt{df\_expected})
+  \]
+  \item \textbf{Detectar faltantes estructurales}:
+  \[
+    \texttt{df\_missing\_delisted} := \texttt{detect\_missing\_delisted}(\texttt{df\_pit}, \texttt{df\_expected})
+  \]
+  \item \textbf{Score agregado}:
+  \[
+    \texttt{survivorship\_risk\_score} := \texttt{compute\_survivorship\_risk\_score}(\texttt{df\_daily})
+  \]
+  \item \textbf{Aplicar gates}:
+  \[
+    \texttt{gate\_status} := \texttt{apply\_survivorship\_gates}(\texttt{df\_daily}, \texttt{thresholds})
+  \]
+  con salida \texttt{pass}, \texttt{warn}, \texttt{fail}.
+\end{enumerate}
 
-17) Casos de prueba minimos (para tests/)
-- Dataset sintetico sin sesgo: gates en pass.
-- Dataset con delisted omitidos: gate fail y reporte correcto.
-- Cambio de ticker con mapping valido no dispara falso positivo.
-- Listings incompletos disparan warning de baja confianza.
-- Comparativa naive vs PIT refleja sesgo cuando se usa solo simbolos actuales.
-- Fechas limite (list_date/delist_date) incluidas correctamente.
+\subsection{Gates de aceptación (configurables)}
+\label{sec:survivorship:gates}
 
-18) Riesgos y decisiones abiertas
-- Calidad real de mapping entre ticker y entidad economica.
-- Definir umbrales de gates por subperiodo/regimen de mercado.
-- Posible subregistro de delistings en fuentes low-cost.
-- Dependencia en disponibilidad de precios para metricas de impacto.
+Ejemplo de gates (configurables en \texttt{survivorship.yaml}):
 
-19) Checklist rapido de implementacion
-- [ ] Carga y validacion de universe_history/current/listings.
-- [ ] Construccion de universo naive historico.
-- [ ] Calculo de expected presence y delisted coverage.
-- [ ] Score agregado y gates configurables.
-- [ ] Reportes parquet/json + manifest.
-- [ ] Tests sinteticos de pass/warn/fail.
+\begin{itemize}
+  \item \texttt{Gate 1} (cobertura de delistings):
+  \[
+    \texttt{delisted\_coverage\_ratio\_mean} \geq 0.95
+  \]
+  \item \texttt{Gate 2} (frecuencia de cobertura baja):
+  \[
+    \texttt{pct\_days\_low\_delisted\_coverage} \leq 0.05
+  \]
+  \item \texttt{Gate 3} (número absoluto de missing symbols):
+  \[
+    n_{\text{missing\_delisted\_symbols}} \leq \tau_{\text{missing}}
+  \]
+  \item \texttt{Gate 4} (impacto en retorno, si hay precios):
+  \[
+    |\texttt{CAGR\_diff\_pit\_vs\_naive}| \leq \tau_{\text{cagr}}
+  \]
+\end{itemize}
+
+\[
+  \texttt{gate\_status} = 
+  \begin{cases}
+    \texttt{pass}  & \text{si todos los gates se cumplen.} \\
+    \texttt{warn}  & \text{incumplimiento leve en un gate no crítico.} \\
+    \texttt{fail}  & \text{incumplimiento severo o múltiple.}
+  \end{cases}
+\]
+
+\subsection{Consideraciones de PIT y anti‑leakage}
+\label{sec:survivorship:pit}
+
+\begin{itemize}
+  \item La auditoría se ejecuta sobre \texttt{run\_id} versionado, con \texttt{config\_hash} asociado.
+  \item \textbf{Ningún ajuste manual} de mappings se aplica durante la corrida sin que se registre en \texttt{manifest}.
+  \item Las fechas \(\mathtt{list\_date}(s)\), \(\mathtt{delist\_date}(s)\) deben respetar el \textit{exchange calendar} y \textit{timezone} de mercado EE.\ UU.
+  \item En caso de \textit{ticker change} con identificador estable (\texttt{FIGI}, \texttt{CIK}, \texttt{issuer\_id}), se considera continuidad de instrumento, no \textit{missing delisting}.
+\end{itemize}
+
+\subsection{Manejo de casos especiales}
+\label{sec:survivorship:edge_cases}
+
+\begin{itemize}
+  \item \textbf{Fusiones/adquisiciones}:
+  \[
+    \text{Si hay evento corporativo válido (merger/spinoff), no se cuenta como \texttt{missing delisted symbols}.}
+  \]
+  \item \textbf{Quiebras OTC}:
+  \[
+    \text{Se mantiene historia hasta \texttt{delist\_date} efectiva; luego se excluye de forma consistente.}
+  \]
+  \item \textbf{Datos incompletos de listings}:
+  \[
+    \texttt{low\_confidence\_flag} \text{ junto con warning en el \texttt{gate\_status}.}
+  \]
+\end{itemize}
+
+\subsection{Salidas y artefactos}
+\label{sec:survivorship:outputs}
+
+\paragraph{Reportes}
+\label{par:survivorship:reports}
+\begin{itemize}
+  \item \texttt{data/universe/audit/survivorship\_summary.json}:
+  \[
+    \{
+      \texttt{delisted\_coverage\_ratio\_mean},
+      \texttt{overlap\_ratio\_p95},
+      \texttt{survivorship\_risk\_score},
+      \texttt{gate\_status}, \texttt{run\_id}, \texttt{config\_hash}
+    \}
+  \]
+  \item \texttt{data/universe/audit/survivorship\_daily.parquet}:
+  \[
+    t \in \mathcal{D} \mapsto (N_t^{\text{PIT}}, N_t^{\text{naive}}, \texttt{overlap\_ratio}(t), \texttt{delisted\_coverage\_ratio}(t), \dots)
+  \]
+  \item \texttt{data/universe/audit/missing\_delisted\_symbols.parquet}:
+  \[
+    \text{Conjunto de \texttt{(symbol, date)} identificados como \texttt{survivorship\_gap}.}
+  \]
+  \item \texttt{data/universe/audit/naive\_vs\_pit\_comparison.parquet}:
+  \[
+    \text{Métricas de retorno y riesgo bajo \textit{PIT} vs \textit{naive} si hay precios.}
+  \]
+\end{itemize}
+
+\paragraph{Artifacts de trazabilidad}
+\label{par:survivorship:manifest}
+\begin{itemize}
+  \item \texttt{survivorship\_manifest.json}:
+  \[
+    \{\texttt{

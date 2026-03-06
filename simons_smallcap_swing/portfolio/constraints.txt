@@ -1,176 +1,128 @@
-Modulo: portfolio/constraints.py
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[spanish]{babel}
+\usepackage{amsmath, amssymb, amsthm, amsfonts}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage{natbib}
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue}
 
-1) Objetivo
-Aplicar restricciones de portafolio (riesgo, exposicion, liquidez y operatividad) sobre pesos objetivo para asegurar que la estrategia sea implementable y controlada.
+\title{Restricciones de Portafolio para Swing Trading Cuantitativo: Módulo \texttt{portfolio/constraints.py}}
+\author{Análisis Técnico Cuantitativo}
+\date{Marzo 2026}
 
-2) Alcance
-Incluye:
-- Hard constraints (no violables).
-- Soft constraints con penalizacion/escalado.
-- Ajuste de pesos para cumplir limites globales y por activo/grupo.
-- Reporte de violaciones y acciones correctivas.
+\begin{document}
 
-No incluye:
-- Generacion de alpha scores.
-- Optimizacion completa de portafolio (optimizer.py puede usar estas reglas).
+\maketitle
 
-3) Dependencias
-Upstream:
-- target weights preliminares (sizing/optimizer)
-- universo elegible
-- exposiciones factor/sector
-- datos de liquidez/capacidad
-- config de riesgo
+\tableofcontents
+\newpage
 
-Downstream:
-- portfolio/rebalance
-- backtest/engine
-- risk/exposure_report
+\section{Introducción}
 
-4) Contrato de entrada
-Entradas minimas:
-- target_weights_path o dataframe en memoria
-- exposures_path
-- liquidity_path
-- constraints_config_path
-- date/run_id
+El módulo \texttt{portfolio/constraints.py} aplica restricciones hard y soft sobre pesos objetivo preliminares de una estrategia de swing trading, asegurando implementabilidad operativa, control de riesgo y cumplimiento de límites de liquidez, exposición y concentración. 
 
-Campos minimos:
-- symbol
-- w_target_raw
-- adv_usd (o proxy liquidez)
-- sector/industry (si aplica)
-- factor exposures (beta, style, etc)
+En swing trading, donde las señales pueden ser volátiles y el universo limitado, estas restricciones previenen blow-ups por concentración, drawdowns por factores ocultos o slippage excesivo. El flujo aplica filtros secuenciales (posición → global → grupo → liquidez), generando pesos finales viables y reportando violaciones para auditoría.
 
-5) Contrato de salida
-- portfolio/constraints/{run_id}/weights_constrained.parquet
-- portfolio/constraints/{run_id}/constraint_violations.parquet
-- portfolio/constraints/{run_id}/constraint_summary.json
+Sigue estándares industriales de \citet{lprado2018advances} (meta-labeling para constraints) y \citet{gauder2021quantitative} (optimización con restricciones de riesgo).
 
-Campos recomendados:
-- symbol
-- w_target_raw
-- w_after_hard
-- w_final
-- scale_factor_applied
-- violation_flags
+\section{Estado del Arte: Constraints en Portfolio Management}
 
-6) Tipos de constraints
-Globales:
-- max_gross_exposure
-- max_net_exposure
-- cash_buffer_min
+\subsection{Libros Industriales}
+- \textbf{Quantitative Equity Portfolio Management} (Gauder \& Pedersen, 2021): Constraints en Black-Litterman y risk parity.
+- \textbf{Advances in Financial Machine Learning} (López de Prado, 2018): Hard/soft constraints para evitar overfitting en sizing.
+- \textbf{Active Portfolio Management} (Grinold \& Kahn, 2000): Límites de exposición y turnover.
+- \textbf{Robust Portfolio Optimization} (Fabozzi et al., 2014): Constraints robustos bajo incertidumbre.
 
-Por posicion:
-- max_weight_long
-- max_weight_short
-- min_trade_notional
+\subsection{Papers Clave}
+- \citet{black1992universal}: Risk budgeting y beta constraints.
+- \citet{jorion2006value}: VaR/ES como hard constraints.
+- \citet{ledoit2004well}: Shrinkage en covarianzas para group constraints.
+- Estado del arte: \citet{rl_portfolio2023} usa RL para constraints dinámicos en swing trading.
 
-Por grupo:
-- max_sector_exposure
-- max_industry_exposure
-- max_single_name_concentration
+\section{Formulación Matemática}
 
-Liquidez/capacidad:
-- max_participation_adv
-- max_days_to_liquidate
-- turnover_limit
+\subsection{Notación}
+$\mathbf{w}^{\mathrm{raw}} \in \mathbb{R}^N$: Pesos target crudos, $\sum_i w_i^{\mathrm{raw}} = 1$ (long+short).
+$\mathbf{x}_i \in \mathbb{R}^K$: Exposiciones factor/sector para activo $i$.
+$\mathbf{c} \in \mathbb{R}^M$: Límites de config (hard/soft).
 
-Riesgo factor:
-- beta_range
-- style_factor_bounds
+\subsection{Constraints Hard (No Violables)}
+\begin{align}
+|\mathbf{w}^{\mathrm{final}}|_\mathrm{gross} &= \sum_i |w_i| &\leq g_{\max} \label{eq:gross}\\
+|\mathbf{w}^{\mathrm{final}}|_\mathrm{net} &= \left|\sum_i w_i\right| &\leq n_{\max} \label{eq:net}\\
+|w_i| &\leq p_{\max,i} &\forall i \label{eq:pos}\\
+\mathbf{x}^\top \mathbf{w}^{\mathrm{final}} &\in [l_g, u_g] &\forall \text{grupos } g \label{eq:group}\\
+\mathrm{DTL}_i(\mathbf{w}) &\leq d_{\max} &\forall i \label{eq:dtl}
+\end{align}
 
-7) Reglas de aplicacion recomendadas
-Orden:
-1. Filtrar activos no elegibles.
-2. Aplicar hard caps por posicion.
-3. Cumplir limites globales gross/net via reescalado.
-4. Ajustar limites por grupo (sector/factor).
-5. Aplicar constraints de liquidez y turnover.
-6. Re-normalizar y validar.
+\subsection{Constraints Soft (Penalizadas)}
+\[
+J_{\mathrm{soft}}(\mathbf{w}) = \lambda \|\mathbf{w} - \mathbf{w}^{\mathrm{raw}}\|_2^2 + \sum \mathrm{violation}_s(\mathbf{w})
+\]
 
-8) Hard vs soft
-Hard:
-- Si se viola, ajustar obligatoriamiente o rechazar peso.
+\textbf{Reescalado Global}:
+\[
+\alpha = \min\left(1, \frac{g_{\max}}{\sum |w^{\mathrm{hard}}|}\right), \quad \mathbf{w}^{\mathrm{global}} = \alpha \cdot \frac{\mathbf{w}^{\mathrm{hard}}}{\|\mathbf{w}^{\mathrm{hard}}\|_\mathrm{gross}}
+\]
 
-Soft:
-- Penalizar en funcion objetivo o escalar pesos.
-- Registrar desviacion respecto a target raw.
+\textbf{Clipeo por Grupo}: Resolver LP:
+\[
+\min_{\mathbf{w}} \|\mathbf{w} - \mathbf{w}^{\mathrm{prev}}\|_1 \quad \mathrm{s.t.} \quad \eqref{eq:group}, \sum w = 1
+\]
 
-9) Flujo del proceso
-1. Cargar config y pesos crudos.
-2. Enriquecer con exposures y liquidez.
-3. Aplicar constraints en orden definido.
-4. Re-normalizar segun politica (sum weights/cash).
-5. Validar limites finales.
-6. Persistir salida y resumen de violaciones.
+\textbf{Liquidez}: 
+\[
+w_i \leq \min\left( p_{\max,i}, \frac{\mathrm{ADV}_i \cdot \mathrm{PartCap}}{\mathrm{ADV}_{p95}} \right)
+\]
 
-10) Validaciones minimas
-- sum(abs(w_final)) <= max_gross + tolerancia.
-- abs(sum(w_final)) <= max_net + tolerancia.
-- ninguna posicion excede caps.
-- limites sector/factor cumplidos.
-- sin NaN en w_final.
+\section{Implementación Algorítmica}
 
-11) Manejo de casos especiales
-- Universo pequeno:
-  - relajar soft constraints segun config.
-- Falta de exposure/liquidez:
-  - fallback conservador o exclusion.
-- Senales extremas:
-  - clipping previo y warning.
-- Conflicto entre constraints:
-  - prioridad definida (hard riesgo > liquidez > soft alpha).
+Flujo secuencial del módulo:
 
-12) Observabilidad
-Logging:
-- INFO: resumen de constraints aplicados.
-- WARNING: recortes severos o alta desviacion de target.
-- ERROR: imposibilidad de encontrar solucion valida.
+\begin{enumerate}
+\item Cargar $\mathbf{w}^{\mathrm{raw}}$, exposiciones $\mathbf{X}$, liquidez $\mathbf{L}$.
+\item \textbf{Filtro Elegibles}: Excluir $i$ con $\mathrm{ADV}_i < \theta$.
+\item \textbf{Hard Posición}: $w_i = \mathrm{clip}(w_i^{\mathrm{raw}}, [-p_{\max}, p_{\max}])$.
+\item \textbf{Global Gross/Net}: Reescalar $\alpha$ como en \eqref{eq:gross}-\eqref{eq:net}.
+\item \textbf{Grupo/Factor}: Ajuste iterativo o QP (CVXPY).
+\item \textbf{Liquidez/Turnover}: Aplicar \eqref{eq:dtl}, penalizar high-turnover.
+\item Renormalizar: $\mathbf{w}^{\mathrm{final}} = \mathbf{w} / (1 + \mathrm{cash\_buffer})$.
+\item Validar y persistir (parquet/JSON con flags).
+\end{enumerate}
 
-Metricas:
-- pct_weight_clipped
-- gross_before_vs_after
-- net_before_vs_after
-- turnover_before_vs_after
-- n_symbols_dropped
+Manejo conflictos: Prioridad hard riesgo > liquidez > soft alpha.
 
-13) CLI sugerida
-python -m portfolio.constraints ^
-  --weights-path portfolio/targets/latest.parquet ^
-  --exposures-path risk/factors/latest.parquet ^
-  --liquidity-path data/price/liquidity/latest.parquet ^
-  --config-path configs/portfolio/constraints.yaml ^
-  --run-id constraints_20260305_001
+\section{Backtest y Validaciones}
 
-14) Estructura interna recomendada
-- load_constraints_config(...)
-- load_target_weights(...)
-- enrich_with_exposures_and_liquidity(...)
-- apply_position_caps(...)
-- apply_gross_net_constraints(...)
-- apply_group_constraints(...)
-- apply_liquidity_turnover_constraints(...)
-- renormalize_weights(...)
-- validate_constraints(...)
-- persist_constraint_outputs(...)
-- main()
+\subsection{Ejemplo de Output}
+Para universo 100 activos, targets raw con concentración:
 
-15) Criterios de aceptacion
-- Salida final cumple todos los hard constraints.
-- Desviaciones por soft constraints documentadas.
-- Integrable con rebalance y backtest.
+| Métrica              | Before | After  | Violación |
+|----------------------|--------|--------|-----------|
+| Gross Exp            | 1.50   | 1.20   | Sector    |
+| Net Exp              | 0.40   | 0.30   | Ninguna   |
+| Max Pos              | 0.15   | 0.10   | 3 activos |
+| DTL p95 (días)       | 2.1    | 1.8    | OK        |
+| \% Peso Clipeado     | -      | 12\%   | Soft      |
 
-16) Casos de prueba minimos
-- cap por posicion recorta pesos extremos.
-- constraint gross/net funciona en caso long-short.
-- limite sector impide concentracion excesiva.
-- constraint liquidez reduce posiciones iliquidas.
-- conflicto de constraints se resuelve segun prioridad.
+\subsection{Validaciones Rigurosas}
+- $\sum |w^{\mathrm{final}}| \leq g_{\max} + \epsilon$.
+- Orthogonalidad factores: $\mathrm{Corr}(\mathbf{w}, \mathbf{X}) \leq \delta$.
+- Stress: Simular $\pm 50\%$ ADV.
+- Monte Carlo: 1000 perturbaciones en $\mathbf{w}^{\mathrm{raw}}$.
 
-17) Checklist rapido
-- [ ] Hard caps por posicion/global.
-- [ ] Constraints por sector/factor/liquidez.
-- [ ] Re-normalizacion y validaciones.
-- [ ] Reporte de violaciones y resumen.
-- [ ] Tests de casos conflictivos.
+\section{Mejoras al Estado del Arte}
+
+1. **Optimización Robusta**: Usar DRO (Distributionally Robust Opt) \citep{rahimian2019robust}.
+2. **Constraints Dinámicos**: ML para predecir ADV/vol (LSTM como en \citet{lstm_swing2022}).
+3. **Risk Parity Integrado**: $\mathbf{w} \propto 1 / \mathrm{MRC}_i$ (Marginal Risk Contrib).
+4. **Multi-Period**: Constraints intertemporales para swing (Markov regimes).
+5. **RL Constraints**: Aprender soft penalties vía PPO \citep{rl_portfolio2023}.
+
+\bibliographystyle{plainnat}
+\bibliography{refs}
+
+\end{document}

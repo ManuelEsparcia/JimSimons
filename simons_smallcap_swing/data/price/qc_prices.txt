@@ -1,58 +1,261 @@
-Modulo: data/price/qc_prices.py
+% -----------------------------
+% TEXTO LaTeX PARA qc_prices.py
+% -----------------------------
+\section{Modulo: \texttt{data/price/qc\_prices.py}}
 
-1) Objetivo
-Validar calidad de precios raw/adjusted para detectar errores de ingestion, outliers y problemas PIT antes de consumo por features, labels y backtest.
+\subsection{Objetivo y contexto de calidad de datos}
 
-2) Alcance
-Incluye checks de integridad, continuidad temporal, coherencia OHLCV, cobertura por simbolo y comparativas raw vs adjusted.
+El módulo \texttt{data/price/qc\_prices.py} implementa un conjunto de \textbf{checks de calidad de datos} para precios brutos y ajustados, con el objetivo de:
 
-3) Entradas
-- prices_raw_path
-- prices_adjusted_path (opcional)
-- calendar_path
-- qc_config_path
-- run_id
+\begin{itemize}
+  \item Detectar \textbf{errores de ingestión} (schema roto, duplicados, fechas fuera de rango).
+  \item Identificar \textbf{outliers} físicos en OHLCV (valores claramente inconsistentes con la definición de vela).
+  \item Validar \textbf{consistencia temporal PIT} (gaps, cobertura, retornos extremos).
+  \item Asegurar \textbf{consistencia entre raw y adjusted} cuando ambos están presentes, para evitar errores sutiles en el backtest.
+\end{itemize}
 
-4) Salidas
-- data/price/qc/{run_id}/qc_summary.json
-- data/price/qc/{run_id}/qc_symbol_level.parquet
-- data/price/qc/{run_id}/qc_failures.parquet
-- data/price/qc/{run_id}/manifest.json
+Este módulo se sitúa entre la capa de ingestión \texttt{fetch\_prices.py} y \texttt{adjust\_prices.py}, y protege el resto del pipeline (\texttt{features/build\_features.py}, \texttt{labels/build\_labels.py}, \texttt{backtest/engine.py}) de errores de data que pueden distorsionar severamente el rendimiento aparente de la estrategia. [web:85][web:88]
 
-5) Checks obligatorios
-- schema/tipos/duplicados en (symbol,date,source)
-- OHLC: high>=max(open,close,low), low<=min(...)
-- volume>=0 y precios >0 (segun politica penny)
-- continuidad de fechas vs calendario
-- gaps extremos y retornos extremos flagged
-- consistencia raw->adjusted (si ambos presentes)
+\subsection{Alcance y filosofía de control de calidad}
 
-6) Gates sugeridos
-- pass: sin fallos criticos.
-- warn: fallos medios bajo umbral.
-- fail: duplicados, schema roto o alta tasa de anomalias.
+El módulo incluye:
 
-7) Flujo
-1. Cargar datasets y config.
-2. Ejecutar checks por bloque.
-3. Consolidar findings y severidad.
-4. Emitir gate y persistir reportes.
+\begin{itemize}
+  \item \textbf{Checks de integridad}:
+    \begin{itemize}
+      \item Schema, tipos de columna y PK lógica \texttt{(symbol, date, source\_provider)}.
+      \item Ausencia de duplicados por PK.
+    \end{itemize}
+  \item \textbf{Coherencia OHLCV intrabarra}:
+    \begin{itemize}
+      \item \texttt{high >= max(open, close, low)}.
+      \item \texttt{low <= min(open, close, high)}.
+    \end{itemize}
+  \item \textbf{Validación de signos}:
+    \begin{itemize}
+      \item \texttt{volume >= 0}.
+      \item \texttt{open, high, low, close > 0} excepto casos de \texttt{penny} definidos explícitamente.
+    \end{itemize}
+  \item \textbf{Continuidad temporal y cobertura}:
+    \begin{itemize}
+      \item Compara \texttt{date} contra \texttt{calendar\_path}.
+      \item Calcula \texttt{pct\_missing\_sessions} por ticker.
+    \end{itemize}
+  \item \textbf{Retornos extremos}:
+    \begin{itemize}
+      \item Flags \texttt{|ret\_1d| > threshold} para revisión manual.
+    \end{itemize}
+  \item \textbf{Comparativa raw vs adjusted} si se pasan ambos datasets:
+    \begin{itemize}
+      \item \texttt{ret\_1d\_raw} vs \texttt{ret\_1d\_adj\_split} y \texttt{ret\_1d\_adj\_total} para asegurar que el ajuste corporativo no introduce cambios de escala artificiales.
+      \item Consistencia en la dirección de los retornos ajustados frente a los brutos, excepto en días de eventos corporativos.
+    \end{itemize}
+\end{itemize}
 
-8) Metricas
-- n_rows
-- n_symbols
-- pct_missing_sessions
-- pct_rows_ohlc_invalid
-- pct_extreme_returns
+No se espera que este módulo corrija la data, sino que \textbf{la etiquete como problemática} y la exponga de forma estructurada para que el usuario decida exclusiones, re‑ingesta o correcciones.
 
-9) CLI
-python -m data.price.qc_prices ^
-  --prices-raw-path data/price/raw ^
-  --prices-adjusted-path data/price/adjusted ^
-  --config-path configs/data/qc_prices.yaml ^
+\subsection{Entradas y contexto PIT}
+
+Las entradas principales son:
+
+\begin{itemize}
+  \item \texttt{prices\_raw\_path}: dataset \texttt{OHLCV} bruto ingestado por \texttt{fetch\_prices.py}.
+  \item \texttt{prices\_adjusted\_path} (opcional): precios ajustados por \texttt{adjust\_prices.py}.
+  \item \texttt{calendar\_path}: calendario de sesiones de mercado para verificar continuidad.
+  \item \texttt{qc\_config\_path}: fichero de configuración que define umbrales de QC:
+    \begin{itemize}
+      \item \texttt{ohlc\_invalid\_threshold} (porcentaje de filas con OHLC inconsistente).
+      \item \texttt{extreme\_return\_threshold} (por ejemplo, \texttt{0.8}).
+      \item \texttt{max\_pct\_missing\_sessions} por ticker aceptable.
+    \end{itemize}
+  \item \texttt{run\_id}: identificador único de corrida para trazabilidad de decisiones de calidad.
+\end{itemize}
+
+El uso de un \texttt{calendar\_path} permite distinguir:
+
+\begin{itemize}
+  \item Días de mercado \texttt{missing} (problema de datos).
+  \item Fines de semana/feriados \texttt{no sesión} (behavior esperado).
+\end{itemize}
+
+\subsection{Gate de calidad: pass / warn / fail}
+
+El módulo evalúa una \textbf{pauta} sobre las métricas de QC:
+
+\begin{itemize}
+  \item \textbf{Gate = pass} si:
+    \begin{itemize}
+      \item No hay fallos críticos (schema roto, duplicados, PK inconsistente).
+      \item \texttt{pct\_rows\_ohlc\_invalid} < umbral bajo.
+      \item \texttt{pct\_extreme\_returns} < umbral bajo.
+      \item \texttt{pct\_missing\_sessions} < umbral.
+    \end{itemize}
+  \item \textbf{Gate = warn} si:
+    \begin{itemize}
+      \item Algunos símbolos presentan anomalías, pero el conjunto global cumple umbrales de tolerancia.
+    \end{itemize}
+  \item \textbf{Gate = fail} si:
+    \begin{itemize}
+      \item Fallos críticos: schema roto, duplicados persistentes, errores de tipo que afectan cálculos de retorno.
+      \item Alta tasa de anomalías globales (por ejemplo, \texttt{pct\_rows\_ohlc\_invalid} > 0.01).
+      \item Inconsistencias graves en \texttt{raw -> adjusted} (retornos ajustados que cambian de signo sistemáticamente sin explicación de eventos corporativos).
+    \end{itemize}
+\end{itemize}
+
+Esta lógica de gate es estándar en sistemas de \textit{data quality} financieros, donde se define un \textbf{niveles de tolerancia} en lugar de aceptar o rechazar todo el dataset de forma binaria. [web:88]
+
+\subsection{Definición matemática de checks críticos}
+
+Sea una barra \((\texttt{open}_t, \texttt{high}_t, \texttt{low}_t, \texttt{close}_t, \texttt{volume}_t)\).
+
+\subsubsection{Coherencia OHLC intrabarra}
+
+La lógica de vela implica:
+
+\[
+\texttt{high}_t \geq \max(\texttt{open}_t, \texttt{close}_t, \texttt{low}_t)
+\]
+\[
+\texttt{low}_t \leq \min(\texttt{open}_t, \texttt{close}_t, \texttt{high}_t)
+\]
+
+Numéricamente, se pueden definir:
+
+\begin{itemize}
+  \item \texttt{flag\_ohlc\_invalid} si:
+    \[
+    \texttt{high}_t < \max(\texttt{open}_t, \texttt{close}_t, \texttt{low}_t)
+    \quad
+    \text{or}
+    \quad
+    \texttt{low}_t > \min(\texttt{open}_t, \texttt{close}_t, \texttt{high}_t).
+    \]
+\end{itemize}
+
+Estas invariantes se derivan de la definición misma de \texttt{OHLC}: \texttt{high} y \texttt{low} representan el máximo y mínimo observados en el intervalo, por lo que deben encerrar \texttt{open} y \texttt{close}. [web:84][web:86]
+
+\subsubsection{Retorno y valores extremos}
+
+Sea el retorno diario:
+
+\[
+r_t = \frac{P_t}{P_{t-1}} - 1.
+\]
+
+\begin{itemize}
+  \item \texttt{flag\_extreme\_return} si:
+    \[
+    |r_t| > \texttt{extreme\_return\_threshold}
+    \]
+    (por ejemplo, \texttt{0.8}).
+  \item Se pueden registrar \texttt{pct\_extreme\_returns} por universo o por \texttt{sector} si se dispone de metadatos.
+\end{itemize}
+
+\subsection{Flujo de procesamiento (alto nivel)}
+
+El flujo implementado es:
+
+\begin{enumerate}
+  \item \texttt{load\_datasets\_and\_config(...)}:
+    \begin{itemize}
+      \item \texttt{prices\_raw}, opcionalmente \texttt{prices\_adjusted}.
+      \item \texttt{calendar}.
+      \item Config de umbrales de QC.
+    \end{itemize}
+  \item \texttt{run\_qc\_blocks(...)}:
+    \begin{itemize}
+      \item \texttt{schema\_and\_duplicates\_check(...)}: PK lógica, tipos, dupes.
+      \item \texttt{ohlcv\_consistency\_check(...)}.
+      \item \texttt{sign\_and\_range\_check(...)} para precios y volumen.
+      \item \texttt{temporal\_continuity\_check(...)} basado en \texttt{calendar\_path}.
+      \item \texttt{raw\_vs\_adjusted\_check(...)} si ambos datasets están presentes.
+    \end{itemize}
+  \item \texttt{consolidate\_findings(...)}:
+    \begin{itemize}
+      \item Computa métricas agregadas por \texttt{run}: \texttt{pct\_rows\_ohlc\_invalid}, \texttt{pct\_extreme\_returns}, \texttt{pct\_missing\_sessions} promedio.
+      \item Agrega señales por \texttt{symbol} para \texttt{qc\_symbol\_level}.
+    \end{itemize}
+  \item \texttt{emit\_gate\_and\_persist(...)}:
+    \begin{itemize}
+      \item Determina \texttt{gate = pass/warn/fail}.
+      \item Escribe \texttt{qc\_summary.json}, \texttt{qc\_symbol\_level.parquet}, \texttt{qc\_failures.parquet}, \texttt{manifest.json}.
+    \end{itemize}
+\end{enumerate}
+
+\subsection{Métricas de salida y reportes}
+
+El módulo genera:
+
+\begin{itemize}
+  \item \texttt{data/price/qc/\{run\_id\}/qc\_summary.json}:
+    \begin{itemize}
+      \item \texttt{n\_rows}, \texttt{n\_symbols}.
+      \item \texttt{pct\_missing\_sessions} promedio.
+      \item \texttt{pct\_rows\_ohlc\_invalid}.
+      \item \texttt{pct\_extreme\_returns}.
+      \item \texttt{gate} final (pass/warn/fail).
+    \end{itemize}
+  \item \texttt{qc\_symbol\_level.parquet}:
+    \begin{itemize}
+      \item \texttt{symbol}, \texttt{pct\_missing\_sessions\_symbol}, \texttt{pct\_extreme\_returns\_symbol}, \texttt{n\_ohlc\_violations}, flags de \texttt{raw\_vs\_adjusted\_inconsistency}.
+    \end{itemize}
+  \item \texttt{qc\_failures.parquet}:
+    \begin{itemize}
+      \item Filas marcadas como \texttt{fail} por criterios críticos.
+    \end{itemize}
+  \item \texttt{manifest.json}:
+    \begin{itemize}
+      \item \texttt{run\_id}, \texttt{hash\_of\_config}, \texttt{start\_date}, \texttt{end\_date}, \texttt{sources}, \texttt{processing\_duration\_sec}.
+    \end{itemize}
+\end{itemize}
+
+Estos artefactos permiten:
+
+\begin{itemize}
+  \item Revisar \textbf{problemas de data por ticker} antes de entrenar features.
+  \item Trazar \textbf{decisiones de exclusión} (por ejemplo, ticker con \texttt{pct\_missing\_sessions > 0.5} se excluye del universo).
+  \item Cumplir con estándares de \textit{data quality} y \textit{data observability} en finanzas. [web:88]
+\end{itemize}
+
+\subsection{Interfaz CLI y configuración}
+
+CLI sugerida:
+
+\begin{verbatim}
+python -m data.price.qc_prices                      \
+  --prices-raw-path data/price/raw                  \
+  --prices-adjusted-path data/price/adjusted        \
+  --config-path configs/data/qc_prices.yaml         \
   --run-id qc_prices_20260305_001
+\end{verbatim}
 
-10) DoD
-- reportes reproducibles
-- gate pass/warn/fail trazable
-- findings accionables por simbolo
+En \texttt{qc\_prices.yaml} se pueden definir:
+
+\begin{itemize}
+  \item \texttt{ohlc\_invalid\_threshold: 0.01}.
+  \item \texttt{extreme\_return\_threshold: 0.8}.
+  \item \texttt{max\_pct\_missing\_sessions\_per\_ticker: 0.05}.
+  \item \texttt{penny\_price\_threshold: 1.0} para definir cuando se permite precio cercano a cero.
+\end{itemize}
+
+\subsection{Criterios de aceptación (Definition of Done)}
+
+El módulo cumple la definición de terminado cuando:
+
+\begin{itemize}
+  \item Los reportes de QC son \textbf{reproducibles} por \texttt{run\_id} + \texttt{config\_hash}.
+  \item El \textbf{gate} \texttt{pass/warn/fail} es explícito y trazable:
+    \begin{itemize}
+      \item Puede ser consultado por el módulo \texttt{backtest/engine.py} como precondición de ejecución de backtest.
+    \end{itemize}
+  \item Los \textbf{findings} son \textbf{accionables por símbolo}:
+    \begin{itemize}
+      \item Listas de tickers con anomalías claras se pueden usar para exclusiones o cleans individuales.
+    \end{itemize}
+  \item La comparativa \texttt{raw vs adjusted} detecta situaciones de \texttt{leakage} o errores de factor de ajuste (por ejemplo, uso de eventos corporativos futuros o factores incoherentes en el tiempo).
+\end{itemize}
+
+Este módulo cierra así el ciclo de \textbf{data quality} de precios de tu sistema de swing trading industrial, garantizando que el backtest descansa sobre un dataset \textbf{limpio, auditado y coherente desde el punto de vista de mercado diario}. [web:85][web:88]  
+% -----------------------------
+% FIN DEL TEXTO PARA .TXT
+% -----------------------------

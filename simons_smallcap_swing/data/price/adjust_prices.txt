@@ -1,212 +1,267 @@
-Modulo: data/price/adjust_prices.py
+% -----------------------------
+% TEXTO LaTeX PARA adjust_prices.py
+% -----------------------------
+\section{Modulo: \texttt{data/price/adjust_prices.py}}
 
-1) Objetivo
-Este modulo transforma precios raw diarios en series ajustadas consistentes para research y modelado, aplicando eventos corporativos (splits, reverse splits y dividendos segun politica configurada) sin introducir leakage temporal.
+\subsection{Objetivo y motivacion economica}
 
-2) Alcance
-Incluye:
-- Lectura de precios raw canonicos desde fetch_prices.
-- Ingestion de eventos corporativos (splits/dividendos) con fecha efectiva.
-- Construccion de factores de ajuste por simbolo y fecha.
-- Generacion de columnas ajustadas (OHLC, volumen y retornos).
-- Persistencia de dataset ajustado + tabla de factores + manifest.
+El modulo \texttt{data/price/adjust_prices.py} tiene como objetivo transformar series de precios brutos (``raw'') diarios en \textbf{series ajustadas consistentes} para \textit{research} y modelado cuantitativo, aplicando correctamente eventos corporativos (splits, reverse splits y dividendos en efectivo) sin introducir \textbf{leakage temporal} en el backtest.
 
-No incluye:
-- Descarga de precios raw.
-- Deteccion final de anomalias (lo cubre qc_prices.py).
-- Construccion de features/labels.
+Desde un punto de vista financiero, la clave es que el \textbf{retorno total} de una posicion larga debe ser el mismo tanto si se calcula a partir de precios brutos como si se ajustan splits y dividendos, siempre que el calendario de eventos corporativos utilizado sea \textbf{point-in-time} (PIT) y no futuro. [web:35][web:39][web:46]
 
-3) Dependencias aguas arriba y aguas abajo
-Upstream:
-- data/price/raw/... (fetch_prices)
-- data/universe/corporate_actions (o fuente equivalente PIT)
-- calendario de sesiones de mercado
+\subsection{Marco matematico de ajuste de precios}
 
-Downstream:
-- data/price/qc_prices.py
-- features/build_features.py
-- labels/build_labels.py
-- backtest/engine.py
+Sea \(P_t\) el precio de cierre bruto en la fecha \(t\). Definimos:
 
-4) Politica de ajuste (debe quedar explicita en config)
-Modes soportados:
-- split_only: ajusta solo por splits/reverse splits.
-- total_return_like: ajusta por splits + dividendos cash (aprox TR).
-- dual_output: emite simultaneamente close_split_adj y close_total_adj.
+\begin{itemize}
+  \item \(S_t\): factor de split acumulado en \(t\), normalizado a \(1\) en la fecha más reciente del rango.
+  \item \(D_t\): factor de dividendo acumulado, si se aplica (en modo \texttt{total\_return\_like} o \texttt{dual\_output}).
+\end{itemize}
 
-Regla recomendada por defecto:
-- Mantener dual_output para evitar ambiguedad en research.
-- En entrenamiento baseline usar split_only salvo hipotesis explicita de total return.
+\subsubsection{Ajuste por split}
 
-5) Contrato de entrada
-Entradas minimas:
-- prices_raw_path: ruta parquet raw canonico.
-- corporate_actions_path: ruta de eventos corporativos PIT.
-- start_date, end_date
-- adjust_mode: split_only | total_return_like | dual_output
-- run_id
+Sea un split \(a:b\) con fecha ex-date \(E\). La convencion recomendada es:
 
-Campos minimos esperados en precios raw:
-- symbol, date, open, high, low, close, volume
+\[
+P_t^{\text{adj-split}} =
+\begin{cases}
+P_t / S_t, & \text{si se busca mantener el retorno basico}, \\
+(S_t \cdot P_t), & \text{si se desea reescalar en sentido inverso (menos comun)}.
+\end{cases}
+\]
 
-Campos minimos esperados en eventos corporativos:
-- symbol
-- event_type (split | dividend)
-- ex_date (date efectiva)
-- split_from, split_to (para splits; ejemplo 1->4)
-- dividend_cash (para dividendos cash)
-- ingest_ts_utc o effective_known_ts (para auditoria PIT)
+La convencion estándar (coherente con CRSP, muchos proveedores y bibliotecas de ajuste) es que:
 
-6) Contrato de salida
-Ruta sugerida:
-- data/price/adjusted/mode={adjust_mode}/date={asof_date}/part-*.parquet
+\[
+P_t^{\text{adj-split}} = \frac{P_t}{S_t}, \quad
+V_t^{\text{adj}} = V_t \cdot S_t,
+\]
 
-Columnas requeridas:
-- symbol, date
-- open_raw, high_raw, low_raw, close_raw, volume_raw
-- split_factor_cum (float64)
-- dividend_factor_cum (float64, nullable en split_only)
-- open_adj, high_adj, low_adj, close_adj
-- volume_adj
-- ret_1d_raw
-- ret_1d_adj_split (siempre)
-- ret_1d_adj_total (solo en total_return_like o dual_output)
-- adjustment_mode
-- run_id, ingest_ts_utc
+donde \(V_t\) es el volumen bruto. [web:39][web:40][web:46]
 
-Artefactos auxiliares:
-- adjustment_factors.parquet (factor diario por simbolo)
-- adjustment_events_applied.parquet
-- adjustment_manifest.json
+Para un split \(a:b\) en \(E\), el factor elemental es:
 
-7) Reglas PIT y anti-leakage
-- Aplicar solo eventos con ex_date <= date de observacion.
-- No usar correction files publicados despues de la fecha de run sin versionado.
-- El calculo de factor historico debe ser determinista con el snapshot de eventos usado.
-- Guardar hash/version de corporate_actions en manifest.
+\[
+\phi_{\text{split}}^{(E)} = \frac{b}{a},
+\]
 
-8) Definiciones y formulas
-Notacion:
-- P_t = close_raw en t
-- S_t = factor de split acumulado para t (normalizado a 1 en fecha mas reciente del rango)
-- D_t = factor de dividendo acumulado (si aplica)
+y se aplica a todas las fechas anteriores a \(E\). El factor acumulado multiplicativo es:
 
-Split factor:
-- Para split a:b en ex_date E (ejemplo 1:4):
-  - precios anteriores a E se escalan por b/a segun convencion elegida.
-- Convencion recomendada:
-  - close_adj_t = close_raw_t / S_t
-  - volume_adj_t = volume_raw_t * S_t
+\[
+S_t = \prod_{E \in \text{Splits}, E \geq t} \phi_{\text{split}}^{(E)}.
+\]
 
-Dividend factor (total_return_like aproximado):
-- Ajuste backward por cash dividend en ex_date.
-- Factor elemental:
-  - f_div(E-1) = (P_{E-1} - div_cash_E) / P_{E-1}
-- Factor acumulado multiplicativo hacia atras.
+\subsubsection{Ajuste por dividendo en efectivo (total return aproximado)}
 
-Retornos:
-- ret_1d_raw = P_t / P_{t-1} - 1
-- ret_1d_adj_split usando close_adj_split
-- ret_1d_adj_total usando close_adj_total (si aplica)
+Sea un dividendo en efectivo \(d_E\) en el ex-date \(E\). El ajuste backward por cash dividend se modela como:
 
-9) Flujo del proceso (alto nivel)
-1. Cargar precios raw y eventos corporativos.
-2. Filtrar rango temporal y universo efectivo.
-3. Validar schema y tipos de entrada.
-4. Para cada simbolo:
-   - Ordenar por fecha ascendente.
-   - Construir serie de split_factor_cum por fecha.
-   - Si corresponde, construir dividend_factor_cum.
-   - Calcular OHLC ajustado y volumen ajustado.
-   - Calcular retornos raw/adj.
-5. Concatenar simbolos y validar invariantes globales.
-6. Persistir dataset ajustado y artefactos de factores.
-7. Emitir reportes de cobertura y cambios extremos.
+\begin{equation}
+\phi_{\text{div}}^{(E)} = \frac{P_{E-1} - d_E}{P_{E-1}} = 1 - \frac{d_E}{P_{E-1}}.
+\end{equation}
 
-10) Validaciones minimas
-Por simbolo:
-- Fechas unicas y ascendentes.
-- split_factor_cum > 0 siempre.
-- volume_adj >= 0.
-- open_adj/high_adj/low_adj/close_adj > 0 salvo penny edge cases definidos.
+El factor acumulado multiplicativo hacia el pasado es:
 
-Relaciones OHLC:
-- high_adj >= max(open_adj, close_adj, low_adj)
-- low_adj <= min(open_adj, close_adj, high_adj)
+\[
+D_t = \prod_{E \in \text{Dividends}, E \geq t} \phi_{\text{div}}^{(E)}.
+\]
 
-Sanidad de retornos:
-- Sin infinities/NaN fuera de primera observacion o gaps conocidos.
-- Flags cuando |ret_1d_adj| > umbral (ej. 80%) para revision en qc.
+El precio de cierre ajustado total viene entonces dado por:
 
-11) Manejo de casos especiales
-- Multiples eventos el mismo dia (split + dividendo): aplicar orden determinista documentado.
-- Reverse split extremo: permitir factor alto pero marcar warning.
-- Dividendos extraordinarios: marcar flag extra_dividend.
-- Simbolos sin eventos: factor=1 y salida equivalente a raw.
-- Gaps de cotizacion por suspension: no imputar, mantener discontinuidad.
+\[
+P_t^{\text{adj-total}} =
+\begin{cases}
+P_t / S_t, & \text{modo \texttt{split\_only}}, \\
+P_t / (S_t D_t), & \text{modo \texttt{total\_return\_like} o \texttt{dual\_output}}.
+\end{cases}
+\]
 
-12) Observabilidad y trazabilidad
-Logging estructurado:
-- INFO: progreso por simbolo/lote.
-- WARNING: eventos ambiguos, retornos extremos, faltantes en acciones corporativas.
-- ERROR: simbolo no procesable por datos corruptos.
+Este esquema es consistente con la construccion de indices de retorno total, donde el retorno total diario cumple:
 
-Metricas:
-- symbols_processed
-- symbols_with_splits
-- symbols_with_dividends
-- rows_adjusted
-- pct_rows_changed_vs_raw
-- num_extreme_returns_flagged
-- run_duration_sec
+\[
+1 + r_t^{\text{TR}} =
+\frac{P_t^{\text{adj-total}} + d_t}{P_{t-1}^{\text{adj-total}}}
+\approx \frac{P_t^{\text{adj-total}}}{P_{t-1}^{\text{adj-total}}},
+\]
 
-13) Interfaz de ejecucion (CLI sugerida)
-python -m data.price.adjust_prices ^
-  --prices-raw-path data/price/raw/provider=polygon/freq=1d/date=2026-03-05 ^
-  --corporate-actions-path data/universe/corporate_actions/current.parquet ^
-  --start-date 2014-01-01 ^
-  --end-date 2026-03-01 ^
-  --adjust-mode dual_output ^
+cuando se trabaja exclusivamente con precios ajustados. [web:35][web:36][web:39]
+
+\subsubsection{Retornos}
+
+Los retornos diarios definidos en el contrato de salida son:
+
+\begin{align}
+r_t^{\text{raw}}    &= \frac{P_t^{\text{raw}}}{P_{t-1}^{\text{raw}}} - 1, \\
+r_t^{\text{adj-split}} &= \frac{P_t^{\text{adj-split}}}{P_{t-1}^{\text{adj-split}}} - 1, \\
+r_t^{\text{adj-total}} &= \frac{P_t^{\text{adj-total}}}{P_{t-1}^{\text{adj-total}}} - 1 \quad \text{(si aplica)}.
+\end{align}
+
+Bajo el esquema de ajuste multiplicativo, la serie de \(r_t^{\text{adj-share}}\) (sin dividendo) es invariante al split y refleja unicamente el retorno de la accion, mientras que \(r_t^{\text{adj-total}}\) incorpora implicitamente el efecto de los dividendos. [web:39][web:45]
+
+\subsection{Link con el estado del arte cuantitativo}
+
+El patrón de ajuste multiplicativo inverso por splits y dividendos es el \textbf{standard de facto} en:
+
+\begin{itemize}
+  \item CRSP y muchos proveedores de datos (Yahoo Finance, Bloomberg, etc.). [web:39][web:43]
+  \item Indices de retorno total de grandes proveedores (LSEG/FTSE, Euronext, etc.). [web:36][web:37]
+  \item Herramientas de backtest y research que requieren coherencia entre retornos brutos y ajustados. [web:41][web:47]
+\end{itemize}
+
+Este enfoque es crucial para evitar:
+
+\begin{itemize}
+  \item \textbf{Leakage}: usar eventos corporativos publicados despues de la fecha de run sin versionado PIT.
+  \item \textbf{Overfitting}: aprender patrones numericos artificiales en el cruce de periodos pre/post split.
+\end{itemize}
+
+\subsection{Flujo del proceso (alto nivel) y estructura de funciones}
+
+El flujo implementa un pipeline determinista por símbolo:
+
+\begin{enumerate}
+  \item Cargar precios brutos y eventos corporativos.
+  \item Filtrar rango temporal y universo efectivo.
+  \item Validar esquema y tipos de entrada.
+  \item Para cada símbolo:
+    \begin{itemize}
+      \item Ordenar por fecha ascendente.
+      \item Construir \(S_t\) acumulado (funcion \texttt{build\_split\_factors}).
+      \item Si corresponde, construir \(D_t\) acumulado (funcion \texttt{build\_dividend\_factors}).
+      \item Calcular OHLC ajustado y volumen ajustado:
+        \begin{align}
+          \text{OHLC}_t^{\text{adj}} &= \text{OHLC}_t^{\text{raw}} / S_t \quad (\text{split\_only}), \\
+          \text{OHLC}_t^{\text{adj}} &= \text{OHLC}_t^{\text{raw}} / (S_t D_t) \quad (\text{total\_return\_like}).
+        \end{align}
+      \item Calcular retornos raw/ajustados (funcion \texttt{compute\_returns}).
+    \end{itemize}
+  \item Concatenar símbolos y validar invariantes globales.
+  \item Persistir dataset ajustado, tabla de factores y manifest (funciones \texttt{persist\_adjusted\_outputs} y \texttt{main}).
+\end{enumerate}
+
+\subsection{Validaciones y reglas PIT}
+
+El modulo impone validaciones de sanidad por símbolo:
+
+\begin{itemize}
+  \item Fechas unicas y estrictamente crecientes.
+  \item \(S_t > 0\) siempre (para evitar divisiones por cero).
+  \item \(V_t^{\text{adj}} \geq 0\).
+  \item \( \text{OHLC}_t^{\text{adj}} > 0\) salvo casos extremos predefinidos (``penny stocks'').
+\end{itemize}
+
+Las relaciones de OHLC ajustado deben satisfacer:
+
+\begin{align}
+\max(\text{open}_t^{\text{adj}}, \text{close}_t^{\text{adj}}, \text{low}_t^{\text{adj}}) &\leq \text{high}_t^{\text{adj}}, \\
+\min(\text{open}_t^{\text{adj}}, \text{close}_t^{\text{adj}}, \text{high}_t^{\text{adj}}) &\geq \text{low}_t^{\text{adj}}.
+\end{align}
+
+Adicionalmente, se flagan retornos extremos:
+
+\[
+\left| r_t^{\text{adj}} \right| > \text{threshold},
+\]
+
+por ejemplo \texttt{threshold} = 0.8, para revision en \texttt{qc\_prices.py}. [web:35][web:47]
+
+\subsection{Dataset de salida y contrato de columnas}
+
+El modulo emite un dataset ajustado con estructura:
+
+\begin{itemize}
+  \item \texttt{symbol, date, open_raw, high_raw, low_raw, close_raw, volume_raw}.
+  \item \texttt{split_factor_cum} (factor multiplicativo \(S_t\)).
+  \item \texttt{dividend_factor_cum} (factor multiplicativo \(D_t\), nulo en \texttt{split\_only}).
+  \item \texttt{open_adj, high_adj, low_adj, close_adj, volume_adj}.
+  \item \texttt{ret_1d_raw, ret_1d_adj_split, ret_1d_adj_total} (según el modo).
+  \item Metadatos: \texttt{adjustment\_mode, run\_id, ingest\_ts\_utc}.
+\end{itemize}
+
+Ademas se generan artefactos:
+
+\begin{itemize}
+  \item \texttt{adjustment\_factors.parquet} (factor diario por símbolo).
+  \item \texttt{adjustment\_events\_applied.parquet} (registro de qué eventos se usaron).
+  \item \texttt{adjustment\_manifest.json} (hash/version de los eventos corporativos PIT usados).
+\end{itemize}
+
+\subsection{Interfaz de ejecucion (CLI) y configuracion}
+
+Una interfaz CLI tipica sería:
+
+\begin{verbatim}
+python -m data.price.adjust_prices               \
+  --prices-raw-path data/price/raw/provider=polygon/freq=1d/date=2026-03-05 \
+  --corporate-actions-path data/universe/corporate_actions/current.parquet \
+  --start-date 2014-01-01                          \
+  --end-date 2026-03-01                            \
+  --adjust-mode dual_output                        \
   --run-id adjust_prices_20260305_001
+\end{verbatim}
 
-14) Estructura interna recomendada (funciones)
-- load_raw_prices(...)
-- load_corporate_actions(...)
-- validate_input_schemas(...)
-- build_split_factors(df_prices_symbol, df_actions_symbol)
-- build_dividend_factors(df_prices_symbol, df_actions_symbol)
-- apply_adjustments(df_prices_symbol, split_factors, dividend_factors, mode)
-- compute_returns(df_symbol)
-- validate_adjusted_frame(df_adj)
-- persist_adjusted_outputs(df_adj, df_factors, output_path, ...)
-- main()
+La configuración de \texttt{adjust\_mode} debe ser explícita, recomendándose:
 
-15) Criterios de aceptacion (Definition of Done)
-- Genera dataset ajustado reproducible con manifest completo.
-- Factores de split/dividendo auditables por simbolo y fecha.
-- No introduce leakage (reglas PIT verificables).
-- Retornos ajustados coherentes y sin errores numericos graves.
-- Modo configurable (split_only/total_return_like/dual_output) funcionando.
+\begin{itemize}
+  \item \texttt{dual\_output} por defecto para evitar ambigüedad en research.
+  \item \texttt{split\_only} en entrenamiento baseline salvo que se quiera modelar explícitamente el efecto de dividendos.
+\end{itemize}
 
-16) Casos de prueba minimos (para tests/)
-- Split simple 2:1 y verificacion de OHLC/volumen ajustados.
-- Reverse split 1:10 con continuidad de retornos ajustados.
-- Dividendo cash normal y extraordinario en total_return_like.
-- Simbolo sin eventos (adj == raw salvo columnas auxiliares).
-- Multiples eventos misma fecha (orden de aplicacion estable).
-- Eventos fuera de rango no afectan periodo.
-- Deteccion de schema invalido en corporate_actions.
+\subsection{Casos especiales y politicas de riesgo}
 
-17) Riesgos y decisiones abiertas
-- Definir convencion exacta de ajuste frente a proveedor (comparabilidad externa).
-- Politica para dividendos especiales y spin-offs (si no hay data suficiente).
-- Fuente maestra de corporate actions y versionado PIT estricto.
-- Umbrales definitivos de retornos extremos para flags en qc.
+El modulo debe manejar:
 
-18) Checklist rapido de implementacion
-- [ ] Definir y documentar convencion matematica de factores.
-- [ ] Implementar pipeline por simbolo deterministico.
-- [ ] Persistir tabla de factores y eventos aplicados.
-- [ ] Validaciones de invariantes OHLC/retornos.
-- [ ] CLI + config + run manifest.
-- [ ] Tests unitarios de splits/dividendos y edge cases.
+\begin{itemize}
+  \item Multiples eventos el mismo dia (split + dividendo): aplicar un orden determinista (por ejemplo, split primero).
+  \item Reverse splits extremos: permitir factores altos pero marcar \texttt{warning}.
+  \item Dividendos extraordinarios: marcar flag \texttt{extra\_dividend}.
+  \item Símbolos sin eventos: factor \(S_t = D_t = 1\), y la serie ajustada es equivalente a la bruta, salvo columnas auxiliares.
+  \item Gaps por suspension: no imputar, mantener la discontinuidad (no modelar interpolación).
+\end{itemize}
+
+Entre los riesgos y decisiones abiertas:
+
+\begin{itemize}
+  \item Definir convencion exacta de ajuste frente a proveedor externo (para comparabilidad cruzada).
+  \item Política para spin‑offs y dividendos accionarios (si la fuente de datos no los proporciona).
+  \item Umbral definitivo de retornos extremos para flags en \texttt{qc\_prices.py}.
+\end{itemize}
+
+\subsection{Criterios de aceptacion y tests}
+
+El modulo cumple la \textit{Definition of Done} cuando:
+
+\begin{itemize}
+  \item Genera dataset ajustado reproducible con manifest completo.
+  \item Factores de split/dividendo son auditables por símbolo y fecha.
+  \item No introduce leakage: reglas PIT verificables y versionado explícito.
+  \item Retornos ajustados son coherentes y sin errores numéricos graves.
+  \item Los modos \texttt{split\_only}, \texttt{total\_return\_like} y \texttt{dual\_output} funcionan correctamente.
+\end{itemize}
+
+Los tests mínimos recomendados incluyen:
+
+\begin{itemize}
+  \item Split 2:1 con verificación de OHLC/volumen ajustados.
+  \item Reverse split 1:10 con continuidad de retornos ajustados.
+  \item Dividendo en efectivo normal y extraordinario (en \texttt{total\_return\_like}).
+  \item Símbolo sin eventos (ajustado == bruto salvo columnas auxiliares).
+  \item Multiples eventos el mismo día con orden estable.
+  \item Eventos fuera del rango de fecha que no afectan el periodo.
+  \item Detección de schema inválido en \texttt{corporate\_actions}.
+\end{itemize}
+
+\subsection{Checklist rapido de implementacion}
+
+\begin{itemize}
+  \item [ ] Definir y documentar convencion matematica de factores de split y dividendo.
+  \item [ ] Implementar pipeline por símbolo deterministico y reproducible.
+  \item [ ] Persistir tabla de factores y eventos aplicados.
+  \item [ ] Validar invariantes OHLC y retornos.
+  \item [ ] Exponer CLI, config y manifest de ejecucion.
+  \item [ ] Implementar tests unitarios de splits, dividendos y casos extremos.
+\end{itemize}
+
+Con este modulo, el sistema de \texttt{data/price/adjust\_prices.py} se convierte en la \textbf{capa de ajuste de precios industrial} que permite construir un sistema de swing trading de alto nivel, preparado para investigación cuantitativa robusta y backtest sin leakage. [web:35][web:41][web:47]
+% -----------------------------
+% FIN DEL TEXTO PARA .TXT
+% -----------------------------
