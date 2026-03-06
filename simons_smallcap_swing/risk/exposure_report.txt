@@ -1,14 +1,18 @@
 \documentclass{article}
 \usepackage[utf8]{inputenc}
-\usepackage{amsmath,amssymb,amsfonts}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,mathtools}
 \usepackage{booktabs}
-\usepackage{listings}
-\usepackage{hyperref}
+\usepackage{array}
+\usepackage{enumitem}
 \usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
 \geometry{margin=1in}
 
-\title{Explicación SOTA: risk/exposure\_report.py \\ Risk Budgeting Factorial para Swing Trading (AQR/DE Shaw Level)}
-\author{Análisis Research Industrial}
+\title{\textbf{Especificación Técnica: \texttt{risk/exposure\_report.py}}}
+\author{Quant Research Infrastructure}
 \date{Marzo 2026}
 
 \begin{document}
@@ -17,87 +21,517 @@
 \tableofcontents
 \newpage
 
-\section{Objetivo y Alcance}
-Reporta exposures factoriales/sectoriales/concentración/liquidez para monitoreo diario y gates pre-trade. Limita beta<1.2, sector<20\%, HHI<0.1, participation<3\% en swings $[web:25]$.
+\section{Propósito del módulo}
 
-\section{Teoría Matemática}
-Factor exposure (APT):
-\[
-e_f = \sum_i w_i \beta_{i,f}, \quad r_i = \alpha_i + \sum_f \beta_{i,f} f + \epsilon_i
-\]
-Gross/Net: $Gross = \sum |w_i|$, $Net = \sum w_i$.
+Este módulo calcula, valida y reporta exposiciones agregadas del portafolio para control diario y para \emph{gating} pre-trade. Su función es traducir posiciones individuales en métricas de riesgo interpretables a nivel de cartera: exposición factorial, exposición sectorial, concentración, liquidez operativa y uso de capacidad.
 
-HHI:
-\[
-HHI = \sum_i w_i^2, \quad \text{cap } HHI \le 0.15
-\]
+El módulo no existe para ``mejorar el alpha'' por sí mismo. Su valor reside en gobernanza cuantitativa: impedir que una cartera aparentemente diversificada acumule, de forma no intencionada, una sensibilidad excesiva a un factor, un sector, una posición dominante o una restricción de liquidez incompatible con la ejecución real.
 
-Liquidez:
-\[
-DTL = \frac{|w_i| \cdot Price_i}{\lambda \cdot ADV_i}, \quad \lambda=0.1\% \text{ (impact)}
-\]
+En una estrategia \emph{swing} sobre small caps, este módulo es especialmente importante porque la concentración económica real suele ser mayor que la visible en el número nominal de posiciones. Un portafolio con muchas líneas puede seguir estando excesivamente cargado en beta de mercado, tamaño, momentum, sectores ilíquidos o nombres con baja capacidad de salida.
 
-Participation: $ \frac{Trade\ Notional}{ADV} < 5\% $.
+\section{Objetivo operativo}
 
-\section{Papers Seminales}
-\begin{itemize}
-\item \href{https://www.jstor.org/stable/2329112}{Fama-French (1993)}: 3-factors para $\beta$.
-\item \href{https://ssrn.com/abstract=2353821}{Ang (2014)}: 4 new factors (vol, mom, etc.).
-\item Kozak et al. (2020): ML auto-factors.
-\item \href{https://arxiv.org/abs/1902.11142}{López de Prado (2019)}: Purged CV para exposures PIT.
-\end{itemize}
+El módulo debe cumplir cinco funciones:
 
-\section{Libros Industriales}
-\begin{itemize}
-\item Grinold \& Kahn (2000): \textit{Active Portfolio Mgmt.} -- IR = IC $\sqrt{B}$, exposure budgeting.
-\item Ang (2014): \textit{Asset Management} -- Smart beta exposures.
-\item Chan (2020): \textit{Quantitative Trading} -- Sector neutral swings.
-\item Clarke (2002): \textit{Risk Control} -- HHI/liquidity en L/S.
-\end{itemize}
-
-\section{Análisis del Flujo}
-\begin{enumerate}
-\item Load positions, factor_exposures (parquet PIT), sector_map.
-\item Enrich: $e_f = w \cdot \beta$.
-\item Compute: gross/net, sector sums, top5 weights, HHI, DTL/participation.
-\item Limits eval: breaches por severity.
-\item Persist: daily.parquet, summary.json, breaches.parquet.
+\begin{enumerate}[label=\arabic*.]
+    \item Agregar las exposiciones del libro a partir de posiciones y metadatos por activo.
+    \item Comparar las métricas agregadas con una política explícita de límites.
+    \item Clasificar cada violación por severidad.
+    \item Producir artefactos persistentes para auditoría y monitoreo.
+    \item Servir como capa de decisión para bloquear, advertir o permitir órdenes pre-trade.
 \end{enumerate}
 
-Casos: Fallback 0 en missing \(\beta\), warn ilíquidos.
+La prioridad del diseño no es sofisticación cosmética, sino consistencia, trazabilidad y uso operativo inmediato.
 
-\section{Optimizaciones SOTA}
-- Kalman \(\beta_t\): $ \beta_t = \beta_{t-1} + K_t (r_t - \beta_{t-1} f_t) $.
-- Dynamic HHI: Sector-neutralized.
-Snippet:
-\begin{lstlisting}[language=Python]
-factor_exp = np.dot(weights, factor_betas)
-hhi = np.sum(np.abs(weights)**2)
-\end{lstlisting}
+\section{Entradas, salidas y contrato del módulo}
 
-\section{Backtest Élite Swing}
-Rebalance semanal, factors Fama-French5 + custom:
+\subsection{Entradas mínimas}
 
-\begin{table}[h]
-\centering
-\begin{tabular}{lccc}
+El módulo requiere, para una fecha de evaluación \(t\):
+
+\begin{itemize}
+    \item vector de pesos o notionals del portafolio:
+    \[
+    w_t = (w_{1,t}, \dots, w_{N,t})^\top;
+    \]
+    \item matriz de exposiciones factoriales por activo:
+    \[
+    B_t = (\beta_{i,f,t}) \in \mathbb{R}^{N \times F};
+    \]
+    \item mapeo sectorial por activo;
+    \item métricas de liquidez por activo: precio, volumen medio diario, ADV monetario o equivalente;
+    \item propuesta de órdenes nuevas, si la evaluación es pre-trade;
+    \item parámetros de límites y tolerancias.
+\end{itemize}
+
+\subsection{Salida principal}
+
+La salida principal consiste en:
+
+\begin{itemize}
+    \item métricas agregadas de exposición;
+    \item estado de cumplimiento de límites;
+    \item severidad por violación;
+    \item decisión operativa:
+    \[
+    \texttt{allow}, \quad \texttt{warn}, \quad \texttt{block};
+    \]
+    \item artefactos persistidos para monitoreo y auditoría.
+\end{itemize}
+
+\subsection{Artefactos persistidos}
+
+El módulo debe persistir, como mínimo:
+
+\begin{itemize}
+    \item \texttt{daily.parquet}: métricas agregadas por fecha;
+    \item \texttt{breaches.parquet}: una fila por violación detectada;
+    \item \texttt{summary.json}: resumen de límites, severidad y decisión final;
+    \item \texttt{inputs\_coverage.json}: cobertura y calidad de metadatos usados.
+\end{itemize}
+
+\subsection{Campos mínimos de \texttt{summary.json}}
+
+\begin{itemize}
+    \item fecha;
+    \item gross exposure;
+    \item net exposure;
+    \item factor exposures;
+    \item sector exposures;
+    \item HHI;
+    \item top-1 y top-5 concentration;
+    \item participation máxima;
+    \item días teóricos para liquidación;
+    \item número de breaches;
+    \item breach más severo;
+    \item decisión final;
+    \item datos faltantes detectados;
+    \item si hubo \emph{fallback}.
+\end{itemize}
+
+\section{Definiciones matemáticas}
+
+\subsection{Gross y net exposure}
+
+Sea \(w_i\) el peso del activo \(i\). Definimos:
+
+\[
+Gross = \sum_{i=1}^N |w_i|,
+\qquad
+Net = \sum_{i=1}^N w_i.
+\]
+
+Estas métricas no sustituyen a la descomposición factorial, pero sirven como primer control de apalancamiento económico y sesgo direccional agregado.
+
+\subsection{Exposición factorial}
+
+Sea \(\beta_{i,f}\) la carga del activo \(i\) al factor \(f\). La exposición agregada del portafolio al factor \(f\) es:
+
+\[
+e_f = \sum_{i=1}^N w_i \beta_{i,f}.
+\]
+
+En forma matricial:
+
+\[
+e = B^\top w,
+\]
+donde \(e \in \mathbb{R}^F\).
+
+Esta métrica debe interpretarse como sensibilidad agregada de primer orden del portafolio a movimientos del factor. No equivale a contribución al riesgo salvo que se combine con una covarianza factorial.
+
+\subsection{Exposición sectorial}
+
+Sea \(S_g\) el conjunto de activos pertenecientes al sector \(g\). La exposición sectorial se define como:
+
+\[
+E_g = \sum_{i \in S_g} w_i.
+\]
+
+En libros long-only, \(E_g\) es directamente un peso sectorial. En libros long-short, conviene además reportar versiones:
+
+\begin{itemize}
+    \item neta:
+    \[
+    E_g^{\text{net}} = \sum_{i \in S_g} w_i;
+    \]
+    \item bruta:
+    \[
+    E_g^{\text{gross}} = \sum_{i \in S_g} |w_i|.
+    \]
+\end{itemize}
+
+La versión canónica del módulo debe persistir ambas cuando existan posiciones cortas.
+
+\subsection{Concentración por Herfindahl--Hirschman}
+
+La concentración del portafolio puede medirse mediante:
+
+\[
+HHI = \sum_{i=1}^N \tilde{w}_i^2,
+\]
+donde \(\tilde{w}_i\) es la exposición normalizada usada para el cálculo.
+
+En long-only, puede tomarse \(\tilde{w}_i = w_i\) si \(\sum_i w_i = 1\). En libros con signos mixtos, la definición operativa correcta para concentración económica es normalmente:
+
+\[
+\tilde{w}_i = \frac{|w_i|}{\sum_{j=1}^N |w_j|}.
+\]
+
+Esta elección debe quedar fija en la implementación. No debe alternarse silenciosamente entre pesos con signo y pesos absolutos.
+
+\subsection{Concentración top-k}
+
+Además del HHI, el módulo debe reportar:
+
+\[
+C_{top1} = \max_i |w_i|,
+\qquad
+C_{top5} = \sum_{i \in \text{Top-5}} |w_i|.
+\]
+
+Estas métricas son más fáciles de interpretar operativamente que el HHI en revisiones humanas de cartera.
+
+\subsection{Participation rate}
+
+Para una orden propuesta de notional \(Q_i\) sobre el activo \(i\), definimos:
+
+\[
+PR_i = \frac{|Q_i|}{ADV_i},
+\]
+donde \(ADV_i\) es el volumen monetario medio diario.
+
+Si el sistema trabaja por participación intradía prevista, puede usarse una fracción ajustada del \(ADV\) efectivo, pero la semántica debe quedar explícita.
+
+\subsection{Días teóricos para liquidación}
+
+Una medida simple de capacidad es:
+
+\[
+DTL_i = \frac{|PositionNotional_i|}{\phi \cdot ADV_i},
+\]
+donde \(0 < \phi \le 1\) es la fracción de ADV que se considera utilizable sin asumir impacto excesivo.
+
+Esta métrica no modela microestructura fina. Su papel es servir como control operativo conservador, no como estimador exacto del coste de ejecución.
+
+\section{Política de límites}
+
+\subsection{Principio general}
+
+Los límites del módulo son \emph{policy parameters}, no verdades universales. Deben calibrarse por:
+
+\begin{itemize}
+    \item tipo de estrategia;
+    \item liquidez del universo;
+    \item frecuencia de rebalanceo;
+    \item capacidad deseada;
+    \item tolerancia de riesgo de la cartera.
+\end{itemize}
+
+La implementación base puede incluir valores por defecto, pero debe tratarlos como configuración explícita.
+
+\subsection{Límites por defecto razonables}
+
+Una política base puede incluir:
+
+\begin{center}
+\begin{tabular}{>{\raggedright\arraybackslash}p{5.5cm} >{\raggedright\arraybackslash}p{6.5cm}}
 \toprule
-Métrica & Sin Report & Con Limits & Mejora \% \\
+Métrica & Límite base \\
 \midrule
-HHI Conc. & 0.25 & 0.08 & -68 \\
-Max Sector (\%) & 35 & 15 & -57 \\
-Beta Drift & ±0.5 & ±0.1 & -80 \\
-Liq. DTL (dias) & 10 & 2 & -80 \\
-Info Ratio & 0.4 & 0.8 & +100 \\
+\(|e_{\beta\_mkt}|\) & \(\le 1.20\) \\
+\(|E_g^{\text{net}}|\) por sector & \(\le 20\%\) \\
+\(HHI\) & \(\le 0.10\) \\
+\(C_{top1}\) & \(\le 8\%\) \\
+\(C_{top5}\) & \(\le 30\%\) \\
+\(PR_i\) por orden & \(\le 3\%\) del ADV \\
+\(DTL_i\) por posición & \(\le 3\) días \\
 \bottomrule
 \end{tabular}
-\caption{Backtest 2015-2026, universe 200 equities $[web:42]$.}
-\end{table}
+\end{center}
 
-\section{Integración}
-Pre-trade gate para optimizer, post con drawdown_control.
+Estos valores deben interpretarse como una política conservadora inicial para small caps y no como una calibración óptima definitiva.
 
-\section{Próximos Pasos}
-AutoML factors via PCR (Principal Cov Risk).
+\subsection{Jerarquía de severidad}
+
+No todas las violaciones tienen la misma gravedad. La decisión operativa debe usar al menos tres niveles:
+
+\begin{itemize}
+    \item \texttt{info}: desviación menor, no bloqueante;
+    \item \texttt{warn}: desviación material, requiere revisión;
+    \item \texttt{hard}: violación bloqueante.
+\end{itemize}
+
+Ejemplo de criterio:
+
+\[
+\texttt{severity} =
+\begin{cases}
+\texttt{info}, & x \le L,\\
+\texttt{warn}, & L < x \le L(1+\tau),\\
+\texttt{hard}, & x > L(1+\tau),
+\end{cases}
+\]
+donde \(L\) es el límite y \(\tau\) una tolerancia relativa pequeña.
+
+\subsection{Decisión final del módulo}
+
+La decisión agregada debe seguir la regla:
+
+\[
+\texttt{block} \quad \text{si existe al menos un breach hard},
+\]
+\[
+\texttt{warn} \quad \text{si no hay hard pero sí warn},
+\]
+\[
+\texttt{allow} \quad \text{si no hay breaches materiales}.
+\]
+
+Esta política evita ambigüedad y facilita integración con el optimizador y el motor de ejecución.
+
+\section{Tratamiento de datos faltantes}
+
+\subsection{Principio básico}
+
+El módulo no debe usar \(\beta=0\) como \emph{default} silencioso cuando faltan exposiciones factoriales. Asignar exposición nula por ausencia de dato es, en general, una hipótesis demasiado agresiva y puede ocultar riesgo real.
+
+\subsection{Política correcta para \(\beta\) faltantes}
+
+Si faltan cargas factoriales para un activo, la política por defecto debe ser una de las siguientes, en orden de preferencia:
+
+\begin{enumerate}[label=\arabic*.]
+    \item usar la última exposición válida \emph{point-in-time} si existe y es reciente;
+    \item usar una aproximación sectorial o por clúster de liquidez/capitalización documentada;
+    \item marcar el activo como cobertura insuficiente y elevar un \texttt{warn} o \texttt{hard}, según el tamaño de la posición;
+    \item excluir el activo del cálculo agregado solo si esa exclusión queda registrada y la posición es inmaterial.
+\end{enumerate}
+
+La implementación nunca debe ocultar una posición material detrás de un \(\beta=0\) por conveniencia.
+
+\subsection{Cobertura mínima}
+
+El módulo debe registrar:
+
+\begin{itemize}
+    \item porcentaje de notional con exposiciones factoriales válidas;
+    \item porcentaje de posiciones con sector válido;
+    \item porcentaje de notional con métricas de liquidez válidas.
+\end{itemize}
+
+Si la cobertura cae por debajo de un umbral configurado, el módulo debe elevar una alerta o bloquear el \emph{pre-trade gate}.
+
+\section{Algoritmo operativo}
+
+\begin{enumerate}[label=\arabic*.]
+    \item Cargar posiciones y órdenes propuestas para la fecha \(t\).
+    \item Cargar exposiciones factoriales \emph{point-in-time}, mapeo sectorial y métricas de liquidez.
+    \item Validar claves, cobertura y consistencia temporal.
+    \item Construir pesos efectivos post-trade si la evaluación es pre-trade.
+    \item Calcular gross, net, exposiciones factoriales, sectoriales, HHI, top-k, participation y DTL.
+    \item Comparar cada métrica con su política de límites.
+    \item Etiquetar severidad por breach.
+    \item Agregar decisión final: \texttt{allow}, \texttt{warn} o \texttt{block}.
+    \item Persistir métricas, violaciones y cobertura.
+\end{enumerate}
+
+\section{Pre-trade vs post-trade}
+
+\subsection{Modo pre-trade}
+
+En modo pre-trade, el módulo debe evaluar la cartera resultante de aplicar las órdenes propuestas:
+
+\[
+w^{\text{post}} = w^{\text{current}} + \Delta w.
+\]
+
+La decisión del módulo afecta directamente a la posibilidad de enviar órdenes al mercado.
+
+\subsection{Modo post-trade}
+
+En modo post-trade, el módulo actúa como monitor de control y auditoría. Su función es verificar que la cartera ejecutada permanece dentro de límites y que no existe deriva no intencionada.
+
+Ambos modos deben usar la misma semántica de métricas, pero pueden usar límites diferentes si así lo define la política del sistema.
+
+\section{Interacción con otros módulos}
+
+\subsection{Con \texttt{portfolio/optimizer.py}}
+
+El optimizador produce pesos candidatos. Este módulo decide si esos pesos son admisibles desde el punto de vista de exposición agregada. No debe reoptimizar; debe evaluar y bloquear si procede.
+
+\subsection{Con \texttt{risk/factor\_model.py}}
+
+Las exposiciones factoriales deben provenir idealmente del modelo factorial canónico del sistema. Este módulo no debe reestimar betas localmente salvo en modo de contingencia documentado.
+
+\subsection{Con \texttt{risk/drawdown\_control.py}}
+
+Si el portafolio está en estado \texttt{derisk} o \texttt{kill}, la evaluación de exposición debe realizarse sobre los pesos efectivamente ejecutables tras aplicar el multiplicador de riesgo, no sobre los pesos crudos del optimizador.
+
+\subsection{Con \texttt{execution}}
+
+Las métricas de participation y capacidad deben ser consumibles por el motor de ejecución para decidir fraccionamiento, aplazamiento o rechazo de órdenes.
+
+\section{Casos límite}
+
+\subsection{Portafolio casi vacío}
+
+Si el portafolio tiene gross exposure muy baja, algunas métricas normalizadas pueden ser inestables. En ese caso, el módulo debe persistir métricas en bruto y marcar la interpretación como limitada.
+
+\subsection{Signos mixtos y neutralidad aparente}
+
+Un libro puede tener net exposure cercana a cero y, sin embargo, concentración bruta elevada. Por ello, gross y HHI sobre pesos absolutos son obligatorios. La neutralidad neta no debe usarse como prueba de diversificación.
+
+\subsection{Sector desconocido}
+
+Si un activo no tiene sector conocido, debe asignarse a una categoría \texttt{UNKNOWN} y esa categoría debe entrar en el cálculo de exposición sectorial. No debe descartarse silenciosamente.
+
+\subsection{ADV nulo o no fiable}
+
+Si \(ADV_i \le 0\) o falta, toda métrica de liquidez del activo debe marcarse como inválida. Si la posición u orden es material, ello debe generar al menos un \texttt{warn}.
+
+\section{Pseudocódigo de referencia}
+
+\begin{lstlisting}[language=Python,basicstyle=\ttfamily\small,breaklines=true]
+weights_post = weights_current + weights_delta
+
+gross = np.sum(np.abs(weights_post))
+net = np.sum(weights_post)
+
+factor_exp = factor_betas.T @ weights_post
+
+abs_weights = np.abs(weights_post)
+if gross > 0:
+    w_norm = abs_weights / gross
+else:
+    w_norm = abs_weights
+
+hhi = np.sum(w_norm ** 2)
+top1 = np.max(abs_weights)
+top5 = np.sum(np.sort(abs_weights)[-5:])
+
+sector_exp = positions.groupby("sector")["weight_post"].sum()
+sector_gross = positions.groupby("sector")["abs_weight_post"].sum()
+
+participation = np.abs(order_notional) / adv_notional
+dtl = np.abs(position_notional) / (phi * adv_notional)
+
+breaches = evaluate_limits(
+    factor_exp=factor_exp,
+    sector_exp=sector_exp,
+    hhi=hhi,
+    top1=top1,
+    top5=top5,
+    participation=participation,
+    dtl=dtl,
+    coverage=coverage_stats,
+)
+
+decision = aggregate_decision(breaches)
+\end{lstlisting}
+
+\section{Métricas diagnósticas obligatorias}
+
+Además de las métricas principales, el módulo debe reportar:
+
+\begin{itemize}
+    \item porcentaje de notional cubierto por factores;
+    \item porcentaje de notional con sector conocido;
+    \item porcentaje de notional con métricas de liquidez válidas;
+    \item mayor contribución individual a cada exposición factorial;
+    \item sector dominante neto y bruto;
+    \item concentración de las 5 mayores posiciones;
+    \item número de breaches por severidad.
+\end{itemize}
+
+Estas métricas facilitan diagnóstico y no deben omitirse aunque la decisión final sea \texttt{allow}.
+
+\section{Pruebas mínimas de aceptación}
+
+\subsection{Test 1: consistencia de gross y net}
+
+Deben cumplirse:
+
+\[
+Gross \ge |Net|,
+\qquad
+Gross \ge 0.
+\]
+
+\subsection{Test 2: factor aggregation}
+
+Dada una matriz \(B\) y un vector \(w\) conocidos, el módulo debe reproducir exactamente:
+
+\[
+e = B^\top w.
+\]
+
+\subsection{Test 3: HHI}
+
+En una cartera equiponderada de \(N\) nombres con gross normalizado a 1, debe cumplirse:
+
+\[
+HHI = \frac{1}{N}.
+\]
+
+\subsection{Test 4: severidad}
+
+Si una métrica supera el límite duro, la decisión final no puede ser \texttt{allow}.
+
+\subsection{Test 5: missing beta}
+
+Una posición material sin \(\beta\) válida no debe computarse como exposición cero sin alerta explícita.
+
+\subsection{Test 6: unknown sector}
+
+Un activo sin sector debe aparecer en la bucket \texttt{UNKNOWN} y afectar el agregado sectorial.
+
+\subsection{Test 7: liquidity metrics}
+
+Si \(ADV\) es cero o faltante, la métrica de participation o DTL debe marcarse inválida y reflejarse en cobertura.
+
+\section{Qué no debe hacer este módulo}
+
+La versión canónica no debe:
+
+\begin{itemize}
+    \item justificar su valor con tablas de \emph{Info Ratio} o \emph{Sharpe} como si fuera una fuente directa de alpha;
+    \item introducir Kalman, AutoML factors o ajustes dinámicos antes de cerrar el contrato básico;
+    \item mezclar definiciones distintas de HHI sin documentarlo;
+    \item usar \(\beta=0\) o sector vacío como \emph{fallback} silencioso;
+    \item confundir exposición con contribución al riesgo.
+\end{itemize}
+
+\section{Extensiones futuras razonables}
+
+Una vez estabilizado el módulo base, pueden estudiarse como extensiones:
+
+\begin{itemize}
+    \item límites por régimen de mercado;
+    \item exposición sectorial neutralizada por benchmark;
+    \item contribuciones al riesgo por factor usando covarianza factorial;
+    \item \emph{capacity stress} por escenario de volumen;
+    \item límites dinámicos basados en turnover y liquidez observada;
+    \item monitoreo intradía si la ejecución lo requiere.
+\end{itemize}
+
+Estas extensiones deben vivir detrás de flags experimentales o en investigación, no dentro del contrato mínimo del módulo.
+
+\section{Resumen ejecutivo}
+
+\texttt{risk/exposure\_report.py} debe ser una capa de control y gobernanza cuantitativa. Su responsabilidad es convertir posiciones en un diagnóstico claro de exposición agregada y decidir si la cartera propuesta es operativamente aceptable.
+
+La prioridad correcta de diseño es:
+
+\[
+\text{cobertura de datos}
+\;\rightarrow\;
+\text{métricas bien definidas}
+\;\rightarrow\;
+\text{límites y severidad}
+\;\rightarrow\;
+\text{integración pre-trade}.
+\]
+
+Si el módulo cumple ese orden, deja de ser un texto de presentación y pasa a ser una pieza real de infraestructura de riesgo.
 
 \end{document}

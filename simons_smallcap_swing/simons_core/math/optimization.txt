@@ -1,129 +1,510 @@
 \documentclass[12pt,a4paper]{article}
+
 \usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
 \usepackage[spanish]{babel}
-\usepackage{amsmath,amssymb,amsthm}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
 \usepackage{geometry}
 \geometry{margin=2.5cm}
 \usepackage{hyperref}
 \usepackage{listings}
 \usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{booktabs}
 
-\title{\textbf{Simons Core: Optimización Numérica para Swing Trading} \\ Módulo: \texttt{simons\_core/math/optimization.py}}
-\author{Research Industrial -- Nivel Jim Simons}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue,
+    citecolor=blue
+}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    columns=fullflexible
+}
+
+\title{\textbf{Simons Core: Optimización Convexa para Construcción de Carteras} \\ Módulo: \texttt{simons\_core/math/optimization.py}}
+\author{Especificación técnica}
 \date{Marzo 2026}
 
 \begin{document}
 
 \maketitle
-
 \tableofcontents
 
-\section{Objetivo y Contexto Industrial}
-Este módulo centraliza utilidades de optimización numérica convexa y QP (Quadratic Programming) para construcción de portafolios en swing trading. En quant finance, la optimización resuelve:
-\[
-\min_w \frac{1}{2} w^T Q w + c^T w \quad \text{s.t.} \quad A w \geq b, \, G w = h, \, lb \leq w \leq ub
-\]
-donde $Q = \Sigma$ (covarianza), $c$ penaliza biases, constraints incluyen retorno objetivo, turnover, y long-only (simplex). Usado en Renaissance/Medallion para mean-variance con risk parity [Maillard et al., 2010].
+\section{Propósito del módulo}
 
-\textbf{Referencias clave:}
+Este módulo agrupa primitivas de optimización convexa necesarias para la construcción, proyección y validación numérica de pesos de cartera en un sistema de \emph{swing trading}. Su objetivo no es implementar una capa de \emph{research} específica, sino proporcionar una base matemática estable, testeable y reutilizable para problemas de asignación con restricciones lineales, costes de rotación y diagnósticos de optimalidad.
+
+El caso de uso principal es la resolución de programas cuadráticos convexos de dimensión moderada,
+\[
+\min_{w \in \mathbb{R}^n} \; \frac{1}{2} w^\top Q w + c^\top w,
+\]
+sujetos a igualdades, desigualdades y cotas por activo, con extensiones estándar para penalizar \emph{turnover}, imponer presupuestos, controlar exposición neta/bruta y verificar condiciones KKT tras la resolución.
+
+\section{Principios de diseño}
+
+El módulo se rige por los siguientes principios:
+
+\begin{enumerate}[label=\arabic*)]
+    \item \textbf{Semántica matemática explícita.} Cada familia de restricciones debe tener una representación inequívoca: desigualdades, igualdades y cotas se tratan por separado.
+    \item \textbf{Convexidad verificable.} El camino principal del módulo asume \(Q \succeq 0\). Si \(Q\) no es semidefinida positiva dentro de tolerancia numérica, el problema se rechaza o se regulariza de forma explícita.
+    \item \textbf{API estable.} La interfaz debe ser suficientemente general para servir a optimizadores de cartera, calibradores de mezclas y rutinas auxiliares del \emph{pipeline}.
+    \item \textbf{Diagnóstico antes que opacidad.} El resultado de un solver debe acompañarse de métricas de factibilidad primal, cierre dual, violaciones máximas y estado normalizado.
+    \item \textbf{Postprocesado determinista.} Operaciones como proyección al simplex o recorte por cotas deben producir salidas reproducibles y bien definidas.
+\end{enumerate}
+
+\section{Formulación canónica}
+
+La formulación base adoptada por el módulo es:
+
+\begin{align}
+\min_{w \in \mathbb{R}^n} \quad & \frac{1}{2} w^\top Q w + c^\top w \label{eq:qp_base} \\
+\text{s.a.} \quad
+& C w \le d, \label{eq:ineq} \\
+& E w = f, \label{eq:eq} \\
+& \ell \le w \le u. \label{eq:bounds}
+\end{align}
+
+donde:
+
 \begin{itemize}
-\item Markowitz (1952): ``Portfolio Selection'' -- QP origen.
-\item Black-Litterman (1992): Views + priors.
-\item Libro: \textit{Quantitative Equity Portfolio Management} (Chincarini \& Kim, 2021).
+    \item \(Q \in \mathbb{R}^{n \times n}\) es simétrica y semidefinida positiva;
+    \item \(c \in \mathbb{R}^{n}\) recoge términos lineales;
+    \item \(C \in \mathbb{R}^{m \times n}\), \(d \in \mathbb{R}^{m}\) representan desigualdades lineales;
+    \item \(E \in \mathbb{R}^{p \times n}\), \(f \in \mathbb{R}^{p}\) representan igualdades lineales;
+    \item \(\ell, u \in \mathbb{R}^n\) son cotas inferiores y superiores, respectivamente.
 \end{itemize}
 
-Estado del arte: Integración CVXPY + ECOS solver; extensiones a quantum QP via Qiskit [Perdomo-Ortiz et al., 2012].
+Esta convención evita ambigüedades del tipo “\(A w \ge b\) vs. \(G w = h\)” y facilita la inspección de violaciones por bloque. En particular:
 
-\section{Alcance y Funciones Clave}
+\begin{itemize}
+    \item la restricción de presupuesto \(\mathbf{1}^\top w = 1\) pertenece a \eqref{eq:eq};
+    \item la restricción \emph{long-only} \(w_i \ge 0\) se implementa normalmente mediante \eqref{eq:bounds}, con \(\ell = 0\);
+    \item límites sectoriales, caps por nombre o exposición máxima se expresan de forma natural en \eqref{eq:ineq}.
+\end{itemize}
 
-\subsection{solve\_qp(Q, c, A, b, G, h, bounds, solver\_cfg)}
-Wrapper unificado para QP. Formulación estándar:
+\section{Penalización de turnover}
+
+La penalización de \emph{turnover} no debe modelarse como si fuese un término lineal directo en \(c\) cuando la penalización deseada es de tipo \(\ell_1\). Si \(w^{\text{prev}}\) denota la cartera anterior, el término
+\[
+\lambda_{\text{to}} \, \|w - w^{\text{prev}}\|_1
+\]
+se introduce correctamente mediante variables auxiliares \(t \in \mathbb{R}^n\), \(t \ge 0\), y la reformulación epigráfica:
+
 \begin{align}
-Q &\succeq 0 \quad (\text{convexidad PSD}), \\
-A &\in \mathbb{R}^{m \times n} \quad (\text{lineales $\geq$}), \\
-G &\in \mathbb{R}^{p \times n} \quad (\text{igualdades}).
+\min_{w,t} \quad & \frac{1}{2} w^\top Q w + c^\top w + \lambda_{\text{to}} \sum_{i=1}^n t_i \\
+\text{s.a.} \quad
+& Cw \le d, \\
+& Ew = f, \\
+& \ell \le w \le u, \\
+& -(t_i) \le w_i - w_i^{\text{prev}} \le t_i, \qquad i=1,\dots,n, \\
+& t_i \ge 0, \qquad i=1,\dots,n.
 \end{align}
-Manejo: OSQP fallback si CVXOPT falla. Tolerancias $\epsilon = 10^{-6}$.
 
-\textbf{Código sugerido (Python):}
-\begin{lstlisting}[language=Python, basicstyle=\ttfamily\small]
+Esta construcción preserva convexidad y evita errores conceptuales frecuentes al mezclar penalizaciones absolutas con la forma estándar de un QP.
+
+\section{Interfaz principal}
+
+\subsection{\texttt{solve\_qp}}
+
+La función principal del módulo debe aceptar un problema en la forma \eqref{eq:qp_base}--\eqref{eq:bounds}, con soporte opcional para \emph{turnover}:
+
+\begin{lstlisting}[language=Python]
+from typing import Any, Dict, Optional
+import numpy as np
+
+def solve_qp(
+    Q: np.ndarray,
+    c: np.ndarray,
+    C: Optional[np.ndarray] = None,
+    d: Optional[np.ndarray] = None,
+    E: Optional[np.ndarray] = None,
+    f: Optional[np.ndarray] = None,
+    lb: Optional[np.ndarray] = None,
+    ub: Optional[np.ndarray] = None,
+    w_prev: Optional[np.ndarray] = None,
+    turnover_penalty: float = 0.0,
+    solver_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    ...
+\end{lstlisting}
+
+\subsection{Contrato de entrada}
+
+\begin{itemize}
+    \item \(Q\) debe ser cuadrada, simétrica dentro de tolerancia y compatible con \(c\).
+    \item Si se proporcionan \(C\) y \(d\), sus dimensiones deben ser \((m,n)\) y \((m,)\).
+    \item Si se proporcionan \(E\) y \(f\), sus dimensiones deben ser \((p,n)\) y \((p,)\).
+    \item Las cotas \texttt{lb}, \texttt{ub} deben tener dimensión \((n,)\), permitiendo \(\pm\infty\).
+    \item Si \texttt{turnover\_penalty} \(>0\), entonces \texttt{w\_prev} debe estar definido.
+\end{itemize}
+
+\subsection{Contrato de salida}
+
+La función debe devolver, como mínimo, un diccionario con los siguientes campos:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Clave} & \textbf{Descripción} \\
+\midrule
+\texttt{x\_opt} & Solución primal \(w^\star\) \\
+\texttt{status} & Estado normalizado del problema \\
+\texttt{objective\_value} & Valor de la función objetivo \\
+\texttt{solver} & Solver finalmente utilizado \\
+\texttt{diagnostics} & Métricas de factibilidad y cierre KKT \\
+\texttt{meta} & Información auxiliar de dimensión, tiempos y configuración \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Implementación de referencia}
+
+Una implementación mínima razonable con \texttt{CVXPY} puede estructurarse así:
+
+\begin{lstlisting}[language=Python]
 import cvxpy as cp
 import numpy as np
-from typing import Dict, Any
+from typing import Any, Dict, Optional
 
-def solve_qp(Q: np.ndarray, c: np.ndarray, A: np.ndarray, b: np.ndarray,
-             G: np.ndarray, h: np.ndarray, bounds: tuple = None,
-             solver_cfg: Dict[str, Any] = None) -> Dict[str, Any]:
+def solve_qp(
+    Q: np.ndarray,
+    c: np.ndarray,
+    C: Optional[np.ndarray] = None,
+    d: Optional[np.ndarray] = None,
+    E: Optional[np.ndarray] = None,
+    f: Optional[np.ndarray] = None,
+    lb: Optional[np.ndarray] = None,
+    ub: Optional[np.ndarray] = None,
+    w_prev: Optional[np.ndarray] = None,
+    turnover_penalty: float = 0.0,
+    solver_cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    Q = np.asarray(Q, dtype=float)
+    c = np.asarray(c, dtype=float).reshape(-1)
     n = Q.shape[0]
+
+    if Q.shape != (n, n):
+        raise ValueError("Q must be square.")
+    if c.shape != (n,):
+        raise ValueError("c must have shape (n,).")
+
+    Q = 0.5 * (Q + Q.T)
+
+    eig_min = np.linalg.eigvalsh(Q).min()
+    if eig_min < -1e-10:
+        raise ValueError("Q is not PSD within tolerance.")
+
     w = cp.Variable(n)
-    objective = cp.quad_form(w, Q)/2 + c @ w
-    constraints = [A @ w >= b, G @ w == h]
-    if bounds:
-        lb, ub = bounds
-        constraints += [w >= lb, w <= ub]
-    prob = cp.Problem(cp.Minimize(objective), constraints)
-    prob.solve(**solver_cfg or {'solver': 'ECOS'})
-    return {
-        'x_opt': w.value,
-        'status': prob.status,
-        'objective_value': prob.value,
-        'diagnostics': {'residuals': prob.constraints[0].residuals()}
+    objective = 0.5 * cp.quad_form(w, Q) + c @ w
+    constraints = []
+
+    if C is not None and d is not None:
+        C = np.asarray(C, dtype=float)
+        d = np.asarray(d, dtype=float).reshape(-1)
+        constraints.append(C @ w <= d)
+
+    if E is not None and f is not None:
+        E = np.asarray(E, dtype=float)
+        f = np.asarray(f, dtype=float).reshape(-1)
+        constraints.append(E @ w == f)
+
+    if lb is not None:
+        lb = np.asarray(lb, dtype=float).reshape(-1)
+        constraints.append(w >= lb)
+
+    if ub is not None:
+        ub = np.asarray(ub, dtype=float).reshape(-1)
+        constraints.append(w <= ub)
+
+    t = None
+    if turnover_penalty > 0.0:
+        if w_prev is None:
+            raise ValueError("w_prev is required when turnover_penalty > 0.")
+        w_prev = np.asarray(w_prev, dtype=float).reshape(-1)
+        if w_prev.shape != (n,):
+            raise ValueError("w_prev must have shape (n,).")
+        t = cp.Variable(n, nonneg=True)
+        constraints += [
+            w - w_prev <= t,
+            -(w - w_prev) <= t,
+        ]
+        objective += turnover_penalty * cp.sum(t)
+
+    problem = cp.Problem(cp.Minimize(objective), constraints)
+
+    cfg = dict(solver_cfg or {})
+    solver_order = cfg.pop("solver_order", [cp.OSQP, cp.CLARABEL, cp.SCS])
+
+    last_error = None
+    used_solver = None
+    for solver in solver_order:
+        try:
+            problem.solve(solver=solver, **cfg)
+            used_solver = str(solver)
+            if problem.status in ("optimal", "optimal_inaccurate"):
+                break
+        except Exception as exc:
+            last_error = exc
+
+    if problem.status not in ("optimal", "optimal_inaccurate"):
+        if last_error is not None:
+            raise RuntimeError(f"All solvers failed. Last error: {last_error}")
+        raise RuntimeError(f"Optimization did not converge. Status: {problem.status}")
+
+    x_opt = None if w.value is None else np.asarray(w.value).reshape(-1)
+
+    diagnostics = {
+        "max_eq_violation": _max_eq_violation(E, f, x_opt),
+        "max_ineq_violation": _max_ineq_violation(C, d, x_opt),
+        "max_lb_violation": _max_lb_violation(lb, x_opt),
+        "max_ub_violation": _max_ub_violation(ub, x_opt),
+        "turnover_l1": None if w_prev is None or x_opt is None else float(np.abs(x_opt - w_prev).sum()),
     }
+
+    return {
+        "x_opt": x_opt,
+        "status": problem.status,
+        "objective_value": float(problem.value),
+        "solver": used_solver,
+        "diagnostics": diagnostics,
+        "meta": {
+            "n_assets": n,
+            "has_turnover": turnover_penalty > 0.0,
+        },
+    }
+
+
+def _max_eq_violation(E, f, x):
+    if E is None or f is None or x is None:
+        return 0.0
+    return float(np.max(np.abs(E @ x - f))) if E.size else 0.0
+
+
+def _max_ineq_violation(C, d, x):
+    if C is None or d is None or x is None:
+        return 0.0
+    return float(np.max(np.maximum(C @ x - d, 0.0))) if C.size else 0.0
+
+
+def _max_lb_violation(lb, x):
+    if lb is None or x is None:
+        return 0.0
+    return float(np.max(np.maximum(lb - x, 0.0)))
+
+
+def _max_ub_violation(ub, x):
+    if ub is None or x is None:
+        return 0.0
+    return float(np.max(np.maximum(x - ub, 0.0)))
 \end{lstlisting}
 
-\subsection{project\_to\_simplex(w)}
-Proyección $\ell_1=1$, $w \geq 0$ (long-only portfolios):
+\subsection{Comentarios de implementación}
+
+\begin{itemize}
+    \item \texttt{OSQP} es un candidato natural para QP convexos con estructura cuadrática y restricciones lineales.
+    \item \texttt{CLARABEL} y \texttt{SCS} son \emph{fallbacks} razonables cuando la canonicalización o la estructura del problema hace menos conveniente la ruta principal.
+    \item La política de \emph{fallback} debe ser explícita y registrada en la salida.
+    \item Un estado distinto de \texttt{optimal} u \texttt{optimal\_inaccurate} no debe interpretarse como éxito silencioso.
+\end{itemize}
+
+\section{Funciones auxiliares}
+
+\subsection{\texttt{project\_to\_simplex}}
+
+Proyecta un vector \(z \in \mathbb{R}^n\) sobre el simplex estándar:
 \[
-\pi(w) = \arg\min_{\hat{w} \geq 0, \sum \hat{w}=1} \| \hat{w} - w \|^2_2
+\Delta_n = \left\{ w \in \mathbb{R}^n : w_i \ge 0,\ \sum_{i=1}^n w_i = 1 \right\}.
 \]
-Solución closed-form: sort + cumulative [Michelot, 1986].
 
-Estado del arte: Usado en risk budgeting [Roncalli, 2013].
+El problema es:
+\[
+\Pi_{\Delta_n}(z) = \arg\min_{w \in \Delta_n} \|w - z\|_2^2.
+\]
 
-\subsection{enforce\_box\_constraints(w, lb, ub)}
-Clipping simple: $w_i = \max(lb_i, \min(ub_i, w_i))$. Post-procesado para regulatory (e.g., 10\% max weight).
+La solución se obtiene mediante ordenación y umbralización. Es una rutina apropiada para postprocesado de scores o pesos preliminares cuando se desea una cartera \emph{long-only} totalmente invertida.
 
-\subsection{build\_turnover\_penalty(w_old, lambda=0.1)}
-Penalidad L1: $c = \lambda |w - w_{old}|_1$ para low-turnover en swing (reduce costs ~0.1\%/trade).
-
-\section{Diagnósticos Avanzados: Condiciones KKT}
-Verificación primal-dual optimality:
-\begin{align}
-\nabla L(w^*, \lambda^*, \nu^*) &= 0, \\
-A w^* &\geq b \quad \Rightarrow \quad \lambda^* \geq 0, \, \lambda^{*T} (A w^* - b) = 0.
-\end{align}
-Función \texttt{check\_kkt\_conditions}: Computa residuals $\|r_p\| < \epsilon$, $\|r_d\| < \epsilon$.
-
-Feasibility report: Detección infactible via dual unbounded.
-
-\section{Integración en Swing Trading}
-- \texttt{portfolio/optimizer}: QP para weights semanales (swing horizon).
-- Calibración blender: Opt multi-estrategia.
-- Backtest: Incorpora costs reales, slippage; target Sharpe $>2.0$.
-
-\textbf{Ejemplo toy (Mean-Variance):}
 \begin{lstlisting}[language=Python]
-Q = np.array([[0.1, 0.01], [0.01, 0.2]])
-c = np.zeros(2)
-A = np.ones((1,2)); b = np.array([1.0])  # sum w=1? Wait, equality.
-res = solve_qp(Q, c, np.zeros((0,2)), np.zeros(0), A, b)
-print(res['x_opt'])  # ~ [0.55, 0.45]
+import numpy as np
+
+def project_to_simplex(z: np.ndarray) -> np.ndarray:
+    z = np.asarray(z, dtype=float).reshape(-1)
+    if z.size == 0:
+        return z.copy()
+
+    u = np.sort(z)[::-1]
+    cssv = np.cumsum(u) - 1.0
+    rho = np.nonzero(u - cssv / (np.arange(z.size) + 1) > 0)[0][-1]
+    theta = cssv[rho] / (rho + 1.0)
+    w = np.maximum(z - theta, 0.0)
+    return w / w.sum()
 \end{lstlisting}
 
-\section{Validaciones y CLI}
-- Toy problems: Soluciones analíticas conocidas.
-- Self-test: \texttt{python -m simons\_core.math.optimization --self-test}.
-- Reproducibilidad: Seeds en NumPy/CVXPY.
+\subsection{\texttt{enforce\_box\_constraints}}
 
-\section{Estado del Arte y Mejoras Propuestas}
-- \textbf{Quantum QP:} Qiskit QAOA para large-scale [Hadfield et al., 2019].
-- \textbf{ML Tuning:} BayesianOpt para $\lambda$ hyperparameters.
-- \textbf{Risk Innovador:} CVaR constraints: $\min \mathbb{E}[L | L \geq VaR]$.
-- Libro reco: \textit{Advances in Financial Machine Learning} (López de Prado, 2018) -- Ch. 9 Optimization pitfalls.
+Aplica cotas componente a componente:
+\[
+w_i \leftarrow \min\{u_i,\max\{\ell_i,w_i\}\}.
+\]
 
-DoD: Toolkit robusto, con diagnostics KKT y fallbacks, listo para prod swing trading.
+Debe entenderse como utilidad de saneamiento o postprocesado local, no como sustituto general de una optimización con restricciones.
+
+\begin{lstlisting}[language=Python]
+def enforce_box_constraints(w: np.ndarray, lb: np.ndarray, ub: np.ndarray) -> np.ndarray:
+    w = np.asarray(w, dtype=float)
+    lb = np.asarray(lb, dtype=float)
+    ub = np.asarray(ub, dtype=float)
+    return np.minimum(np.maximum(w, lb), ub)
+\end{lstlisting}
+
+\subsection{\texttt{build\_turnover\_epigraph}}
+
+Construye el bloque auxiliar necesario para modelar
+\(\|w - w^{\text{prev}}\|_1\)
+mediante variables \(t\). Esta función separa la lógica algebraica de la lógica de ensamblado del problema y reduce el riesgo de inconsistencias entre formulación y código.
+
+\subsection{\texttt{check\_kkt\_conditions}}
+
+Evalúa, hasta tolerancia, los cuatro bloques clásicos:
+
+\begin{align}
+&\text{factibilidad primal}, \\
+&\text{factibilidad dual}, \\
+&\text{estacionariedad}, \\
+&\text{holgura complementaria}.
+\end{align}
+
+Para el problema sin variables auxiliares de \emph{turnover}, el lagrangiano es
+\[
+\mathcal{L}(w,\lambda,\nu,\alpha,\beta)
+=
+\frac{1}{2} w^\top Q w + c^\top w
++ \lambda^\top (Cw-d)
++ \nu^\top (Ew-f)
++ \alpha^\top (\ell-w)
++ \beta^\top (w-u),
+\]
+con
+\[
+\lambda \ge 0, \qquad \alpha \ge 0, \qquad \beta \ge 0.
+\]
+
+La estacionariedad exige:
+\[
+Qw^\star + c + C^\top \lambda^\star + E^\top \nu^\star - \alpha^\star + \beta^\star = 0.
+\]
+
+En la práctica, la rutina debe devolver normas o máximos absolutos de residuales, por ejemplo:
+
+\begin{itemize}
+    \item \texttt{stationarity\_inf\_norm}
+    \item \texttt{max\_eq\_violation}
+    \item \texttt{max\_ineq\_violation}
+    \item \texttt{complementarity\_gap}
+\end{itemize}
+
+y una bandera booleana \texttt{is\_kkt\_ok} basada en tolerancias configurables.
+
+\section{Integración en el sistema de swing trading}
+
+Dentro del \emph{stack}, este módulo debe actuar como dependencia matemática de bajo nivel. Algunos usos naturales son:
+
+\begin{itemize}
+    \item \textbf{Optimizador de cartera.} Resolver asignaciones sujeto a presupuesto, caps, neutralidades y penalización de rotación.
+    \item \textbf{Combinación de señales.} Ajustar pesos entre subestrategias bajo restricciones de exposición agregada.
+    \item \textbf{Controles de riesgo.} Imponer límites por nombre, sector, factor o beta.
+    \item \textbf{Postprocesado determinista.} Proyección al simplex o saneamiento por cotas cuando el origen de pesos no es un solver convexo.
+\end{itemize}
+
+El módulo no debe contener hipótesis específicas sobre horizonte temporal, alfa concreto ni estructura de costes de mercado. Esas decisiones pertenecen a capas superiores del repositorio.
+
+\section{Ejemplo mínimo consistente}
+
+Un ejemplo correcto de media-varianza \emph{long-only} totalmente invertido es:
+
+\begin{lstlisting}[language=Python]
+import numpy as np
+
+Q = np.array([
+    [0.10, 0.01],
+    [0.01, 0.20],
+], dtype=float)
+
+c = np.array([0.0, 0.0], dtype=float)
+
+E = np.ones((1, 2), dtype=float)
+f = np.array([1.0], dtype=float)
+
+lb = np.zeros(2, dtype=float)
+ub = np.ones(2, dtype=float)
+
+res = solve_qp(Q=Q, c=c, E=E, f=f, lb=lb, ub=ub)
+print(res["status"])
+print(res["x_opt"])
+print(res["diagnostics"])
+\end{lstlisting}
+
+Aquí la restricción de presupuesto se codifica correctamente como igualdad:
+\[
+w_1 + w_2 = 1,
+\]
+mientras que la condición \emph{long-only} se impone mediante \(w_i \ge 0\).
+
+\section{Validación y pruebas}
+
+La robustez del módulo debe apoyarse en un conjunto de validaciones deterministas:
+
+\begin{enumerate}[label=\arabic*)]
+    \item \textbf{Casos analíticos simples.} Problemas de dos o tres activos con solución conocida.
+    \item \textbf{Chequeos de forma.} Errores claros ante dimensiones incompatibles.
+    \item \textbf{Pruebas de factibilidad.} Casos factibles e infactibles con diagnóstico verificable.
+    \item \textbf{Pruebas de cotas.} Confirmar que \texttt{lb}/\texttt{ub} se respetan a tolerancia.
+    \item \textbf{Pruebas de turnover.} Comparar solución con y sin penalización para verificar reducción de rotación.
+    \item \textbf{Pruebas KKT.} Confirmar que los residuales devueltos son pequeños en instancias bien condicionadas.
+\end{enumerate}
+
+Un \texttt{self-test} útil del módulo puede exponerse vía:
+\begin{lstlisting}[language=bash]
+python -m simons_core.math.optimization --self-test
+\end{lstlisting}
+siempre que ejecute casos breves, deterministas y sin dependencia de datos externos.
+
+\section{Errores habituales que este módulo debe evitar}
+
+\begin{itemize}
+    \item Tratar una igualdad de presupuesto como si fuese una desigualdad.
+    \item Introducir una penalización \(\ell_1\) dentro del vector lineal \(c\) sin reformulación auxiliar.
+    \item Aceptar silenciosamente matrices \(Q\) no simétricas o no PSD.
+    \item Devolver una solución sin reportar violaciones máximas de restricciones.
+    \item Usar una rutina de \emph{clipping} como si fuese equivalente a resolver el problema restringido.
+    \item Mezclar lógica de optimización con lógica específica de costes, slippage o \emph{research} de señales.
+\end{itemize}
+
+\section{Extensiones razonables}
+
+Una vez estabilizado el núcleo anterior, las extensiones naturales incluyen:
+
+\begin{itemize}
+    \item restricciones sobre exposición bruta o neta;
+    \item penalización \(\ell_2\) a desviación respecto de una cartera de referencia;
+    \item formulaciones con variables auxiliares para costes lineales por compra/venta;
+    \item soporte para \emph{warm-start};
+    \item métricas de condicionamiento y regularización diagonal explícita.
+\end{itemize}
+
+Estas extensiones deben incorporarse solo cuando queden perfectamente alineadas con la semántica base del módulo y con su batería de pruebas.
+
+\section{Resumen}
+
+\texttt{simons\_core/math/optimization.py} debe entenderse como la capa de optimización convexa general del sistema. Su responsabilidad es resolver problemas cuadráticos bien planteados, imponer restricciones con semántica clara, modelar correctamente costes de rotación y devolver diagnósticos suficientes para que capas superiores no operen a ciegas.
+
+Una especificación fuerte para este módulo no necesita retórica adicional: necesita formulación inequívoca, API estable, control numérico, pruebas reproducibles y separación estricta entre álgebra de optimización y lógica de estrategia.
 
 \bibliographystyle{plain}
-\bibliography{refs}  % Añade tu .bib con papers
+\bibliography{refs}
 
 \end{document}

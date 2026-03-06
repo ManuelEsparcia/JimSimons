@@ -1,134 +1,454 @@
-\section{Ingeniería de \texttt{regime\_features} para detección de regímenes en swing trading}
+\section{Arquitectura de \texttt{regime\_features} para inferencia robusta de regímenes en swing trading}
 
 \subsection{Objetivo del módulo}
-El módulo \texttt{models/regimes/regime\_features.py} construye \textbf{features de régimen de mercado} que capturan el \textbf{estado macro/micro de riesgo}, \textbf{volatilidad}, \textbf{liquidez}, \textbf{tendencia} y \textbf{amplitud de mercado} sobre diferentes horizontes temporales, con el fin de:
-\begin{itemize}
-  \item Clasificar contextos de mercado (\emph{risk‑on} vs \emph{risk‑off}), regímenes de volatilidad y liquidity shocks.
-  \item Habilitar decisiones adaptativas en modelos cuantitativos (HMM, regime‑gating, portfolio risk allocation) \cite{Hamilton2010, Ang2012, Admati1988}.
-\end{itemize}
-Formalmente, el módulo transforma series de precios y datos de mercado en un vector de \texttt{regime\_features} \(\mathbf{z}_t \in \mathbb{R}^p\) cuya estructura funcional y escala son robustas a cola pesada, ruido y cambios estructurales.
 
-\subsection{Taxonomía de \texttt{regime\_features}}
+El módulo \texttt{models/regimes/regime\_features.py} construye una capa de representación del \emph{estado del mercado} destinada a alimentar modelos de inferencia latente y mecanismos de adaptación downstream. Su propósito no es generar señales de alpha directas ni añadir indicadores técnicos ornamentales, sino producir un vector de estado \(\mathbf{z}_t \in \mathbb{R}^p\) que resuma de forma \textbf{causal, estable, parsimoniosa y operativamente útil} la estructura contemporánea de volatilidad, tendencia, correlación, liquidez, amplitud y estrés del mercado.
+
+Formalmente, el módulo implementa una transformación:
+\begin{equation}
+\mathcal{T}: \mathcal{D}_{\le t} \longmapsto \mathbf{z}_t,
+\end{equation}
+donde \(\mathcal{D}_{\le t}\) representa el conjunto de observaciones disponibles hasta la fecha \(t\), incluyendo precios, volumen, información cross-sectional del universo y, opcionalmente, proxies externos macro o cross-asset. La construcción de \(\mathbf{z}_t\) debe satisfacer simultáneamente cuatro restricciones:
+
 \begin{itemize}
-  \item \textbf{Volatilidad}:
-    \begin{itemize}
-      \item \texttt{realized\_vol\_10d/20d/63d}: \(\sigma^{(k)}_t = \sqrt{\frac{1}{k}\sum_{i=t-k+1}^{t} r^2_i}\), donde \(r_i\) es el retorno diario del índice de mercado.
-      \item \texttt{vol\_of\_vol}: \(\sqrt{\text{Var}(\sigma^{(k)}_s\ \mid\ s=t-m+1,\dots,t)}\), captura “volatility of volatility” como proxy de incertidumbre de segundo orden \cite{Graves2012}.
-      \item \texttt{jump\_proxy}: \(\mathbb{I}(|r_t| > \text{threshold})\) o estadístico de colas \(\text{VaR}_\alpha(r_t)\), para identificar spikes de volatilidad.
-    \end{itemize}
-  \item \textbf{Tendencia / momentum de mercado}:
-    \begin{itemize}
-      \item \texttt{trend\_ret\_20d/63d}: \(\mu^{(k)}_t = \frac{1}{k} \sum_{i=t-k+1}^{t} r_i\), media de retornos en el horizonte.
-      \item \texttt{ma\_spread\_50/200}: \(\text{MA}_{50,t} - \text{MA}_{200,t}\), donde \(\text{MA}_{k,t} = \frac{1}{k} \sum_{i=t-k+1}^{t} p_i\) para el precio de mercado \cite{Moskowitz2012}.
-    \end{itemize}
-  \item \textbf{Correlación y dispersión}:
-    \begin{itemize}
-      \item \texttt{avg\_pair\_corr\_cross\_section}: \(\frac{2}{n(n-1)} \sum_{i<j} \text{Corr}(r_{i,t:l}, r_{j,t:l})\), correlación media entre pares de activos del universo en ventana \([t-l, t]\) \cite{Chen2004}.
-      \item \texttt{dispersion\_returns\_cross\_section}: \(\text{Var}(\{r_{i,t}\}_{i\in\mathcal{U}_t})\), varianza de retornos de universo, proxy de “picking risk” y oportunidad de alojamiento multi‑factor \cite{Pástor2017}.
-      \item \texttt{correlation\_regime\_index}: \(\text{eigen\_ratio}(\mathbf{C}_t)\), donde \(\mathbf{C}_t\) es la matriz de correlaciones de universo.
-    \end{itemize}
-  \item \textbf{Liquidez / risk‑off}:
-    \begin{itemize}
-      \item \texttt{market\_turnover\_proxy}: \(\sum_{i\in\mathcal{U}_t} v_{i,t} / \text{mcap}_{i,t}\) como flujo relativo de volumen.
-      \item \texttt{spread\_proxy\_index}: \(\sum_{i\in\mathcal{U}_t} \text{spread}_i v_{i,t} / \sum v_{i,t}\), media ponderada por volumen.
-      \item \texttt{illiquidity\_proxy} (tipo Amihud agregado): \(\sum_{i\in\mathcal{U}_t} \frac{|r_{i,t}|}{v_{i,t}} \big/ \sum v_{i,t}\), captura el impacto de volumen sobre el precio de mercado \cite{Amihud2002, Hasbrouck2013}.
-    \end{itemize}
-  \item \textbf{Breadth / sentimiento técnico}:
-    \begin{itemize}
-      \item \texttt{pct\_symbols\_above\_ma\_50/200}: \(\#\{i \in \mathcal{U}_t : p_{i,t} > \text{MA}_{k,i,t}\} / |\mathcal{U}_t|\), grado de participación alcista/bajista.
-      \item \texttt{advance\_decline\_ratio}: \(\text{advances}_t / \text{declines}_t\), medida clásica de breadth de mercado \cite{Kraus1989}.
-    \end{itemize}
-  \item \textbf{Stress proxies}:
-    \begin{itemize}
-      \item \texttt{tail\_loss\_frequency}: \(\sum_{t=m}^{t} \mathbb{I}(r_t < -\text{VaR}_\alpha)\), frecuencia de pérdidas extremas.
-      \item \texttt{drawdown\_speed}: \(\Delta (\text{max\_drawdown}_t)\) por ventana, para identificar aceleración de correcciones \cite{Benoit2017}.
-    \end{itemize}
+  \item \textbf{Point-in-time correctness}: ninguna componente de \(\mathbf{z}_t\) puede depender de información futura.
+  \item \textbf{Robustez estadística}: las features deben tolerar colas pesadas, outliers, universos cambiantes y observaciones incompletas.
+  \item \textbf{Estabilidad operacional}: la representación no debe cambiar de naturaleza por ruido, micro-gaps de datos o fluctuaciones triviales del universo.
+  \item \textbf{Utilidad downstream}: el vector resultante debe mejorar la inferencia de \texttt{hmm.py} y la calidad de decisión en \texttt{regime\_gating.py}, sin sobrealimentar al sistema con redundancia o dimensionalidad espuria.
 \end{itemize}
 
-\subsection{Transformaciones y normalización robustas}
-Cada \(\texttt{regime\_feature}_{t}\) se construye bajo principio de \emph{no–look‑ahead} y se transforma para:
+Desde una perspectiva económica, el módulo modela la idea de que el mercado no transita solo a través de niveles de retorno, sino a través de \textbf{configuraciones de riesgo}. Dos fechas con retorno similar pueden pertenecer a contextos radicalmente distintos si difieren en dispersión cross-sectional, compresión de liquidez, concentración de correlaciones o anchura del rally. La misión de \texttt{regime\_features.py} es codificar precisamente esa geometría del entorno.
+
+\subsection{Rol arquitectónico}
+
+Dentro de la carpeta \texttt{models/regimes}, la arquitectura se concibe como una cadena funcional:
+\[
+\texttt{regime\_features} \;\longrightarrow\; \texttt{hmm} \;\longrightarrow\; \texttt{regime\_gating}.
+\]
+
+\texttt{regime\_features.py} ocupa la capa de \textbf{representación del estado observable}. No clasifica directamente regímenes ni impone decisiones de riesgo, pero determina el espacio estadístico sobre el cual esas capas posteriores van a operar. Por tanto, la calidad de este módulo condiciona directamente:
+
 \begin{itemize}
-  \item \textbf{Robust z‑score}: \(\tilde{z}_t = \frac{z_t - \text{med}_{t-l}^{t}(z_s)}{\text{MAD}_{t-l}^{t}(z_s)}\), usando \texttt{rolling mediana} y \texttt{MAD} para colas pesadas \cite{Huber2011}.
-  \item \textbf{rank‑gauss}: \(\text{rank}(z_t)\) transformada a cuantiles gaussianos \(\Phi^{-1}(F(z_t))\) para estabilizar colas \cite{Rubinstein2017}.
-  \item \textbf{Smoothing EMA}: \(\tilde{z}_t^{\text{smooth}} = \alpha z_t + (1-\alpha)\tilde{z}_{t-1}^{\text{smooth}}\), con \(\alpha \propto 1/\text{lookback}\), evitando \emph{chattering} en señales de régimen \cite{Hamilton2010}.
-  \item \textbf{clipping}: limitado a percentiles \texttt{winsor\_limits} para evitar outlier‑inflation de momentos.
+  \item la separabilidad estadística de los estados latentes;
+  \item la estabilidad del HMM entre reentrenamientos;
+  \item la intensidad y fiabilidad del gating downstream;
+  \item la sensibilidad global del stack a shocks, ruido y drift estructural.
 \end{itemize}
 
-\subsection{Reglas PIT y anti‑leakage}
+Un principio central del diseño es que una mala capa de \texttt{regime\_features} no solo empeora la inferencia, sino que puede inducir falsos cambios de régimen, chattering, sobreajuste del HMM y destrucción innecesaria de alpha vía exceso de prudencia.
+
+\subsection{Contrato de entrada y salida}
+
+\paragraph{Entradas principales}
 \begin{itemize}
-  \item Todas las features de fecha \(t\) se calculan únicamente con información \(\leq t\) (o \(\leq t-1\) si el timing de entrada exige lag de ejecución).
-  \item No se backfill con datos futuros: \(\texttt{lookback}\) y \(\texttt{min\_history\_days}\) garantizan que las series sean \emph{causales} y reproducibles en walk‑forward.
-  \item En caso de \texttt{forward‑fill} de proxies externos, se limita \texttt{max\_staleness} y se registra en \texttt{manifest} el origen y fecha de última actualización \cite{Bailey2014}.
+  \item \texttt{market\_prices\_path}: series temporales de índice de mercado y/o benchmark canónico.
+  \item \texttt{universe\_history\_path}: composición del universo por fecha.
+  \item \texttt{daily\_bars\_path}: OHLCV individual por símbolo.
+  \item \texttt{macro\_proxy\_path} (opcional): proxies externos macro, de crédito, tipos o volatilidad implícita.
+  \item \texttt{sector\_indices\_path} (opcional): índices sectoriales o subuniversos.
+  \item \texttt{regime\_feature\_config}: lookbacks, ventanas, política de normalización, smoothing, clipping, universe guards y políticas PIT.
 \end{itemize}
 
-\subsection{Flujo de procesamiento (alto nivel)}
+\paragraph{Salidas principales}
+\begin{itemize}
+  \item \texttt{regime\_features.parquet}: matriz temporal \((T \times p)\) con todas las features válidas por fecha.
+  \item \texttt{regime\_feature\_dictionary\_\{run\_id\}.json}: definición económica, fórmula, upstream, unidades y valid flags de cada feature.
+  \item \texttt{regime\_feature\_summary\_\{run\_id\}.json}: cobertura, momentos robustos, estabilidad, staleness y correlaciones.
+  \item \texttt{manifest\_\{run\_id\}.json}: metadatos completos del run, hash de configuración, versión de inputs y política de fallbacks.
+  \item \texttt{feature\_selection\_report\_\{run\_id\}.json}: selección final, features descartadas, razones de descarte y tests de redundancia/estabilidad.
+\end{itemize}
+
+\subsection{Principios de diseño}
+
+El módulo se construye bajo una serie de principios fuertes:
+
+\paragraph{1. Representar el entorno, no la predicción inmediata}
+Las \texttt{regime\_features} no están diseñadas para maximizar señal direccional a un día, sino para describir la estructura del estado del sistema en horizontes compatibles con swing trading.
+
+\paragraph{2. Parsimonia con cobertura conceptual}
+La representación final debe cubrir los grandes ejes del estado de mercado sin convertirse en una sopa de indicadores altamente correlacionados.
+
+\paragraph{3. Robustez al cambio de universo}
+Las medidas cross-sectional deben permanecer comparables incluso cuando el número y composición de símbolos cambia materialmente en el tiempo.
+
+\paragraph{4. Reproducibilidad industrial}
+Cada valor de cada feature debe poder reconstruirse exactamente a posteriori a partir del manifiesto, configuración y datos point-in-time.
+
+\paragraph{5. Downstream awareness}
+La selección de features debe considerar no solo su elegancia estadística aislada, sino también su impacto sobre estabilidad del HMM y utilidad del \texttt{regime\_gating}.
+
+\subsection{Taxonomía canónica de \texttt{regime\_features}}
+
+La representación se organiza en familias. Cada familia captura una dimensión económica distinta del estado del mercado.
+
+\subsubsection{Volatilidad y convexidad de riesgo}
+
+Estas features describen la escala y la inestabilidad de las fluctuaciones del mercado.
+
+\begin{itemize}
+  \item \texttt{realized\_vol\_10d}, \texttt{realized\_vol\_20d}, \texttt{realized\_vol\_63d}:
+  \begin{equation}
+  \sigma_t^{(k)} = \sqrt{\frac{1}{k}\sum_{i=t-k+1}^{t} r_i^2},
+  \end{equation}
+  donde \(r_i\) es el retorno diario del benchmark o índice representativo.
+
+  \item \texttt{vol\_of\_vol\_20d}:
+  \begin{equation}
+  \text{VoV}_t^{(k,m)}
+  =
+  \sqrt{\frac{1}{m}\sum_{s=t-m+1}^{t}\left(\sigma_s^{(k)}-\overline{\sigma}_{t}^{(k,m)}\right)^2},
+  \end{equation}
+  que captura incertidumbre de segundo orden y fragilidad de estabilidad.
+
+  \item \texttt{jump\_proxy}:
+  medida de discontinuidad o shock puntual, por ejemplo:
+  \begin{equation}
+  \text{Jump}_t = \mathbb{I}(|r_t| > c \cdot \hat{\sigma}_t),
+  \end{equation}
+  o una intensidad suavizada de eventos extremos basada en cuantiles de cola.
+\end{itemize}
+
+Estas variables separan regímenes de volatilidad comprimida, expansión ordenada y dislocación abrupta.
+
+\subsubsection{Tendencia sistémica y estructura temporal}
+
+Esta familia resume el sesgo direccional y la calidad estructural del movimiento del mercado.
+
+\begin{itemize}
+  \item \texttt{trend\_ret\_20d}, \texttt{trend\_ret\_63d}:
+  \begin{equation}
+  \mu_t^{(k)} = \frac{1}{k}\sum_{i=t-k+1}^{t} r_i.
+  \end{equation}
+
+  \item \texttt{ma\_spread\_50\_200}:
+  \begin{equation}
+  \text{MASpread}_t = \text{MA}_{50,t} - \text{MA}_{200,t}.
+  \end{equation}
+
+  \item \texttt{trend\_persistence\_proxy}:
+  proporción de días con signo consistente o pendiente acumulada robusta en una ventana dada.
+\end{itemize}
+
+No se busca aquí hacer timing táctico fino, sino distinguir entre entornos de drift favorable, lateralización o deterioro tendencial.
+
+\subsubsection{Correlación, concentración y dispersión cross-sectional}
+
+Esta familia es crítica porque muchos cambios de régimen se manifiestan antes en la estructura cross-sectional que en el nivel agregado del índice.
+
+\begin{itemize}
+  \item \texttt{avg\_pair\_corr\_cross\_section}:
+  \begin{equation}
+  \bar{\rho}_t^{(l)} = \frac{2}{n_t(n_t-1)} \sum_{i<j} \text{Corr}\left(r_{i,\tau}, r_{j,\tau}\right)_{\tau=t-l+1}^{t},
+  \end{equation}
+  donde \(n_t = |\mathcal{U}_t|\) es el tamaño efectivo del universo en la fecha \(t\).
+
+  \item \texttt{dispersion\_returns\_cross\_section}:
+  \begin{equation}
+  \text{Disp}_t = \text{Var}\left(\{r_{i,t}\}_{i \in \mathcal{U}_t}\right).
+  \end{equation}
+
+  \item \texttt{correlation\_regime\_index}:
+  razón espectral o concentración del primer autovalor de la matriz de correlaciones:
+  \begin{equation}
+  \text{CorrConc}_t = \frac{\lambda_{1,t}}{\sum_{j=1}^{n_t}\lambda_{j,t}},
+  \end{equation}
+  lo que aproxima el grado de dominancia del factor común de mercado.
+\end{itemize}
+
+Esta familia permite distinguir entornos de selección rica de acciones frente a contextos dominados por beta sistémica y correlación de pánico.
+
+\subsubsection{Liquidez y fricción de mercado}
+
+Estas features capturan si el mercado está funcionando como un mecanismo profundo y transaccionalmente sano o como uno frágil y costoso.
+
+\begin{itemize}
+  \item \texttt{market\_turnover\_proxy}:
+  \begin{equation}
+  \text{Turnover}_t = \frac{\sum_{i\in \mathcal{U}_t} v_{i,t}}{\sum_{i\in \mathcal{U}_t}\text{mcap}_{i,t}},
+  \end{equation}
+  o una versión equivalente normalizada por free float cuando esté disponible.
+
+  \item \texttt{spread\_proxy\_index}:
+  \begin{equation}
+  \text{SpreadProxy}_t = \frac{\sum_{i\in \mathcal{U}_t} \text{spread}_{i,t} \cdot v_{i,t}}{\sum_{i\in \mathcal{U}_t} v_{i,t}}.
+  \end{equation}
+
+  \item \texttt{illiquidity\_proxy}:
+  una agregación robusta del tipo Amihud:
+  \begin{equation}
+  \text{Illiq}_t = \text{Agg}_{i\in \mathcal{U}_t}\left(\frac{|r_{i,t}|}{\max(v_{i,t},\varepsilon)}\right),
+  \end{equation}
+  donde \(\text{Agg}\) será preferentemente mediana o media winsorizada antes que suma simple.
+\end{itemize}
+
+Una decisión importante aquí es que la agregación cross-sectional debe ser \textbf{robusta} y no dejar que un pequeño subconjunto de nombres ilíquidos domine artificialmente el estado agregado.
+
+\subsubsection{Breadth y participación de mercado}
+
+Estas variables buscan medir si el movimiento del mercado está respaldado por participación amplia o por concentración estrecha.
+
+\begin{itemize}
+  \item \texttt{pct\_symbols\_above\_ma\_50}, \texttt{pct\_symbols\_above\_ma\_200}:
+  \begin{equation}
+  \text{PctAboveMA}_{k,t}
+  =
+  \frac{\#\{i\in\mathcal{U}_t: p_{i,t}>\text{MA}_{k,i,t}\}}{|\mathcal{U}_t|}.
+  \end{equation}
+
+  \item \texttt{advance\_decline\_ratio}:
+  \begin{equation}
+  \text{ADR}_t = \frac{\text{advances}_t + \varepsilon}{\text{declines}_t + \varepsilon}.
+  \end{equation}
+
+  \item \texttt{breadth\_slope\_proxy}: cambio suavizado en la anchura de participación.
+\end{itemize}
+
+En entornos swing, esta familia es clave para diferenciar rallies sanos de rebotes estrechos o agotados.
+
+\subsubsection{Stress proxies y deterioro acelerado}
+
+Esta familia identifica entornos en los que el riesgo no solo es alto, sino que está empeorando de forma no lineal.
+
+\begin{itemize}
+  \item \texttt{tail\_loss\_frequency}:
+  \begin{equation}
+  \text{TailFreq}_t^{(m,\alpha)}
+  =
+  \sum_{s=t-m+1}^{t}\mathbb{I}(r_s < q_{\alpha}),
+  \end{equation}
+  donde \(q_{\alpha}\) es un cuantil histórico o rolling compatible con PIT.
+
+  \item \texttt{drawdown\_speed}:
+  \begin{equation}
+  \text{DDSpeed}_t = \Delta \text{MDD}_t^{(m)},
+  \end{equation}
+  o una derivada discreta robusta del drawdown acumulado.
+\end{itemize}
+
+\subsection{Features internas vs proxies externos}
+
+La especificación distingue formalmente dos clases de inputs:
+
+\paragraph{Features internas}
+Se derivan exclusivamente del universo y benchmark del propio sistema. Son la base canónica del módulo y deben estar siempre disponibles.
+
+\paragraph{Proxies externos}
+Incluyen VIX, spreads de crédito, curvas de tipos, proxies macro o cross-asset. Su uso es opcional y está sujeto a reglas mucho más estrictas por riesgo de staleness, lag de publicación y no sincronía.
+
+El principio por defecto es:
+\begin{quote}
+\textbf{el sistema debe ser plenamente funcional con proxies internos únicamente; los externos solo pueden añadir información marginal, nunca ser condición de existencia del módulo.}
+\end{quote}
+
+Toda feature externa debe especificar:
+\begin{itemize}
+  \item frecuencia de actualización;
+  \item lag real de disponibilidad;
+  \item política de forward-fill;
+  \item \texttt{max\_staleness};
+  \item fallback interno si el proxy falta.
+\end{itemize}
+
+\subsection{Transformaciones robustas y estandarización}
+
+El objetivo de esta capa no es solo construir variables, sino convertirlas en una representación homogénea, comparativa y resistente a colas pesadas.
+
+\paragraph{Robust z-score}
+\begin{equation}
+\tilde{z}_t
+=
+\frac{z_t - \operatorname{median}(z_{t-l:t})}
+{\operatorname{MAD}(z_{t-l:t}) + \varepsilon}.
+\end{equation}
+
+\paragraph{Rank-gauss}
+Sea \(u_t = \widehat{F}_t(z_t)\) un percentil empírico rolling. Entonces:
+\begin{equation}
+\tilde{z}_t^{\text{RG}} = \Phi^{-1}(u_t),
+\end{equation}
+lo cual estabiliza colas y homogeneiza escala.
+
+\paragraph{Smoothing causal}
+\begin{equation}
+\bar{z}_t = \alpha z_t + (1-\alpha)\bar{z}_{t-1},
+\end{equation}
+con \(\alpha\) calibrado por familia de feature y horizonte económico. El smoothing debe reducir ruido sin borrar cambios reales de entorno.
+
+\paragraph{Clipping / winsorización}
+Cada feature puede limitarse a percentiles configurables:
+\[
+z_t^{\text{clip}} = \min\{\max(z_t, q_{\ell}), q_u\},
+\]
+donde \(q_{\ell}, q_u\) son cuantiles rolling o históricos compatibles con PIT.
+
+\subsection{Gobernanza de redundancia y selección canónica}
+
+Uno de los principales riesgos de este módulo es mezclar amplitud conceptual con inflación dimensional. Por ello, la selección final de features no se deja abierta, sino gobernada por una política explícita.
+
+Sea \(\mathcal{F}_{raw}\) el conjunto inicial de features candidatas. El conjunto final \(\mathcal{F}_{final}\) se obtiene mediante una secuencia de filtros:
+
 \begin{enumerate}
-  \item \texttt{load\_regime\_feature\_config} carga \texttt{lookbacks}, \texttt{smoothing\_method}, \texttt{winsor\_limits}, \texttt{standardization\_mode}.
-  \item \texttt{load\_market\_inputs} integra \texttt{market\_prices\_path}, \texttt{universe\_history\_path}, opcionalmente \texttt{macro\_proxy\_path}, \texttt{sector\_indices\_path}.
-  \item \texttt{build\_volatility\_regime\_features}, \texttt{build\_trend\_regime\_features}, \texttt{build\_corr\_dispersion\_features}, \texttt{build\_liquidity\_stress\_features} construyen familias de features \(\mathbf{z}_t\).
-  \item \texttt{normalize\_and\_smooth\_features} aplica z‑score, rank‑gauss, EMA, clipping.
-  \item \texttt{validate\_regime\_features} comprueba cobertura, rangos y correlaciones extremas.
-  \item \texttt{persist\_regime\_feature\_outputs} serializa:
-    \begin{itemize}
-      \item \texttt{models/regimes/features/date=\{yyyy-mm-dd\}/part-*.parquet} por partición temporal.
-      \item \texttt{regime\_feature\_dictionary\_\{run\_id\}.json} (descripción de cada \texttt{regime\_feature\_\{name\}}).
-      \item \texttt{regime\_feature\_summary\_\{run\_id\}.json} (estadísticas por feature y fecha).
-      \item \texttt{manifest\_\{run\_id\}.json} (metadatos de \texttt{run\_id}, ventanas, features, \texttt{config\_hash}).
-    \end{itemize}
+  \item \textbf{Cobertura}: se eliminan features con exceso de missing, staleness o dependencia frágil de inputs.
+  \item \textbf{Estabilidad}: se eliminan features con distribución extremadamente inestable entre subperiodos.
+  \item \textbf{Redundancia}: si \(|\rho_{ij}| > \rho_{\max}\) de forma persistente, se conserva solo la más interpretable o más estable.
+  \item \textbf{Cross-run robustness}: se penalizan features cuya utilidad depende demasiado de un subperiodo o composición del universo.
+  \item \textbf{Downstream utility}: se priorizan aquellas que mejoran la separabilidad del HMM y el comportamiento del gating en validación.
 \end{enumerate}
 
-\subsection{Validaciones mínimas}
+Formalmente, la selección puede expresarse como:
+\begin{equation}
+\mathcal{F}_{final}
+=
+\arg\max_{\mathcal{S}\subseteq \mathcal{F}_{raw}}
+\left[
+U_{\text{HMM}}(\mathcal{S})
++
+U_{\text{gating}}(\mathcal{S})
+-
+\lambda_1 R_{\text{redundancy}}(\mathcal{S})
+-
+\lambda_2 R_{\text{instability}}(\mathcal{S})
+\right].
+\end{equation}
+
+La especificación oficial debe incluir una \textbf{lista canónica por defecto} de features activas. Las demás pueden existir como experimentales, pero no deben entrar en producción sin validación formal.
+
+\subsection{Estabilidad cross-sectional con universo cambiante}
+
+En small caps, el universo cambia de tamaño y composición con frecuencia. Por tanto, no basta con computar estadísticas cross-sectional: hay que garantizar que siguen siendo comparables en el tiempo.
+
+Se imponen cuatro reglas:
+
 \begin{itemize}
-  \item Cobertura temporal continua en \([start\_date, end\_date]\), alineada a calendario canónico.
-  \item Sin \texttt{NaN} en features core (\texttt{realized\_vol\_20d, trend\_ret\_20d}, \texttt{illiquidity\_proxy}, etc.).
-  \item Rangos por feature compatibles con literatura (e.g. volatilidad anualizada en \([0.05, 0.6]\), \texttt{advance\_decline\_ratio} en \([0.1, 10]\)).
-  \item Correlaciones \(\rho_{ij} > 0.95\) entre features redundantes etiquetadas para posible reducción de dimensionalidad (PCA / factorization).
+  \item \textbf{Minimum universe size}: features cross-sectional solo son válidas si \(n_t \ge n_{\min}\).
+  \item \textbf{Robust aggregation}: preferencia por mediana, trimmed mean o winsorized mean.
+  \item \textbf{Comparabilidad temporal}: normalización por universo efectivo o mediante percentiles internos.
+  \item \textbf{Confidence flags}: toda fecha con universo débil o composición anómala se marca explícitamente.
 \end{itemize}
 
-\subsection{Manejo de casos especiales}
+Así, una caída brusca del universo no puede confundirse con un cambio real de régimen.
+
+\subsection{Reglas PIT y anti-leakage}
+
+Las reglas point-in-time son \textbf{hard constraints}, no recomendaciones blandas.
+
 \begin{itemize}
-  \item \texttt{pocos activos} en universo: \texttt{feature\_valid\_flag} marcado como bajo nivel de confianza para features cross‑sectionales (\texttt{avg\_pair\_corr}, \texttt{dispersion\_returns}).
-  \item \texttt{gaps de mercado} o \texttt{holiday mismatch}: se alinea todo a calendario canónico usando \texttt{next\_business\_date} y \texttt{fillna(limit=max\_staleness)}.
-  \item \texttt{proxy externo faltante} (macro, cross‑asset): se utiliza proxy interno con \texttt{fallback} y \texttt{WARNING} en log, con clara documentación en \texttt{manifest}.
+  \item Toda feature en fecha \(t\) usa información disponible a más tardar en \(t\), o en \(t-1\) si la operativa requiere un lag de ejecución.
+  \item No se permite backfill con datos futuros.
+  \item Toda transformación rolling debe cerrarse en \(t\).
+  \item Todo proxy externo debe respetar su \texttt{data\_lag} real.
+  \item Toda imputación debe quedar registrada con \texttt{feature\_valid\_flag}, \texttt{staleness\_days} y origen del fallback.
 \end{itemize}
+
+\subsection{Flujo operativo del módulo}
+
+\begin{enumerate}
+  \item Cargar configuración efectiva y manifiesto de inputs.
+  \item Construir benchmark y universo efectivo por fecha.
+  \item Calcular familias básicas: volatilidad, tendencia, correlación/dispersión, liquidez, breadth y stress.
+  \item Aplicar guards por universo mínimo y disponibilidad de datos.
+  \item Transformar mediante normalización robusta, rank-gauss, smoothing y clipping.
+  \item Ejecutar filtros de calidad, redundancia y estabilidad.
+  \item Construir el conjunto canónico final.
+  \item Persistir outputs, diccionarios, resúmenes y flags de confianza.
+\end{enumerate}
+
+\subsection{Defaults oficiales recomendados}
+
+Para evitar una especificación excesivamente abierta, el módulo debe fijar defaults explícitos:
+
+\begin{itemize}
+  \item \texttt{lookbacks\_vol} = \{10, 20, 63\}
+  \item \texttt{lookbacks\_trend} = \{20, 63\}
+  \item \texttt{corr\_window} = 20
+  \item \texttt{smoothing\_ema\_halflife} por familia
+  \item \texttt{winsor\_limits} = \((0.01, 0.99)\) o equivalente robusto
+  \item \texttt{min\_history\_days} coherente con la mayor ventana usada
+  \item \texttt{min\_universe\_size} para features cross-sectional
+  \item \texttt{max\_staleness} estricto para proxies externos
+  \item \texttt{redundancy\_corr\_threshold} en zona 0.90--0.95
+\end{itemize}
+
+Los defaults no son arbitrarios: existen para evitar que el módulo derive en un laboratorio abierto imposible de versionar y auditar.
+
+\subsection{Validaciones mínimas}
+
+\begin{itemize}
+  \item Cobertura temporal continua y alineada con calendario canónico.
+  \item Ausencia de \texttt{NaN} no explicados en features core.
+  \item Rango económico plausible por feature.
+  \item Consistencia entre universe size y validez de features cross-sectional.
+  \item Correlaciones extremas detectadas y etiquetadas.
+  \item Flags de staleness correctamente poblados.
+  \item Reconstruibilidad exacta desde manifiesto.
+\end{itemize}
+
+\subsection{Criterios de aceptación y rechazo}
+
+El módulo no debe dar por bueno cualquier conjunto de features generado. Un run solo se considera \texttt{accepted} si cumple:
+
+\begin{itemize}
+  \item cobertura suficiente de todas las features canónicas;
+  \item ausencia de leakage;
+  \item estabilidad razonable por subperiodos;
+  \item redundancia contenida;
+  \item universo suficiente en fechas clave;
+  \item proxies externos, si existen, dentro de límites de staleness;
+  \item mejora o no deterioro material del stack downstream en validación.
+\end{itemize}
+
+Si estas condiciones no se cumplen, el run puede persistirse para auditoría, pero no debe pasar a producción ni alimentar automáticamente al HMM.
 
 \subsection{Observabilidad y trazabilidad}
-Logging:
+
+El módulo debe exponer logging y métricas suficientes para auditar el estado de la representación construida.
+
+\paragraph{Logging}
 \begin{itemize}
-  \item \texttt{INFO}: \texttt{build\_volatility\_regime\_features} completado, \texttt{build\_corr\_dispersion\_features} completado, etc.
-  \item \texttt{WARNING}: \texttt{pct\_missing\_core\_features} alto, \texttt{low\_confidence\_dates} identificados, correlaciones extremas.
-  \item \texttt{ERROR}: falta de \texttt{market\_prices\_path} o \texttt{universe\_history\_path}.
-\end{itemize}
-Métricas operativas:
-\begin{itemize}
-  \item \texttt{n\_features\_regime}.
-  \item \texttt{n\_dates}.
-  \item \texttt{pct\_missing\_core\_features}.
-  \item \texttt{n\_low\_confidence\_dates}.
-  \item \texttt{runtime\_sec}.
+  \item \texttt{INFO}: familias construidas, número de fechas válidas, selección final de features.
+  \item \texttt{WARNING}: missing elevado, baja confianza cross-sectional, staleness, redundancia extrema.
+  \item \texttt{ERROR}: inputs críticos ausentes, calendario inconsistente o corrupción del universo.
 \end{itemize}
 
-\subsection{Reglas de diseño de \texttt{regime\_features} para modelo HMM y regime‑gating}
+\paragraph{Métricas operativas}
 \begin{itemize}
-  \item \textbf{Parsimonia}: un subconjunto \(\mathcal{I} \subset \{1,\dots,p\}\) con \texttt{AIC} o \texttt{BIC} óptimo para HMM gaussiano \cite{Bozdogan1987}.
-  \item \textbf{Multi‑horizonte}: combinación de \texttt{realized\_vol\_10d} (micro‑risk) y \texttt{vol\_63d} (macro‑regime) para capturar escala de tiempo de cambios de régimen \cite{Andersen2016}.
-  \item \textbf{Liquidity/stress}: \texttt{illiquidity\_proxy} y \texttt{tail\_loss\_frequency} permiten separar estados \emph{risk‑on} (liquidez alta, bumps de vol moderados) de \emph{risk‑off/crisis} (liquidez baja, colas extremas).
-  \item \textbf{Breadth/tendencia}: \texttt{pct\_symbols\_above\_ma} y \texttt{trend\_ret\_63d} definen regímenes de momentum fuerte vs debilidad de tendencia, críticos para swing‑trading multi‑horizonte \cite{Moskowitz2012}.
+  \item \texttt{n\_features\_raw}
+  \item \texttt{n\_features\_final}
+  \item \texttt{n\_dates}
+  \item \texttt{pct\_missing\_core\_features}
+  \item \texttt{n\_low\_confidence\_dates}
+  \item \texttt{mean\_feature\_entropy}
+  \item \texttt{n\_external\_proxy\_fallbacks}
+  \item \texttt{runtime\_sec}
 \end{itemize}
+
+\subsection{Casos especiales y fallbacks}
+
+\paragraph{Universo insuficiente}
+Las features cross-sectional no se imputan ciegamente. Se marcan con baja confianza o se desactivan.
+
+\paragraph{Holiday mismatch y gaps}
+Todo se alinea a un calendario canónico. Los rellenos permitidos quedan sujetos a límites estrictos.
+
+\paragraph{Fallo de proxy externo}
+Se utiliza fallback interno si existe, y el hecho queda documentado explícitamente en el manifiesto.
+
+\paragraph{Stress extremo}
+Durante episodios de crisis, el módulo puede aceptar clipping menos agresivo o límites de validación adaptativos, pero siempre de forma documentada y reproducible.
 
 \subsection{Casos de prueba mínimos}
+
 \begin{itemize}
-  \item \texttt{build\_volatility\_regime\_features} calcula \(\sigma^{(20)}_t\) correctamente en serie sintética con conocimiento analítico.
-  \item No hay \emph{leakage temporal} en ventanas rolling: \(\texttt{regime\_feature}_t\) no depende de \(\texttt{close}_{t+1}\).
-  \item \texttt{normalize\_and\_smooth\_features} maneja \texttt{NaN} según política (forward / backward / interpolación), con \texttt{feature\_valid\_flag} bien seteado.
-  \item \texttt{EMA} y \texttt{clipping} reducen ruido sin transladarse fuera de \texttt{[t-1, t]}\ en el tiempo.
+  \item Las ventanas rolling son estrictamente causales.
+  \item Las medidas de volatilidad y tendencia coinciden con resultados analíticos en series sintéticas.
+  \item Las medidas cross-sectional cambian de forma estable ante perturbaciones controladas del universo.
+  \item La normalización robusta no introduce dependencia futura.
+  \item Los fallbacks externos se activan correctamente y quedan reflejados en los metadatos.
+  \item La selección final de features es reproducible dado el mismo \texttt{run\_id}, inputs y configuración.
 \end{itemize}
 
-\subsection{Decisiones de riesgo abiertas}
-\begin{itemize}
-  \item \textbf{Set final de features}: trade‑off entre expresividad (modelo HMM más rico) y riesgo de overfitting y \emph{transaction cost} inducido por ruido \cite{Bailey2014}.
-  \item \textbf{Sensibilidad a \texttt{smoothing} y \texttt{lookbacks}}: mayor \texttt{lookback} estabiliza features pero introduce lag, crítico en swing trading con horizonte \(\sim\) 20–100 días \cite{Hamilton2010}.
-  \item \textbf{Dependencia de proxies externos}: si se añaden \texttt{macro\_proxy\_path}, se debe evaluar \texttt{refresh\_frequency} y \texttt{data\_lag} para evitar \emph{regime mistagging} \cite{Adrian2019}.
-\end{itemize}
+\subsection{Interpretación final}
 
-Este módulo es la base de toda la \emph{regime‑aware pipeline} (HMM, regime‑gating, risk‑allocation) y debe ser \textbf{PIT‑reproducible, robusto a ruido} y \textbf{versionado} para su consumo en backtesting industrial y producción en vivo.
+Este módulo constituye la \textbf{capa de representación observable del estado de mercado} sobre la que se apoyan la inferencia de regímenes y las decisiones de adaptación downstream. Su valor no reside en acumular indicadores, sino en construir una base estadística con semántica económica clara, robusta a ruido, universos cambiantes y datos incompletos.
+
+En un sistema cuantitativo serio, las \texttt{regime\_features} no son un conjunto de ``features macro'' pegadas al pipeline, sino una infraestructura de estado: una interfaz entre datos de mercado heterogéneos y modelos de decisión sensibles al entorno. Por ello, este módulo debe entenderse como una pieza de representación industrial, no como una colección de métricas exploratorias.

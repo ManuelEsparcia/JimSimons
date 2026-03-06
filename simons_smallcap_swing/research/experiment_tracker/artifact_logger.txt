@@ -1,121 +1,654 @@
 \documentclass[12pt,a4paper]{article}
+
 \usepackage[spanish]{babel}
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
-\usepackage{amsmath,amsfonts,amssymb}
-\usepackage{hyperref}
+\usepackage{lmodern}
+\usepackage{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
 \usepackage{booktabs}
+\usepackage{array}
+\usepackage{hyperref}
 \usepackage{graphicx}
 \usepackage{listings}
-\usepackage[backend=biber,style=authoryear]{biblatex}
-\addbibresource{references.bib}
+\usepackage{xcolor}
 
-\title{Análisis Exhaustivo e Industrial de \\ \texttt{artifact_logger.py} \\ para Trazabilidad en Swing Trading Cuantitativo}
-\author{Perplexity AI Research}
+\geometry{margin=2.5cm}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue,
+    citecolor=blue
+}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    columns=fullflexible
+}
+
+\title{\textbf{Especificación Formal de \texttt{artifact\_logger.py}}\\
+Trazabilidad, Integridad e Idempotencia para Investigación Cuantitativa en \textit{Swing Trading}}
+\author{Research Specification}
 \date{Marzo 2026}
 
 \begin{document}
 
 \maketitle
 
-\section{Introducción Teórica y Objetivo}
-El módulo \texttt{artifact_logger.py} implementa un sistema de logging de artefactos para experimentos de ML en swing trading, asegurando reproducibilidad y auditoría. En contextos industriales como Renaissance Technologies (Simons), la trazabilidad es crítica: un fallo en lineage puede costar millones en backtests no reproducibles \parencite{pinecone2023repro}.
+\section{Propósito del módulo}
 
-\textbf{Objetivo matemático}: Registrar artefactos \( A = \{a_i\} \) con metadata \( M(a_i) = (\path_i, \type_i, \version_i, \checksum_i) \), donde \(\checksum_i = \mathcal{H}(a_i)\) usa SHA-256 para integridad \[\mathcal{H}(x) = \SHA256(x) = \bigoplus_{k=0}^{63} \Sigma_k(m_k),\] con rotaciones y constantes primas para colisión-resistencia (probabilidad \( 2^{-128} \)) \parencite{nist2015sha}.
+El módulo \texttt{artifact\_logger.py} es responsable de registrar, versionar y vincular artefactos producidos durante un experimento cuantitativo de forma que el resultado sea:
 
-Libros clave: \emph{``Machine Learning for Asset Managers''} de López de Prado (2020) enfatiza lineage para evitar p-hacking en alpha decay; \emph{``Advances in Financial Machine Learning''} detalla artefactos en walk-forward optimization.
-
-\section{Alcance y Dependencias}
-\textbf{Alcance}: Logging post-pipeline, excluyendo init (MLflow/W&B). Downstream: \texttt{research_pipeline.py} para swing signals (momentum + mean-reversion).
-
-Dependencias formales:
 \begin{itemize}
-\item Upstream: Runs activos \( R = \{r_j\} \), artefactos de GARCH/volatility models.
-\item Downstream: Model registry con governance (versiónado semántico \(\semver\)).
+    \item \textbf{reproducible}: cada artefacto relevante puede asociarse a un \texttt{run}, una configuración y una instantánea de datos;
+    \item \textbf{auditable}: el sistema permite reconstruir qué produjo cada fichero, cuándo, con qué contenido y bajo qué contexto experimental;
+    \item \textbf{idempotente}: reintentar una operación no debe duplicar registros ni corromper el estado;
+    \item \textbf{consistente}: el estado publicado en el tracker remoto y el lineage local deben poder reconciliarse sin ambigüedad;
+    \item \textbf{operativamente seguro}: el módulo debe fallar de forma explícita, detectable y recuperable.
 \end{itemize}
 
-State-of-the-art: Integra con DVC (Data Version Control) para Git-like datos \parencite{dvc2024}.
+No es función de este módulo entrenar modelos, generar predicciones o decidir qué artefactos son científicamente válidos. Su responsabilidad es exclusivamente la de \emph{persistir evidencia experimental de manera determinista y verificable}.
 
-\section{Contrato Matemático de Entrada/Salida}
-Entradas: \( \mathbf{I} = (\runref, \artlist, \metrics, \params, \runid) \), con \( |\artlist| \leq 1000 \).
+\section{Alcance y no-alcance}
 
-Salidas: 
-- \( \summary.json \): \( \JSON(\{\runid \mapsto \stats\}) \)
-- \( \lineage.parquet \): Tabla con esquema 
+\subsection{Alcance}
+
+\texttt{artifact\_logger.py} cubre:
+
+\begin{itemize}
+    \item validación del manifiesto de artefactos de entrada;
+    \item cálculo de huellas de contenido;
+    \item asignación de metadatos obligatorios;
+    \item subida o registro en el almacén/tracker configurado;
+    \item escritura de \texttt{lineage.parquet} y \texttt{artifact\_summary.json};
+    \item deduplicación por contenido;
+    \item control de versiones lógicas y físicas;
+    \item journaling para recuperación tras fallos parciales.
+\end{itemize}
+
+\subsection{No-alcance}
+
+No corresponde a este módulo:
+
+\begin{itemize}
+    \item iniciar el backend de experiment tracking;
+    \item resolver credenciales o secretos de infraestructura;
+    \item promover artefactos a un model registry de producción;
+    \item borrar artefactos remotos;
+    \item decidir políticas de retención a largo plazo.
+\end{itemize}
+
+\section{Definición formal del objeto artefacto}
+
+Cada artefacto \(a_i\) se modela como una tupla tipada
+
 \[
-\begin{array}{c|c|c|c|c|c|c|c}
-\artifactid & \type & \path & \uri & \checksum & \version & \step & \runid \\
-\hline
-uuid & model & /path & mlflow:// & sha256 & v1.2 & producer & abc123 \\
-\end{array}
+a_i =
+(\texttt{artifact\_id},
+ \texttt{run\_id},
+ \texttt{logical\_name},
+ \texttt{kind},
+ \texttt{local\_path},
+ \texttt{store\_uri},
+ \texttt{content\_hash},
+ \texttt{content\_size},
+ \texttt{compression},
+ \texttt{producer\_step},
+ \texttt{logical\_version},
+ \texttt{physical\_version},
+ \texttt{schema\_version},
+ \texttt{status},
+ \texttt{created\_at})
 \]
-Checksum verificación: \( \verify(c_1, c_2) = \mathbb{I}(c_1 = c_2) \), fail si \( \Pr[\mismatch] > \epsilon = 10^{-6} \).
 
-\section{Tipos de Artefactos y Reglas}
-Tipos recomendados para swing trading:
+donde:
+
 \begin{itemize}
-\item \texttt{model\_artifact}: XGBoost para entry/exit signals, \( f(\mathbf{x}) = \sum_{t=1}^T \gamma_t \regtree_t(\mathbf{x}) \).
-\item \texttt{prediction\_artifact}: \(\hat{y}_t = \E[y_t | \mathcal{F}_{t-1}]\), con \(\mathcal{F}\) filtration precios.
-\item \texttt{metrics\_report}: Sharpe \( S = \frac{\E[r] - r_f}{\sigma_r} \), target \( S > 2.5 \).
+    \item \(\texttt{artifact\_id}\) es un identificador único e inmutable;
+    \item \(\texttt{logical\_name}\) identifica el papel semántico del artefacto dentro del \texttt{run};
+    \item \(\texttt{kind}\) pertenece a un conjunto cerrado de tipos permitidos;
+    \item \(\texttt{content\_hash}\) identifica el contenido binario exacto;
+    \item \(\texttt{logical\_version}\) versiona la semántica del artefacto;
+    \item \(\texttt{physical\_version}\) versiona la representación persistida;
+    \item \(\texttt{status} \in \{\texttt{pending}, \texttt{uploaded}, \texttt{committed}, \texttt{failed}, \texttt{orphaned}\}\).
 \end{itemize}
 
-Reglas: Rutas deterministas \( \path = f(\runid, \type) \), no overwrite (atomic writes con \texttt{tempfile}).
+\subsection{Tipos permitidos}
 
-\section{Flujo Matemático y Validaciones}
-Flujo algorítmico:
+Para este sistema de \textit{swing trading}, los tipos iniciales recomendados son:
+
+\begin{itemize}
+    \item \texttt{config\_snapshot}
+    \item \texttt{data\_snapshot}
+    \item \texttt{feature\_frame}
+    \item \texttt{label\_frame}
+    \item \texttt{trained\_model}
+    \item \texttt{prediction\_frame}
+    \item \texttt{backtest\_report}
+    \item \texttt{risk\_report}
+    \item \texttt{diagnostic\_plot}
+    \item \texttt{environment\_snapshot}
+\end{itemize}
+
+El conjunto debe tratarse como \emph{cerrado por configuración}; cualquier tipo no declarado debe producir error de validación.
+
+\section{Contrato de entrada}
+
+La entrada del módulo consta de:
+
+\[
+\mathcal{I} = (\mathcal{R}, \mathcal{M}, \mathcal{C})
+\]
+
+donde:
+
+\begin{itemize}
+    \item \(\mathcal{R}\): contexto de \texttt{run} activo;
+    \item \(\mathcal{M} = \{m_1,\dots,m_n\}\): manifiesto de artefactos;
+    \item \(\mathcal{C}\): configuración operacional del logger.
+\end{itemize}
+
+\subsection{Precondiciones}
+
+Antes de procesar el manifiesto deben cumplirse todas las condiciones siguientes:
+
 \begin{enumerate}
-\item \( \validate(\artlist) \): Check existencia \( \exists \file \) y legible.
-\item \( \checksum_i = \mathcal{H}(\read(\path_i)) \).
-\item \( \log(\tracker, a_i, M_i) \): Upload idempotente.
-\item Persist \( L = \lineage(R, A) \), con \( |L| = O(n \artifacts) \).
+    \item \texttt{run\_id} no nulo y sintácticamente válido;
+    \item cada \texttt{local\_path} existe, es legible y apunta a un fichero regular;
+    \item no hay dos entradas con la misma clave lógica
+    \[
+    (\texttt{run\_id}, \texttt{logical\_name}, \texttt{logical\_version});
+    \]
+    \item el tamaño de cada artefacto satisface
+    \[
+    0 < \texttt{content\_size} \leq S_{\max},
+    \]
+    con \(S_{\max}\) configurable;
+    \item cada artefacto declara \texttt{kind}, \texttt{producer\_step} y \texttt{schema\_version};
+    \item la ruta destino derivada es determinista y no ambigua.
 \end{enumerate}
 
-Validaciones: Schema con JSONSchema v7, métricas convenciones (snake\_case, units).
+\subsection{Límites operativos recomendados}
 
-Errores: Retry con exponential backoff \( \tau_k = 2^k \cdot \base \), max 5 intentos (95\% success en AWS S3).
+Para evitar comportamientos implícitos, el módulo debe documentar y aplicar límites explícitos. Una política razonable inicial es:
 
-\section{Observabilidad y Métricas}
-Logs estructurados (JSON): \( \loglevel(\msg, \{\key: \val\}) \).
+\begin{itemize}
+    \item número máximo de artefactos por llamada: \(N_{\max}=1000\);
+    \item tamaño máximo por artefacto por defecto: \(S_{\max}=2\ \text{GiB}\);
+    \item artefactos \(>512\ \text{MiB}\): compresión o chunking obligatorio;
+    \item timeout por operación remota: configurable y obligatorio;
+    \item número máximo de reintentos: fijo y visible en configuración.
+\end{itemize}
 
-Métricas push a Prometheus:
+\section{Contrato de salida}
+
+El módulo produce como mínimo:
+
+\begin{enumerate}
+    \item \texttt{artifact\_summary.json}
+    \item \texttt{lineage.parquet}
+    \item \texttt{artifact\_journal.jsonl}
+\end{enumerate}
+
+\subsection{\texttt{artifact\_summary.json}}
+
+Contiene estadísticas agregadas de la llamada:
+
+\begin{itemize}
+    \item \texttt{run\_id}
+    \item \texttt{n\_requested}
+    \item \texttt{n\_uploaded}
+    \item \texttt{n\_deduplicated}
+    \item \texttt{n\_committed}
+    \item \texttt{n\_failed}
+    \item \texttt{total\_bytes}
+    \item \texttt{wall\_clock\_seconds}
+\end{itemize}
+
+\subsection{\texttt{lineage.parquet}}
+
+Debe ser una tabla \emph{append-only} con esquema estable:
+
+\begin{center}
+\begin{tabular}{>{\ttfamily}p{3.0cm} >{\ttfamily}p{2.2cm} >{\ttfamily}p{2.3cm} >{\ttfamily}p{2.2cm} >{\ttfamily}p{2.3cm}}
+\toprule
+artifact\_id & run\_id & logical\_name & kind & producer\_step \\
+logical\_version & physical\_version & content\_hash & content\_size & compression \\
+local\_path & store\_uri & schema\_version & status & created\_at \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{\texttt{artifact\_journal.jsonl}}
+
+Es un diario operacional para recuperación. Cada evento debe registrar al menos:
+
 \[
-n_\artifacts = \sum_i \mathbb{I}(\success_i), \quad \latency = t_\end - t_\start.
+(\texttt{event\_time}, \texttt{artifact\_id}, \texttt{phase}, \texttt{result}, \texttt{details})
 \]
 
-CLI: ArgumentParser con Typer para type hints.
+con \(\texttt{phase} \in \{\texttt{validated}, \texttt{hashed}, \texttt{uploaded}, \texttt{registered}, \texttt{committed}, \texttt{failed}\}\).
 
-\section{Estructura Código Desglosada}
-Funciones clave (pseudocódigo optimizado para +1000 líneas):
+\section{Invariantes del sistema}
+
+El valor del módulo no está en “subir ficheros”, sino en mantener invariantes fuertes. Deben cumplirse los siguientes:
+
+\subsection{Invariante de integridad}
+
+Para todo artefacto comprometido,
+
+\[
+\texttt{content\_hash} = H(\texttt{bytes(local\_path)})
+\]
+
+en el momento de su publicación. La función \(H\) debe ser determinista y estable; por defecto, SHA-256 es suficiente.
+
+\subsection{Invariante de unicidad lógica}
+
+No pueden coexistir dos filas comprometidas con la misma clave lógica
+
+\[
+(\texttt{run\_id}, \texttt{logical\_name}, \texttt{logical\_version})
+\]
+
+salvo que la política permita reemplazo explícito, lo cual no debe ser el comportamiento por defecto.
+
+\subsection{Invariante de deduplicación física}
+
+Si dos artefactos \(a_i, a_j\) tienen el mismo \(\texttt{content\_hash}\), el sistema puede reutilizar el mismo objeto físico remoto:
+
+\[
+\texttt{content\_hash}(a_i)=\texttt{content\_hash}(a_j)
+\Rightarrow
+\texttt{store\_uri}(a_i)=\texttt{store\_uri}(a_j)
+\]
+
+siempre que ambos tengan metadatos lógicos propios y filas independientes en \texttt{lineage.parquet}.
+
+\subsection{Invariante de append-only}
+
+Ni \texttt{lineage.parquet} ni el journal deben mutar filas previamente comprometidas. Las correcciones se expresan mediante nuevos eventos o nuevos registros, no mediante sobrescritura silenciosa.
+
+\section{Versionado: lógico frente a físico}
+
+Una de las fuentes clásicas de ambigüedad es mezclar “versión del significado” con “versión del fichero”. El módulo debe separarlas.
+
+\subsection{Versión lógica}
+
+\texttt{logical\_version} cambia cuando cambia la semántica del artefacto. Ejemplos:
+
+\begin{itemize}
+    \item nueva especificación de features;
+    \item cambio en definición de etiquetas;
+    \item modificación del protocolo de backtest;
+    \item cambio de esquema en un reporte.
+\end{itemize}
+
+\subsection{Versión física}
+
+\texttt{physical\_version} cambia cuando cambia la representación material del artefacto sin alterar necesariamente su papel lógico. Ejemplos:
+
+\begin{itemize}
+    \item compresión distinta;
+    \item migración de formato;
+    \item reserialización compatible;
+    \item cambio de ruta de almacenamiento.
+\end{itemize}
+
+Esta separación evita errores de auditoría y facilita deduplicación y migraciones.
+
+\section{Política de compresión}
+
+La compresión no debe ser implícita ni ad hoc. Debe seguir una política declarativa por tipo:
+
+\begin{itemize}
+    \item \texttt{feature\_frame}, \texttt{label\_frame}, \texttt{prediction\_frame}: preferencia por Parquet comprimido;
+    \item \texttt{diagnostic\_plot}: formato ya comprimido si aplica;
+    \item \texttt{trained\_model}: compresión opcional según serializador;
+    \item \texttt{risk\_report}, \texttt{backtest\_report}: compresión si supera umbral de tamaño.
+\end{itemize}
+
+El campo \texttt{compression} debe quedar siempre explicitado, incluso cuando su valor sea \texttt{none}.
+
+\section{Protocolo operacional}
+
+La operación completa debe dividirse en fases observables y reanudables.
+
+\subsection{Fase 1: validación}
+
+Para cada entrada del manifiesto:
+
+\begin{enumerate}
+    \item validar existencia y legibilidad;
+    \item validar tipo permitido;
+    \item validar tamaño;
+    \item derivar clave lógica;
+    \item comprobar colisiones lógicas previas.
+\end{enumerate}
+
+Si una sola entrada es inválida, la política por defecto debe ser \texttt{fail-fast} para la llamada completa, salvo configuración explícita de procesamiento parcial.
+
+\subsection{Fase 2: preparación}
+
+\begin{enumerate}
+    \item calcular \texttt{content\_hash};
+    \item calcular \texttt{content\_size};
+    \item generar \texttt{artifact\_id};
+    \item derivar \texttt{store\_uri} determinista;
+    \item escribir evento \texttt{validated} y \texttt{hashed} en journal.
+\end{enumerate}
+
+Una clave de idempotencia recomendable es:
+
+\[
+K(a) = (\texttt{run\_id}, \texttt{logical\_name}, \texttt{logical\_version}, \texttt{content\_hash})
+\]
+
+Toda repetición con la misma clave debe resolverse como \emph{replay seguro}, no como duplicado.
+
+\subsection{Fase 3: subida o deduplicación}
+
+\begin{enumerate}
+    \item si el \texttt{content\_hash} ya existe en el almacén, no subir de nuevo;
+    \item si no existe, subir a una ruta temporal o staging;
+    \item verificar integridad post-subida si el backend lo permite;
+    \item registrar evento \texttt{uploaded} o \texttt{deduplicated}.
+\end{enumerate}
+
+\subsection{Fase 4: commit}
+
+Un artefacto solo se considera publicado cuando:
+
+\begin{enumerate}
+    \item existe objeto físico remoto o referencia deduplicada válida;
+    \item se ha escrito la fila correspondiente en \texttt{lineage.parquet};
+    \item el journal refleja un evento \texttt{committed}.
+\end{enumerate}
+
+Antes de ese punto, el estado debe considerarse provisional.
+
+\section{Atomicidad y consistencia}
+
+La atomicidad perfecta entre sistema de ficheros local y tracker remoto no suele estar garantizada por infraestructura heterogénea. Por tanto, el módulo no debe fingir transacciones que no puede ofrecer; debe implementar un modelo de consistencia \emph{explícito y recuperable}.
+
+\subsection{Regla de publicación}
+
+La regla operativa recomendada es:
+
+\begin{quote}
+\textbf{primero} asegurar la existencia física del objeto remoto, \textbf{después} comprometer su metadata local.
+\end{quote}
+
+Esto minimiza el caso peligroso “lineage comprometido sin objeto existente”.
+
+\subsection{Estados parciales posibles}
+
+Ante fallo pueden aparecer:
+
+\begin{itemize}
+    \item \textbf{objeto remoto sin commit local}: estado \texttt{orphaned};
+    \item \textbf{journal con pending sin uploaded}: reintento seguro;
+    \item \textbf{uploaded sin committed}: reconciliación obligatoria al reinicio.
+\end{itemize}
+
+\subsection{Recuperación}
+
+En el arranque, el módulo debe escanear el journal en busca de entradas no comprometidas y aplicar una rutina de reconciliación:
+
+\[
+\texttt{recover()} :
+\begin{cases}
+\text{si objeto remoto existe y falta commit local} \rightarrow \texttt{commit} \\
+\text{si no existe objeto remoto} \rightarrow \texttt{retry / fail} \\
+\text{si hay inconsistencia irrecuperable} \rightarrow \texttt{mark\_failed}
+\end{cases}
+\]
+
+\section{Política de overwrite, colisiones y nombres}
+
+El comportamiento por defecto debe ser \textbf{no overwrite}. Esto aplica tanto a la clave lógica como a la ruta física final. Si se detecta una colisión, el sistema debe:
+
+\begin{enumerate}
+    \item verificar si es un replay idempotente exacto;
+    \item si no lo es, abortar con error explícito;
+    \item registrar la colisión en el journal.
+\end{enumerate}
+
+Queda prohibida cualquier sobrescritura silenciosa.
+
+\section{Tratamiento de artefactos preexistentes}
+
+Si el backend remoto ya contiene un objeto con el mismo hash:
+
+\begin{itemize}
+    \item no debe re-subirse;
+    \item sí debe generarse un nuevo registro lógico si corresponde a un nuevo \texttt{run} o nuevo papel semántico;
+    \item el resumen debe reflejarlo como \texttt{deduplicated}, no como \texttt{uploaded}.
+\end{itemize}
+
+Si existe un artefacto con misma clave lógica pero hash distinto, el comportamiento correcto por defecto es error de conflicto.
+
+\section{Observabilidad}
+
+El módulo debe emitir logs estructurados, nunca mensajes libres sin contexto. Cada evento relevante debe incluir:
+
+\begin{itemize}
+    \item \texttt{run\_id}
+    \item \texttt{artifact\_id}
+    \item \texttt{logical\_name}
+    \item \texttt{phase}
+    \item \texttt{status}
+    \item \texttt{latency\_ms}
+    \item \texttt{retry\_count}
+\end{itemize}
+
+Métricas mínimas recomendadas:
+
+\[
+n_{\text{requested}},\quad
+n_{\text{uploaded}},\quad
+n_{\text{deduplicated}},\quad
+n_{\text{committed}},\quad
+n_{\text{failed}},\quad
+\text{bytes}_{\text{total}},\quad
+\text{latency}_{p50},\quad
+\text{latency}_{p95}
+\]
+
+Estas métricas son útiles porque permiten detectar degradación operacional, no porque añadan “aire enterprise”.
+
+\section{Complejidad y rendimiento}
+
+Si \(n\) es el número de artefactos y \(B=\sum_i b_i\) el total de bytes leídos, el coste temporal base es
+
+\[
+T(n,B)=O(n)+O(B)+O(U)
+\]
+
+donde \(U\) representa el coste de subida remota. El cuello de botella real no suele ser el cálculo de hash, sino la E/S y la latencia de red.
+
+Por tanto, la optimización razonable del módulo es:
+
+\begin{itemize}
+    \item streaming de hash en bloques;
+    \item evitar lectura completa en memoria;
+    \item paralelismo controlado solo donde no rompa reproducibilidad operacional;
+    \item límite explícito de concurrencia;
+    \item orden determinista de commit.
+\end{itemize}
+
+\section{Interfaz propuesta}
+
+La interfaz debe ser estrecha y explícita. Un esqueleto razonable es:
+
 \begin{lstlisting}[language=Python]
-def load_artifact_manifest(path: str) -> List[Artifact]:
-    # JSON load + Pydantic validate
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Literal, Optional
 
-def compute_checksum(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, 'rb') as f: h.update(f.read())
-    return h.hexdigest()
+ArtifactKind = Literal[
+    "config_snapshot",
+    "data_snapshot",
+    "feature_frame",
+    "label_frame",
+    "trained_model",
+    "prediction_frame",
+    "backtest_report",
+    "risk_report",
+    "diagnostic_plot",
+    "environment_snapshot",
+]
 
-def log_to_tracker(run_uri: str, artifacts: List[Artifact]):
-    mlflow.log_artifacts(..., run_uri)  # Con retry
+@dataclass(frozen=True)
+class ArtifactSpec:
+    logical_name: str
+    kind: ArtifactKind
+    local_path: Path
+    producer_step: str
+    logical_version: str
+    schema_version: str
+    compression: str = "none"
+
+@dataclass(frozen=True)
+class LoggedArtifact:
+    artifact_id: str
+    run_id: str
+    logical_name: str
+    kind: str
+    store_uri: str
+    content_hash: str
+    content_size: int
+    logical_version: str
+    physical_version: str
+    status: str
+
+def log_artifacts(
+    run_id: str,
+    artifacts: Iterable[ArtifactSpec],
+    tracker_uri: str,
+    lineage_path: Path,
+    journal_path: Path,
+) -> list[LoggedArtifact]:
+    ...
 \end{lstlisting}
 
-Para swing trading: Integra con backtrader/Zipline para artefactos de portfolio optimization:
-\[ \max_\w \E[\ret] - \lambda \w^T \Sigma \w, \quad \w \in \Delta^{n-1}. \]
+\section{Pseudocódigo operacional}
 
-\section{Mejoras State-of-the-Art}
-- Integra LakeFS para branching datos.
-- AutoML metadata con Great Expectations.
-- Quantum checksums futuros (NIST post-cuánticos).
-- Backtest lineage: Vincula a QuantConnect/Backtrader runs para Sharpe simulados.
+\begin{lstlisting}[language=Python]
+def log_artifacts(run_id, artifacts, tracker_uri, lineage_path, journal_path):
+    specs = list(artifacts)
+    validate_manifest(run_id, specs)
 
-\section{Casos de Prueba y Criterios}
-15+ tests con pytest: coverage >95\%, incluyendo chaos (network fail).
+    prepared = []
+    for spec in specs:
+        content_hash = compute_sha256_streaming(spec.local_path)
+        content_size = spec.local_path.stat().st_size
+        artifact_id = make_artifact_id(run_id, spec, content_hash)
+        store_uri = build_store_uri(spec, content_hash)
 
-Checklist verificado al 100\%.
+        write_journal_event(journal_path, artifact_id, "hashed", "ok", {...})
 
-\section{Conclusión y Próximos Pasos}
-Este logger eleva reproducibilidad a industrial, clave para alpha persistente en swing (holding 3-10 días, winrate >60\%). Próximo: Optimizar para HFT extensions.
+        prepared.append(
+            PreparedArtifact(
+                artifact_id=artifact_id,
+                run_id=run_id,
+                spec=spec,
+                content_hash=content_hash,
+                content_size=content_size,
+                store_uri=store_uri,
+            )
+        )
 
-\printbibliography
+    committed = []
+    for item in prepared:
+        if remote_hash_exists(tracker_uri, item.content_hash):
+            upload_result = "deduplicated"
+        else:
+            upload_to_staging(tracker_uri, item)
+            promote_from_staging(tracker_uri, item)
+            upload_result = "uploaded"
+
+        write_journal_event(journal_path, item.artifact_id, "uploaded", upload_result, {...})
+        append_lineage_row(lineage_path, item, upload_result)
+        write_journal_event(journal_path, item.artifact_id, "committed", "ok", {...})
+
+        committed.append(materialize_logged_artifact(item, upload_result))
+
+    write_summary_json(run_id, committed)
+    return committed
+\end{lstlisting}
+
+\section{Matriz mínima de pruebas}
+
+Un módulo de este tipo no se valida con ejemplos felices únicamente. Debe probarse contra fallos reales.
+
+\subsection{Casos obligatorios}
+
+\begin{enumerate}
+    \item manifiesto vacío;
+    \item fichero inexistente;
+    \item tipo de artefacto no permitido;
+    \item colisión de clave lógica;
+    \item replay idempotente exacto;
+    \item mismo nombre lógico con hash distinto;
+    \item deduplicación por hash en dos \texttt{runs} distintos;
+    \item fallo de red antes de subir;
+    \item fallo de red después de subir y antes de commit;
+    \item corrupción detectada por hash;
+    \item escritura parcial del journal;
+    \item recuperación tras reinicio;
+    \item fichero mayor que límite;
+    \item compresión obligatoria no satisfecha;
+    \item orden determinista de commits.
+\end{enumerate}
+
+\subsection{Criterio de calidad}
+
+La métrica importante no es solo cobertura, sino cobertura sobre rutas de fallo. Un estándar razonable es:
+
+\begin{itemize}
+    \item cobertura alta en funciones críticas;
+    \item tests específicos de idempotencia;
+    \item tests de recuperación;
+    \item tests de consistencia entre lineage y backend remoto.
+\end{itemize}
+
+\section{Errores y semántica de fallo}
+
+Las excepciones deben distinguir entre:
+
+\begin{itemize}
+    \item \texttt{ValidationError}
+    \item \texttt{ConflictError}
+    \item \texttt{UploadError}
+    \item \texttt{CommitError}
+    \item \texttt{RecoveryError}
+\end{itemize}
+
+La semántica debe ser clara:
+
+\begin{itemize}
+    \item los errores de validación no se reintentan;
+    \item los errores transitorios de red sí se reintentan con política explícita;
+    \item los errores de conflicto exigen intervención o nueva versión lógica;
+    \item cualquier artefacto no comprometido debe quedar trazado en journal.
+\end{itemize}
+
+\section{Conclusión}
+
+Un \texttt{artifact\_logger} serio no se mide por adjetivos, sino por el número de ambigüedades que elimina. La especificación correcta para este módulo no consiste en proclamar “trazabilidad industrial”, sino en dejar resueltas las preguntas que rompen reproducibilidad en sistemas reales:
+
+\begin{itemize}
+    \item qué entra y con qué contrato;
+    \item qué se considera versión;
+    \item qué significa reintentar;
+    \item cuándo un artefacto está verdaderamente publicado;
+    \item cómo se detecta y repara un estado parcial;
+    \item cómo se separa identidad lógica de contenido físico.
+\end{itemize}
+
+Si este módulo respeta los invariantes anteriores, entonces la capa de investigación del sistema podrá reconstruir con precisión qué modelo, qué datos, qué configuración y qué reporte corresponden a cada experimento de \textit{swing trading}. Esa es la propiedad que importa.
 
 \end{document}

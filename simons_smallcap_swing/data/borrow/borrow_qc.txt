@@ -6,280 +6,552 @@
 \usepackage{graphicx}
 \usepackage{hyperref}
 \usepackage[margin=2.5cm]{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
 
-\title{Módulo de Quality Control de Borrow: \texttt{data/borrow/borrow\_qc.py}}
+\title{Especificación Research--Production del Control de Calidad de Borrow para \texttt{data/borrow/borrow\_qc.py}}
 \author{}
 \date{}
 
 \begin{document}
 \maketitle
 
-
 \section{Objetivo del módulo}
-El módulo \texttt{data/borrow/borrow\_qc.py} realiza un \emph{audit de calidad} de los datos y proxies de \emph{borrow} y \emph{locate} para asegurar su consistencia, cobertura y realismo en supuestos de \emph{shorting} dentro de un sistema de trading cuantitativo industrial.  
 
-El objetivo es garantizar que:
-\begin{itemize}
-  \item El \emph{borrow fee proxy} y el \emph{availability score} estén en rangos razonables y libres de outliers críticos.
-  \item La cobertura por universo y por fecha sea suficiente para backtest robustos.
-  \item El comportamiento temporal sea estable (sin saltos extremos día a día).
-  \item El sistema de \emph{locate} esté alineado con las reglas de borrow fee y disponibilidad (por ejemplo, bloquear cortos cuando el coste o la falta de inventario así lo dictan).
+El módulo \texttt{data/borrow/borrow\_qc.py} implementa la capa formal de control de calidad de los datos y proxies de \emph{borrow}, disponibilidad de inventario y reglas de \emph{locate} utilizadas por el sistema \texttt{simons\_smallcap\_swing} para modelizar de forma realista el lado corto.
+
+Su función no es meramente descriptiva ni exploratoria. El módulo existe para decidir, de forma reproducible, trazable y causal, si el estado de los datos de préstamo en una fecha dada permite:
+
+\begin{itemize}[leftmargin=2em]
+    \item ejecutar backtests con realismo suficiente;
+    \item consumir el \texttt{borrow\_cost\_proxy} y el \texttt{locate\_filter} sin introducir sesgos optimistas;
+    \item detectar degradaciones estructurales de cobertura, consistencia o estabilidad antes de que contaminen construcción de cartera, estimación de retornos netos o evaluación de alpha.
 \end{itemize}
 
-Este auditor actúa como una \emph{capa de validación científica} antes de usar los proxies de borrow en estrategias de swing trading, similar a las prácticas de control de calidad de datos de securities finance y lending en la industria \cite{spg2023securitiesfinance, quantrocket2024borrowfees, neudata2025shortinterest}.
+En consecuencia, este QC debe actuar como un \textbf{gate operativo} y no como un simple dashboard. La salida principal del módulo es una decisión diaria de calidad (\texttt{pass}/\texttt{warn}/\texttt{fail}) acompañada de un diagnóstico granular por símbolo, fecha, tipo de error y severidad.
 
+\section{Alcance}
 
-\section{Alcance del control de calidad}
-El módulo implementa:
-\begin{itemize}
-  \item \textbf{Checks de rango} para \texttt{borrow\_fee\_proxy} y \texttt{availability\_score}.
-  \item \textbf{Checks de cobertura}: por fecha y por universo.
-  \item \textbf{Checks de estabilidad temporal}: saltos extremos día a día en el borrow fee.
-  \item \textbf{Checks de coherencia} entre el proxy de borrow y el filtro de \texttt{locate} (qué activos se marcan como \emph{blocked} según el coste y la disponibilidad).
+El módulo controla cinco dimensiones, todas obligatorias:
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Integridad estructural}: presencia de columnas requeridas, unicidad por símbolo/fecha, tipos válidos, ausencia de duplicados.
+    \item \textbf{Validez numérica}: rangos admisibles para \texttt{borrow\_fee}, \texttt{availability}, \texttt{stress\_score} y flags derivados.
+    \item \textbf{Cobertura}: porcentaje del universo con datos utilizables y calidad mínima suficiente.
+    \item \textbf{Estabilidad temporal}: detección de saltos anómalos, series obsoletas, discontinuidades por cambios de régimen o fallos del pipeline.
+    \item \textbf{Coherencia lógica}: alineación entre el coste estimado de préstamo, la disponibilidad, los flags HTB y la decisión final de \texttt{locate}.
+\end{enumerate}
+
+Quedan explícitamente fuera del alcance:
+\begin{itemize}[leftmargin=2em]
+    \item la reconstrucción del mercado completo de securities lending;
+    \item la reestimación del proxy de borrow;
+    \item la modificación automática de posiciones ya ejecutadas.
 \end{itemize}
 
-La salida se estructura como:
-\begin{itemize}
-  \item Un \emph{summary} de QC por \texttt{run\_id}.
-  \item Un panel diario agregado.
-  \item Un registro de \emph{failures} (violaciones de reglas).
-  \item Un \texttt{manifest.json} para trazabilidad de metadatos.
+Sí está dentro del alcance la generación de señales de rechazo o degradación que puedan ser consumidas por el motor de backtest o por la capa de portfolio construction.
+
+\section{Principios de diseño no negociables}
+
+La especificación del QC se rige por los siguientes principios:
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Causalidad}: el QC sólo puede usar información disponible en la fecha efectiva del job.
+    \item \textbf{Conservadurismo}: ante duda entre error benigno y error crítico, prevalece la interpretación más severa.
+    \item \textbf{Trazabilidad}: todo gate y toda violación deben ser explicables mediante reglas versionadas.
+    \item \textbf{Separación entre fallo duro y degradación blanda}: no toda anomalía exige \texttt{fail}, pero toda anomalía debe quedar clasificada.
+    \item \textbf{Invariancia contractual}: si cambia el universo, la cobertura debe interpretarse respecto del universo efectivo de esa fecha, no respecto de universos futuros o retrospectivos.
+    \item \textbf{No arbitraje informal}: la resolución de conflictos entre checks debe seguir una precedencia formal definida en esta especificación.
+\end{enumerate}
+
+\section{Entradas, dependencias y contrato mínimo}
+
+Entradas requeridas:
+
+\begin{itemize}[leftmargin=2em]
+    \item \texttt{borrow\_proxy\_path}: output de \texttt{borrow\_cost\_proxy.py}, con granularidad símbolo/fecha.
+    \item \texttt{locate\_filter\_path}: output de \texttt{locate\_filter.py}, con flags de elegibilidad de corto.
+    \item \texttt{universe\_path}: universo causalmente elegible por fecha.
+    \item \texttt{qc\_config\_path}: parámetros versionados del QC.
+    \item \texttt{run\_id}: identificador único de ejecución.
 \end{itemize}
 
+El QC asume que el dataset de \texttt{borrow\_proxy} contiene, como mínimo:
 
-\section{Entradas y arquitectura}
-Entradas utilizadas:
-\begin{itemize}
-  \item \texttt{borrow\_proxy\_path}: output de \texttt{borrow\_cost\_proxy.py} (por dia, simbolo).
-  \item \texttt{locate\_filter\_path}: flags de \emph{locate} (allowed/blocked) por símbolo/fecha.
-  \item \texttt{universe\_path}: universo de activos elegibles.
-  \item \texttt{qc\_config\_path}: umbrales de rango, cobertura mínima, umbrales de \emph{jump} y de coherencia locate.
-  \item \texttt{run\_id}: id único para el job de QC.
-\end{itemize}
+\begin{center}
+\begin{tabular}{>{\ttfamily}p{4.3cm} p{8.3cm}}
+\toprule
+\textnormal{\textbf{Campo}} & \textbf{Descripción} \\
+\midrule
+symbol & ticker normalizado \\
+date & fecha efectiva \\
+borrow\_fee\_annual & fee anualizado estimado \\
+borrow\_fee\_daily & fee diario equivalente \\
+borrow\_availability\_score & score en $[0,1]$ \\
+htb\_flag & hard-to-borrow flag \\
+borrow\_tier & easy / medium / hard / blocked \\
+proxy\_quality & high / medium / low \\
+proxy\_source & fuente dominante \\
+stress\_score & score latente del proxy \\
+jump\_flag & flag de salto del proxy \\
+stale\_input\_flag & flag de input obsoleto \\
+fallback\_flag & flag de fallback \\
+config\_version & versión del proxy \\
+\bottomrule
+\end{tabular}
+\end{center}
 
-La arquitectura de datos sigue un esquema de fact table por símbolo/fecha:
+Si faltan columnas obligatorias, el QC no continúa a checks posteriores: se emite \texttt{fail} estructural.
+
+\section{Representación formal del dataset}
+
+Sea $\mathcal{U}_t$ el universo efectivo en fecha $t$, y sea:
+
 \[
-  \mathcal{D}_{t} = \{ (i, t, \widehat{B}_{i,t}, \alpha_{i,t}, L_{i,t}) \}_{i \in \mathcal{U}_t},
+\mathcal{D}_t = \left\{(i,t,\widehat{B}_{i,t},\widehat{b}_{i,t},\alpha_{i,t},H_{i,t},T_{i,t},Q_{i,t},L_{i,t})\right\}_{i\in\mathcal{U}_t^\ast},
 \]
+
 donde:
-\begin{itemize}
-  \item $ \widehat{B}_{i,t} $: \emph{borrow fee proxy} anualizado.
-  \item $ \alpha_{i,t} \in [0,1] $: \emph{availability score}.
-  \item $ L_{i,t} \in \{0,1\} $: \emph{locate} habilitado (0 = bloqueado).
+\begin{itemize}[leftmargin=2em]
+    \item $\widehat{B}_{i,t}$ es el \emph{borrow fee} anualizado;
+    \item $\widehat{b}_{i,t}$ es el coste diario;
+    \item $\alpha_{i,t}\in[0,1]$ es el \emph{availability score};
+    \item $H_{i,t}\in\{0,1\}$ es el flag HTB;
+    \item $T_{i,t}\in\{\texttt{easy},\texttt{medium},\texttt{hard},\texttt{blocked}\}$ es el tier;
+    \item $Q_{i,t}\in\{\texttt{high},\texttt{medium},\texttt{low}\}$ es la calidad del proxy;
+    \item $L_{i,t}\in\{0,1\}$ es la elegibilidad de locate, con $0=$ bloqueado;
+    \item $\mathcal{U}_t^\ast\subseteq\mathcal{U}_t$ denota el subconjunto con registros presentes tras el join.
 \end{itemize}
 
-Sobre este conjunto se calculan métricas diarias y se generan alertas cuando se violan los checks.
+El QC opera siempre sobre el \textbf{join causal} entre \texttt{universe}, \texttt{borrow\_proxy} y \texttt{locate\_filter}. Las ausencias de join son, en sí mismas, eventos de calidad.
 
+\section{Jerarquía de checks}
 
-\section{Checks obligatorios}
-Los checks se diseñan como funciones de validación $ C_j $ sobre el conjunto diario $ \mathcal{D}_t $.  
+Los checks no son homogéneos. Se dividen en cuatro niveles de severidad:
 
-\subsection{Rango de borrow fee y availability}
-\begin{itemize}
-  \item \textbf{Non‑negativity}:
-  \[
-    C_{\text{fee}}(\mathcal{D}_t) = \mathbb{1}\left( \min_{i \in \mathcal{U}_t} \widehat{B}_{i,t} \geq 0 \right).
-  \]
-  Saltos negativos indican errores de estimación o transformación en el pipeline de \texttt{borrow\_cost\_proxy.py} \cite{hankins2018termstructure, guerrieri2025securitieslending}.
-  \item \textbf{Normalization de availability}:
-  \[
-    C_{\text{avail}}(\mathcal{D}_t) = \mathbb{1}\left( \alpha_{i,t} \in [0,1] \quad \forall i \in \mathcal{U}_t \right).
-  \]
-  Valores fuera de este rango sugieren problemas en el modelo de \emph{availability score} (por ejemplo, falta de saturación en transformaciones logísticas o no‑lineales).
-\end{itemize}
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Nivel 0 -- structural hard fails}: ausencia de columnas, duplicados por clave primaria, fechas inválidas, tipos incompatibles.
+    \item \textbf{Nivel 1 -- numeric hard fails}: fees negativos, availability fuera de $[0,1]$, NaNs en campos críticos, símbolos con múltiples decisiones de locate para la misma fecha.
+    \item \textbf{Nivel 2 -- soft degradation}: cobertura insuficiente, saltos anómalos, inputs obsoletos, exceso de fallback, inconsistencia moderada entre borrow y locate.
+    \item \textbf{Nivel 3 -- informational}: métricas de monitorización que no cambian gate por sí mismas, pero enriquecen diagnóstico.
+\end{enumerate}
 
-\subsection{Cobertura mínima por universo}
-Sea $ N_t = |\mathcal{U}_t| $ el número de activos en el universo en $ t $, y $ N_t^{\text{qc}} \leq N_t $ el número de activos con borrow proxy y locate definidos.
+Esta jerarquía es vinculante. Un fallo de nivel superior domina el gate final aunque el resto de checks sea satisfactorio.
 
-La \emph{coverage rate} diaria:
+\section{Checks estructurales obligatorios}
+
+\subsection{Unicidad por símbolo y fecha}
+
+Para toda fecha $t$:
 \[
-  \psi_t = \frac{N_t^{\text{qc}}}{N_t}.
+C_{\text{unique}}(\mathcal{D}_t)=
+\mathbb{1}\left(
+\text{cada }(i,t)\text{ aparece a lo sumo una vez}
+\right).
 \]
 
-El check de cobertura:
-\[
-  C_{\text{cov}}(\mathcal{D}_t) = \mathbb{1}\left( \psi_t \geq \theta_{\psi} \right),
-\]
-con $ \theta_{\psi} \in (0,1) $ ajustado según el universo y el objetivo de backtest (por ejemplo, 0.95 para carteras largas y 0.9 para estrategias concentradas) \cite{spg2023securitiesfinance, neudata2025shortinterest}.
+Si un símbolo aparece duplicado en \texttt{borrow\_proxy} o en \texttt{locate\_filter}, se registra un \texttt{duplicate\_key\_failure} y el gate pasa a \texttt{fail}.
 
-\subsection{Saltos extremos día a día}
-Para el borrow fee:
-\[
-  \Delta \widehat{B}_{i,t} = \frac{ \left| \widehat{B}_{i,t} - \widehat{B}_{i,t-1} \right| }{ \max\left( \widehat{B}_{i,t-1}, \epsilon \right) },
-\]
-con $ \epsilon $ un pequeño offset para evitar divisiones por cero.
+\subsection{Presencia de columnas obligatorias}
 
-Un \textbf{jump flag}:
+Sea $\mathcal{R}$ el conjunto de columnas requeridas. Entonces:
 \[
-  J_{i,t} = \mathbb{1}\left( \Delta \widehat{B}_{i,t} > \theta_{\text{jump}} \right).
+C_{\text{schema}} = \mathbb{1}(\mathcal{R}\subseteq \text{columns}).
 \]
 
-El módulo:
-\begin{itemize}
-  \item Cuenta el número de saltos extremos:
-  \[
-    J_t^{\text{count}} = \sum_{i \in \mathcal{U}_t} J_{i,t}.
-  \]
-  \item Emite una alerta cuando $ J_t^{\text{count}} $ supera un umbral de robustez (por ejemplo, \% de símbolos con saltos).  
-\end{itemize}
+Si $C_{\text{schema}}=0$, el QC se interrumpe. No se intenta imputar ni continuar.
 
-Esto ayuda a identificar:
-\begin{itemize}
-  \item Cambios abruptos en feeds parciales de securities lending.
-  \item Cambios de bucket o umbrales en el modelo de \texttt{borrow\_cost\_proxy} \cite{hankins2018termstructure, guerrieri2025securitieslending}.
-\end{itemize}
+\subsection{Dominio de variables categóricas}
 
-\subsection{Coherencia entre borrow y locate}
-El sistema de \emph{locate} debe bloquear cortos cuando el coste de préstamo o la falta de disponibilidad lo justifican.  
-
-Definimos:
-\begin{itemize}
-  \item \textbf{Regla de block por coste}:
-  \[
-    R_{B}(i,t) = \mathbb{1}\left( \widehat{B}_{i,t} > \theta_B^{\text{block}} \right).
-  \]
-  \item \textbf{Regla de block por disponibilidad}:
-  \[
-    R_{\alpha}(i,t) = \mathbb{1}\left( \alpha_{i,t} < \theta_{\alpha}^{\text{block}} \right).
-  \]
-\end{itemize}
-
-El \textbf{flag de bloqueo esperado}:
+Debe cumplirse:
 \[
-  E_{i,t} = R_{B}(i,t) \vee R_{\alpha}(i,t).
+T_{i,t}\in\{\texttt{easy},\texttt{medium},\texttt{hard},\texttt{blocked}\},\qquad
+Q_{i,t}\in\{\texttt{high},\texttt{medium},\texttt{low}\}.
 \]
 
-El \textbf{flag de bloqueo real}:
+Valores fuera de catálogo se consideran error duro.
+
+\section{Checks numéricos obligatorios}
+
+\subsection{No negatividad y límites de fee}
+
 \[
-  R_{i,t}^{(L)} = \mathbb{1}\left( L_{i,t} = 0 \right).
+C_{\text{fee-lb}}(\mathcal{D}_t)=
+\mathbb{1}\left(\min_{i\in\mathcal{U}_t^\ast}\widehat{B}_{i,t}\ge 0\right).
 \]
 
-El \textbf{inconsistency flag}:
+Además, se define un límite superior de sanidad:
 \[
-  I_{i,t} = \mathbb{1}\left( E_{i,t} \neq R_{i,t}^{(L)} \right).
+C_{\text{fee-ub}}(\mathcal{D}_t)=
+\mathbb{1}\left(\widehat{B}_{i,t}\le B_{\max}^{\text{qc}}\quad \forall i\in\mathcal{U}_t^\ast\right).
 \]
 
-El número de inconsistencias diarias:
+Que exista un fee muy alto no implica automáticamente error, pero sí exige clasificación contextual:
+\begin{itemize}[leftmargin=2em]
+    \item si el símbolo está marcado como HTB y el valor cae dentro del rango extremo permitido por configuración, se registra \texttt{warn} contextual;
+    \item si excede el techo absoluto del sistema sin justificación HTB, se registra \texttt{fail}.
+\end{itemize}
+
+\subsection{Normalización de availability}
+
 \[
-  I_t^{\text{count}} = \sum_{i \in \mathcal{U}_t} I_{i,t}.
+C_{\text{avail}}(\mathcal{D}_t)=
+\mathbb{1}\left(0\le \alpha_{i,t}\le 1 \quad \forall i\in\mathcal{U}_t^\ast\right).
 \]
 
-El módulo debe:
-\begin{itemize}
-  \item Reportar $ I_t^{\text{count}} $ como \texttt{inconsistency\_count}.
-  \item Actuar como \textbf{feedback loop} para ajustar los umbrales $ \theta_B^{\text{block}}, \theta_{\alpha}^{\text{block}} $ en el sistema de locate.
-\end{itemize}
+Cualquier valor fuera de ese rango es un error de implementación o de transformación y produce \texttt{fail}.
 
-Esto encaja en la literatura de \emph{securities lending data quality} y coherencia entre inventario y costes de prestación, que se aplica en plataformas de crédito y trading cuantitativo \cite{spg2023securitiesfinance, neudata2025shortinterest, quantrocket2024borrowfees}.
+\subsection{Completitud de campos críticos}
 
-
-\section{Gates de calidad (pass / warn / fail)}
-El módulo emite un \emph{gate} diario para la capa de borrow:
-
-\begin{itemize}
-  \item \textbf{pass}: todas las validaciones obligatorias cumplen y las métricas están dentro de umbrales de operación normal.
-  \item \textbf{warn}: degradación moderada de cobertura o de calidad (por ejemplo, cobertura baja durante cortos períodos, pocos saltos extremos, o consistencia locate cercana al límite).
-  \item \textbf{fail}: inconsistencias críticas (por ejemplo, borrow fee negativo, cobertura por debajo de un mínimo absoluto, gran número de inconsistencias locate, o saltos masivos en el borrow fee).
-\end{itemize}
-
-El gate puede definirse formalmente como:
+Definimos el conjunto crítico:
 \[
-  \text{Gate}_t =
-  \begin{cases}
-    \text{fail}   & \text{si } C_{\text{fee}}(\mathcal{D}_t) = 0 \text{ o } C_{\text{avail}}(\mathcal{D}_t) = 0 \text{ o } \psi_t < \theta_{\psi}^{\text{hard}}, \\
-    \text{warn}  & \text{si } \psi_t \in [\theta_{\psi}^{\text{soft}}, \theta_{\psi}^{\text{hard}}) \text{ o } I_t^{\text{count}} > \theta_I^{\text{warn}}, \\
-    \text{pass}  & \text{en otro caso}.
-  \end{cases}
+\mathcal{K}=\{\widehat{B}_{i,t},\alpha_{i,t},T_{i,t},L_{i,t}\}.
 \]
 
-Este tipo de gating es análogo a los sistemas de calidad de datos usados en supervisión financiera y en riesgo de datos (data quality gates) \cite{fsb2015globaldata, boe2025collateral, imf2025haircuts}.
+El check:
+\[
+C_{\text{nonnull}}(\mathcal{D}_t)=
+\mathbb{1}\left(\text{ningún campo de }\mathcal{K}\text{ es NaN}\right).
+\]
 
+Los NaNs en campos críticos nunca se imputan dentro del QC. Se contabilizan como fallo.
 
-\section{Flujo de ejecución}
-El flujo del módulo es:
+\section{Cobertura y sensibilidad al cambio de universo}
 
-1. \textbf{Carga de datos y config}.
-   \begin{itemize}
-     \item Cargar \texttt{borrow\_proxy}, \texttt{locate\_filter}, \texttt{universe}.
-     \item Cargar \texttt{qc\_config} (umbrales de rango, cobertura, jump, coherencia).
-   \end{itemize}
+Sea $N_t=|\mathcal{U}_t|$ y sea $N_t^{\text{valid}}$ el número de símbolos del universo con join válido y campos críticos presentes.
 
-2. \textbf{Ejecución de checks por símbolo/fecha}.
-   \begin{itemize}
-     \item Calcular flags de rango, cobertura, jump, inconsistencia.
-   \end{itemize}
+La cobertura diaria:
+\[
+\psi_t=\frac{N_t^{\text{valid}}}{N_t}.
+\]
 
-3. \textbf{Agregación diaria}.
-   \begin{itemize}
-     \item Métricas por fecha:
-     \[
-       \text{coverage\_rate}_t = \psi_t,
-       \quad
-       \text{blocked\_share}_t = \frac{1}{N_t} \sum_{i \in \mathcal{U}_t} \mathbb{1}\left( R_{i,t}^{(L)} = 1 \right),
-     \]
-     \[
-       \text{avg\_borrow\_fee\_daily}_t = \frac{1}{N_t^{\text{qc}}} \sum_{i \in \mathcal{U}_t} \widehat{b}_{i,t},
-       \quad
-       \text{p95\_borrow\_fee\_daily}_t = \text{percentil 95} \left( \widehat{b}_{i,t} \right),
-     \]
-     \[
-       \text{inconsistency\_count}_t = I_t^{\text{count}}.
-     \]
-   \end{itemize}
+La cobertura debe analizarse respecto del universo efectivo del día. Esto es importante: si el universo cambia por rebalanceo, entradas, salidas o corporates, el QC no debe interpretar automáticamente esa variación como degradación del pipeline.
 
-4. \textbf{Emitir gate y reportes}.
-   \begin{itemize}
-     \item Persistir:
-     \begin{itemize}
-       \item \texttt{borrow\_qc\_summary.json}.
-       \item \texttt{borrow\_qc\_daily.parquet} (métricas diarias).
-       \item \texttt{borrow\_qc\_failures.parquet} (registros de violaciones).
-       \item \texttt{manifest.json} (metadatos de ejecución y umbrales).
-     \end{itemize}
-   \end{itemize}
+Se definen tres umbrales:
+\[
+\theta_{\psi}^{\text{pass}} > \theta_{\psi}^{\text{warn}} > \theta_{\psi}^{\text{fail}}.
+\]
 
+Regla:
+\[
+\text{CoverageGate}_t=
+\begin{cases}
+\texttt{fail} & \text{si } \psi_t<\theta_{\psi}^{\text{fail}},\\
+\texttt{warn} & \text{si } \theta_{\psi}^{\text{fail}}\le \psi_t < \theta_{\psi}^{\text{pass}},\\
+\texttt{pass} & \text{si } \psi_t\ge \theta_{\psi}^{\text{pass}}.
+\end{cases}
+\]
 
-\section{Métricas de calidad de borrow}
-Las métricas clave a monitorizar son:
-
-\begin{itemize}
-  \item \textbf{coverage\_rate}: porcentaje de universo con datos de borrow y locate.
-  \item \textbf{blocked\_share}: porcentaje de activos bloqueados para shorting.
-  \item \textbf{avg\_borrow\_fee\_daily}: coste medio de préstamo diario.
-  \item \textbf{p95\_borrow\_fee\_daily}: refleja el sesgo hacia activos HTB en el universo.
-  \item \textbf{inconsistency\_count}: indicador de discrepancia entre proxies y reglas de locate.
+Además, se calcula cobertura estratificada por:
+\begin{itemize}[leftmargin=2em]
+    \item tamaño;
+    \item bucket de liquidez;
+    \item bucket de borrow tier;
+    \item largo/corto si el universo está etiquetado para ello.
 \end{itemize}
 
-Estas métricas permiten:
-\begin{itemize}
-  \item Monitorear la evolución temporal del \emph{borrow cost landscape} del universo.
-  \item Calibrar umbrales de locate y decisiones de cartera (por ejemplo, máximo \% de activos HTB aceptados).
-  \item Validar que el sistema de \emph{borrow\_cost\_proxy} no introduce \emph{data leakage} o comportamientos no razonables \cite{spg2023securitiesfinance, quantrocket2024borrowfees}.
+Esto evita que una cobertura global alta esconda un colapso selectivo precisamente en el subuniverso de nombres difíciles de prestar.
+
+\section{Checks de estabilidad temporal}
+
+El problema no es sólo detectar saltos, sino distinguir cambios reales del mercado de errores de pipeline. Para ello el QC usa un esquema dual.
+
+\subsection{Jump ratio por símbolo}
+
+\[
+\Delta \widehat{B}_{i,t}
+=
+\frac{|\widehat{B}_{i,t}-\widehat{B}_{i,t-1}|}
+{\max(\widehat{B}_{i,t-1},\epsilon)}.
+\]
+
+Se define:
+\[
+J_{i,t}=
+\mathbb{1}\left(\Delta \widehat{B}_{i,t}>\theta_{\text{jump}}^{\text{sym}}\right).
+\]
+
+\subsection{Jump share diario}
+
+\[
+\phi_t^{\text{jump}}=
+\frac{1}{N_t^{\text{stable}}}\sum_{i\in\mathcal{U}_t^{\text{stable}}}J_{i,t},
+\]
+donde $\mathcal{U}_t^{\text{stable}}$ excluye símbolos nuevos, recientemente reincorporados o sin histórico suficiente.
+
+Esto es crucial: no se debe castigar al sistema por símbolos que aparecen por primera vez o tras una suspensión larga.
+
+\subsection{Clasificación contextual del salto}
+
+Cada salto se clasifica en una de estas categorías:
+
+\begin{itemize}[leftmargin=2em]
+    \item \texttt{market\_plausible}: coincide con deterioro fuerte de liquidez, aumento HTB, cambio severo de availability o eventos conocidos del símbolo;
+    \item \texttt{config\_induced}: cambio simultáneo en \texttt{config\_version} o buckets;
+    \item \texttt{pipeline\_suspicious}: no existe explicación económica ni de configuración;
+    \item \texttt{insufficient\_history}: no clasificable por falta de serie previa.
 \end{itemize}
 
+Sólo los saltos \texttt{pipeline\_suspicious} contribuyen plenamente al deterioration score del gate.
 
-\section{Uso en backtest y validación}
-El output del módulo se consume en:
+\section{Obsolescencia, staleness y calendario}
 
-\begin{itemize}
-  \item \textbf{Pipeline de backtest}: el \texttt{gate} de calidad borrow se usa como precondición antes de ejecutar backtest de estrategias de \emph{shorting} y \emph{swing trading}.  
-  \item \textbf{Validación de estrategias}: se puede:
-  \begin{itemize}
-    \item Segmentar el histórico en periodos \texttt{pass/warn/fail} y analizar el \emph{alpha} y \emph{risk‑adjusted returns} separadamente.
-    \item Comparar el impacto del coste de prestamo neto cuando se usa el \texttt{borrow\_fee\_proxy} filtrado por QC.
-  \end{itemize}
+Un QC serio debe distinguir entre falta de cambio y dato obsoleto. Para ello se define un \emph{staleness horizon} por fuente. Sea $\tau_{i,t}^{\text{last-update}}$ la última fecha efectiva de actualización del proxy o de alguno de sus inputs dominantes.
+
+El \texttt{stale\_flag}:
+\[
+S_{i,t}=
+\mathbb{1}\left(
+t-\tau_{i,t}^{\text{last-update}} > \theta_{\text{stale}}
+\right).
+\]
+
+La interpretación del horizonte debe respetar:
+\begin{itemize}[leftmargin=2em]
+    \item fines de semana;
+    \item market holidays;
+    \item calendarios parciales del proveedor.
 \end{itemize}
 
-Además, el módulo permite:
-\begin{itemize}
-  \item Controlar la exposición a activos HTB en el backtest, restringiendo la cartera cuando el \texttt{coverage\_rate} es bajo o el \texttt{gate} está en \texttt{warn/fail}.
-  \item Ajustar umbrales de \texttt{borrow\_fee} y \texttt{availability} en el sistema de \texttt{locate\_filter} según la calidad observada en el \texttt{borrow\_qc}.
+El contador de días se hace en \textbf{trading days} y no en días naturales. Esto corrige una de las grandes fuentes de falsos positivos en QC temporales.
+
+\section{Coherencia formal entre borrow y locate}
+
+La capa de \texttt{locate} no puede ignorar sistemáticamente señales severas del proxy de borrow. Definimos:
+
+\[
+R_{B}(i,t)=
+\mathbb{1}\left(\widehat{B}_{i,t}>\theta_B^{\text{block}}\right),
+\qquad
+R_{\alpha}(i,t)=
+\mathbb{1}\left(\alpha_{i,t}<\theta_\alpha^{\text{block}}\right),
+\qquad
+R_{H}(i,t)=H_{i,t}.
+\]
+
+La expectativa mínima de bloqueo:
+\[
+E_{i,t}=R_B(i,t)\vee R_\alpha(i,t)\vee R_H(i,t).
+\]
+
+La decisión real de locate:
+\[
+R^{(L)}_{i,t}=\mathbb{1}(L_{i,t}=0).
+\]
+
+La inconsistencia básica:
+\[
+I_{i,t}=\mathbb{1}(E_{i,t}\neq R^{(L)}_{i,t}).
+\]
+
+Pero el QC no debe quedarse en una inconsistencia binaria plana. Se distinguen cuatro casos:
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Under-blocking crítico}: $E_{i,t}=1$ y $R^{(L)}_{i,t}=0$ no se cumple, es decir, el locate permite un nombre que debía bloquearse.
+    \item \textbf{Over-blocking}: $E_{i,t}=0$ y locate bloquea.
+    \item \textbf{Boundary disagreement}: el símbolo está muy cerca del umbral y la discrepancia puede ser explicable por hysteresis.
+    \item \textbf{Expected exception}: existe una regla de override explícita documentada.
+\end{enumerate}
+
+Sólo el \textbf{under-blocking crítico} tiene severidad de \texttt{fail} potencial, porque introduce el sesgo más peligroso: permitir cortos ficticiamente accesibles.
+
+\section{Scoring agregado de calidad}
+
+La versión anterior hablaba de \texttt{pass/warn/fail} pero no cerraba del todo el mecanismo agregador. Aquí se fija un scoring oficial.
+
+Sea:
+\[
+\text{Score}_t
+=
+w_1 s_t^{\text{coverage}}
++
+w_2 s_t^{\text{stability}}
++
+w_3 s_t^{\text{coherence}}
++
+w_4 s_t^{\text{freshness}}
++
+w_5 s_t^{\text{schema}},
+\]
+donde cada subscore pertenece a $[0,100]$.
+
+Reglas:
+\begin{itemize}[leftmargin=2em]
+    \item \texttt{schema} y \texttt{numeric hard fails} no son compensables: si fallan, el gate es \texttt{fail} aunque el score agregado sea alto;
+    \item \texttt{coverage}, \texttt{stability}, \texttt{coherence} y \texttt{freshness} sí pueden agregarse;
+    \item los pesos $w_j$ deben sumar 1 y quedan versionados en config.
 \end{itemize}
 
-El \textbf{Definition of Done} (DoD) es:
-\begin{itemize}
-  \item El \emph{gate de calidad borrow} está disponible y documentado para consumo en backtest y validación.
-  \item Los outputs de QC pueden ser visualizados y debuggeados (por ejemplo, gráficos de coverage, borrow fee medio, p95 de borrow fee y inconsistencias locate).
-  \item El sistema de \texttt{borrow\_qc} proporciona diagnóstico temprano de degradación de datos de securities lending y proxy de coste de préstamo, permitiendo una toma de decisiones robusta en el diseño de estrategias de shorting y swing trading industrial \cite{spg2023securitiesfinance, quantrocket2024borrowfees, neudata2025shortinterest}.
+Una parametrización razonable es:
+\[
+(w_1,w_2,w_3,w_4,w_5)=(0.30,0.20,0.30,0.10,0.10).
+\]
+
+\section{Gate final}
+
+El gate diario oficial se define por precedencia:
+
+\subsection*{Paso 1: hard fail dominance}
+\[
+\texttt{fail} \quad \text{si existe al menos un fallo estructural o numérico duro.}
+\]
+
+\subsection*{Paso 2: critical coherence failure}
+\[
+\texttt{fail} \quad \text{si la tasa de under-blocking crítico excede } \theta_{\text{ub}}^{\text{fail}}.
+\]
+
+\subsection*{Paso 3: aggregate score}
+Si no se activan los pasos anteriores:
+\[
+\text{Gate}_t=
+\begin{cases}
+\texttt{pass} & \text{si } \text{Score}_t\ge \theta_{\text{score}}^{\text{pass}},\\
+\texttt{warn} & \text{si } \theta_{\text{score}}^{\text{warn}}\le \text{Score}_t<\theta_{\text{score}}^{\text{pass}},\\
+\texttt{fail} & \text{si } \text{Score}_t<\theta_{\text{score}}^{\text{warn}}.
+\end{cases}
+\]
+
+Esto elimina el arbitraje ad hoc. El gate ya no depende de impresiones subjetivas, sino de una precedencia formal.
+
+\section{Política de imputación y valores faltantes}
+
+El QC no debe mezclar auditoría con reparación silenciosa. Por tanto:
+
+\begin{itemize}[leftmargin=2em]
+    \item no se imputan \texttt{borrow\_fee}, \texttt{availability} ni \texttt{locate} dentro del propio módulo;
+    \item sí se permite etiquetar el tipo de missingness: \texttt{missing\_join}, \texttt{missing\_critical}, \texttt{stale\_carry}, \texttt{universe\_entry};
+    \item los missing de campos críticos penalizan cobertura y/o integridad, según su naturaleza;
+    \item sólo se admite \texttt{carry-forward} si ya fue realizado aguas arriba y quedó explícitamente marcado en el dataset.
 \end{itemize}
 
+\section{Versionado y comparabilidad histórica}
+
+Todo output del QC debe incluir:
+\begin{itemize}[leftmargin=2em]
+    \item versión del \texttt{borrow\_cost\_proxy};
+    \item versión del \texttt{locate\_filter};
+    \item versión de \texttt{qc\_config};
+    \item hash o firma del contrato de columnas;
+    \item timestamp de ejecución;
+    \item calendario de mercado utilizado.
+\end{itemize}
+
+Si cambia \texttt{config\_version}, el QC debe marcar la fecha como \texttt{config\_regime\_change}. Esto evita interpretar una modificación voluntaria de thresholds como deterioro espontáneo del dato.
+
+\section{Outputs obligatorios}
+
+El módulo debe persistir, como mínimo:
+
+\begin{enumerate}[leftmargin=2em]
+    \item \texttt{borrow\_qc\_summary.json}
+    \item \texttt{borrow\_qc\_daily.parquet}
+    \item \texttt{borrow\_qc\_failures.parquet}
+    \item \texttt{manifest.json}
+\end{enumerate}
+
+\subsection{Summary}
+
+Debe contener:
+\begin{itemize}[leftmargin=2em]
+    \item \texttt{run\_id};
+    \item ventana temporal analizada;
+    \item número de fechas evaluadas;
+    \item porcentaje de fechas en \texttt{pass/warn/fail};
+    \item conteo total de hard fails;
+    \item submétricas agregadas de cobertura, estabilidad, coherencia y frescura.
+\end{itemize}
+
+\subsection{Panel diario}
+
+Cada fecha debe incluir, como mínimo:
+
+\begin{center}
+\begin{tabular}{>{\ttfamily}p{4.4cm} p{8.2cm}}
+\toprule
+\textnormal{\textbf{Campo}} & \textbf{Descripción} \\
+\midrule
+date & fecha \\
+coverage\_rate & cobertura válida sobre universo efectivo \\
+coverage\_smallcap & cobertura en subuniverso small/micro \\
+jump\_share & porcentaje de símbolos con salto sospechoso \\
+stale\_share & porcentaje de símbolos con staleness \\
+underblocking\_rate & tasa de under-blocking crítico \\
+overblocking\_rate & tasa de over-blocking \\
+avg\_borrow\_fee\_daily & media diaria del fee \\
+p95\_borrow\_fee\_daily & percentil 95 del fee diario \\
+blocked\_share & porcentaje bloqueado por locate \\
+score\_coverage & subscore de cobertura \\
+score\_stability & subscore de estabilidad \\
+score\_coherence & subscore de coherencia \\
+score\_freshness & subscore de frescura \\
+score\_total & score agregado \\
+gate & pass / warn / fail \\
+config\_version & versión de config \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Failures}
+
+Cada violación debe contener:
+\begin{itemize}[leftmargin=2em]
+    \item fecha;
+    \item símbolo si aplica;
+    \item tipo de check;
+    \item severidad;
+    \item valor observado;
+    \item umbral violado;
+    \item clasificación contextual;
+    \item versión de config.
+\end{itemize}
+
+\section{Uso downstream}
+
+El output del QC debe integrarse de forma disciplinada:
+
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Backtest}: fechas con \texttt{fail} no pueden tratarse como igualmente confiables que fechas \texttt{pass}. Deben excluirse, etiquetarse o penalizarse explícitamente.
+    \item \textbf{Portfolio construction}: si el \texttt{underblocking\_rate} se deteriora, el lado corto debe reducir capacidad o endurecer filtros.
+    \item \textbf{Model governance}: una racha de \texttt{warn} o \texttt{fail} debe activar revisión de thresholds o revisión del proxy upstream.
+\end{itemize}
+
+\section{Tests e invariantes}
+
+La implementación debe incluir, al menos, estos tests automáticos:
+
+\begin{enumerate}[leftmargin=2em]
+    \item no existen duplicados por \texttt{(symbol,date)};
+    \item todo \texttt{borrow\_availability\_score} pertenece a $[0,1]$;
+    \item no existen \texttt{borrow\_fee\_annual} negativos;
+    \item si un símbolo tiene \texttt{htb\_flag=1} y \texttt{locate=allowed} sin override documentado, el QC debe registrar incoherencia;
+    \item el cambio de \texttt{config\_version} queda reflejado en outputs;
+    \item los fines de semana y market holidays no disparan falsos \texttt{stale\_flags};
+    \item símbolos nuevos no inflan artificialmente \texttt{jump\_share};
+    \item un fallo estructural fuerza \texttt{gate=fail} independientemente del score agregado.
+\end{enumerate}
+
+\section{Definition of Done}
+
+El módulo \texttt{borrow\_qc.py} se considera terminado únicamente si:
+
+\begin{itemize}[leftmargin=2em]
+    \item valida integridad estructural, cobertura, estabilidad, frescura y coherencia;
+    \item distingue formalmente entre \texttt{hard fail}, degradación y monitorización;
+    \item produce un gate diario con precedencia definida y score reproducible;
+    \item evita falsos positivos por cambios de universo, holidays o símbolos nuevos;
+    \item deja trazabilidad suficiente para depurar cualquier \texttt{warn/fail};
+    \item puede ser consumido por el backtester y la capa de riesgo sin ambigüedad semántica.
+\end{itemize}
+
+En otras palabras, el QC no está terminado cuando ``detecta cosas raras'', sino cuando impide que un sistema de shorting opere o se evalúe sobre una representación engañosa de la realidad del borrow.
+
+\section{Referencias conceptuales}
+
+La intuición económica y operativa del módulo se apoya en prácticas de \emph{data quality governance}, control de cobertura, trazabilidad de datasets financieros, monitorización de lending frictions y coherencia entre coste de préstamo e inventario disponible. El objetivo de estas referencias no es adornar la documentación, sino justificar la necesidad de que la calidad del borrow sea tratada como una restricción de primer orden en cualquier backtest serio del lado corto.
+
+\bibliographystyle{plain}
+\bibliography{borrow_qc_refs}
+
+\end{document}

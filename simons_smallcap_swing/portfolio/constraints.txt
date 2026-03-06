@@ -1,128 +1,675 @@
 \documentclass[11pt,a4paper]{article}
+
 \usepackage[utf8]{inputenc}
 \usepackage[spanish]{babel}
-\usepackage{amsmath, amssymb, amsthm, amsfonts}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm,amsfonts,mathtools}
 \usepackage{graphicx}
 \usepackage{hyperref}
 \usepackage{booktabs}
 \usepackage{siunitx}
-\usepackage{natbib}
-\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue}
+\usepackage{array}
+\usepackage{geometry}
+\geometry{margin=2.5cm}
 
-\title{Restricciones de Portafolio para Swing Trading Cuantitativo: Módulo \texttt{portfolio/constraints.py}}
-\author{Análisis Técnico Cuantitativo}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\title{Especificación Operativa de Restricciones de Portafolio\\
+\large Módulo \texttt{portfolio/constraints.py}}
+\author{Quantitative Research Specification}
 \date{Marzo 2026}
 
 \begin{document}
 
 \maketitle
-
 \tableofcontents
 \newpage
 
-\section{Introducción}
+\section{Objetivo del módulo}
 
-El módulo \texttt{portfolio/constraints.py} aplica restricciones hard y soft sobre pesos objetivo preliminares de una estrategia de swing trading, asegurando implementabilidad operativa, control de riesgo y cumplimiento de límites de liquidez, exposición y concentración. 
-
-En swing trading, donde las señales pueden ser volátiles y el universo limitado, estas restricciones previenen blow-ups por concentración, drawdowns por factores ocultos o slippage excesivo. El flujo aplica filtros secuenciales (posición → global → grupo → liquidez), generando pesos finales viables y reportando violaciones para auditoría.
-
-Sigue estándares industriales de \citet{lprado2018advances} (meta-labeling para constraints) y \citet{gauder2021quantitative} (optimización con restricciones de riesgo).
-
-\section{Estado del Arte: Constraints en Portfolio Management}
-
-\subsection{Libros Industriales}
-- \textbf{Quantitative Equity Portfolio Management} (Gauder \& Pedersen, 2021): Constraints en Black-Litterman y risk parity.
-- \textbf{Advances in Financial Machine Learning} (López de Prado, 2018): Hard/soft constraints para evitar overfitting en sizing.
-- \textbf{Active Portfolio Management} (Grinold \& Kahn, 2000): Límites de exposición y turnover.
-- \textbf{Robust Portfolio Optimization} (Fabozzi et al., 2014): Constraints robustos bajo incertidumbre.
-
-\subsection{Papers Clave}
-- \citet{black1992universal}: Risk budgeting y beta constraints.
-- \citet{jorion2006value}: VaR/ES como hard constraints.
-- \citet{ledoit2004well}: Shrinkage en covarianzas para group constraints.
-- Estado del arte: \citet{rl_portfolio2023} usa RL para constraints dinámicos en swing trading.
-
-\section{Formulación Matemática}
-
-\subsection{Notación}
-$\mathbf{w}^{\mathrm{raw}} \in \mathbb{R}^N$: Pesos target crudos, $\sum_i w_i^{\mathrm{raw}} = 1$ (long+short).
-$\mathbf{x}_i \in \mathbb{R}^K$: Exposiciones factor/sector para activo $i$.
-$\mathbf{c} \in \mathbb{R}^M$: Límites de config (hard/soft).
-
-\subsection{Constraints Hard (No Violables)}
-\begin{align}
-|\mathbf{w}^{\mathrm{final}}|_\mathrm{gross} &= \sum_i |w_i| &\leq g_{\max} \label{eq:gross}\\
-|\mathbf{w}^{\mathrm{final}}|_\mathrm{net} &= \left|\sum_i w_i\right| &\leq n_{\max} \label{eq:net}\\
-|w_i| &\leq p_{\max,i} &\forall i \label{eq:pos}\\
-\mathbf{x}^\top \mathbf{w}^{\mathrm{final}} &\in [l_g, u_g] &\forall \text{grupos } g \label{eq:group}\\
-\mathrm{DTL}_i(\mathbf{w}) &\leq d_{\max} &\forall i \label{eq:dtl}
-\end{align}
-
-\subsection{Constraints Soft (Penalizadas)}
+El módulo \texttt{portfolio/constraints.py} transforma un vector de pesos preliminares
 \[
-J_{\mathrm{soft}}(\mathbf{w}) = \lambda \|\mathbf{w} - \mathbf{w}^{\mathrm{raw}}\|_2^2 + \sum \mathrm{violation}_s(\mathbf{w})
+\mathbf{w}^{\mathrm{pre}} \in \mathbb{R}^N
 \]
-
-\textbf{Reescalado Global}:
+en un vector de pesos \emph{implementable} y \emph{auditado}
 \[
-\alpha = \min\left(1, \frac{g_{\max}}{\sum |w^{\mathrm{hard}}|}\right), \quad \mathbf{w}^{\mathrm{global}} = \alpha \cdot \frac{\mathbf{w}^{\mathrm{hard}}}{\|\mathbf{w}^{\mathrm{hard}}\|_\mathrm{gross}}
+\mathbf{w}^{\mathrm{constr}} \in \mathbb{R}^N,
 \]
+respetando de forma simultánea restricciones de posición, gross, net, grupo, exposición, liquidez y turnover.
 
-\textbf{Clipeo por Grupo}: Resolver LP:
-\[
-\min_{\mathbf{w}} \|\mathbf{w} - \mathbf{w}^{\mathrm{prev}}\|_1 \quad \mathrm{s.t.} \quad \eqref{eq:group}, \sum w = 1
-\]
+La función del módulo no es ``mejorar'' la señal ni reinterpretar el alpha. Su cometido es estrictamente geométrico y operativo: proyectar el portafolio preliminar al conjunto factible más cercano, preservando tanto como sea posible la intención económica del portfolio upstream.
 
-\textbf{Liquidez}: 
-\[
-w_i \leq \min\left( p_{\max,i}, \frac{\mathrm{ADV}_i \cdot \mathrm{PartCap}}{\mathrm{ADV}_{p95}} \right)
-\]
+En particular, este módulo existe para responder una pregunta concreta y reproducible:
 
-\section{Implementación Algorítmica}
+\begin{quote}
+\emph{Dado un vector preliminar de pesos y un conjunto de límites operativos y de riesgo, ¿cuál es el vector factible más próximo bajo la métrica canónica del sistema?}
+\end{quote}
 
-Flujo secuencial del módulo:
+\section{Principios de diseño}
+
+El módulo se construye bajo seis principios no negociables:
 
 \begin{enumerate}
-\item Cargar $\mathbf{w}^{\mathrm{raw}}$, exposiciones $\mathbf{X}$, liquidez $\mathbf{L}$.
-\item \textbf{Filtro Elegibles}: Excluir $i$ con $\mathrm{ADV}_i < \theta$.
-\item \textbf{Hard Posición}: $w_i = \mathrm{clip}(w_i^{\mathrm{raw}}, [-p_{\max}, p_{\max}])$.
-\item \textbf{Global Gross/Net}: Reescalar $\alpha$ como en \eqref{eq:gross}-\eqref{eq:net}.
-\item \textbf{Grupo/Factor}: Ajuste iterativo o QP (CVXPY).
-\item \textbf{Liquidez/Turnover}: Aplicar \eqref{eq:dtl}, penalizar high-turnover.
-\item Renormalizar: $\mathbf{w}^{\mathrm{final}} = \mathbf{w} / (1 + \mathrm{cash\_buffer})$.
-\item Validar y persistir (parquet/JSON con flags).
+    \item \textbf{Contrato cerrado:} entradas, salidas, invariantes y fallos deben estar definidos ex-ante.
+    \item \textbf{Unicidad del método por defecto:} la implementación canónica no será una cascada heurística abierta, sino una única proyección convexa con restricciones explícitas.
+    \item \textbf{Separación de responsabilidades:} \texttt{constraints.py} no optimiza alpha; sólo impone factibilidad sobre pesos preliminares.
+    \item \textbf{Consistencia temporal:} toda liquidez, exposición y universo deben ser point-in-time.
+    \item \textbf{Precedencia clara:} las reglas duras no pueden ser rescatadas por reglas blandas.
+    \item \textbf{Auditabilidad:} toda modificación relevante del portafolio debe quedar trazada en métricas before/after y flags de constraint activity.
 \end{enumerate}
 
-Manejo conflictos: Prioridad hard riesgo > liquidez > soft alpha.
+\section{Qué hace y qué no hace}
 
-\section{Backtest y Validaciones}
+\subsection{Qué hace}
 
-\subsection{Ejemplo de Output}
-Para universo 100 activos, targets raw con concentración:
+\begin{itemize}
+    \item impone límites de posición absoluta,
+    \item impone límites de gross y net,
+    \item impone límites por sector, industria, bucket o factor,
+    \item impone restricciones de liquidez y de tamaño negociable,
+    \item controla turnover máximo respecto al portafolio actual,
+    \item devuelve el vector factible más cercano al preliminar,
+    \item informa qué restricciones quedaron activas o tensas.
+\end{itemize}
 
-| Métrica              | Before | After  | Violación |
-|----------------------|--------|--------|-----------|
-| Gross Exp            | 1.50   | 1.20   | Sector    |
-| Net Exp              | 0.40   | 0.30   | Ninguna   |
-| Max Pos              | 0.15   | 0.10   | 3 activos |
-| DTL p95 (días)       | 2.1    | 1.8    | OK        |
-| \% Peso Clipeado     | -      | 12\%   | Soft      |
+\subsection{Qué no hace}
 
-\subsection{Validaciones Rigurosas}
-- $\sum |w^{\mathrm{final}}| \leq g_{\max} + \epsilon$.
-- Orthogonalidad factores: $\mathrm{Corr}(\mathbf{w}, \mathbf{X}) \leq \delta$.
-- Stress: Simular $\pm 50\%$ ADV.
-- Monte Carlo: 1000 perturbaciones en $\mathbf{w}^{\mathrm{raw}}$.
+\begin{itemize}
+    \item no genera la señal,
+    \item no hace sizing desde cero,
+    \item no neutraliza por su cuenta salvo que una exposición neutral esté definida como restricción explícita,
+    \item no selecciona el solver de optimización global del portfolio final,
+    \item no sustituye a \texttt{optimizer.py},
+    \item no recalibra ADV ni costes.
+\end{itemize}
 
-\section{Mejoras al Estado del Arte}
+\section{Contrato exacto del módulo}
 
-1. **Optimización Robusta**: Usar DRO (Distributionally Robust Opt) \citep{rahimian2019robust}.
-2. **Constraints Dinámicos**: ML para predecir ADV/vol (LSTM como en \citet{lstm_swing2022}).
-3. **Risk Parity Integrado**: $\mathbf{w} \propto 1 / \mathrm{MRC}_i$ (Marginal Risk Contrib).
-4. **Multi-Period**: Constraints intertemporales para swing (Markov regimes).
-5. **RL Constraints**: Aprender soft penalties vía PPO \citep{rl_portfolio2023}.
+\subsection{Entradas obligatorias}
 
-\bibliographystyle{plainnat}
-\bibliography{refs}
+El módulo recibe un único snapshot temporal \(t\) del universo elegible, con las siguientes entradas mínimas.
+
+\subsubsection*{1. Pesos}
+
+\begin{center}
+\begin{tabular}{>{\ttfamily}m{4.0cm} m{9.3cm}}
+\toprule
+\textnormal{Campo} & \textnormal{Descripción} \\
+\midrule
+w\_pre & Peso preliminar por activo tras sizing/neutralización u optimizer upstream \\
+w\_current & Peso actual de cartera antes del rebalanceo \\
+eligible\_flag & Indicador PIT de elegibilidad \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection*{2. Datos de exposición}
+
+\begin{center}
+\begin{tabular}{>{\ttfamily}m{4.0cm} m{9.3cm}}
+\toprule
+\textnormal{Campo} & \textnormal{Descripción} \\
+\midrule
+sector\_id & Grupo categórico principal \\
+industry\_id & Grupo categórico secundario \\
+beta & Exposición escalar opcional a mercado \\
+style\_* & Exposiciones continuas opcionales: size, value, momentum, volatility, etc. \\
+factor\_matrix & Matriz \(X \in \mathbb{R}^{N \times K}\) de exposiciones continuas \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection*{3. Datos de liquidez}
+
+\begin{center}
+\begin{tabular}{>{\ttfamily}m{4.0cm} m{9.3cm}}
+\toprule
+\textnormal{Campo} & \textnormal{Descripción} \\
+\midrule
+price & Precio de referencia ejecutable \\
+adv\_usd & Average Daily Dollar Volume PIT \\
+spread\_bps & Spread estimado o efectivo \\
+halt\_flag & Indicador de activo no negociable \\
+lot\_size & Tamaño mínimo de lote si aplica \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection*{4. Configuración}
+
+El archivo de configuración debe definir de forma explícita:
+
+\begin{itemize}
+    \item \texttt{gross\_max}
+    \item \texttt{net\_min}, \texttt{net\_max}
+    \item \texttt{pos\_max\_long}, \texttt{pos\_max\_short}
+    \item \texttt{turnover\_max}
+    \item \texttt{adv\_participation\_cap}
+    \item \texttt{dtl\_max}
+    \item \texttt{group\_bounds}
+    \item \texttt{factor\_bounds}
+    \item \texttt{distance\_metric}
+    \item \texttt{infeasibility\_policy}
+    \item \texttt{solver\_name}
+    \item \texttt{solver\_tolerances}
+\end{itemize}
+
+\subsection{Salidas obligatorias}
+
+El módulo devuelve:
+
+\begin{enumerate}
+    \item \(\mathbf{w}^{\mathrm{constr}}\): pesos finales factibles;
+    \item \texttt{constraint\_report.json}: resumen de restricciones activas, slacks y violaciones;
+    \item \texttt{before\_after.parquet}: métricas before/after a nivel activo y cartera;
+    \item \texttt{status}: \texttt{optimal}, \texttt{optimal\_inaccurate} o \texttt{infeasible}.
+\end{enumerate}
+
+\section{Notación y definiciones}
+
+Sea \(N\) el número de activos elegibles en la fecha \(t\). Definimos:
+
+\[
+\mathbf{w} \in \mathbb{R}^N
+\quad \text{vector de pesos candidato},
+\]
+\[
+\mathbf{w}^{\mathrm{pre}} \in \mathbb{R}^N
+\quad \text{vector preliminar de entrada},
+\]
+\[
+\mathbf{w}^{\mathrm{cur}} \in \mathbb{R}^N
+\quad \text{vector actual en cartera}.
+\]
+
+Las métricas canónicas de cartera son:
+
+\[
+G(\mathbf{w}) = \sum_{i=1}^N |w_i|
+\qquad \text{(gross exposure)},
+\]
+
+\[
+N(\mathbf{w}) = \sum_{i=1}^N w_i
+\qquad \text{(net exposure)},
+\]
+
+\[
+TO(\mathbf{w},\mathbf{w}^{\mathrm{cur}}) = \sum_{i=1}^N |w_i - w_i^{\mathrm{cur}}|
+\qquad \text{(turnover bruto en pesos)}.
+\]
+
+La exposición de grupo \(g\) se define como:
+
+\[
+E_g(\mathbf{w}) = \sum_{i \in \mathcal{G}_g} w_i,
+\]
+donde \(\mathcal{G}_g\) es el conjunto de activos pertenecientes al grupo \(g\).
+
+La exposición continua a factores se define mediante una matriz
+\[
+X \in \mathbb{R}^{N \times K},
+\]
+de forma que
+\[
+\mathbf{f}(\mathbf{w}) = X^\top \mathbf{w} \in \mathbb{R}^K.
+\]
+
+\section{Restricciones canónicas}
+
+\subsection{Restricciones duras}
+
+Las restricciones duras del módulo son:
+
+\paragraph{1. Límite por posición}
+\[
+0 \leq w_i \leq p_i^{+} \quad \text{si } i \text{ es lado largo permitido},
+\]
+\[
+-p_i^{-} \leq w_i \leq 0 \quad \text{si } i \text{ es lado corto permitido},
+\]
+o de forma compacta,
+\[
+\ell_i \leq w_i \leq u_i, \qquad \forall i=1,\dots,N.
+\]
+
+\paragraph{2. Límite gross}
+\[
+G(\mathbf{w}) = \sum_i |w_i| \leq G_{\max}.
+\]
+
+\paragraph{3. Límite net}
+\[
+N_{\min} \leq \sum_i w_i \leq N_{\max}.
+\]
+
+\paragraph{4. Límites de grupo}
+Para cada grupo \(g\):
+\[
+L_g \leq E_g(\mathbf{w}) \leq U_g.
+\]
+
+\paragraph{5. Límites de factor}
+Para cada factor continuo \(k\):
+\[
+L_k^{(f)} \leq (X^\top \mathbf{w})_k \leq U_k^{(f)}.
+\]
+
+\paragraph{6. Restricción de turnover}
+\[
+TO(\mathbf{w},\mathbf{w}^{\mathrm{cur}}) \leq TO_{\max}.
+\]
+
+\paragraph{7. Restricción de liquidez}
+Sea \(A\) el AUM del portfolio y \(\phi\) la fracción utilizable del \(ADV\). El notional negociado en el activo \(i\) es:
+\[
+q_i(\mathbf{w}) = A \, |w_i - w_i^{\mathrm{cur}}|.
+\]
+La participación implícita es:
+\[
+\pi_i(\mathbf{w}) = \frac{q_i(\mathbf{w})}{\phi \cdot ADV_i^{USD}}.
+\]
+La restricción dura por activo es:
+\[
+\pi_i(\mathbf{w}) \leq \pi_{\max},
+\qquad \forall i.
+\]
+
+Equivalentemente,
+\[
+|w_i - w_i^{\mathrm{cur}}|
+\leq
+\frac{\pi_{\max}\,\phi\,ADV_i^{USD}}{A}.
+\]
+
+\paragraph{8. Restricción DTL opcional}
+Si se activa el control por días para liquidar:
+\[
+DTL_i(\mathbf{w})
+=
+\frac{A\,|w_i|}{\phi \cdot ADV_i^{USD}}
+\leq d_{\max}.
+\]
+
+\subsection{Restricciones blandas}
+
+Las restricciones blandas no sustituyen a las duras. Sólo operan \emph{dentro del conjunto factible}. Su papel es decidir qué punto factible se elige.
+
+La métrica canónica por defecto es una proyección cuadrática ponderada:
+\[
+\min_{\mathbf{w}} \;
+\frac{1}{2}
+(\mathbf{w}-\mathbf{w}^{\mathrm{pre}})^\top
+D
+(\mathbf{w}-\mathbf{w}^{\mathrm{pre}})
+\]
+sujeta a todas las restricciones duras, donde \(D\) es una matriz diagonal positiva definida.
+
+Por defecto:
+\[
+D_{ii} = \frac{1}{(\sigma_i + \varepsilon)^2},
+\]
+o, si no hay volatilidades disponibles,
+\[
+D = I.
+\]
+
+Esto significa que la cartera final es la proyección convexa del portafolio preliminar sobre el conjunto factible, con una penalización explícita por desviación.
+
+\section{Método por defecto: proyección convexa única}
+
+\subsection{Motivación}
+
+El principal problema de un pipeline secuencial del tipo ``clip posición \(\rightarrow\) rescale gross \(\rightarrow\) arreglar grupos \(\rightarrow\) arreglar liquidez'' es que cada paso puede destruir restricciones satisfechas en pasos previos. Esa ambigüedad hace el módulo difícil de mantener, de testear y de razonar matemáticamente.
+
+Por tanto, el \textbf{default canónico} de \texttt{constraints.py} no será una cascada heurística, sino un único problema convexo:
+
+\[
+\begin{aligned}
+\min_{\mathbf{w} \in \mathbb{R}^N}
+\quad &
+\frac{1}{2}
+(\mathbf{w}-\mathbf{w}^{\mathrm{pre}})^\top
+D
+(\mathbf{w}-\mathbf{w}^{\mathrm{pre}})
+\\
+\text{sujeto a} \quad
+&
+\ell_i \leq w_i \leq u_i, \quad \forall i, \\
+&
+\sum_i |w_i| \leq G_{\max}, \\
+&
+N_{\min} \leq \sum_i w_i \leq N_{\max}, \\
+&
+L_g \leq \sum_{i \in \mathcal{G}_g} w_i \leq U_g, \quad \forall g, \\
+&
+L_k^{(f)} \leq (X^\top \mathbf{w})_k \leq U_k^{(f)}, \quad \forall k, \\
+&
+\sum_i |w_i - w_i^{\mathrm{cur}}| \leq TO_{\max}, \\
+&
+|w_i - w_i^{\mathrm{cur}}| \leq \frac{\pi_{\max}\phi ADV_i^{USD}}{A}, \quad \forall i, \\
+&
+\frac{A|w_i|}{\phi ADV_i^{USD}} \leq d_{\max}, \quad \forall i \text{ si DTL activo.}
+\end{aligned}
+\]
+
+Este problema es convexo y puede resolverse con CVXPY usando OSQP, ECOS o SCS según la estructura exacta.
+
+\subsection{Convención operacional}
+
+El módulo debe tratar este problema como la definición oficial de constraints. Cualquier pipeline secuencial alternativo sólo puede existir como \texttt{fallback\_heuristic} y debe declararse expresamente como no canónico.
+
+\section{Precedencia y política de infactibilidad}
+
+\subsection{Precedencia}
+
+Cuando las restricciones ``chocan'', la precedencia no se resuelve por orden secuencial sino por política de factibilidad:
+
+\begin{enumerate}
+    \item validez de datos y elegibilidad,
+    \item límites duros por activo,
+    \item liquidez y turnover,
+    \item gross y net,
+    \item grupo y factor,
+    \item criterio de cercanía a \(\mathbf{w}^{\mathrm{pre}}\).
+\end{enumerate}
+
+Las primeras cinco categorías definen el conjunto factible. La sexta sólo elige un punto dentro de él.
+
+\subsection{Infactibilidad}
+
+Si el problema es infactible, el módulo debe seguir una política explícita definida por
+\texttt{infeasibility\_policy}. El valor por defecto será:
+
+\begin{center}
+\texttt{strict\_fail}
+\end{center}
+
+Bajo esta política:
+
+\begin{enumerate}
+    \item el módulo devuelve \texttt{status = infeasible},
+    \item no fabrica un portafolio heurístico silencioso,
+    \item persiste un diagnóstico con las restricciones probablemente incompatibles,
+    \item delega la resolución al módulo upstream o a una política de relajación controlada.
+\end{enumerate}
+
+\subsection{Relajación opcional y orden canónico}
+
+Si se activa
+\texttt{infeasibility\_policy = prioritized\_relaxation},
+la relajación debe seguir exactamente este orden:
+
+\begin{enumerate}
+    \item límites blandos de factor secundarios,
+    \item límites blandos de grupo secundarios,
+    \item turnover máximo,
+    \item net target estrecho,
+    \item gross máximo.
+\end{enumerate}
+
+Nunca se deben relajar silenciosamente:
+
+\begin{itemize}
+    \item elegibilidad,
+    \item activos suspendidos,
+    \item límites por activo marcados como hard,
+    \item restricciones de liquidez individuales.
+\end{itemize}
+
+Toda relajación debe quedar cuantificada en el reporte.
+
+\section{Tratamiento exacto de grupos y factores}
+
+\subsection{Variables categóricas}
+
+Sectores, industrias, países o buckets discretos se representan mediante una matriz indicadora
+\[
+B \in \{0,1\}^{N \times G}.
+\]
+Entonces la exposición de grupo es:
+\[
+B^\top \mathbf{w}.
+\]
+
+\subsection{Variables continuas}
+
+Factores como beta, volatility, size o momentum se modelan en la matriz continua \(X\). Sus bounds deben estar expresados en la misma convención y escalado que el pipeline de risk model.
+
+\subsection{Multicolinealidad}
+
+Si \(X\) contiene factores muy colineales, el módulo no debe improvisar PCA ni SVD como parte de la implementación por defecto. La ortogonalización o reducción de dimensión debe ocurrir \emph{upstream}, antes de llegar a \texttt{constraints.py}. Este módulo asume que las exposiciones que recibe ya están en una base operacionalmente interpretable.
+
+\section{Liquidez: definición robusta y ejecutable}
+
+La versión anterior de este tipo de documento suele caer en fórmulas ilustrativas pero no operativas. La definición correcta aquí es por \emph{trade size relativo al ADV utilizable}, no por ratios ad hoc contra un percentil agregado.
+
+Para cada activo:
+\[
+\Delta w_i = w_i - w_i^{\mathrm{cur}},
+\]
+\[
+q_i = A |\Delta w_i|,
+\]
+\[
+L_i = \phi \cdot ADV_i^{USD},
+\]
+\[
+\pi_i = \frac{q_i}{L_i}.
+\]
+
+La restricción se impone \emph{por nombre}, no con una media agregada:
+\[
+\pi_i \leq \pi_{\max}.
+\]
+
+Esto evita que un agregado benigno oculte un único activo imposible de ejecutar.
+
+\section{Algoritmo exacto del módulo}
+
+\subsection{Paso 1. Validación de datos}
+
+Antes de resolver el problema:
+
+\begin{itemize}
+    \item eliminar activos con \texttt{eligible\_flag = False},
+    \item eliminar activos con \texttt{halt\_flag = True},
+    \item verificar que \(ADV_i^{USD} > 0\) si la restricción de liquidez está activa,
+    \item verificar que todos los activos tienen bounds \((\ell_i,u_i)\) definidos,
+    \item verificar ausencia de duplicados por activo y fecha,
+    \item alinear exactamente el índice de \(\mathbf{w}^{\mathrm{pre}}, \mathbf{w}^{\mathrm{cur}}, X, B\) y liquidez.
+\end{itemize}
+
+Cualquier desalineación debe producir fallo explícito.
+
+\subsection{Paso 2. Construcción del problema convexo}
+
+Se construye el objetivo y el conjunto completo de restricciones duras. No se aplica ningún reescalado previo salvo limpieza de NaNs y exclusión de activos inoperables.
+
+\subsection{Paso 3. Resolución}
+
+Se resuelve con el solver configurado. La implementación debe registrar:
+
+\begin{itemize}
+    \item solver usado,
+    \item tiempo de resolución,
+    \item status,
+    \item valor objetivo,
+    \item restricciones activas,
+    \item máximas violaciones absolutas y relativas.
+\end{itemize}
+
+\subsection{Paso 4. Validación post-solver}
+
+Aunque el solver devuelva \texttt{optimal}, el módulo debe comprobar numéricamente:
+
+\[
+\max_i \max(0,\ell_i - w_i, w_i - u_i) \leq \varepsilon,
+\]
+\[
+\max(0,G(\mathbf{w}) - G_{\max}) \leq \varepsilon,
+\]
+\[
+\max(0,N_{\min} - N(\mathbf{w}), N(\mathbf{w}) - N_{\max}) \leq \varepsilon,
+\]
+y análogos para grupo, factor, liquidez y turnover.
+
+Si alguna violación supera tolerancia, el estado debe degradarse a
+\texttt{optimal\_inaccurate} o \texttt{fail\_postcheck}.
+
+\subsection{Paso 5. Persistencia}
+
+Se persisten:
+
+\begin{itemize}
+    \item pesos before/after,
+    \item turnover before/after,
+    \item exposición gross/net before/after,
+    \item exposición por grupo before/after,
+    \item exposición por factor before/after,
+    \item porcentaje de nombres pegados a su bound,
+    \item porcentaje de notional limitado por liquidez,
+    \item slacks de cada familia de constraints.
+\end{itemize}
+
+\section{Invariantes del módulo}
+
+Toda salida válida debe cumplir:
+
+\begin{enumerate}
+    \item \(\mathbf{w}^{\mathrm{constr}}\) tiene exactamente la misma dimensión e índice que el universo elegible de entrada.
+    \item Ningún activo no elegible o suspendido recibe peso distinto de cero.
+    \item Todas las restricciones duras se satisfacen dentro de tolerancia.
+    \item El vector final es el minimizador de la distancia canónica al vector preliminar sobre el conjunto factible.
+    \item Si el problema es infactible y la política es \texttt{strict\_fail}, no se devuelve un portafolio silenciosamente parcheado.
+\end{enumerate}
+
+\section{Métricas before/after obligatorias}
+
+El reporte debe incluir, como mínimo:
+
+\begin{center}
+\begin{tabular}{>{\ttfamily}m{5.0cm} m{8.3cm}}
+\toprule
+\textnormal{Métrica} & \textnormal{Descripción} \\
+\midrule
+gross\_before / gross\_after & Exposición gross \\
+net\_before / net\_after & Exposición net \\
+turnover\_before / turnover\_after & Turnover respecto a cartera actual \\
+max\_pos\_before / max\_pos\_after & Máxima posición absoluta \\
+group\_breach\_count\_before / after & Número de grupos fuera de rango \\
+factor\_breach\_count\_before / after & Número de factores fuera de rango \\
+liquidity\_breach\_count\_before / after & Número de nombres por encima de \(\pi_{\max}\) \\
+distance\_to\_pre & Distancia final al portafolio preliminar \\
+active\_constraints & Lista de constraints activas al óptimo \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Parámetros por defecto}
+
+Hasta que exista calibración más fina, los defaults deben ser conservadores y trazables:
+
+\begin{center}
+\begin{tabular}{m{7.5cm} m{4.8cm}}
+\toprule
+\textnormal{Parámetro} & \textnormal{Default} \\
+\midrule
+\texttt{distance\_metric} & \texttt{weighted\_l2} \\
+\texttt{solver\_name} & \texttt{OSQP} \\
+\texttt{infeasibility\_policy} & \texttt{strict\_fail} \\
+\texttt{adv\_participation\_cap} & \(10\%\) \\
+\texttt{dtl\_max} & \(5\) días \\
+\texttt{solver\_tolerance} & \(10^{-8}\) a \(10^{-6}\) según solver \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Los límites de gross, net, posición, turnover, grupo y factor no deben codificarse como constantes internas del módulo; deben venir siempre desde configuración o desde el portfolio template correspondiente.
+
+\section{Fallback heurístico permitido}
+
+Aunque el método canónico es la proyección convexa única, se permite un \texttt{fallback\_heuristic} exclusivamente para contingencias de solver. Ese fallback debe ser explícitamente secundario y seguir este orden:
+
+\begin{enumerate}
+    \item clip por activo,
+    \item restricción por liquidez individual,
+    \item rescale conservador de gross y net,
+    \item ajuste proyectivo de grupo y factor,
+    \item postcheck completo.
+\end{enumerate}
+
+Si el fallback se usa, el reporte debe marcar:
+\[
+\texttt{used\_fallback = True}.
+\]
+
+Nunca debe confundirse con la implementación principal.
+
+\section{Tests mínimos obligatorios}
+
+\subsection*{1. Test de factibilidad trivial}
+Si \(\mathbf{w}^{\mathrm{pre}}\) ya es factible, entonces:
+\[
+\mathbf{w}^{\mathrm{constr}} = \mathbf{w}^{\mathrm{pre}}
+\]
+salvo error numérico despreciable.
+
+\subsection*{2. Test de clip por activo}
+Si un único activo supera \(u_i\), el resultado debe pegar ese activo al bound correcto sin violar el resto.
+
+\subsection*{3. Test de liquidez}
+Si un nombre requiere una participación superior a \(\pi_{\max}\), el peso final debe reducirse hasta el límite o declarar infactibilidad si además hay targets agregados incompatibles.
+
+\subsection*{4. Test de turnover}
+Si el portafolio preliminar exige turnover excesivo, la solución debe ser la proyección factible más cercana bajo \(TO_{\max}\).
+
+\subsection*{5. Test de grupo}
+Si la exposición sectorial excede el bound, el resultado debe reintroducir factibilidad sin violar gross ni posición.
+
+\subsection*{6. Test de infactibilidad real}
+Si los bounds por activo, gross y net son mutuamente incompatibles, el módulo debe devolver \texttt{infeasible} bajo \texttt{strict\_fail}.
+
+\subsection*{7. Test de auditoría}
+El \texttt{constraint\_report.json} debe incluir todas las familias de constraints y sus slacks.
+
+\section{Integración con el resto del pipeline}
+
+\texttt{constraints.py} se sitúa después del módulo que genera \(\mathbf{w}^{\mathrm{pre}}\) y antes de rebalanceo/ejecución final.
+
+La semántica correcta del pipeline es:
+
+\[
+\texttt{signal}
+\rightarrow
+\texttt{sizing}
+\rightarrow
+\texttt{neutralize (si aplica)}
+\rightarrow
+\texttt{constraints}
+\rightarrow
+\texttt{optimizer o rebalance final, según arquitectura}
+\]
+
+Si la arquitectura del sistema utiliza un \texttt{optimizer.py} global que ya resuelve simultáneamente alpha, riesgo y restricciones, entonces \texttt{constraints.py} debe operar como capa de validación o como projector final de seguridad, no como optimizador redundante.
+
+\section{Resumen ejecutivo}
+
+La versión correcta de \texttt{portfolio/constraints.py} no debe parecer un catálogo abierto de ideas de portfolio construction, sino una \textbf{especificación cerrada de factibilidad}. El módulo debe tener una semántica inequívoca:
+
+\begin{enumerate}
+    \item recibe pesos preliminares y datos PIT,
+    \item construye un conjunto factible con restricciones duras bien definidas,
+    \item proyecta el portafolio preliminar al punto factible más cercano,
+    \item maneja la infactibilidad de forma explícita,
+    \item persiste un reporte auditable before/after.
+\end{enumerate}
+
+Ese diseño elimina la ambigüedad de los filtros secuenciales que se rompen entre sí, convierte el módulo en algo testeable y preserva exactamente lo importante en un sistema cuantitativo serio: \emph{disciplina geométrica, reproducibilidad operativa y trazabilidad de cada concesión impuesta al alpha preliminar}.
 
 \end{document}

@@ -1,249 +1,593 @@
 \section{Módulo: \texttt{data/edgar/parse\_xbrl.py}}
 
-\subsection{Objetivo general del módulo}
+\subsection{Objetivo estratégico del módulo}
 
-El módulo \texttt{parse\_xbrl.py} normaliza y transforma \emph{facts XBRL} provenientes de \texttt{submissions} y \texttt{companyfacts} de EDGAR en una \emph{tabla de facts fundamentales canónica}, lista para ser usada en la construcción de series \emph{point‑in‑time} (PIT) y modelos de trading cuantitativo.
+El módulo \texttt{parse\_xbrl.py} implementa la capa formal de \emph{canonización semántica}, \emph{normalización de unidades}, \emph{resolución de contexto contable} y \emph{deduplicación determinista} de los \emph{facts} XBRL procedentes del subsistema EDGAR. Su función no es únicamente transformar una estructura XBRL heterogénea en una tabla tabular, sino construir una \textbf{base canónica de hechos fundamentales} que preserve comparabilidad económica, trazabilidad documental y compatibilidad \emph{point-in-time} para investigación cuantitativa, construcción de features y validación de señales.
 
-Formalmente, el módulo implementa una función de normalización:
+El principio rector del módulo es el siguiente:
+
+\begin{quote}
+\emph{Un fact XBRL no es utilizable porque exista en el payload de origen, sino porque puede mapearse de forma determinista a una métrica interna, con unidad, periodo, contexto y prioridad semántica compatibles con el esquema analítico del sistema.}
+\end{quote}
+
+Formalmente, el módulo implementa un operador de canonización:
+
 \[
-  \mathcal{N}: \mathcal{B} \times \mathcal{M} \longrightarrow \mathcal{F}^{\text{c}},
+\mathcal{C}_{\mathrm{xbrl}} :
+(\mathcal{B}, \Theta, r, a)
+\longrightarrow
+(\mathcal{F}^{\mathrm{can}}, \mathcal{R}^{\mathrm{rej}}, \mathcal{M}),
 \]
+
 donde:
-\begin{itemize}
-  \item \(\mathcal{B}\) es el conjunto de datos brutos de XBRL (submissions y companyfacts),
-  \item \(\mathcal{M}\) es el conjunto de mappings de tags a métricas internas,
-  \item \(\mathcal{F}^{\text{c}}\) es el espacio de facts fundamentales en una métrica canónica, con unidades, periodos y contexto homogéneo.
-\end{itemize}
-
-Este módulo es \emph{la capa de traducción} entre la taxonomía XBRL (US‑GAAP, DEI, etc.) y el esquema de metricas interno usado por el sistema de trading, permitiendo comparabilidad trans‑temporal y trans‑sectorial\cite{XBRLGuide, XBRLUSGAAPGuide}.
-
-\subsection{Alcance del módulo}
-
-El alcance incluye:
 
 \begin{itemize}
-  \item \textbf{Mapping de tags a métricas internas}: asociar conceptos XBRL (por ejemplo, \texttt{RevenueFromContractWithCustomerExcludingAssessedTax}) a métricas internas normalizadas (por ejemplo, \texttt{Revenue\_Canonical}).
-  \item \textbf{Normalización de unidades y escala}: convertir todas las unidades (USD, shares, PER‑share, miles, millones, etc.) a una unidad base definida.
-  \item \textbf{Selección de periodos}: seleccionar el registro más relevante por \((cik, \texttt{metric\_name}, \texttt{period\_end}, \texttt{filed\_date})\).
-  \item \textbf{Deduplicación de versiones}: eliminar duplicados de facts alineados por \emph{periodo de informe} y \emph{fecha de presentación}.
+  \item \(\mathcal{B}\) es el conjunto de hechos XBRL brutos procedentes de \texttt{submissions} y \texttt{companyfacts},
+  \item \(\Theta\) es la configuración versionada de mappings, reglas de prioridad, normalización y arbitraje,
+  \item \(r\) es el \texttt{run\_id},
+  \item \(a\) es el \texttt{asof} lógico de la corrida, cuando aplique,
+  \item \(\mathcal{F}^{\mathrm{can}}\) es la tabla de \emph{facts canonical},
+  \item \(\mathcal{R}^{\mathrm{rej}}\) es el conjunto de \emph{facts rejected} con motivo explícito,
+  \item \(\mathcal{M}\) es el \emph{manifest} auditable de la ejecución.
 \end{itemize}
 
-El módulo actúa como \emph{ETL de normalización} para datos XBRL, análogo a un \emph{data normalization engine} en sistemas de \emph{structured data for financial analysis}\cite{XBRLWhyNormalize, XBRLUSGAAPGuide}. Su salida es la base de datos inmediata de \texttt{facts\_canonical} consumida por \texttt{point\_in\_time} y modelos de factores fundamentales.
+El módulo constituye, por tanto, la frontera entre ``tener tags XBRL'' y ``tener hechos fundamentales comparables''. Su valor no reside en parsear más registros, sino en resolver correctamente las ambigüedades que separan un \emph{fact} bruto de una métrica cuantitativamente explotable.
+
+\subsection{Rol dentro de la arquitectura EDGAR}
+
+\texttt{parse\_xbrl.py} se sitúa aguas abajo de:
+
+\begin{itemize}
+  \item \texttt{fetch\_submissions.py}, que captura la cronología y metadata de filings;
+  \item \texttt{fetch\_companyfacts.py}, que materializa el repositorio raw de \emph{facts};
+\end{itemize}
+
+y aguas arriba de:
+
+\begin{itemize}
+  \item \texttt{filings\_flags.py}, que deriva señales de calidad y riesgo regulatorio;
+  \item \texttt{point\_in\_time.py}, que impone observabilidad temporal estricta;
+  \item la construcción de features fundamentales;
+  \item y el subsistema de validación y control de calidad EDGAR.
+\end{itemize}
+
+Su responsabilidad es específica y crítica. El módulo:
+
+\begin{itemize}
+  \item sí resuelve mappings entre tags y métricas internas;
+  \item sí normaliza unidades, escalas y tipos de periodo;
+  \item sí arbitra conflictos entre taxonomías, tags equivalentes y contextos múltiples;
+  \item sí decide aceptación o rechazo de un \emph{fact} para el esquema canónico;
+  \item pero \textbf{no} decide todavía la selección PIT final por \texttt{asof};
+  \item y \textbf{no} imputa valores faltantes ni construye directamente factores finales.
+\end{itemize}
+
+En otras palabras, \texttt{parse\_xbrl.py} no es una simple fase ETL, sino una \textbf{capa de resolución semántica contable}.
+
+\subsection{Alcance funcional}
+
+El alcance del módulo incluye, como mínimo:
+
+\begin{enumerate}
+  \item \textbf{Mapping tag \(\rightarrow\) métrica interna}: asociación de conceptos XBRL a un vocabulario analítico interno versionado.
+  \item \textbf{Arbitraje entre taxonomías}: resolución explícita entre US-GAAP, DEI, IFRS u otras taxonomías admitidas.
+  \item \textbf{Normalización de unidades y escalas}: conversión a una unidad base por métrica.
+  \item \textbf{Resolución de contexto}: tratamiento de periodos instantáneos vs duracionales, frames, FY/FP y granularidad temporal.
+  \item \textbf{Deduplicación y selección canónica}: elección determinista del mejor \emph{fact} cuando existen múltiples candidatos para la misma métrica económica.
+  \item \textbf{Validación y rechazo}: separación explícita entre hechos aceptados y rechazados con razón estructurada.
+  \item \textbf{Persistencia auditable}: emisión de artefactos reproducibles bajo \texttt{run\_id}.
+\end{enumerate}
+
+El alcance \textbf{no} incluye:
+
+\begin{itemize}
+  \item imputación estadística de valores ausentes;
+  \item decisión final sobre observabilidad \emph{point-in-time};
+  \item reconciliación económica completa de estados financieros;
+  \item o modelización de factores finales.
+\end{itemize}
+
+Esta separación es esencial: una ingestión fuerte captura, una canonización fuerte resuelve semántica, y una capa PIT fuerte impone temporalidad. Mezclar esas tres responsabilidades es una fuente clásica de leakage y de bugs difíciles de auditar.
 
 \subsection{Entradas del módulo}
 
 Las entradas del módulo son:
 
 \begin{itemize}
-  \item \texttt{submissions\_raw\_path}: ruta al almacén raw de submissions de EDGAR (por ejemplo, \texttt{data/edgar/raw/submissions}).
-  \item \texttt{companyfacts\_raw\_path}: ruta al almacén raw de companyfacts XBRL (por ejemplo, \texttt{data/edgar/raw/companyfacts}).
-  \item \texttt{xbrl\_mapping\_config\_path}: ruta a un archivo de configuración donde se definen mappings de tags a \texttt{metric\_name} y reglas de normalización.
-  \item \texttt{run\_id}: identificador único de la ejecución para trazabilidad y replicabilidad.
+  \item \texttt{submissions\_raw\_path}: ruta al repositorio raw de submissions EDGAR.
+  \item \texttt{companyfacts\_raw\_path}: ruta al repositorio raw de companyfacts XBRL.
+  \item \texttt{xbrl\_mapping\_config\_path}: archivo de configuración con mappings, prioridades taxonómicas, reglas de unidad, ventanas de periodo y causas de rechazo.
+  \item \texttt{run\_id}: identificador único y auditable de ejecución.
+  \item \texttt{asof} (opcional pero recomendado): fecha lógica de snapshot.
 \end{itemize}
 
-En notación formal, el conjunto de entradas es:
+En notación formal:
+
 \[
-  \mathcal{I} = \{ \mathcal{B}_S, \mathcal{B}_F, \Theta_{\text{map}}, r \},
+\mathcal{I} =
+\{
+\mathcal{B}_{S},
+\mathcal{B}_{F},
+\Theta_{\mathrm{map}},
+r,
+a
+\},
 \]
+
 donde:
+
 \begin{itemize}
-  \item \(\mathcal{B}_S\) es el conjunto de submissions,
-  \item \(\mathcal{B}_F\) es el conjunto de companyfacts,
-  \item \(\Theta_{\text{map}}\) es el conjunto de mappings y reglas de normalización,
+  \item \(\mathcal{B}_{S}\) es el conjunto de submissions,
+  \item \(\mathcal{B}_{F}\) es el conjunto de companyfacts,
+  \item \(\Theta_{\mathrm{map}}\) es la parametrización del motor de canonización,
+  \item \(r\) es el \texttt{run\_id},
+  \item \(a\) es el \texttt{asof} lógico.
+\end{itemize}
+
+\subsection{Contrato mínimo de entrada}
+
+Antes de aceptar ningún \emph{fact} para procesamiento, el módulo debe validar:
+
+\begin{itemize}
+  \item legibilidad y existencia de los paths de entrada;
+  \item presencia de los campos mínimos para reconstruir el \emph{fact}:
+  \[
+  (\texttt{cik}, \texttt{taxonomy}, \texttt{tag}, \texttt{unit}, \texttt{value}, \texttt{filed\_date}),
+  \]
+  con \texttt{period\_end} o un contexto temporal equivalente;
+  \item parseabilidad de fechas y timestamps;
+  \item validez sintáctica y semántica del archivo de configuración;
+  \item existencia de una política explícita para taxonomías no reconocidas y unidades no convertibles.
+\end{itemize}
+
+Si este contrato falla a nivel de lote o de payload, el módulo debe registrar la incidencia de forma auditable y rechazar los registros afectados sin contaminar la tabla canónica.
+
+\subsection{Unidad de observación y representación intermedia}
+
+La unidad de observación natural no es aún la métrica canónica, sino el \emph{fact candidato}. Cada candidato puede representarse como:
+
+\[
+x = (c, \tau, t, u_0, v_0, e, d_f, \alpha, \phi, \pi, \xi, r),
+\]
+
+donde:
+
+\begin{itemize}
+  \item \(c\) es el \texttt{CIK};
+  \item \(\tau\) es la taxonomía;
+  \item \(t\) es el tag XBRL original;
+  \item \(u_0\) es la unidad original;
+  \item \(v_0\) es el valor bruto;
+  \item \(e\) es el \texttt{period\_end};
+  \item \(d_f\) es la \texttt{filed\_date};
+  \item \(\alpha\) es \texttt{acceptance\_datetime}, cuando exista;
+  \item \(\phi\) es el \texttt{period\_type} o el contexto temporal bruto;
+  \item \(\pi\) representa metadatos fiscales como \texttt{fy}/\texttt{fp};
+  \item \(\xi\) representa contexto auxiliar (\texttt{frame}, \texttt{accession\_number}, \texttt{form\_type}, fuente, etc.);
   \item \(r\) es el \texttt{run\_id}.
 \end{itemize}
 
-\subsection{Salidas y artefactos}
+La canonización transforma este candidato \(x\) en un \emph{fact canónico} \(f^{\mathrm{can}}\) o en un rechazo estructurado \(r^{\mathrm{rej}}\).
 
-El módulo genera tres artefactos clave:
+\subsection{Modelo de salida canónica}
 
-\begin{itemize}
-  \item \texttt{data/edgar/parsed/facts\_canonical\_\{run\_id\}.parquet}: tabla de facts fundamentales canónicos, lista para ser usada en \texttt{point\_in\_time}.
-  \item \texttt{data/edgar/parsed/facts\_rejected\_\{run\_id\}.parquet}: registros de facts que fallaron alguno de los criterios de normalización o validación.
-  \item \texttt{data/edgar/parsed/manifest\_\{run\_id\}.json}: metadatos de la ejecución (número de facts procesados, dropped, etc.).
-\end{itemize}
+Cada fila aceptada en \texttt{facts\_canonical} debe contener, como mínimo:
 
-Estos artefactos permiten:
-\begin{itemize}
-  \item reconstruir la misma versión de datos canónicos a partir de \texttt{run\_id},
-  \item monitorear la tasa de facts \emph{rejected} y detectar cambios en la taxonomía o en el pipeline de ingesta,
-  \item y usar \texttt{facts\_rejected} para auditoría de casos marginales (por ejemplo, nuevos tags US‑GAAP, extensiones de filer, etc.).
-\end{itemize}
-
-\subsection{Modelo de datos y campos mínimos}
-
-El módulo asegura que cada fila de \texttt{facts\_canonical} contenga al menos los siguientes campos:
-
-\begin{itemize}
-  \item \texttt{cik}: clave de identificación de la entidad.
-  \item \texttt{symbol} (si está disponible en el mapping): ticker asociado al CIK.
-  \item \texttt{metric\_name}: nombre de métrica canonico interno (por ejemplo, \texttt{Revenue\_Canonical}, \texttt{NetIncome\_Canonical}).
-  \item \texttt{value}: valor numérico de la métrica, en la unidad de base definida.
-  \item \texttt{period\_end}: fecha de término del período de informe (por ejemplo, 31‑12‑2023).
-  \item \texttt{period\_type} (\texttt{Q} o \texttt{YTTM}): tipo de período (trimestral o anual/TTM).
-  \item \texttt{filed\_date}: fecha de presentación del filing.
-  \item \texttt{acceptance\_datetime}: timestamp de aceptación en EDGAR.
-  \item \texttt{source\_tag}: tag XBRL original (por ejemplo, \texttt{RevenueFromContractWithCustomerExcludingAssessedTax}).
-  \item \texttt{unit}: unidad de medida, homogeneizada a una base común.
-  \item \texttt{run\_id}: identificador de la ejecución.
-\end{itemize}
-
-En notación matemática, cada registro canónico se representa como:
 \[
-  f^{\text{c}} = (c, s, m, v, e, \tau, f_d, \alpha, t, u, r),
+(
+\texttt{cik},
+\texttt{symbol},
+\texttt{metric\_name},
+\texttt{value},
+\texttt{unit\_base},
+\texttt{period\_end},
+\texttt{period\_type},
+\texttt{filed\_date},
+\texttt{acceptance\_datetime},
+\texttt{source\_taxonomy},
+\texttt{source\_tag},
+\texttt{source\_unit},
+\texttt{accession\_number},
+\texttt{form\_type},
+\texttt{mapping\_version},
+\texttt{run\_id}
+).
 \]
-donde:
+
+Campos de alta prioridad recomendados:
+
 \begin{itemize}
-  \item \(c \in \mathcal{C}\) es el CIK,
-  \item \(s\) es el \texttt{symbol},
-  \item \(m\) es el \texttt{metric\_name},
-  \item \(v \in \mathbb{R}\) es el valor normalizado,
-  \item \(e\) es \texttt{period\_end},
-  \item \(\tau \in \{\texttt{Q}, \texttt{YTTM}\}\) es el \texttt{period\_type},
-  \item \(f_d\) es \texttt{filed\_date},
-  \item \(\alpha\) es \texttt{acceptance\_datetime},
-  \item \(t\) es el \texttt{source\_tag},
-  \item \(u\) es la unidad normalizada,
-  \item \(r\) es el \texttt{run\_id}.
+  \item \texttt{metric\_family},
+  \item \texttt{unit\_scale\_factor},
+  \item \texttt{canonical\_priority\_rank},
+  \item \texttt{selection\_reason},
+  \item \texttt{quality\_score},
+  \item \texttt{rejection\_class} en la tabla de rechazados,
+  \item \texttt{source\_record\_hash}.
 \end{itemize}
 
-\subsection{Reglas de normalización y selección}
+En notación matemática:
 
-El módulo aplica varias reglas clave:
+\[
+f^{\mathrm{can}} =
+(c, s, m, v, u, e, \phi^{\star}, d_f, \alpha, \tau, t, u_0, a_n, \omega, \nu, r),
+\]
+
+donde \(m\) es la métrica interna resuelta, \(u\) la unidad base y \(\phi^{\star}\) el tipo de periodo ya canonizado.
+
+\subsection{Arquitectura de resolución semántica}
+
+La parte crítica del módulo no es el parseo, sino el arbitraje. Para un candidato \(x\), la canonización puede describirse como una composición:
+
+\[
+\mathcal{C}_{\mathrm{xbrl}}
+=
+\mathcal{S}_{\mathrm{select}}
+\circ
+\mathcal{V}_{\mathrm{validate}}
+\circ
+\mathcal{U}_{\mathrm{unit}}
+\circ
+\mathcal{P}_{\mathrm{period}}
+\circ
+\mathcal{M}_{\mathrm{map}},
+\]
+
+donde:
 
 \begin{itemize}
-  \item \textbf{Mapping tag \(\rightarrow\) metric\_name versionado}:
-    \[
-      m = \Phi_{\theta}(t),
-    \]
-    donde \(\Phi_{\theta}\) es una función de mapping parametrizada por \(\theta\), versionada por \texttt{run\_id}, tal que:
-    \[
-      \forall t \in \mathcal{T}, \ \Phi_{\theta}(t) \in \mathcal{M}_{\text{internal}},
-    \]
-    y \(\mathcal{T}\) es el conjunto de tags XBRL y \(\mathcal{M}_{\text{internal}}\) es el conjunto de métricas internas.
+  \item \(\mathcal{M}_{\mathrm{map}}\) resuelve el mapping tag \(\rightarrow\) métrica interna;
+  \item \(\mathcal{P}_{\mathrm{period}}\) canoniza el contexto temporal;
+  \item \(\mathcal{U}_{\mathrm{unit}}\) normaliza unidad y escala;
+  \item \(\mathcal{V}_{\mathrm{validate}}\) aplica reglas de aceptación/rechazo;
+  \item \(\mathcal{S}_{\mathrm{select}}\) decide el mejor candidato entre múltiples hechos equivalentes.
+\end{itemize}
 
-  \item \textbf{Conversión de unidades a base definida}:
-    Para una unidad original \(u_0\) y un factor de escala \(s_u\), el valor se normaliza como:
-    \[
-      v = v_0 \cdot s_u,
-    \]
-    de forma que todas las unidades se expresen en una base común (por ejemplo, USD en millones, PER‑share sin escala, etc.)\cite{XBRLUnitDeclarations}. Esto permite comparabilidad homogénea entre empresas y periodos\cite{XBRLWhyNormalize}.
+\subsection{Mapping versionado tag \(\rightarrow\) métrica}
 
-  \item \textbf{Selección del registro más reciente por clave}:
-    Se define la clave:
-    \[
-      k = (c, m, e, f_d),
-    \]
-    y se selecciona:
-    \[
-      f^{\text{c}}_{\text{best}} = \arg\max_{f \in \mathcal{F}(k)} f_d,
-    \]
-    es decir, se retiene el registro con la fecha de presentación más reciente para cada combinación \((cik, metric\_name, period\_end, filed\_date)\), garantizando la versión más actualizada de cada hecho\cite{XBRLGuide}.
+Sea \(t\) un tag XBRL y \(\tau\) su taxonomía. El mapping canónico no debe depender solo del tag, sino del par \((\tau,t)\) y, cuando proceda, del contexto. Se define:
 
-  \item \textbf{No mezclar taxonomías incompatibles sin flag}:
-    Si un hecho proviene de una taxonomía distinta a la base (por ejemplo, \texttt{ifrs} en lugar de \texttt{us‑gaap}), se debe:
-    \begin{itemize}
-      \item o convertirlo a la métrica canónica mediante un mapeo bien definido,
-      \item o mantenerlo en un conjunto separado con un flag que indique la fuente.
-    \end{itemize}
-    Esto evita bugs de \emph{mixing taxonomies} que pueden introducir sesgos de comparabilidad entre mercados\cite{XBRLTechnicalGuide}.
+\[
+m = \Phi_{\Theta}(\tau, t, \xi),
+\]
+
+donde \(\Phi_{\Theta}\) es una función versionada y externa al código, parametrizada por \(\Theta\).
+
+La salida del mapping debe incluir no solo la métrica interna \(m\), sino también:
+
+\begin{itemize}
+  \item un \texttt{mapping\_status} en \(\{\texttt{exact}, \texttt{alias}, \texttt{heuristic}, \texttt{unmapped}\}\),
+  \item una prioridad de mapping,
+  \item una versión de configuración,
+  \item y, si aplica, una familia económica de la métrica.
+\end{itemize}
+
+Esto permite distinguir un mapping sólido de uno provisional, y evita tratar como igualmente fiables todos los tags resolvidos.
+
+\subsection{Precedencia entre taxonomías}
+
+Una de las debilidades clásicas en pipelines XBRL es mezclar taxonomías compatibles solo parcialmente. Este módulo debe definir una precedencia explícita entre taxonomías. Por ejemplo:
+
+\[
+\texttt{us-gaap} \succ \texttt{dei} \succ \texttt{ifrs-full} \succ \texttt{issuer-extension},
+\]
+
+salvo que una regla específica de configuración indique lo contrario para una métrica concreta.
+
+Esto implica que, si dos tags diferentes de taxonomías distintas compiten por representar la misma métrica interna, no se elige arbitrariamente. Se aplica una política explícita:
+
+\begin{enumerate}
+  \item priorizar la taxonomía de mayor jerarquía admitida para esa métrica;
+  \item si la taxonomía es equivalente pero el tag tiene menor prioridad semántica, degradarlo;
+  \item si la competencia no puede resolverse sin ambigüedad, rechazar o marcar el caso para revisión según configuración.
+\end{enumerate}
+
+Esta jerarquía es indispensable para evitar que la tabla canónica termine siendo una mezcla opaca de conceptos solo superficialmente equivalentes.
+
+\subsection{Normalización de unidades y escala}
+
+Para una métrica interna \(m\), la configuración debe definir una unidad base \(u^{\star}(m)\). Dado un hecho con unidad original \(u_0\) y valor \(v_0\), la transformación es:
+
+\[
+v = v_0 \cdot \lambda(u_0, m),
+\qquad
+u = u^{\star}(m),
+\]
+
+donde \(\lambda(u_0,m)\) es el factor de conversión/escala aplicable.
+
+El punto importante es que la normalización no puede depender solo de la cadena textual de la unidad. Debe considerar:
+
+\begin{itemize}
+  \item unidades monetarias vs monetarias por acción;
+  \item magnitudes instantáneas vs acumuladas;
+  \item factores de escala explícitos o implícitos;
+  \item unidades incompatibles que no deben fusionarse;
+  \item y casos donde la conversión es técnicamente posible pero semánticamente incorrecta.
+\end{itemize}
+
+Por tanto, la política correcta es:
+
+\begin{itemize}
+  \item convertir cuando la unidad es compatible y la regla es explícita;
+  \item rechazar cuando la unidad es incompatible para la métrica;
+  \item no inventar conversiones heurísticas de alto riesgo sin marcarlas como tales.
+\end{itemize}
+
+\subsection{Canonización del contexto temporal}
+
+La dimensión temporal no se reduce a \texttt{period\_end}. El módulo debe resolver:
+
+\begin{itemize}
+  \item si el hecho es \textbf{instantáneo} o \textbf{duracional};
+  \item la duración económica relevante del hecho;
+  \item la conversión a \texttt{period\_type} interno;
+  \item y la compatibilidad entre hechos con distinto frame o distinto FY/FP.
+\end{itemize}
+
+Sea \(x\) un candidato. La función temporal puede expresarse como:
+
+\[
+\phi^{\star} = \Psi_{\Theta}(e, \phi, \pi, \xi),
+\]
+
+donde \(\phi^{\star}\) pertenece a un vocabulario interno como:
+
+\[
+\{\texttt{Q}, \texttt{Y}, \texttt{TTM}, \texttt{H1}, \texttt{NineM}, \texttt{Instant}\},
+\]
+
+o al subconjunto que decida el sistema.
+
+No todos los contextos deben aceptarse automáticamente. Deben rechazarse o marcarse los hechos cuya duración sea incompatible con la métrica canónica objetivo o no pueda resolverse de forma estable.
+
+\subsection{Clave económica y deduplicación}
+
+El texto original se quedaba corto en la definición de clave de selección. La clave correcta no puede ser solo \((c,m,e,f_d)\), porque dos hechos pueden compartir esos campos y diferir materialmente en taxonomía, unidad, contexto o prioridad semántica.
+
+La clave de equivalencia económica mínima debe aproximarse a:
+
+\[
+k_{\mathrm{econ}} =
+(\texttt{cik}, \texttt{metric\_name}, \texttt{period\_end}, \texttt{period\_type}).
+\]
+
+Para cada clase de equivalencia \( \mathcal{F}(k_{\mathrm{econ}})\), el módulo debe resolver un único \emph{fact canonical} o marcar conflicto.
+
+\subsection{Regla de selección determinista}
+
+Cuando varios candidatos compiten por la misma clave económica, se debe aplicar una política explícita de precedencia. Una formulación razonable es ordenar candidatos por la tupla lexicográfica:
+
+\[
+\Big(
+\texttt{taxonomy\_priority},
+\texttt{mapping\_priority},
+\texttt{unit\_compatibility},
+\texttt{context\_quality},
+\texttt{filed\_date},
+\texttt{acceptance\_datetime}
+\Big).
+\]
+
+Esto implica la siguiente jerarquía:
+
+\begin{enumerate}
+  \item mayor prioridad taxonómica;
+  \item mejor prioridad de mapping semántico;
+  \item unidad totalmente compatible frente a unidad dudosa;
+  \item contexto temporal más alineado con la definición de la métrica;
+  \item filing más reciente;
+  \item mayor \texttt{acceptance\_datetime} si persiste el empate.
+\end{enumerate}
+
+Si persiste un empate exacto incluso después de estos criterios, el caso debe:
+
+\begin{itemize}
+  \item o resolverse con una regla final documentada en configuración;
+  \item o marcarse como conflicto crítico y salir a \texttt{facts\_rejected}.
+\end{itemize}
+
+Esto es justamente lo que eleva el módulo de ``parseo correcto'' a ``spec robusta de producción''.
+
+\subsection{Reglas de rechazo}
+
+Todo rechazo debe quedar clasificado. Una taxonomía útil de motivos de rechazo es:
+
+\[
+\texttt{rejection\_class} \in
+\{
+\texttt{unmapped\_tag},
+\texttt{unsupported\_taxonomy},
+\texttt{incompatible\_unit},
+\texttt{invalid\_value},
+\texttt{invalid\_date},
+\texttt{ambiguous\_context},
+\texttt{duplicate\_dominated},
+\texttt{conflict\_unresolved}
+\}.
+\]
+
+Esta clasificación permite:
+
+\begin{itemize}
+  \item monitorear deriva de taxonomías;
+  \item distinguir ausencia de cobertura de conflicto semántico;
+  \item y detectar dónde está realmente la fricción del pipeline.
+\end{itemize}
+
+\subsection{Validaciones obligatorias}
+
+El módulo debe imponer, como mínimo, las siguientes validaciones:
+
+\begin{itemize}
+  \item \textbf{Mapping resuelto}:
+  \[
+  \forall f \in \mathcal{F}^{\mathrm{can}},\quad \texttt{metric\_name}(f) \neq \varnothing.
+  \]
+
+  \item \textbf{Fechas coherentes}:
+  \[
+  \texttt{filed\_date} \ge \texttt{period\_end},
+  \]
+  y cuando exista:
+  \[
+  \texttt{acceptance\_datetime} \ge \texttt{period\_end}.
+  \]
+
+  \item \textbf{Unidad compatible}: la unidad del hecho debe ser convertible a la unidad base de la métrica o el hecho debe rechazarse.
+
+  \item \textbf{Valor numérico válido}: sin infinitos, NaNs operativamente inválidos o cadenas no parseables.
+
+  \item \textbf{Rango económico razonable}: para cada métrica \(m\),
+  \[
+  v \in [\underline{v}_m,\overline{v}_m],
+  \]
+  donde los límites pueden depender de la familia económica de la métrica.
+
+  \item \textbf{Compatibilidad de contexto}: el \texttt{period\_type} derivado debe ser admisible para la métrica interna.
+\end{itemize}
+
+Es importante subrayar que estas validaciones no son solo QA cosmético: protegen frente a mezclas silenciosas de hechos incompatibles que destruyen comparabilidad sin generar errores sintácticos.
+
+\subsection{Quality score del fact canónico}
+
+Para uso downstream avanzado, conviene que cada \emph{fact canonical} lleve un \texttt{quality\_score}. No para decidir PIT final, sino para informar a capas posteriores sobre la fortaleza relativa del proceso de resolución.
+
+Sea \(f\) un candidato aceptado. Puede definirse:
+
+\[
+q(f)
+=
+w_{\tau}\,q_{\tau}(f)
++
+w_{m}\,q_{m}(f)
++
+w_{u}\,q_{u}(f)
++
+w_{\phi}\,q_{\phi}(f)
++
+w_{d}\,q_{d}(f),
+\]
+
+con \(q(f)\in[0,1]\), donde cada componente mide calidad taxonómica, de mapping, de unidad, de contexto y de dominancia en la selección.
+
+Esto permite, por ejemplo, distinguir:
+
+\begin{itemize}
+  \item un fact US-GAAP exacto, perfectamente compatible y dominante;
+  \item de un fact aceptado vía alias o mapping heurístico con menor prioridad.
 \end{itemize}
 
 \subsection{Flujo de ejecución}
 
-El flujo del módulo se puede descomponer en cuatro pasos:
+El flujo del módulo debe estructurarse en seis etapas:
 
 \begin{enumerate}
-  \item \textbf{Carga de raw facts y mapping config}:
-    Se leen \texttt{submissions\_raw\_path} y \texttt{companyfacts\_raw\_path}, y se cargan los mappings de tags definidos en \texttt{xbrl\_mapping\_config\_path}.
-
-  \item \textbf{Aplicación de mapping y conversión de unidades}:
-    \begin{itemize}
-      \item Se mapea cada tag XBRL a \texttt{metric\_name}.
-      \item Se aplican conversiones de unidad y escala según una tabla de factores predefinidos.
-    \end{itemize}
-
-  \item \textbf{Resolución de conflictos y deduplicados}:
-    Para cada clave \((cik, metric\_name, period\_end, filed\_date)\):
-    \begin{itemize}
-      \item se selecciona el registro más reciente,
-      \item se marcan como \texttt{rejected} los duplicados y los registros con taxonomías incompatibles o sin metric\_name.
-    \end{itemize}
-
-  \item \textbf{Emisión de outputs}:
-    \begin{itemize}
-      \item Se guarda \texttt{facts\_canonical\_\{run\_id\}.parquet}.
-      \item Se guarda \texttt{facts\_rejected\_\{run\_id\}.parquet}.
-      \item Se genera \texttt{manifest\_\{run\_id\}.json} con metadatos de la ejecución.
-    \end{itemize}
+  \item \textbf{Carga y validación de inputs}: lectura de raw facts, submissions y configuración.
+  \item \textbf{Construcción de candidatos}: expansión del raw XBRL a una tabla intermedia de hechos candidatos.
+  \item \textbf{Resolución semántica}: mapping, prioridad taxonómica, unidad y contexto.
+  \item \textbf{Validación y rechazo}: separación entre aceptables y no aceptables.
+  \item \textbf{Selección canónica}: deduplicación y arbitraje entre candidatos equivalentes.
+  \item \textbf{Persistencia}: escritura de \texttt{facts\_canonical}, \texttt{facts\_rejected} y \texttt{manifest}.
 \end{enumerate}
 
-Este flujo implementa un patrón de \emph{normalization ETL} para datos XBRL, donde se transforma una estructura anidada y heterogénea de facts en una tabla tabular consistente, lista para ser consumida por sistemas de time series PIT y modelos de factores fundamentales\cite{CampbellEtAl2001, DePrado2018Advances}.
+\subsection{Artefactos de salida}
 
-\subsection{Validaciones aplicadas}
-
-El módulo aplica varias validaciones para asegurar calidad:
+El módulo debe generar como mínimo:
 
 \begin{itemize}
-  \item \textbf{metric\_name no nulo para registros aceptados}:
-    \[
-      \forall f \in \mathcal{F}_{\text{accepted}}, \ m \neq \emptyset,
-    \]
-    es decir, se rechazan automática o explícitamente los facts que no pueden ser mapeados a una métrica interna.
+  \item \texttt{data/edgar/parsed/facts\_canonical\_\{run\_id\}.parquet}
+  \item \texttt{data/edgar/parsed/facts\_rejected\_\{run\_id\}.parquet}
+  \item \texttt{data/edgar/parsed/facts\_metrics\_\{run\_id\}.parquet}
+  \item \texttt{data/edgar/parsed/manifest\_\{run\_id\}.json}
+\end{itemize}
 
-  \item \textbf{value en rango razonable según métrica}:
-    Para cada métrica \(m\), se verifica que:
-    \[
-      v \in [\underline{v}_m, \overline{v}_m],
-    \]
-    donde \(\underline{v}_m\) y \(\overline{v}_m\) son límites de rango económico (por ejemplo, \texttt{Revenue} y \texttt{TotalAssets} no pueden ser negativos, \texttt{EPS} no debe ser infinito, etc.). Valores fuera de rango se marcan como \texttt{rejected} o se señalan con flags de anomalía.
+El \emph{manifest} debe incluir:
 
-  \item \textbf{fechas coherentes}:
-    Debe cumplirse:
-    \[
-      f_d \ge e,
-    \]
-    es decir, la fecha de presentación no puede ser anterior a la fecha de término del período de informe, evitando \emph{look‑ahead bias} en el manejo de facts temporales\cite{SECXBRLGuide}.
+\begin{itemize}
+  \item \texttt{run\_id},
+  \item \texttt{asof},
+  \item número de candidatos procesados,
+  \item número de aceptados,
+  \item número de rechazados por clase,
+  \item distribución por taxonomía,
+  \item distribución por \texttt{mapping\_status},
+  \item hash de configuración,
+  \item timestamps de inicio y fin.
+\end{itemize}
+
+\subsection{Precedencia de errores}
+
+No todos los fallos tienen la misma gravedad. La jerarquía correcta debe ser:
+
+\[
+\texttt{schema/config failure}
+\succ
+\texttt{systemic mapping failure}
+\succ
+\texttt{taxonomy conflict}
+\succ
+\texttt{unit/context incompatibility}
+\succ
+\texttt{row-level anomaly}.
+\]
+
+Esto implica que:
+
+\begin{itemize}
+  \item un fallo de configuración o schema puede invalidar toda la corrida;
+  \item una caída masiva del mapping no puede tratarse como una simple suma de rejects fila a fila;
+  \item conflictos semánticos sistémicos pesan más que pequeñas anomalías individuales;
+  \item un pipeline no es sano solo porque el porcentaje de filas aceptadas sea alto.
 \end{itemize}
 
 \subsection{CLI y uso operativo}
 
-El módulo se invoca mediante la línea de comandos:
+La interfaz operativa recomendada es:
 
 \begin{verbatim}
 python -m data.edgar.parse_xbrl ^
   --submissions-path data/edgar/raw/submissions ^
   --companyfacts-path data/edgar/raw/companyfacts ^
   --config-path configs/data/edgar_parse_xbrl.yaml ^
-  --run-id parse_xbrl_20260305_001
+  --run-id parse_xbrl_20260305_001 ^
+  --asof 2026-03-05
 \end{verbatim}
 
-Esto permite:
+El uso de \texttt{asof} explícito es recomendable para mantener versionado coherente con el resto del subsistema EDGAR.
+
+\subsection{Tests mínimos obligatorios}
+
+Para que el módulo quede realmente cerrado a nivel de producción, su DoD debe exigir al menos:
+
 \begin{itemize}
-  \item integrar el módulo en pipelines de features fundamental y PIT,
-  \item actualizar periódicamente la tabla canónica conforme llegan nuevos filings,
-  \item y mantener versiones reproducibles de mappings y normalizaciones mediante \texttt{run\_id}.
+  \item test de mapping exacto de tag a métrica interna;
+  \item test de prioridad correcta entre taxonomías competidoras;
+  \item test de rechazo de unidad incompatible;
+  \item test de conversión correcta de escala y unidad;
+  \item test de resolución consistente de \texttt{period\_type};
+  \item test de deduplicación determinista entre múltiples candidatos;
+  \item test de conflicto no resoluble enviado a \texttt{facts\_rejected};
+  \item test de estabilidad bajo misma configuración y misma entrada;
+  \item test de persistencia íntegra de manifest y métricas;
+  \item test de clasificación correcta de \texttt{rejection\_class}.
 \end{itemize}
 
-\subsection{Definición de término (DoD)}
+\subsection{Definición de terminado (DoD)}
 
-La definición de término del módulo establece que:
+El módulo se considera terminado únicamente si:
 
 \begin{itemize}
-  \item La tabla \texttt{facts\_canonical\_\{run\_id\}.parquet} debe ser \emph{consistente} y lista para ser consumida por el módulo \texttt{point\_in\_time}, sin discrepancias de:
-    \begin{itemize}
-      \item métricas internas,
-      \item unidades de medida,
-      \item y estructura de periodos.
-    \end{itemize}
-  \item No debe haber facts aceptados sin \texttt{metric\_name} ni facts aceptados con violaciones graves de rango o fechas.
-  \item Debe existir un registro auditado de rechazos y metadatos en \texttt{facts\_rejected\_\{run\_id\}.parquet} y \texttt{manifest\_\{run\_id\}.json}, que permita rastrear la evolución de la calidad de los mappings XBRL a lo largo del tiempo.
+  \item transforma hechos XBRL brutos en métricas internas canónicas con reglas versionadas;
+  \item resuelve explícitamente taxonomía, unidad, escala y contexto;
+  \item aplica una política determinista de selección entre candidatos equivalentes;
+  \item registra rechazos con causa auditable;
+  \item emite artefactos reproducibles bajo \texttt{run\_id};
+  \item y supera los tests mínimos de robustez semántica.
 \end{itemize}
 
-\subsection{Conexión con estado del arte y literatura}
+\subsection{Conclusión}
 
-El diseño de \texttt{parse\_xbrl.py} se alinea con:
+\texttt{parse\_xbrl.py} es el núcleo semántico del subsistema fundamental EDGAR. Si esta capa es débil, el sistema no trabaja con hechos comparables, sino con una mezcla opaca de tags, unidades y contextos solo aparentemente homogéneos. Por ello, su diseño debe tener el mismo estándar que cualquier infraestructura crítica de datos cuantitativos: \textbf{mapping versionado, arbitraje determinista, precedencia explícita, rechazo auditable, compatibilidad temporal y disciplina formal de canonización}.
 
-\begin{itemize}
-  \item \textbf{Guías de XBRL y US‑GAAP}: los mappings y normalizaciones siguen las recomendaciones de la \emph{XBRL US GAAP Taxonomy Preparers Guide} y de la \emph{XBRL US Data Quality Guidance}\cite{XBRLGuide, XBRLTechnicalGuide}, que enfatizan la consistencia de unidades, taxonomías y contexto de facts.
-  \item \textbf{Normalización de datos financieros}: las prácticas de normalización de unidades y métricas se alinean con la literatura de \emph{data normalization for financial reporting}\cite{XB
+Bien implementado, este módulo convierte el ruido estructural del ecosistema XBRL en una base fundamental coherente y explotable. Mal implementado, introduce una fuente silenciosa de sesgo, no comparabilidad y degradación de señal que contaminaria todo el pipeline PIT y cualquier modelo downstream.

@@ -1,125 +1,719 @@
 \documentclass[11pt,a4paper]{article}
+
 \usepackage[utf8]{inputenc}
 \usepackage[spanish]{babel}
-\usepackage{amsmath, amssymb, amsthm, amsfonts}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm,amsfonts,mathtools}
 \usepackage{graphicx}
 \usepackage{hyperref}
 \usepackage{booktabs}
 \usepackage{siunitx}
-\usepackage{natbib}
-\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue}
+\usepackage{array}
+\usepackage{geometry}
+\geometry{margin=2.5cm}
 
-\title{Generación de Pesos Crudos por Sizing de Señales: Módulo \texttt{portfolio/sizing.py}}
-\author{Análisis Técnico Cuantitativo}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\title{Especificación Operativa de Generación de Pesos Crudos por Sizing\\
+\large Módulo \texttt{portfolio/sizing.py}}
+\author{Quantitative Research Specification}
 \date{Marzo 2026}
 
 \begin{document}
 
 \maketitle
-
 \tableofcontents
 \newpage
 
-\section{Introducción}
+\section{Objetivo del módulo}
 
-El módulo \texttt{portfolio/sizing.py} convierte señales/scores de modelos ML en pesos objetivo crudos $\mathbf{w}^{\mathrm{raw}}$, aplicando transformaciones rank/zscore/proporcional, normalización long-short y ajustes por riesgo/líquidez, manteniendo PIT para evitar leakage en swing trading.
-
-Para small caps swing, donde alphas son noisy y universo limitado, sizing rank-based reduce overfitting vs. raw scores. Produce pesos pre-constraints con gross/net targets, escalados por vol/liquidez para control implícito de riesgo.
-
-Sigue \citet{grnold2000active} (IR maximization por breadth) y \citet{lprado2018advances} (hierarchical sizing leakage-free).
-
-\section{Estado del Arte: Signal to Position Sizing}
-
-\subsection{Libros Industriales}
-- \textbf{Active Portfolio Management} (Grinold \& Kahn, 2000): $IR = IC \sqrt{BR}$, sizing $\propto z$-score.
-- \textbf{Advances in Financial Machine Learning} (López de Prado, 2018): Percentile ranks y z-score clipping.
-- \textbf{Quantitative Trading} (Chan, 2021): Risk parity sizing.
-- \textbf{Finding Alphas} (Molina, 2015): AQR-style percentile weighting.
-
-\subsection{Papers Clave}
-- \citet{cohen2013using}: Rank-based long-short.
-- \citet{barberis1998style}: Style-adjusted sizing.
-- \citet{krauss2017statistical}: ML signals to portfolios.
-- Estado del arte: \citet{stockformer2024} usa transformer z-scores para swing.
-
-\section{Formulación Matemática}
-
-\subsection{Notación}
-$\mathbf{z} \in \mathbb{R}^N$: Scores raw por símbolo $i$.
-$\mathcal{U}_t$: Universo elegible en $t$.
-$g^*, n^*$: Gross/net targets.
-
-\subsection{Sizing Mode: Rank-Based}
+El módulo \texttt{portfolio/sizing.py} transforma señales o scores predictivos en un vector de pesos crudos
 \[
-\mathrm{rank}_i = \mathrm{Percentile}(\mathbf{z}_i | \mathcal{U}_t), \quad w_i^{\mathrm{L/S}} = \pm \frac{\mathrm{rank}_i - 0.5}{N/2}
+\mathbf{w}^{\mathrm{raw}} \in \mathbb{R}^N
 \]
-Top $k\%$ longs, bottom $k\%$ shorts, zero middle.
+que expresa la intensidad relativa de convicción por activo antes de la imposición final de restricciones de cartera, optimización global o traducción a órdenes.
 
-\subsection{Sizing Mode: Z-Score}
+Su cometido no es resolver el problema completo de portfolio construction. Su función correcta es más estrecha y más precisa:
+
+\begin{quote}
+\emph{Convertir una sección transversal de señales PIT en una asignación preliminar de capital con semántica estable, escalado controlado, gross y net target explícitos y comportamiento robusto ante outliers, iliquidez y asimetrías del universo.}
+\end{quote}
+
+En una estrategia swing sobre small caps, este paso es crítico porque el mapa
 \[
-z_i = \mathrm{clip}\left( \frac{z_i - \mu_z}{\sigma_z}, [-c_z, c_z] \right)
+\text{score} \rightarrow \text{peso}
 \]
-\[
-w_i = \frac{z_i}{\sum |z_j|} \cdot g^*
-\]
+no es inocente: un sizing mal definido amplifica ruido, concentra exposición en nombres poco líquidos y hace irreproducible el comportamiento aguas abajo de \texttt{neutralize.py}, \texttt{constraints.py} y \texttt{optimizer.py}.
 
-\textbf{Normalización Long/Short (Market Neutral)}:
-\[
-w_i^{\mathrm{L}} \gets \frac{w_i^{\mathrm{L}}}{2} \cdot (1 + n^*), \quad w_i^{\mathrm{S}} \gets -\frac{|w_i^{\mathrm{S}}|}{2} \cdot (1 - n^*)
-\]
+\section{Principios de diseño}
 
-\subsection{Sizing Proporcional (Vol/Liq Adjusted)}
-\[
-w_i \propto \frac{z_i}{\sigma_i \cdot (1 - \mathrm{illiquid\_penalty}_i)}
-\]
-donde $\sigma_i$: Volatilidad PIT, illiquid $\propto 1/\mathrm{ADV}_i$.
-
-\textbf{Efective N (Diversificación)}:
-\[
-N_{\mathrm{eff}} = \frac{1}{\sum_i w_i^2} = \frac{[\sum |w_i|]^2}{\sum w_i^2}
-\]
-
-\section{Implementación Algorítmica}
-
-Flujo PIT-compliant:
+El módulo se rige por los siguientes principios:
 
 \begin{enumerate}
-\item Cargar config (mode, $g^*, n^*, c_z, k_{\max}$), scores $\mathbf{z}_t$, universo $\mathcal{U}_t$.
-\item Filtrar: $|z_i| \geq \theta_z$, activo en $\mathcal{U}_t$.
-\item Clip: $z_i \in [-c_z, c_z]$.
-\item Computar pesos por mode (rank/zscore/prop).
-\item Normalizar: $\sum |w| = g^*$, $\sum w = n^*$.
-\item Ajustes: $w_i \gets w_i / (\sigma_i \cdot \mathrm{ADV}_i^{-\beta})$.
-\item Top-$k$: Seleccionar max names.
-\item Persistir: Parquet con rank/side/score, JSON (N\_eff, coverage).
+    \item \textbf{Point-in-time estricto:} los scores, la elegibilidad, la volatilidad y la liquidez deben estar definidos exclusivamente con información disponible en la fecha \(t\).
+    \item \textbf{Separación de responsabilidades:} \texttt{sizing.py} asigna pesos crudos; no neutraliza exposiciones, no optimiza alpha-riesgo y no genera órdenes.
+    \item \textbf{Método canónico único:} el módulo debe tener un modo por defecto inequívoco. Otros modos pueden existir, pero no pueden dejar ambigua la semántica principal.
+    \item \textbf{Robustez transversal:} el tamaño de posición debe responder a la señal relativa sin quedar dominado por outliers o escalas arbitrarias del modelo.
+    \item \textbf{Normalización exacta:} cualquier ajuste por volatilidad o liquidez debe ir seguido de una renormalización explícita para restaurar gross y net targets.
+    \item \textbf{Auditabilidad:} el módulo debe dejar trazado qué nombres entran, qué nombres se excluyen, qué transformación se aplica y qué concentración resulta.
 \end{enumerate}
 
-\section{Backtest y Validaciones}
+\section{Qué hace y qué no hace}
 
-\subsection{Ejemplo Z-Score Sizing}
-Universe 200 small caps, $g^*=1.2$, $n^*=0.1$, $c_z=3$:
+\subsection{Qué hace}
 
-| Percentil | N Longs | N Shorts | Top Weight | N\_eff | Gross | Net  |
-|-----------|---------|----------|------------|--------|-------|------|
-| Top 20\%  | 40      | 40       | 0.045      | 28     | 1.20  | 0.10 |
+\begin{itemize}
+    \item recibe scores por activo y universo elegible;
+    \item transforma los scores en intensidades de peso;
+    \item aplica clipping/winsorization si se configura;
+    \item permite ajustes por volatilidad y liquidez;
+    \item normaliza el resultado a gross y net target;
+    \item controla top-\(k\), cobertura mínima y concentración;
+    \item devuelve un vector de pesos crudos con semántica consistente.
+\end{itemize}
 
-Post-vol adjust: Top weight $\downarrow$ 12\%.
+\subsection{Qué no hace}
 
-\subsection{Validaciones}
-- $|\sum |w^{\mathrm{raw}}| - g^*| < \epsilon$, $|\sum w - n^*| < \epsilon$.
-- $N_{\mathrm{eff}} \geq n_{\min}$, max $|w_i| \leq p_{\max}$.
-- Leakage check: Correlación scores futuros = 0.
-- Stability: Std dev pesos históricos baja.
+\begin{itemize}
+    \item no decide el universo elegible;
+    \item no impone neutralización de factores como semántica propia;
+    \item no resuelve restricciones finales de cartera;
+    \item no sustituye al optimizador global;
+    \item no usa por defecto Kelly, HRP, RL o sizing no lineal aprendido.
+\end{itemize}
 
-\section{Mejoras al Estado del Arte}
+\section{Contrato exacto del módulo}
 
-1. **Kelly Criterion Sizing**: $f^* = \frac{\mu}{\sigma^2}$ por signal.
-2. **Volatility Timing**: Dynamic $g_t^* \propto 1/VIX_t$.
-3. **Hierarchical Risk Parity**: Cluster signals primero.
-4. **ML Sizing**: NN map scores $\to$ weights \citep{ml_sizing2022}.
-5. **Regime-Aware**: Switch long/short bias por macro regime.
+\subsection{Entradas obligatorias}
 
-\bibliographystyle{plainnat}
-\bibliography{refs}
+El módulo opera sobre una fecha de decisión \(t\) y recibe, como mínimo:
+
+\subsubsection*{1. Scores}
+
+\[
+\mathbf{s}_t \in \mathbb{R}^N
+\]
+vector de señales o scores por activo. La semántica debe venir definida upstream: score monotónico, retorno esperado, logit, probabilidad calibrada u otra magnitud consistente.
+
+\subsubsection*{2. Universo elegible}
+
+Un indicador PIT
+\[
+\mathbf{e}_t \in \{0,1\}^N
+\]
+tal que \(e_{i,t}=1\) si el activo puede participar en el sizing de esa fecha.
+
+\subsubsection*{3. Datos auxiliares PIT}
+
+\begin{center}
+\begin{tabular}{>{\ttfamily}m{4.2cm} m{9.0cm}}
+\toprule
+\textnormal{Campo} & \textnormal{Descripción} \\
+\midrule
+vol\_est & Estimación de volatilidad por activo \\
+adv\_usd & Liquidez en dólares por activo \\
+price & Precio de referencia, si se necesita para reporting \\
+side\_eligibility & Permiso long-only, short-only o long-short \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection*{4. Configuración}
+
+La configuración debe definir explícitamente:
+
+\begin{itemize}
+    \item \texttt{mode}
+    \item \texttt{gross\_target} \(= g^\star\)
+    \item \texttt{net\_target} \(= n^\star\)
+    \item \texttt{score\_clip}
+    \item \texttt{min\_score\_abs}
+    \item \texttt{topk\_long}, \texttt{topk\_short} o fracciones equivalentes
+    \item \texttt{vol\_adjust\_beta}
+    \item \texttt{liq\_adjust\_beta}
+    \item \texttt{min\_effective\_n}
+    \item \texttt{max\_raw\_name\_weight}
+    \item \texttt{small\_universe\_policy}
+    \item \texttt{insufficient\_shorts\_policy}
+\end{itemize}
+
+\subsection{Salidas obligatorias}
+
+El módulo debe producir:
+
+\begin{enumerate}
+    \item \(\mathbf{w}^{\mathrm{raw}}_t\): pesos crudos finales;
+    \item \texttt{sizing\_report.json}: modo, cobertura, concentración, gross/net realizados y diagnóstico;
+    \item \texttt{sizing\_details.parquet}: scores, ranks, side, intensidad preajuste y peso final;
+    \item \texttt{status}: \texttt{ok}, \texttt{degenerate}, \texttt{empty} o \texttt{fail\_postcheck}.
+\end{enumerate}
+
+\section{Notación y definiciones}
+
+Sea \(\mathcal{U}_t\) el conjunto de activos elegibles en \(t\), con cardinalidad
+\[
+N_t = |\mathcal{U}_t|.
+\]
+
+Para cada activo elegible \(i\), definimos:
+
+\[
+s_i \quad \text{score bruto},
+\]
+\[
+\widetilde{s}_i \quad \text{score transformado y clippeado},
+\]
+\[
+a_i \ge 0 \quad \text{intensidad preliminar no normalizada},
+\]
+\[
+w_i^{\mathrm{raw}} \quad \text{peso crudo final}.
+\]
+
+Las métricas básicas del módulo son:
+
+\[
+G(\mathbf{w}) = \sum_i |w_i|,
+\qquad
+N(\mathbf{w}) = \sum_i w_i.
+\]
+
+El número efectivo de posiciones se define como:
+
+\[
+N_{\mathrm{eff}}(\mathbf{w})=
+\frac{\left(\sum_i |w_i|\right)^2}{\sum_i w_i^2}.
+\]
+
+Esta es la definición canónica del módulo para concentración transversal.
+
+\section{Problema que resuelve el módulo}
+
+El módulo debe responder a la siguiente pregunta operativa:
+
+\begin{quote}
+\emph{Dada una sección transversal de scores, qué pesos preliminares deben asignarse para reflejar la convicción relativa de la señal sin convertir diferencias pequeñas de escala en concentraciones excesivas ni romper los targets de gross y net.}
+\end{quote}
+
+La respuesta correcta no puede depender de convenciones implícitas del score. Por ello, el módulo debe usar una transformación intermedia estable antes de normalizar capital.
+
+\section{Método canónico por defecto}
+
+\subsection{Convención oficial}
+
+El método por defecto del módulo será:
+
+\begin{center}
+\texttt{mode = rank\_symmetric}
+\end{center}
+
+La razón es simple: en small caps y en alphas ML ruidosos, el orden relativo suele ser más estable fuera de muestra que la magnitud absoluta del score.
+
+\subsection{Transformación base}
+
+Sobre el universo elegible \(\mathcal{U}_t\), se calcula el percentil empírico:
+
+\[
+r_i = \mathrm{PercentileRank}(s_i \mid \mathcal{U}_t) \in (0,1).
+\]
+
+La intensidad firmada base se define como:
+
+\[
+q_i = 2r_i - 1 \in (-1,1).
+\]
+
+Así, los mejores nombres tienen \(q_i>0\), los peores \(q_i<0\), y el centro de la distribución queda cerca de cero.
+
+\subsection{Filtro por banda muerta}
+
+Para evitar micro-posiciones generadas por scores poco informativos, el módulo puede aplicar una banda muerta simétrica:
+
+\[
+q_i \leftarrow 0
+\quad \text{si} \quad
+|q_i| < \theta_q.
+\]
+
+Por defecto, esta banda muerta es preferible a umbrales sobre el score original, porque es invariante a reescalados monotónicos del modelo.
+
+\subsection{Selección de lados}
+
+Definimos los conjuntos candidatos:
+
+\[
+\mathcal{L} = \{i : q_i > 0 \text{ y } i \text{ permite largos}\},
+\]
+\[
+\mathcal{S} = \{i : q_i < 0 \text{ y } i \text{ permite cortos}\}.
+\]
+
+Si se usa top-\(k\), se conservan únicamente los \(k_L\) mayores de \(\mathcal{L}\) y los \(k_S\) menores de \(\mathcal{S}\). El resto se fija a intensidad cero.
+
+\section{Otros modos permitidos}
+
+Aunque la semántica canónica sea \texttt{rank\_symmetric}, el módulo puede exponer:
+
+\begin{itemize}
+    \item \texttt{zscore\_symmetric}
+    \item \texttt{proportional\_signed}
+\end{itemize}
+
+pero siempre con contrato idéntico de normalización y postcheck.
+
+\subsection{Modo z-score}
+
+Si se activa \texttt{zscore\_symmetric}, el score transformado es:
+
+\[
+z_i =
+\mathrm{clip}
+\left(
+\frac{s_i-\mu_s}{\sigma_s+\varepsilon},
+-c_s,
+c_s
+\right),
+\]
+donde \(\mu_s\) y \(\sigma_s\) se calculan sólo sobre el universo elegible de la fecha.
+
+La intensidad preliminar es:
+\[
+q_i = z_i.
+\]
+
+\subsection{Modo proporcional}
+
+Si se activa \texttt{proportional\_signed}, la intensidad preliminar es directamente una función monótona del score, opcionalmente clippeada:
+\[
+q_i = \mathrm{clip}(s_i, -c_s, c_s).
+\]
+
+Este modo sólo debe usarse si la escala del score tiene una interpretación suficientemente estable entre fechas.
+
+\section{Ajustes por volatilidad y liquidez}
+
+\subsection{Motivación}
+
+Una vez obtenidas intensidades firmadas \(q_i\), el módulo puede ajustar su agresividad según riesgo y negociabilidad del nombre.
+
+Sin embargo, estos ajustes no pueden ser el paso final, porque alteran gross y net. Deben ir siempre seguidos de una renormalización exacta.
+
+\subsection{Ajuste por volatilidad}
+
+Sea \(\sigma_i > 0\) una estimación PIT de volatilidad. El ajuste de intensidad por volatilidad es:
+
+\[
+q_i^{(\sigma)} =
+\frac{q_i}{(\sigma_i+\varepsilon)^{\beta_\sigma}},
+\qquad \beta_\sigma \ge 0.
+\]
+
+\subsection{Ajuste por liquidez}
+
+Sea \(ADV_i^{USD} > 0\). El ajuste por liquidez será:
+
+\[
+q_i^{(\sigma,L)} =
+q_i^{(\sigma)} \cdot
+\left(
+\frac{ADV_i^{USD}}{ADV_{\mathrm{ref}}}
+\right)^{\beta_L},
+\qquad \beta_L \ge 0,
+\]
+donde \(ADV_{\mathrm{ref}}\) es una escala fija de referencia, por ejemplo la mediana del universo elegible.
+
+Esta formulación penaliza implícitamente nombres menos líquidos sin introducir una función ad hoc difícil de calibrar.
+
+\subsection{Regla obligatoria}
+
+La salida de este paso nunca se interpreta aún como peso final. Sólo es una intensidad ajustada:
+\[
+\widehat{q}_i.
+\]
+
+\section{Separación explícita entre intensidad y capital}
+
+Para evitar inconsistencias, el módulo debe separar conceptualmente:
+
+\begin{enumerate}
+    \item \textbf{intensidad relativa de convicción} \(\widehat{q}_i\),
+    \item \textbf{asignación final de capital} \(w_i^{\mathrm{raw}}\).
+\end{enumerate}
+
+Muchos errores de implementación aparecen cuando el pipeline mezcla ambos niveles y luego “reescala” de forma informal. Aquí esa frontera queda cerrada.
+
+\section{Normalización canónica a gross y net target}
+
+\subsection{Descomposición por lados}
+
+Definimos:
+
+\[
+\widehat{q}_i^{+} = \max(\widehat{q}_i,0),
+\qquad
+\widehat{q}_i^{-} = \max(-\widehat{q}_i,0).
+\]
+
+Sea
+\[
+Q^{+} = \sum_i \widehat{q}_i^{+},
+\qquad
+Q^{-} = \sum_i \widehat{q}_i^{-}.
+\]
+
+Dados los targets
+\[
+g^\star > 0,
+\qquad
+|n^\star| \le g^\star,
+\]
+definimos los gross por lado deseados:
+
+\[
+G_L^\star = \frac{g^\star + n^\star}{2},
+\qquad
+G_S^\star = \frac{g^\star - n^\star}{2}.
+\]
+
+La normalización canónica es:
+
+\[
+w_i^{\mathrm{raw}} =
+\begin{cases}
+\displaystyle
+\frac{\widehat{q}_i^{+}}{Q^{+}}\, G_L^\star, & \widehat{q}_i > 0, \\[1.2em]
+\displaystyle
+-\frac{\widehat{q}_i^{-}}{Q^{-}}\, G_S^\star, & \widehat{q}_i < 0, \\[1.2em]
+0, & \widehat{q}_i = 0.
+\end{cases}
+\]
+
+\subsection{Ventaja}
+
+Con esta formulación se garantiza, salvo degeneración de un lado, que:
+
+\[
+\sum_i |w_i^{\mathrm{raw}}| = g^\star,
+\qquad
+\sum_i w_i^{\mathrm{raw}} = n^\star.
+\]
+
+Esta es la definición oficial del módulo y debe aplicarse \emph{después} de todos los ajustes de intensidad, no antes.
+
+\section{Casos degenerados y políticas obligatorias}
+
+\subsection{Caso 1: ausencia de lado corto}
+
+Si \(Q^{-}=0\) pero \(G_S^\star>0\), entonces no existe suficiente señal o elegibilidad corta para construir el lado short deseado.
+
+La política por defecto será:
+
+\begin{center}
+\texttt{insufficient\_shorts\_policy = redistribute\_to\_cash}
+\end{center}
+
+Esto significa:
+
+\begin{itemize}
+    \item se conserva el lado largo disponible;
+    \item el gross faltante del lado corto no se redistribuye automáticamente al lado largo;
+    \item el net realizado podrá diferir del target teórico y el déficit quedará reportado.
+\end{itemize}
+
+\subsection{Caso 2: ausencia de lado largo}
+
+Análogamente, si \(Q^{+}=0\) pero \(G_L^\star>0\), el déficit se va a caja y se reporta.
+
+\subsection{Caso 3: universo pequeño}
+
+Si \(N_t\) es demasiado pequeño para sostener la estructura configurada, la política por defecto será:
+
+\begin{center}
+\texttt{small\_universe\_policy = shrink\_breadth\_keep\_formula}
+\end{center}
+
+Esto significa que el módulo reduce el número efectivo de nombres usados, pero mantiene la misma fórmula de sizing y no inventa scores ni redistribuye agresivamente capital a pocos nombres sin control.
+
+\subsection{Caso 4: scores todos iguales}
+
+Si la dispersión transversal del score es nula o numéricamente despreciable, el módulo debe devolver:
+
+\[
+\mathbf{w}^{\mathrm{raw}}=\mathbf{0}
+\]
+o una salida vacía según configuración, con
+\[
+\texttt{status = degenerate}.
+\]
+
+\subsection{Caso 5: scores muy asimétricos}
+
+Si la masa de la señal está casi toda en un lado, el módulo no debe forzar simetría artificial mediante inversión de ranking del lado opuesto. Debe usar únicamente el lado genuinamente soportado por la señal y reportar el déficit respecto al target.
+
+\section{Control de concentración}
+
+Aunque los pesos crudos todavía no son los pesos finales del portfolio, el módulo debe impedir concentraciones absurdas antes de pasar aguas abajo.
+
+\subsection{Bound por nombre}
+
+Debe existir un límite explícito:
+\[
+|w_i^{\mathrm{raw}}| \le p_{\max}^{\mathrm{raw}}.
+\]
+
+Si este límite se viola tras la normalización, el módulo debe aplicar una operación de \emph{cap-and-redistribute} dentro del mismo lado:
+
+\begin{enumerate}
+    \item capar nombres por encima de \(p_{\max}^{\mathrm{raw}}\),
+    \item redistribuir el exceso proporcionalmente al resto del lado correspondiente,
+    \item repetir hasta convergencia o hasta declarar degeneración.
+\end{enumerate}
+
+\subsection{Número efectivo}
+
+El módulo debe calcular:
+\[
+N_{\mathrm{eff}}(\mathbf{w}^{\mathrm{raw}})
+\]
+y compararlo con \texttt{min\_effective\_n}. Si el resultado cae por debajo del umbral, el módulo no debe ocultarlo: debe registrarlo y opcionalmente degradar el estado a \texttt{degenerate}.
+
+\section{Algoritmo exacto del módulo}
+
+\subsection{Paso 1. Validación de inputs}
+
+Verificar:
+
+\begin{itemize}
+    \item alineación exacta de scores, elegibilidad, volatilidad y liquidez;
+    \item ausencia de duplicados por activo;
+    \item definición explícita de \(g^\star\) y \(n^\star\);
+    \item consistencia:
+    \[
+    g^\star \ge |n^\star|;
+    \]
+    \item ausencia de NaN o infinitos en columnas activas.
+\end{itemize}
+
+\subsection{Paso 2. Filtrado del universo}
+
+Conservar únicamente activos con:
+
+\begin{itemize}
+    \item \texttt{eligible\_flag = True},
+    \item score válido,
+    \item side permitido por configuración.
+\end{itemize}
+
+\subsection{Paso 3. Transformación del score}
+
+Aplicar el modo configurado:
+\[
+\mathbf{s} \rightarrow \mathbf{q}.
+\]
+
+\subsection{Paso 4. Banda muerta y top-\(k\)}
+
+Eliminar intensidades pequeñas y, si procede, truncar a los nombres top-\(k\) por lado.
+
+\subsection{Paso 5. Ajustes por volatilidad y liquidez}
+
+Transformar:
+\[
+\mathbf{q} \rightarrow \widehat{\mathbf{q}}.
+\]
+
+\subsection{Paso 6. Normalización exacta}
+
+Construir
+\[
+\mathbf{w}^{\mathrm{raw}}
+\]
+usando la fórmula canónica por lados para restaurar exactamente gross y net target cuando ambos lados existen.
+
+\subsection{Paso 7. Cap-and-redistribute}
+
+Aplicar caps por nombre si se configuran.
+
+\subsection{Paso 8. Postcheck}
+
+Verificar gross, net, cobertura, concentración y degeneración.
+
+\subsection{Paso 9. Persistencia}
+
+Guardar pesos finales y diagnóstico completo.
+
+\section{Postcheck obligatorio}
+
+El módulo debe comprobar numéricamente, dentro de tolerancia \(\varepsilon\):
+
+\[
+\left| \sum_i |w_i^{\mathrm{raw}}| - g^\star \right| \le \varepsilon
+\]
+si ambos lados requeridos existen,
+
+\[
+\left| \sum_i w_i^{\mathrm{raw}} - n^\star \right| \le \varepsilon
+\]
+si ambos lados requeridos existen,
+
+\[
+|w_i^{\mathrm{raw}}| \le p_{\max}^{\mathrm{raw}} + \varepsilon
+\]
+para todo nombre si el cap está activo.
+
+Si las igualdades de gross/net no pueden alcanzarse por ausencia estructural de uno de los lados, el reporte debe indicar explícitamente:
+
+\begin{itemize}
+    \item gross objetivo,
+    \item gross realizado,
+    \item net objetivo,
+    \item net realizado,
+    \item capital no asignado por insuficiencia de señal o elegibilidad.
+\end{itemize}
+
+\section{Campos obligatorios del detalle de sizing}
+
+El archivo \texttt{sizing\_details.parquet} debe contener al menos:
+
+\begin{center}
+\begin{tabular}{>{\ttfamily}m{4.5cm} m{8.7cm}}
+\toprule
+\textnormal{Campo} & \textnormal{Descripción} \\
+\midrule
+date & Fecha de decisión \\
+asset\_id & Identificador del activo \\
+score\_raw & Score original \\
+score\_transformed & Score tras transformación base \\
+rank\_pct & Percentil si aplica \\
+side & long / short / zero \\
+vol\_adj & Factor de ajuste por volatilidad \\
+liq\_adj & Factor de ajuste por liquidez \\
+intensity\_final & Intensidad antes de normalizar capital \\
+w\_raw & Peso crudo final \\
+selected\_flag & Indicador de activo seleccionado \\
+drop\_reason & Razón de exclusión si aplica \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Taxonomía mínima de \texttt{drop\_reason}}
+
+Para mantener trazabilidad, el módulo debe usar un vocabulario controlado:
+
+\begin{itemize}
+    \item \texttt{not\_eligible}
+    \item \texttt{invalid\_score}
+    \item \texttt{below\_deadband}
+    \item \texttt{topk\_trim}
+    \item \texttt{side\_not\_allowed}
+    \item \texttt{degenerate\_distribution}
+    \item \texttt{fully\_selected}
+\end{itemize}
+
+\section{Parámetros por defecto}
+
+Hasta una calibración más fina, los defaults deben ser explícitos:
+
+\begin{center}
+\begin{tabular}{m{7.6cm} m{4.6cm}}
+\toprule
+\textnormal{Parámetro} & \textnormal{Default} \\
+\midrule
+\texttt{mode} & \texttt{rank\_symmetric} \\
+\texttt{vol\_adjust\_beta} & \(0.0\) o conservador, según estrategia \\
+\texttt{liq\_adjust\_beta} & \(0.0\) o conservador, según estrategia \\
+\texttt{insufficient\_shorts\_policy} & \texttt{redistribute\_to\_cash} \\
+\texttt{small\_universe\_policy} & \texttt{shrink\_breadth\_keep\_formula} \\
+\texttt{postcheck\_tolerance} & \(10^{-8}\) a \(10^{-6}\) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Los valores concretos de \(g^\star\), \(n^\star\), top-\(k\), caps y betas de ajuste no deben estar hardcodeados en el módulo; deben venir siempre desde configuración.
+
+\section{Invariantes del módulo}
+
+Toda salida válida debe cumplir:
+
+\begin{enumerate}
+    \item mismo índice y universo que el subconjunto elegible final;
+    \item ningún activo no elegible con peso distinto de cero;
+    \item semántica única de gross y net;
+    \item todo ajuste por volatilidad o liquidez va seguido de renormalización explícita;
+    \item todo déficit estructural de un lado queda cuantificado y reportado;
+    \item la salida es determinista dadas las mismas entradas.
+\end{enumerate}
+
+\section{Tests mínimos obligatorios}
+
+\subsection*{1. Test de identidad de ranking}
+Si dos reescalados monotónicos del mismo score producen el mismo orden, el modo \texttt{rank\_symmetric} debe devolver exactamente los mismos pesos.
+
+\subsection*{2. Test de gross/net}
+Si ambos lados existen y no hay caps activos, debe cumplirse:
+\[
+\sum_i |w_i^{\mathrm{raw}}| = g^\star,
+\qquad
+\sum_i w_i^{\mathrm{raw}} = n^\star
+\]
+dentro de tolerancia.
+
+\subsection*{3. Test de renormalización tras ajuste}
+Después de aplicar ajustes por volatilidad y liquidez, la renormalización debe restaurar gross y net target.
+
+\subsection*{4. Test de insuficiencia de shorts}
+Si no existen nombres cortos válidos, el módulo no debe inventar el lado short y debe reportar déficit de capital asignado.
+
+\subsection*{5. Test de universo pequeño}
+Con un universo muy reducido, el módulo debe seguir una política explícita y no concentrar capital silenciosamente por encima del cap configurado.
+
+\subsection*{6. Test de score degenerado}
+Si todos los scores son iguales, la salida debe ser \texttt{degenerate} o cero según la configuración.
+
+\subsection*{7. Test de cap-and-redistribute}
+Si un nombre excede el cap crudo, el exceso debe redistribuirse dentro del mismo lado sin alterar indebidamente el opuesto.
+
+\subsection*{8. Test de auditoría}
+El reporte debe contener modo, gross/net realizados, cobertura, \(N_{\mathrm{eff}}\), concentración máxima y razones de exclusión.
+
+\section{Integración con el resto del pipeline}
+
+La posición correcta del módulo en el pipeline es:
+
+\[
+\texttt{signal}
+\rightarrow
+\texttt{sizing}
+\rightarrow
+\texttt{neutralize / constraints / optimizer}
+\rightarrow
+\texttt{rebalance}
+\rightarrow
+\texttt{execution}
+\]
+
+\texttt{sizing.py} debe producir una asignación preliminar interpretable, no una cartera final. Por ello, no debe duplicar la lógica de neutralización, constraints o optimización global. Su salida debe ser suficientemente disciplinada como para no sabotear esas etapas, pero no debe invadir su responsabilidad.
+
+\section{Resumen ejecutivo}
+
+La versión correcta de \texttt{portfolio/sizing.py} no debe ser una lista abierta de modos de asignación y referencias al estado del arte. Debe ser una especificación cerrada del primer mapa entre señal y capital.
+
+Su definición operativa final es:
+
+\begin{enumerate}
+    \item recibe scores PIT y universo elegible;
+    \item transforma la señal en intensidades robustas, por defecto mediante ranking simétrico;
+    \item aplica opcionalmente ajustes por volatilidad y liquidez;
+    \item renormaliza de forma exacta a gross y net target;
+    \item controla concentración, cobertura y casos degenerados;
+    \item persiste un output auditable y estable.
+\end{enumerate}
+
+Eso convierte el sizing en una etapa programable, reproducible y coherente con una arquitectura cuantitativa seria. La señal deja de ser un número abstracto y pasa a convertirse en una primera asignación de capital con semántica controlada, robusta y directamente utilizable por el resto del stack.
 
 \end{document}

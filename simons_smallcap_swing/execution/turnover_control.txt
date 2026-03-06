@@ -1,256 +1,571 @@
 \section{Módulo: execution/turnover\_control.py}
 
-\subsection{Objetivo y contexto de control de turnover}
+\subsection{Objetivo económico y justificación dentro del stack}
 \label{sec:turnover-objective}
 
-El objetivo de \texttt{execution/turnover\_control.py} es \textbf{limitar el turnover de cartera} para:
-\begin{itemize}
-    \item Reducir la fricción de costes de ejecución e impacto de mercado.
-    \item Mantener implementabilidad operativa bajo límites de trading y políticas de house risk.
-\end{itemize}
-Este módulo se enmarca en el marco de \textit{transaction cost control} y \textit{implementation of factor/momentum trading} descrito en la literatura de trading cuantitativo (Chan, 2021; De Prado, 2018), donde se establece que estrategias de alto turnover suelen ser inviables al añadir costes de execution y market impact.\footnote{%
-    Chan, E. (2021). \textit{Quantitative Trading}.\\
-    De Prado, M. (2018). \textit{ADVANCED RISK AND PORTFOLIO MANAGEMENT}.}
+El propósito de \texttt{execution/turnover\_control.py} es transformar una cartera objetivo teórica en una cartera objetivo \textbf{implementable bajo un presupuesto explícito de rotación}, preservando la mayor fracción posible del alpha esperado una vez incorporadas restricciones operativas, costes de ejecución, impacto de mercado y límites de trading. En una arquitectura cuantitativa seria, el turnover no debe tratarse como una métrica descriptiva calculada ex post, sino como una \textbf{variable de control} que actúa directamente sobre el mapa entre señal y orden.
 
-\subsection{Alcance y límites del módulo}
-\label{sec:turnover-scope}
+La función económica del módulo es, por tanto, resolver de forma explícita el siguiente problema:
 
-\subsubsection{Funcionalidades incluidas}
+\begin{quote}
+\textit{dado un conjunto de cambios de pesos deseados, ¿qué subconjunto y qué magnitud de esos cambios deben implementarse para maximizar la retención de alpha bajo una restricción de turnover y sin violar constraints duros de cartera?}
+\end{quote}
 
-\begin{itemize}
-    \item \textbf{Calculo de turnover ex‑ante/ex‑post}:
-        \begin{itemize}
-            \item \texttt{turnover\_1way} y \texttt{turnover\_2way} por cartera y período.
-        \end{itemize}
-    \item \textbf{Reglas de capping de turnover}:
-        \begin{itemize}
-            \item \texttt{hard cap} diario y (opcionalmente) semanal.
-        \end{itemize}
-    \item \textbf{Throttling de órdenes}:
-        \begin{itemize}
-            \item Recorte de deltas de peso según política de \textit{no‑trade band} y \textit{priority execution}.
-        \end{itemize}
-    \item \textbf{Reporte de degradación de alpha}:
-        \begin{itemize}
-            \item \texttt{alpha\_retention\_proxy} para cuantificar el efecto de los recortes de turnover.
-        \end{itemize}
-\end{itemize}
+Esta formulación es esencial porque, en universos de \textit{small caps} y estrategias \textit{swing}, una política de rebalance ingenua puede producir carteras con excelente alpha bruto pero económicamente inviables una vez se añaden impacto, costes de implementación y limitaciones de capacidad diaria. El módulo existe precisamente para cerrar ese hueco entre \textit{portfolio intent} y \textit{portfolio executable}.
 
-\subsubsection{Funcionalidades no incluidas}
+\subsection{Principio rector}
+\label{sec:turnover-principle}
 
-\begin{itemize}
-    \item Optimización de ruta de ejecución (\textit{smart order routing}).
-    \item Simulación de fills y costes de execution detallados (capa \texttt{fills\_simulator} / \texttt{cost\_model}).
-\end{itemize}
+La filosofía del módulo puede resumirse así:
 
-\subsection{Entradas}
-\label{sec:turnover-inputs}
+\begin{quote}
+\textit{el turnover es un recurso escaso que debe asignarse preferentemente a los cambios de cartera con mayor beneficio marginal esperado por unidad de fricción.}
+\end{quote}
 
-\begin{itemize}
-    \item \texttt{target\_weights\_path}:
-        \begin{itemize}
-            \item Pesos objetivo de la cartera post‑estrategia, \texttt{w\_target\_i}.
-        \end{itemize}
-    \item \texttt{current\_weights\_path}:
-        \begin{itemize}
-            \item Pesos actuales de la cartera, \texttt{w\_current\_i}.
-        \end{itemize}
-    \item \texttt{turnover\_config\_path}:
-        \begin{itemize}
-            \item Límites de \texttt{turnover\_cap}, \texttt{threshold\_no\_trade\_band}, etc.
-        \end{itemize}
-    \item \texttt{run\_id} / \texttt{date}:
-        \begin{itemize}
-            \item Identificador del run o fecha de rebalance.
-        \end{itemize}
-\end{itemize}
-
-\subsection{Definiciones de turnover}
-\label{sec:turnover-defs}
-
-Sea:
-\begin{itemize}
-    \item \( i \in \{1,\dots,N\} \): conjuto de activos de la cartera.
-    \item \( w_{i}^{\text{current}} \): peso actual del activo \( i \).
-    \item \( w_{i}^{\text{target}} \): peso objetivo del activo \( i \).
-    \item \( \Delta w_{i} = w_{i}^{\text{target}} - w_{i}^{\text{current}} \) el \textit{delta} de peso.
-\end{itemize}
-
-Las definiciones operativas de turnover son:
-
-\begin{itemize}
-    \item \textbf{Turnover 1‑way}:
-        \begin{equation}
-            \texttt{turnover\_1way} 
-            = 
-            \frac{1}{2} 
-            \sum_{i=1}^{N}
-            \left\lvert w_{i}^{\text{target}} - w_{i}^{\text{current}} \right\rvert.
-        \end{equation}
-    \item \textbf{Turnover 2‑way}:
-        \begin{equation}
-            \texttt{turnover\_2way} 
-            = 
-            \sum_{i=1}^{N}
-            \left\lvert \Delta w_{i} \right\rvert.
-        \end{equation}
-\end{itemize}
-
-Estas definiciones son estándar en la industria de \textit{equity portfolio management} y coinciden con la literatura académica sobre \textit{portfolio turnover} y costes de transacción.\footnote{%
-    Campbell, J., et al. (2001). “Who Pays for Active Management?”;\\
-    De Prado, M. (2018). \textit{ADVANCED RISK AND PORTFOLIO MANAGEMENT}.}
-
-\subsection{Políticas de control de turnover}
-\label{sec:turnover-policies}
-
-\subsubsection{Hard cap de turnover}
-
-El módulo implementa un \texttt{turnover\_cap} configurable (por ejemplo, 2\% diario), tal que:
-
-\begin{equation}
-    \texttt{turnover\_2way}^{\text{final}} 
-    \leq 
-    \text{cap} 
-    + 
-    \text{tolerancia},
-\end{equation}
-siendo \texttt{turnover\_2way}^\text{final} el turnover después de recortar deltas.
-
-\subsubsection{Threshold no‑trade band}
-
-\begin{itemize}
-    \item \texttt{threshold\_no\_trade\_band}: umbral de cambio de peso por debajo del cual no se emite ninguna orden.
-        \begin{equation}
-            \lvert \Delta w_{i} \rvert 
-            < 
-            \text{band}
-            \quad
-            \Rightarrow 
-            \quad
-            \Delta w_{i} 
-            = 
-            0.
-        \end{equation}
-\end{itemize}
-
-\subsubsection{Priority execution}
-
-\begin{itemize}
-    \item Los \textit{top signals} de la estrategia (por ejemplo, mayores \texttt{alpha\_score}) reciben prioridad en el presupuesto de turnover.
-    \item Si el turnover total excede el cap, los recortes se aplican primero a los cambios de peso de menor poder predictivo.
-\end{itemize}
-
-\subsubsection{Staggered rebalance}
-
-\begin{itemize}
-    \item Cuando el turnover excede el cap, el módulo puede dividir las órdenes en múltiples días dentro de un \texttt{stagger\_window} definido en la configuración.
-    \item Esto reduce el impacto de mercado pero introduce \textit{execution delay} y \textit{slippage} adicional, que deberá ser capturado por el \texttt{cost\_model}.
-\end{itemize}
-
-\subsection{Flujo del proceso}
-\label{sec:turnover-flow}
+De este principio se derivan cinco reglas de diseño:
 
 \begin{enumerate}
-    \item \textbf{Calcular deltas de pesos}:
-        \begin{equation}
-            \Delta w_{i} 
-            = 
-            w_{i}^{\text{target}} 
-            - 
-            w_{i}^{\text{current}}.
-        \end{equation}
-    \item \textbf{Estimar turnover base}:
-        \begin{itemize}
-            \item \texttt{turnover\_1way} y \texttt{turnover\_2way} sin restricción.
-        \end{itemize}
-    \item \textbf{Aplicar políticas de control}:
-        \begin{itemize}
-            \item \texttt{no\_trade\_band}, \texttt{priority\_execution}.
-            \item \texttt{staggered\_rebalance} si excede \texttt{turnover\_cap}.
-        \end{itemize}
-    \item \textbf{Recortar deltas}:
-        \begin{itemize}
-            \item Se ajustan \(\Delta w_{i}\) para que el \texttt{turnover\_2way}^\text{final} esté bajo el cap.
-        \end{itemize}
-    \item \textbf{Recalcular turnover final}:
-        \begin{itemize}
-            \item \texttt{turnover\_before} vs \texttt{turnover\_after}.
-        \end{itemize}
-    \item \textbf{Persistir outputs}:
-        \begin{itemize}
-            \item \texttt{weights\_after\_turnover\_control.parquet}.
-            \item \texttt{turnover\_summary.json}.
-            \item \texttt{throttled\_orders.parquet}.
-            \item \texttt{manifest.json}.
-        \end{itemize}
+    \item El turnover se controla \textbf{antes} de la simulación de fills, no después.
+    \item Las reducciones de riesgo y los cambios exigidos por constraints duros no deben competir en igualdad de condiciones con trades puramente oportunistas.
+    \item Las \textit{no-trade bands} deben reducir ruido de rebalance, no introducir un sesgo sistemático no deseado.
+    \item El presupuesto de turnover debe asignarse según una política explícita de prioridad, no mediante recorte uniforme implícito salvo que esa sea la política elegida y registrada.
+    \item Toda degradación de turnover debe ser trazable en términos de pérdida de exposición deseada y de pérdida de alpha proxy.
 \end{enumerate}
 
-\subsection{Validaciones mínimas}
-\label{sec:turnover-validations}
+\subsection{Rol dentro de la arquitectura}
+\label{sec:turnover-role}
+
+Este módulo ocupa la capa intermedia entre:
 
 \begin{itemize}
-    \item \texttt{turnover\_final} \(\leq\) \texttt{cap} + \texttt{tolerancia}.
-    \item No se violan \textit{constraints hard} (por ejemplo, límites de peso por sector) tras el recorte.
-    \item Valores \texttt{null} o \texttt{inf} controlados en \texttt{delta\_w}, \texttt{turnover}.
+    \item \texttt{portfolio construction / constraints}, donde se generan pesos objetivo teóricos;
+    \item y \texttt{execution}, donde esos pesos se convierten en órdenes, fills y costes realizados.
 \end{itemize}
 
-\subsection{Métricas de impacto en alpha}
-\label{sec:turnover-metrics}
+Su salida no es el coste final ni la ejecución material. Su salida es una versión \textbf{throttled, banded y eventualmente escalonada} de la intención de rebalance, con semántica suficientemente fuerte como para que el resto del stack pueda consumirla sin ambigüedad.
+
+En otras palabras:
+
+\[
+\text{target weights}
+\neq
+\text{turnover-controlled target weights}
+\neq
+\text{filled portfolio}.
+\]
+
+Esa separación es obligatoria si se quiere medir de forma limpia cuánto alpha se pierde por control de turnover, cuánto por ejecución y cuánto por carry o retraso temporal.
+
+\subsection{Alcance del módulo}
+\label{sec:turnover-scope}
+
+\subsubsection{Incluido}
+\begin{itemize}
+    \item Cálculo de turnover ex ante y ex post.
+    \item Aplicación de \textit{no-trade bands}.
+    \item Asignación de presupuesto de turnover bajo política explícita de prioridad.
+    \item Recorte (\textit{throttling}) de cambios de peso.
+    \item Escalonamiento temporal (\textit{staggered rebalance}) si está habilitado.
+    \item Generación de métricas de retención de señal y pérdida de implementación.
+    \item Persistencia de artefactos auditables para módulos downstream.
+\end{itemize}
+
+\subsubsection{Explícitamente no incluido}
+\begin{itemize}
+    \item Simulación de fills, slippage o impacto realizado.
+    \item Smart order routing o scheduling intradía.
+    \item Reoptimización global completa de cartera bajo coste cuadrático, salvo que se implemente una versión posterior más sofisticada.
+\end{itemize}
+
+\subsection{Relación con el resto del sistema}
+\label{sec:turnover-relations}
+
+\subsubsection{Inputs upstream}
+\begin{itemize}
+    \item \texttt{portfolio/constraints}: pesos objetivo finales tras restricciones duras.
+    \item \texttt{backtest/engine} o estado de cartera: pesos actuales.
+    \item \texttt{alpha model}: scores, rankings o utilidad marginal por activo.
+    \item \texttt{config/execution/turnover\_control}: caps, bands, prioridades y política de escalonamiento.
+\end{itemize}
+
+\subsubsection{Outputs downstream}
+\begin{itemize}
+    \item \texttt{execution/order\_builder}: pesos controlados convertidos en órdenes.
+    \item \texttt{execution/fills\_simulator}: órdenes ya depuradas por presupuesto de turnover.
+    \item \texttt{validation} y \texttt{reports}: análisis de turnover perdido, carry y retención de alpha.
+\end{itemize}
+
+\subsection{Semántica temporal obligatoria}
+\label{sec:turnover-time-semantics}
+
+Para cada fecha de rebalance \( t \), el módulo debe distinguir entre:
 
 \begin{itemize}
-    \item \texttt{turnover\_before}: turnover sin restricción.
-    \item \texttt{turnover\_after}: turnover tras aplicación de políticas.
-    \item \texttt{pct\_delta\_clipped}: porcentaje de \(\Delta w_{i}\) recortados.
-    \item \texttt{alpha\_retention\_proxy}:
-        \begin{itemize}
-            \item \texttt{alpha\_retention\_proxy} 
-                = \(\frac{\text{alpha\_tras\_turnover}}{\text{alpha\_sin\_turnover}}\), donde \texttt{alpha} se puede estimar como correlación entre \(\Delta w_{i}\) y \texttt{alpha\_score} antes y después del recorte.
-            \item Mide cuánto alpha se pierde al limitar el turnover.
-        \end{itemize}
+    \item \textbf{cartera actual} \( w^{\mathrm{cur}}_t \),
+    \item \textbf{cartera objetivo teórica} \( w^{\mathrm{tar}}_t \),
+    \item \textbf{cartera objetivo tras control de turnover} \( w^{\mathrm{ctrl}}_t \),
+    \item \textbf{cartera efectivamente ejecutada} \( w^{\mathrm{exec}}_{t+1:t+k} \), si existe carry multiday.
 \end{itemize}
 
-\subsection{Salidas}
+La lógica correcta del módulo opera exclusivamente en la transición:
+
+\[
+w^{\mathrm{cur}}_t \rightarrow w^{\mathrm{ctrl}}_t,
+\]
+
+no en la transición final a la cartera realmente ejecutada. Si se usa \textit{staggered rebalance}, el módulo puede additionally producir un plan temporal:
+
+\[
+w^{\mathrm{ctrl}}_t \rightarrow \left\{w^{\mathrm{plan}}_{t}, w^{\mathrm{plan}}_{t+1}, \dots, w^{\mathrm{plan}}_{t+h}\right\},
+\]
+
+pero sigue sin simular fills. Esa responsabilidad permanece en capas posteriores.
+
+\subsection{Contrato de entrada}
+\label{sec:turnover-inputs}
+
+\subsubsection{Rutas mínimas}
+\begin{itemize}
+    \item \texttt{target\_weights\_path}
+    \item \texttt{current\_weights\_path}
+    \item \texttt{turnover\_config\_path}
+    \item \texttt{run\_id}
+    \item \texttt{date}
+\end{itemize}
+
+\subsubsection{Rutas recomendadas}
+\begin{itemize}
+    \item \texttt{alpha\_scores\_path}
+    \item \texttt{risk\_flags\_path}
+    \item \texttt{hard\_constraint\_tags\_path}
+\end{itemize}
+
+\subsubsection{Campos mínimos}
+Para cada símbolo \( i \):
+
+\begin{itemize}
+    \item \texttt{date}
+    \item \texttt{symbol}
+    \item \texttt{weight\_current}
+    \item \texttt{weight\_target}
+\end{itemize}
+
+\subsubsection{Campos recomendados}
+\begin{itemize}
+    \item \texttt{alpha\_score}
+    \item \texttt{priority\_score}
+    \item \texttt{risk\_reducing\_flag}
+    \item \texttt{hard\_constraint\_trade\_flag}
+    \item \texttt{sector}
+    \item \texttt{liquidity\_bucket}
+\end{itemize}
+
+\subsubsection{Invariantes de entrada}
+\begin{itemize}
+    \item \(\sum_i w_i^{\mathrm{cur}} = 1\) y \(\sum_i w_i^{\mathrm{tar}} = 1\) dentro de tolerancia numérica, salvo presencia explícita de cash residual.
+    \item No puede haber duplicados en \texttt{(date, symbol)}.
+    \item Los pesos deben ser finitos y no nulos por error de carga.
+    \item Si la política usa prioridad por alpha, debe existir \texttt{alpha\_score} o una métrica equivalente.
+\end{itemize}
+
+\subsection{Definiciones formales}
+\label{sec:turnover-definitions}
+
+Sea \( i \in \{1,\dots,N\} \) el conjunto de activos. Definimos:
+
+\begin{itemize}
+    \item \( w_i^{\mathrm{cur}} \): peso actual.
+    \item \( w_i^{\mathrm{tar}} \): peso objetivo teórico.
+    \item \( \Delta w_i = w_i^{\mathrm{tar}} - w_i^{\mathrm{cur}} \): cambio deseado de peso.
+    \item \( \Delta w_i^{\mathrm{ctrl}} \): cambio final tras control de turnover.
+    \item \( w_i^{\mathrm{ctrl}} = w_i^{\mathrm{cur}} + \Delta w_i^{\mathrm{ctrl}} \): peso controlado.
+\end{itemize}
+
+Definimos:
+
+\begin{equation}
+\texttt{turnover\_2way}^{\mathrm{raw}} = \sum_{i=1}^{N} |\Delta w_i|,
+\end{equation}
+
+y
+
+\begin{equation}
+\texttt{turnover\_1way}^{\mathrm{raw}} = \frac{1}{2}\sum_{i=1}^{N} |\Delta w_i|.
+\end{equation}
+
+Tras control:
+
+\begin{equation}
+\texttt{turnover\_2way}^{\mathrm{ctrl}} = \sum_{i=1}^{N} |\Delta w_i^{\mathrm{ctrl}}|,
+\end{equation}
+
+\begin{equation}
+\texttt{turnover\_1way}^{\mathrm{ctrl}} = \frac{1}{2}\sum_{i=1}^{N} |\Delta w_i^{\mathrm{ctrl}}|.
+\end{equation}
+
+\subsection{Presupuesto de turnover}
+\label{sec:turnover-budget}
+
+Sea \( B_t \) el presupuesto de turnover disponible en la fecha \( t \). El módulo debe garantizar:
+
+\begin{equation}
+\texttt{turnover\_2way}^{\mathrm{ctrl}} \le B_t + \varepsilon,
+\end{equation}
+
+donde \(\varepsilon\) es una tolerancia numérica mínima.
+
+Este presupuesto puede ser:
+
+\begin{itemize}
+    \item fijo por día,
+    \item dependiente del régimen de mercado,
+    \item dependiente de la liquidez agregada de la cartera,
+    \item o parte de un presupuesto mayor semanal/mensual si existe \textit{budget carryover}.
+\end{itemize}
+
+\paragraph{Regla semántica importante.}
+Si el módulo soporta simultáneamente caps diarios y semanales, la precedencia debe fijarse explícitamente. La política recomendada es:
+
+\begin{enumerate}
+    \item primero respetar caps diarios,
+    \item después verificar acumulado semanal,
+    \item en caso de conflicto, prevalece el límite más restrictivo.
+\end{enumerate}
+
+\subsection{No-trade band}
+\label{sec:turnover-band}
+
+La \textit{no-trade band} debe aplicarse como filtro de primer nivel para eliminar cambios de pesos cuya magnitud sea demasiado pequeña para justificar su coste económico esperado.
+
+Formalmente:
+
+\begin{equation}
+|\Delta w_i| < \tau_i
+\quad \Rightarrow \quad
+\Delta w_i^{\mathrm{band}} = 0,
+\end{equation}
+
+y en caso contrario:
+
+\begin{equation}
+\Delta w_i^{\mathrm{band}} = \Delta w_i.
+\end{equation}
+
+\paragraph{Política recomendada.}
+La banda \(\tau_i\) no debería ser necesariamente escalar global. Una especificación más madura permite:
+
+\begin{itemize}
+    \item banda fija global,
+    \item banda por bucket de liquidez,
+    \item banda por señal esperada,
+    \item o banda ajustada por volatilidad/coste esperado.
+\end{itemize}
+
+\paragraph{Regla para evitar sesgo sistemático.}
+Si la banda se aplica de forma ciega sobre \(|\Delta w_i|\), puede introducir persistencia artificial en ciertos nombres y un sesgo de inercia de cartera. Por ello, el módulo debe permitir excepciones explícitas para:
+
+\begin{itemize}
+    \item trades de reducción de riesgo,
+    \item trades impuestos por constraints duros,
+    \item cierres de posiciones cuyo alpha cambió de signo de manera material.
+\end{itemize}
+
+\subsection{Política de prioridad y asignación del presupuesto}
+\label{sec:turnover-priority}
+
+Una vez aplicada la \textit{band}, el presupuesto de turnover restante debe asignarse mediante una política explícita. No se permite un recorte implícito ambiguo.
+
+\subsubsection{Orden de precedencia recomendado}
+La precedencia institucional recomendada es:
+
+\begin{enumerate}
+    \item \textbf{Hard-constraint trades}: órdenes necesarias para volver a cumplimiento.
+    \item \textbf{Risk-reducing trades}: reducciones de exposición agregada, concentración o violaciones de riesgo.
+    \item \textbf{Alpha-positive priority trades}: cambios con mayor utilidad marginal esperada.
+    \item \textbf{Residual low-priority trades}: el resto.
+\end{enumerate}
+
+\subsubsection{Definición de score de prioridad}
+Sea \( p_i \) el score de prioridad. La política mínima recomendable es:
+
+\begin{equation}
+p_i =
+\lambda_1 \cdot \mathbb{I}(\text{hard-constraint})
++
+\lambda_2 \cdot \mathbb{I}(\text{risk-reducing})
++
+\lambda_3 \cdot u_i,
+\end{equation}
+
+donde \(u_i\) representa utilidad marginal esperada del trade, por ejemplo derivada de \texttt{alpha\_score} o de una proxy de mejora esperada de cartera.
+
+Con \(\lambda_1 \gg \lambda_2 \gg \lambda_3 > 0\), se garantiza la precedencia correcta entre clases de órdenes.
+
+\subsection{Throttling de cambios de peso}
+\label{sec:turnover-throttling}
+
+Una vez ordenados los trades por prioridad, el módulo debe convertir el presupuesto disponible en cambios de peso efectivos.
+
+Se permiten al menos dos políticas:
+
+\subsubsection{1. Greedy by priority}
+Asignar presupuesto secuencialmente de mayor a menor prioridad. Para el activo \(i\):
+
+\begin{equation}
+|\Delta w_i^{\mathrm{ctrl}}| =
+\min\left(|\Delta w_i^{\mathrm{band}}|,\; B_t^{\mathrm{rem}}\right),
+\end{equation}
+
+actualizando el presupuesto remanente tras cada asignación.
+
+\subsubsection{2. Proportional throttling within priority tier}
+Dentro de un mismo tier de prioridad, recortar de forma proporcional:
+
+\begin{equation}
+\Delta w_i^{\mathrm{ctrl}} = \kappa_g \Delta w_i^{\mathrm{band}},
+\qquad \kappa_g \in [0,1],
+\end{equation}
+
+donde \(g\) denota el grupo o tier y \(\kappa_g\) se elige para respetar el presupuesto restante.
+
+\paragraph{Recomendación.}
+Para evitar discontinuidades excesivas y sesgos de frontera, una política robusta es:
+\begin{itemize}
+    \item precedencia entre tiers,
+    \item y recorte proporcional dentro de cada tier.
+\end{itemize}
+
+Esto es superior a un puro \textit{top-k} duro cuando varios trades tienen utilidad marginal muy similar.
+
+\subsection{Definición formal del \texttt{alpha\_retention\_proxy}}
+\label{sec:turnover-alpha-retention}
+
+El \texttt{alpha\_retention\_proxy} no debe quedar como una intuición narrativa. Debe definirse de forma explícita y reproducible.
+
+Sea \( a_i \) una proxy de utilidad marginal del trade \(i\), por ejemplo \texttt{alpha\_score} firmado de acuerdo con la dirección del rebalance. Definimos:
+
+\begin{equation}
+U^{\mathrm{raw}} = \sum_{i=1}^{N} a_i \, \Delta w_i,
+\end{equation}
+
+\begin{equation}
+U^{\mathrm{ctrl}} = \sum_{i=1}^{N} a_i \, \Delta w_i^{\mathrm{ctrl}}.
+\end{equation}
+
+Entonces:
+
+\begin{equation}
+\texttt{alpha\_retention\_proxy}
+=
+\frac{U^{\mathrm{ctrl}}}{U^{\mathrm{raw}}},
+\end{equation}
+
+siempre que \(U^{\mathrm{raw}} \neq 0\). Si \(U^{\mathrm{raw}}=0\), el valor debe marcarse como no definido y no imputarse arbitrariamente.
+
+\paragraph{Interpretación.}
+Este ratio mide qué fracción de la utilidad de rebalance teórica sobrevive tras el control de turnover. Es mucho más estable y económicamente interpretable que una mera correlación entre \(\Delta w_i\) y \texttt{alpha\_score} antes y después del recorte.
+
+\subsection{Interacción con constraints de cartera}
+\label{sec:turnover-constraints-interaction}
+
+Un error frecuente consiste en aplicar recortes de turnover y solo después verificar constraints, lo que puede generar una cartera final semánticamente inválida. Este módulo debe fijar el siguiente principio:
+
+\begin{quote}
+\textit{el control de turnover nunca puede producir una cartera que viole constraints duros ya satisfechos por la cartera objetivo teórica, salvo que exista una política explícita de relajación.}
+\end{quote}
+
+\subsubsection{Precedencia recomendada}
+\begin{enumerate}
+    \item Construir primero \texttt{weight\_target} compatible con constraints duros.
+    \item Aplicar turnover control preservando en prioridad máxima los trades necesarios para mantener cumplimiento.
+    \item Verificar ex post que \texttt{weight\_ctrl} no rompe límites de concentración, sector, gross, net o liquidez.
+\end{enumerate}
+
+\subsubsection{Regla obligatoria}
+Si un recorte de turnover amenaza con reintroducir una violación dura, el módulo debe:
+\begin{itemize}
+    \item o bien preservar íntegramente el trade de corrección,
+    \item o bien reasignar presupuesto desde trades de menor prioridad.
+\end{itemize}
+
+\subsection{Staggered rebalance}
+\label{sec:turnover-staggered}
+
+Si el presupuesto no permite implementar todo el cambio deseado, el módulo puede escalonar parte del rebalance en un horizonte \(h\).
+
+Sea:
+
+\begin{equation}
+\Delta w_i^{\mathrm{deferred}} = \Delta w_i^{\mathrm{band}} - \Delta w_i^{\mathrm{ctrl}}.
+\end{equation}
+
+Entonces el módulo puede producir un plan:
+
+\begin{equation}
+\Delta w_i^{\mathrm{plan}}(t), \Delta w_i^{\mathrm{plan}}(t+1), \dots, \Delta w_i^{\mathrm{plan}}(t+h),
+\end{equation}
+
+tal que:
+
+\begin{equation}
+\sum_{\tau=t}^{t+h} \Delta w_i^{\mathrm{plan}}(\tau)
+=
+\Delta w_i^{\mathrm{band}}.
+\end{equation}
+
+\paragraph{Regla importante.}
+El \textit{staggering} no debe ocultar turnover excedido. La fecha \(t\) debe reportar solo el turnover realmente asignado a \(t\), y el resto debe registrarse como \texttt{deferred\_turnover}. Esto evita inflar artificialmente la implementabilidad diaria.
+
+\subsection{Casos frontera obligatorios}
+\label{sec:turnover-edge-cases}
+
+\begin{enumerate}
+    \item \textbf{Trade minúsculo con alpha muy alto.}  
+    La banda puede eliminarlo, pero el sistema debe permitir una excepción si existe política \texttt{band\_override\_by\_priority}.
+
+    \item \textbf{Trade grande con alpha débil pero que reduce riesgo.}  
+    Debe tener prioridad sobre trades alpha puros de menor relevancia operacional.
+
+    \item \textbf{Cap insuficiente con múltiples trades empatados.}  
+    El desempate debe seguir una regla determinista, por ejemplo \texttt{symbol} lexicográfico o \texttt{order\_id}.
+
+    \item \textbf{Alpha bruto negativo o casi nulo.}  
+    El \texttt{alpha\_retention\_proxy} debe marcarse como no definido o inestable, no forzarse a valores espurios.
+
+    \item \textbf{Presupuesto cero.}  
+    Solo se permiten trades obligatorios por hard constraints si la política así lo define; el resto debe quedar a cero.
+
+    \item \textbf{Presencia de cash residual.}  
+    Debe conservarse explícitamente y no absorberse implícitamente como error de normalización.
+\end{enumerate}
+
+\subsection{Invariantes de salida}
+\label{sec:turnover-invariants}
+
+Deben cumplirse siempre:
+
+\begin{equation}
+w_i^{\mathrm{ctrl}} = w_i^{\mathrm{cur}} + \Delta w_i^{\mathrm{ctrl}},
+\end{equation}
+
+\begin{equation}
+\sum_i |\Delta w_i^{\mathrm{ctrl}}| \le B_t + \varepsilon,
+\end{equation}
+
+\begin{equation}
+\sum_i w_i^{\mathrm{ctrl}} = 1
+\quad \text{dentro de tolerancia, salvo cash explícito,}
+\end{equation}
+
+y además:
+
+\begin{itemize}
+    \item \(|\Delta w_i^{\mathrm{ctrl}}| \le |\Delta w_i|\) para todo trade no obligatorio,
+    \item toda anulación por banda debe quedar marcada,
+    \item todo recorte por cap debe quedar marcado,
+    \item toda reasignación por prioridad o constraint debe ser trazable.
+\end{itemize}
+
+\subsection{Contrato de salida}
 \label{sec:turnover-outputs}
 
+El módulo debe producir:
+
 \begin{itemize}
-    \item \texttt{execution/turnover/\{run\_id\}/weights\_after\_turnover\_control.parquet}:
-        \begin{itemize}
-            \item \texttt{date, symbol, weight\_current, weight\_target, weight\_after\_control, delta\_clipped}.
-        \end{itemize}
-    \item \texttt{execution/turnover/\{run\_id\}/turnover\_summary.json}:
-        \begin{itemize}
-            \item \texttt{turnover\_before}, \texttt{turnover\_after}, \texttt{pct\_delta\_clipped}, \texttt{alpha\_retention\_proxy}.
-        \end{itemize}
-    \item \texttt{execution/turnover/\{run\_id\}/throttled\_orders.parquet}:
-        \begin{itemize}
-            \item Órdenes recortadas o reprogramadas por política de turnover.
-        \end{itemize}
-    \item \texttt{execution/turnover/\{run\_id\}/manifest.json}:
-        \begin{itemize}
-            \item Metadatos de ejecución y trazabilidad.
-        \end{itemize}
+    \item \texttt{execution/turnover/\{run\_id\}/weights\_after\_turnover\_control.parquet}
+    \item \texttt{execution/turnover/\{run\_id\}/throttled\_orders.parquet}
+    \item \texttt{execution/turnover/\{run\_id\}/turnover\_summary.json}
+    \item \texttt{execution/turnover/\{run\_id\}/manifest.json}
 \end{itemize}
+
+\subsubsection{Campos mínimos de \texttt{weights\_after\_turnover\_control.parquet}}
+\begin{itemize}
+    \item \texttt{date}
+    \item \texttt{symbol}
+    \item \texttt{weight\_current}
+    \item \texttt{weight\_target}
+    \item \texttt{weight\_after\_control}
+    \item \texttt{delta\_raw}
+    \item \texttt{delta\_after\_band}
+    \item \texttt{delta\_after\_control}
+    \item \texttt{priority\_score}
+    \item \texttt{band\_clipped\_flag}
+    \item \texttt{cap\_clipped\_flag}
+    \item \texttt{deferred\_flag}
+    \item \texttt{policy\_version}
+\end{itemize}
+
+\subsubsection{Campos mínimos de \texttt{turnover\_summary.json}}
+\begin{itemize}
+    \item \texttt{turnover\_before\_1way}
+    \item \texttt{turnover\_before\_2way}
+    \item \texttt{turnover\_after\_1way}
+    \item \texttt{turnover\_after\_2way}
+    \item \texttt{deferred\_turnover}
+    \item \texttt{pct\_delta\_band\_clipped}
+    \item \texttt{pct\_delta\_cap\_clipped}
+    \item \texttt{alpha\_retention\_proxy}
+    \item \texttt{hard\_constraint\_override\_count}
+    \item \texttt{risk\_reducing\_priority\_count}
+\end{itemize}
+
+\subsection{Algoritmo operativo recomendado}
+\label{sec:turnover-algorithm}
+
+\begin{enumerate}
+    \item Cargar pesos actuales, pesos objetivo, scores y configuración.
+    \item Calcular \(\Delta w_i\) y turnover bruto.
+    \item Clasificar trades por tipo: hard-constraint, risk-reducing, alpha-driven, residual.
+    \item Aplicar \textit{no-trade bands} con excepciones permitidas.
+    \item Construir \texttt{priority\_score}.
+    \item Asignar presupuesto de turnover por tiers de prioridad.
+    \item Aplicar recorte proporcional o greedy dentro de cada tier según política.
+    \item Reconstruir \(w_i^{\mathrm{ctrl}}\).
+    \item Verificar constraints y, si es necesario, reasignar presupuesto desde tiers inferiores.
+    \item Si está habilitado, generar plan de \textit{staggered rebalance} para el remanente diferido.
+    \item Persistir artefactos y métricas resumen.
+\end{enumerate}
+
+\subsection{Tests de aceptación obligatorios}
+\label{sec:turnover-tests}
+
+\subsubsection{Test A: cumplimiento del cap}
+La suma de turnover final no puede exceder el presupuesto configurado, salvo tolerancia numérica.
+
+\subsubsection{Test B: prioridad correcta}
+Un trade marcado como \texttt{hard\_constraint\_trade\_flag=True} no puede ser recortado antes que un trade puramente oportunista si ambos compiten por el mismo presupuesto.
+
+\subsubsection{Test C: banda sin sesgo sobre trades obligatorios}
+Un trade de reducción de riesgo o de corrección de constraint no debe anularse por \textit{no-trade band} si la política de excepción está activa.
+
+\subsubsection{Test D: consistencia de pesos}
+Debe cumplirse:
+\[
+w_i^{\mathrm{ctrl}} = w_i^{\mathrm{cur}} + \Delta w_i^{\mathrm{ctrl}}
+\]
+para todo símbolo.
+
+\subsubsection{Test E: alpha retention}
+Si el presupuesto de turnover aumenta manteniendo todo lo demás constante, \texttt{alpha\_retention\_proxy} no debería disminuir salvo efectos de discretización o reasignación patológica.
+
+\subsubsection{Test F: constraints preservados}
+La cartera tras control de turnover no puede violar constraints duros previamente satisfechos por la cartera objetivo.
 
 \subsection{CLI sugerida}
 \label{sec:turnover-cli}
 
-Ejemplo de ejecución típica:
-
 \begin{verbatim}
-python -m execution.turnover_control ^
-  --target-weights-path portfolio/constraints/run_latest/weights_constrained.parquet ^
-  --current-weights-path backtest/runs/run_latest/weights.parquet ^
-  --config-path configs/execution/turnover_control.yaml ^
-  --run-id turnover_control_20260305_001
+python -m execution.turnover_control \
+  --target-weights-path portfolio/constraints/run_latest/weights_constrained.parquet \
+  --current-weights-path backtest/runs/run_latest/weights.parquet \
+  --alpha-scores-path signals/run_latest/alpha_scores.parquet \
+  --config-path configs/execution/turnover_control.yaml \
+  --run-id turnover_control_20260306_001
 \end{verbatim}
 
-\subsection{Definition of Done (DoD)}
-\label{sec:turnover-dod}
+\subsection{Conclusión}
+\label{sec:turnover-conclusion}
 
-\begin{itemize}
-    \item \textbf{Turnover bajo control configurable}: la política de \texttt{turnover\_cap} se aplica de forma consistente y reproducible.
-    \item \textbf{Impacto en alpha cuantificado en reporte}: el \texttt{alpha\_retention\_proxy} y \texttt{turnover\_summary.json} permiten evaluar el trade‑off entre fricción operativa y pérdida de poder predictivo.
-\end{itemize}
+\texttt{execution/turnover\_control.py} no debe verse como un simple limitador administrativo de trading, sino como una capa de ingeniería de cartera que decide cómo se asigna un recurso escaso —el presupuesto de rotación— entre cambios de cartera de distinta calidad económica y distinta urgencia operacional. Su valor reside en imponer una semántica fuerte: distinguir turnover bruto de turnover implementable, separar bandas de ruido de recortes por presupuesto, priorizar correctamente trades obligatorios frente a trades oportunistas y medir de forma reproducible la fracción de alpha sacrificada en ese proceso.
 
-Este módulo completa el stack de \texttt{execution} permitiendo mantener estrategias de \textit{swing trading} relativamente agresivas con turnover bajo, minimizando el \textit{implementation shortfall} y maximizando el \textit{alpha net of costs} en el backtest.\footnote{%
-    De Prado, M. (2018). \textit{ADVANCED RISK AND PORTFOLIO MANAGEMENT}.}
+En un sistema institucional, la calidad de este módulo no se mide solo por “operar menos”, sino por operar menos \textit{donde menos duele} y preservar capacidad de actuación \textit{donde más importa}. Esa es precisamente la diferencia entre un control de turnover decorativo y un verdadero módulo de \textit{portfolio implementation engineering}.

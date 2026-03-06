@@ -1,14 +1,18 @@
 \documentclass{article}
 \usepackage[utf8]{inputenc}
-\usepackage{amsmath,amssymb,amsfonts}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,mathtools}
 \usepackage{booktabs}
-\usepackage{listings}
-\usepackage{hyperref}
+\usepackage{array}
+\usepackage{enumitem}
 \usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
 \geometry{margin=1in}
 
-\title{Explicación SOTA: risk/factor\_model.py \\ Modelo APT Multifactor para Small Caps Swing (Barra/AQR Level)}
-\author{Análisis Research Industrial}
+\title{\textbf{Especificación Técnica: \texttt{risk/factor\_model.py}}}
+\author{Quant Research Infrastructure}
 \date{Marzo 2026}
 
 \begin{document}
@@ -17,78 +21,580 @@
 \tableofcontents
 \newpage
 
-\section{Objetivo y Alcance}
-Modelo factorial para exposures \(\beta\), factor returns \(f_t\), specific risk \(\sigma_\epsilon\), cov \(\Sigma = B \Omega_f B^T + D\). Soporta small caps swings con alta idiosincrasia $[web:25]$.
+\section{Propósito del módulo}
 
-\section{Teoría Matemática (APT)}
-\[
-r_{i,t} = \beta_{i,t}^T f_t + \epsilon_{i,t}, \quad \Cov(r) = B \Omega_f B^T + D
-\]
-- \(B\): Exposures rolling OLS, lookback 252d half-life.
-- \(f_t\): Cross-sectional reg \( r_{i,t} = \alpha_t + \beta_t f_t + \epsilon \).
-- \(\sigma_{\epsilon_i}\): EWMA residuals \( \sigma^2_t = \lambda \sigma^2_{t-1} + (1-\lambda) e_t^2 \).
-- Shrinkage \(\Omega_f\): Ledoit-Wolf.
+Este módulo construye el modelo factorial canónico de riesgo del sistema. Su función es descomponer los retornos de los activos en una parte explicada por factores comunes y una parte idiosincrática, de modo que el resto de la infraestructura de riesgo disponga de:
 
-\section{Papers Seminales}
 \begin{itemize}
-\item \href{https://www.jstor.org/stable/1831029}{Ross (1976)}: Arbitrage Pricing Theory.
-\item \href{https://www.jstor.org/stable/2329112}{Fama-French (2015)}: 5-factors.
-\item Lettau \& Pelger (2020): Dynamic ML factors.
-\item Barra Risk (2020): Integrated models.
+    \item exposiciones por activo a factores comunes;
+    \item retornos diarios de los factores;
+    \item riesgo específico por símbolo;
+    \item covarianza total coherente a nivel de cartera.
 \end{itemize}
 
-\section{Libros Industriales}
-\begin{itemize}
-\item Grinold \& Kahn (2000): \textit{Active Portfolio Mgmt.} -- IR = IC $\sqrt{BR}$.
-\item Ang (2014): \textit{Asset Management} -- Factor timing.
-\item Asness et al. (2014): QoE factors.
-\item López de Prado (2019): \textit{AFML} -- Orthogonalization.
-\end{itemize}
+El módulo no existe para contar una historia elegante sobre ``factores'' ni para presentar tablas de \emph{backtest} optimistas. Su valor reside en producir objetos matemáticos bien definidos, \emph{point-in-time}, estables y auditables que puedan ser utilizados por optimización, reporting de exposiciones y stress testing.
 
-\section{Análisis del Flujo}
-\begin{enumerate}
-\item Load returns/universe/config.
-\item Build B (sector/style def + reg).
-\item Estimate \(f_t\) XS daily.
-\item \(\sigma_\epsilon\) EWMA per symbol.
-\item \(\Omega_f\), total cov + PSD fix.
-\item Persist exposures/returns/specific/cov.
+\section{Objetivo operativo}
+
+El módulo debe producir, para cada fecha de cálculo \(t\):
+
+\begin{enumerate}[label=\arabic*.]
+    \item una matriz de exposiciones \(B_t\);
+    \item una serie histórica de retornos factoriales \(f_\tau\) para \(\tau \le t\);
+    \item una estimación de covarianza factorial \(\Omega_{f,t}\);
+    \item una estimación de riesgo específico \(D_t\);
+    \item una covarianza total:
+    \[
+    \Sigma_t = B_t \Omega_{f,t} B_t^\top + D_t.
+    \]
 \end{enumerate}
 
-PIT: Historia <=t. Fallback new symbols.
+La prioridad del módulo es:
 
-\section{Optimizaciones SOTA Small Caps}
-- Kalman \(\beta_t\): State-space dynamic.
-- PCA/ML latents para unobs factors.
-Snippet GARCH specific:
-\begin{lstlisting}[language=Python]
-from arch import arch_model
-specific_risk = arch_model(resids).fit(disp='off').conditional_volatility
+\[
+\text{coherencia econométrica}
+\;\rightarrow\;
+\text{estabilidad}
+\;\rightarrow\;
+\text{trazabilidad}
+\;\rightarrow\;
+\text{sofisticación}.
+\]
+
+\section{Modelo matemático}
+
+\subsection{Modelo lineal multifactor}
+
+Para cada activo \(i\) y fecha \(t\), el retorno se modela como:
+
+\[
+r_{i,t} = \alpha_{i,t} + \beta_{i,t}^\top f_t + \epsilon_{i,t},
+\]
+
+donde:
+
+\begin{itemize}
+    \item \(r_{i,t}\) es el retorno del activo \(i\);
+    \item \(\beta_{i,t} \in \mathbb{R}^K\) es el vector de exposiciones a \(K\) factores;
+    \item \(f_t \in \mathbb{R}^K\) es el vector de retornos de factores;
+    \item \(\epsilon_{i,t}\) es el residuo idiosincrático;
+    \item \(\alpha_{i,t}\) no debe interpretarse como alpha explotable, sino como intercepto residual si se incluye.
+\end{itemize}
+
+La versión canónica del módulo puede fijar \(\alpha_{i,t}=0\) si los factores y retornos han sido centrados apropiadamente y se desea evitar grados de libertad innecesarios. Si se incluye intercepto, debe documentarse explícitamente.
+
+\subsection{Covarianza total}
+
+Bajo el supuesto estándar de que los residuos específicos son incorrelados entre sí condicionalmente al modelo factorial, la covarianza total es:
+
+\[
+\Sigma_t = B_t \Omega_{f,t} B_t^\top + D_t,
+\]
+
+donde:
+
+\begin{itemize}
+    \item \(B_t \in \mathbb{R}^{N \times K}\) es la matriz de exposiciones;
+    \item \(\Omega_{f,t} = \Cov(f_t)\) es la covarianza de factores;
+    \item \(D_t = \operatorname{diag}(\sigma_{\epsilon,1,t}^2,\dots,\sigma_{\epsilon,N,t}^2)\) es la matriz diagonal de varianzas específicas.
+\end{itemize}
+
+La diagonalidad de \(D_t\) es una aproximación operativa del modelo base. Cualquier extensión que permita correlación específica residual debe vivir fuera del contrato mínimo.
+
+\section{Taxonomía de factores}
+
+\subsection{Principio de diseño}
+
+El módulo debe distinguir entre tres familias de factores:
+
+\begin{enumerate}[label=\arabic*.]
+    \item \textbf{Factores estructurales o fundamentales}: sector, industria, tamaño, beta de mercado, volatilidad, momentum, reversión, liquidez.
+    \item \textbf{Factores estadísticos}: componentes principales o factores latentes.
+    \item \textbf{Factores experimentales}: factores derivados de señales internas, macro, sentimiento o modelos ML.
+\end{enumerate}
+
+La versión canónica del módulo no debe mezclar estas familias sin jerarquía. Debe fijar un conjunto base estable y dejar el resto como extensión.
+
+\subsection{Especificación base recomendada}
+
+Para small caps \emph{swing}, una especificación base razonable es:
+
+\begin{itemize}
+    \item \textbf{Mercado}: beta a un índice de referencia o al universo;
+    \item \textbf{Tamaño}: log-capitalización o proxy estable;
+    \item \textbf{Momentum}: retornos acumulados excluyendo el corto plazo más reciente si así se define;
+    \item \textbf{Volatilidad}: volatilidad realizada o EWMA;
+    \item \textbf{Liquidez}: ADV monetario, turnover o spread proxy;
+    \item \textbf{Sectores/industrias}: dummies mutuamente excluyentes.
+\end{itemize}
+
+Esta especificación debe ser suficiente para la primera versión operativa. Factores latentes, Kalman o ML solo deben añadirse después de estabilizar esta base.
+
+\section{Entradas, salidas y contrato del módulo}
+
+\subsection{Entradas mínimas}
+
+El módulo requiere:
+
+\begin{itemize}
+    \item matriz de retornos por activo \(R \in \mathbb{R}^{T \times N}\);
+    \item universo de símbolos elegibles a la fecha \(t\);
+    \item características \emph{point-in-time} por activo para construir factores;
+    \item parámetros:
+    \begin{itemize}
+        \item \texttt{lookback\_beta},
+        \item \texttt{lookback\_factor\_cov},
+        \item \texttt{min\_obs},
+        \item \texttt{beta\_estimation\_method},
+        \item \texttt{factor\_return\_method},
+        \item \texttt{specific\_risk\_method},
+        \item \texttt{factor\_cov\_method},
+        \item \texttt{nan\_policy},
+        \item \texttt{new\_symbol\_policy},
+        \item \texttt{psd\_policy}.
+    \end{itemize}
+\end{itemize}
+
+\subsection{Salidas obligatorias}
+
+El módulo debe persistir:
+
+\begin{itemize}
+    \item \texttt{exposures.parquet}: matriz \(B_t\) por fecha y símbolo;
+    \item \texttt{factor\_returns.parquet}: serie \(f_t\);
+    \item \texttt{specific\_risk.parquet}: diagonal de \(D_t\);
+    \item \texttt{factor\_cov.parquet}: matriz \(\Omega_{f,t}\);
+    \item \texttt{total\_cov.parquet}: matriz \(\Sigma_t\);
+    \item \texttt{diagnostics.json}: métricas de calidad y cobertura.
+\end{itemize}
+
+\subsection{Campos mínimos de \texttt{diagnostics.json}}
+
+\begin{itemize}
+    \item fecha de cálculo;
+    \item número de símbolos \(N\);
+    \item número de factores \(K\);
+    \item cobertura efectiva de características;
+    \item cobertura efectiva de retornos;
+    \item método de estimación de betas;
+    \item método de estimación de retornos factoriales;
+    \item método de riesgo específico;
+    \item método de covarianza factorial;
+    \item número de símbolos con \emph{fallback};
+    \item número de factores descartados por colinealidad;
+    \item número de autovalores corregidos por PSD;
+    \item condición numérica de \(\Omega_f\) y de \(\Sigma\).
+\end{itemize}
+
+\section{Construcción de la matriz de exposiciones \(B_t\)}
+
+\subsection{Principio general}
+
+La matriz \(B_t\) debe construirse usando únicamente información disponible hasta \(t\). Esto significa que todas las características y clasificaciones deben ser \emph{point-in-time}. El módulo no puede usar reclasificaciones sectoriales futuras, datos revisados ex post ni información de supervivencia.
+
+\subsection{Factores categóricos}
+
+Para factores sectoriales o industriales, la construcción base es mediante variables dummy. Si hay \(G\) grupos, puede usarse:
+
+\[
+B_{i,g,t} =
+\begin{cases}
+1, & \text{si el activo } i \text{ pertenece al grupo } g \text{ en } t,\\
+0, & \text{en otro caso.}
+\end{cases}
+\]
+
+Para evitar colinealidad perfecta, debe eliminarse una categoría de referencia o imponerse una restricción de suma cero.
+
+\subsection{Factores continuos}
+
+Para factores como tamaño, momentum, volatilidad o liquidez, las exposiciones deben estandarizarse transversalmente dentro de la fecha \(t\). Una convención razonable es:
+
+\[
+\tilde{x}_{i,t} = \frac{x_{i,t} - \operatorname{median}(x_{\cdot,t})}{\operatorname{MAD}(x_{\cdot,t})},
+\]
+
+o una normalización \emph{z-score} robusta equivalente. La normalización debe quedar fijada por configuración y no cambiar implícitamente entre ejecuciones.
+
+\subsection{Winsorización}
+
+Antes de estandarizar, las características continuas deben winsorizarse o truncarse de forma robusta para evitar que valores extremos dominen las regresiones. La versión base puede usar percentiles fijos o un umbral por MAD.
+
+\section{Estimación de retornos factoriales \(f_t\)}
+
+\subsection{Regresión transversal diaria}
+
+La forma canónica de estimar retornos factoriales es una regresión transversal diaria:
+
+\[
+r_t = B_t f_t + u_t,
+\]
+
+donde:
+
+\begin{itemize}
+    \item \(r_t \in \mathbb{R}^N\) es el vector de retornos de activos en la fecha \(t\);
+    \item \(B_t \in \mathbb{R}^{N \times K}\) es la matriz de exposiciones conocida en \(t\);
+    \item \(f_t \in \mathbb{R}^K\) es el vector de retornos factoriales a estimar;
+    \item \(u_t\) es el residuo transversal.
+\end{itemize}
+
+La solución OLS es:
+
+\[
+\hat{f}_t = (B_t^\top B_t)^{-1} B_t^\top r_t,
+\]
+
+siempre que \(B_t^\top B_t\) sea invertible y esté bien condicionado.
+
+\subsection{Versión ponderada}
+
+En small caps, la heterocedasticidad transversal es material. Por ello, la versión recomendada es WLS:
+
+\[
+\hat{f}_t = (B_t^\top W_t B_t)^{-1} B_t^\top W_t r_t,
+\]
+
+donde \(W_t\) es una matriz diagonal de pesos, típicamente inversos a la varianza específica estimada o una proxy de estabilidad/liquidez.
+
+La versión canónica puede empezar con OLS si el pipeline aún no dispone de pesos fiables, pero la interfaz debe permitir WLS sin rediseño estructural.
+
+\subsection{Control de colinealidad}
+
+Si \(B_t^\top B_t\) es singular o mal condicionado, el módulo debe:
+
+\begin{enumerate}[label=\arabic*.]
+    \item detectar factores redundantes;
+    \item eliminar o combinar columnas colineales;
+    \item o regularizar la inversión de forma documentada.
+\end{enumerate}
+
+Esta corrección debe quedar persistida en diagnósticos. No debe ocurrir silenciosamente.
+
+\section{Estimación de betas por activo}
+
+\subsection{Dos interpretaciones posibles}
+
+El término ``beta'' puede referirse a dos objetos distintos:
+
+\begin{itemize}
+    \item \textbf{Exposiciones estructurales contemporáneas} derivadas de características \(x_{i,t}\);
+    \item \textbf{Cargas estimadas por regresión temporal} frente a factores observados.
+\end{itemize}
+
+El módulo debe fijar explícitamente cuál de estas dos interpretaciones usa para cada factor. No deben mezclarse sin distinción.
+
+\subsection{Política base}
+
+La política recomendada es:
+
+\begin{itemize}
+    \item factores sectoriales y de estilo: exposiciones construidas directamente a partir de características \emph{point-in-time};
+    \item beta de mercado: estimación rolling por regresión temporal;
+    \item factores experimentales: solo si su definición y frecuencia están cerradas.
+\end{itemize}
+
+\subsection{Beta de mercado rolling}
+
+Para una beta de mercado por símbolo, puede estimarse:
+
+\[
+r_{i,\tau} = a_i + \beta_{i,t}^{(mkt)} r_{m,\tau} + \eta_{i,\tau},
+\qquad \tau \in [t-L+1, t],
+\]
+
+donde \(L = \texttt{lookback\_beta}\). La estimación puede ser OLS, EWLS o una variante robusta. Si se usa media vida, debe quedar fijada por parámetro y documentada.
+
+\section{Riesgo específico \(D_t\)}
+
+\subsection{Definición}
+
+Una vez estimados los retornos factoriales, el residuo idiosincrático del activo \(i\) en la fecha \(t\) es:
+
+\[
+\epsilon_{i,t} = r_{i,t} - \beta_{i,t}^\top f_t.
+\]
+
+La varianza específica debe estimarse a partir de esta serie residual.
+
+\subsection{EWMA como política base}
+
+La política canónica recomendada es EWMA:
+
+\[
+\sigma_{\epsilon,i,t}^2
+=
+\lambda \sigma_{\epsilon,i,t-1}^2
++
+(1-\lambda)\epsilon_{i,t}^2,
+\qquad
+0 < \lambda < 1.
+\]
+
+La elección de \(\lambda\) debe ser explícita. Un valor alto produce estabilidad; uno menor, mayor adaptabilidad. No debe hablarse de GARCH o modelos de régimen dentro del contrato base si el sistema no los necesita aún para funcionar.
+
+\subsection{Piso mínimo}
+
+Para evitar varianzas residuales degeneradas, debe imponerse:
+
+\[
+\sigma_{\epsilon,i,t}^2 \leftarrow \max(\sigma_{\epsilon,i,t}^2,\varepsilon_D),
+\]
+
+con \(\varepsilon_D > 0\) pequeño pero no nulo.
+
+\section{Covarianza factorial \(\Omega_{f,t}\)}
+
+\subsection{Estimación base}
+
+Sea \(F_t\) la matriz histórica de retornos factoriales en una ventana de longitud \(L_f\). La covarianza muestral es:
+
+\[
+\hat{\Omega}_{f,t}
+=
+\frac{1}{L_f-1}
+(F_t - \bar{F}_t)^\top (F_t - \bar{F}_t).
+\]
+
+\subsection{Regularización}
+
+Dado que \(K\) puede no ser pequeño y los factores pueden estar correlacionados, la versión base debe permitir shrinkage:
+
+\[
+\Omega_{f,t}^{\text{shrunk}}
+=
+(1-\delta)\hat{\Omega}_{f,t}
++
+\delta \Omega_{f,t}^{\text{target}}.
+\]
+
+La política recomendada es Ledoit--Wolf u otra regularización explícita. Esta parte debe integrarse limpiamente con \texttt{cov\_shrinkage.py}, no duplicarse de manera desordenada.
+
+\subsection{PSD y simetría}
+
+La matriz \(\Omega_{f,t}\) final debe ser simétrica y PSD. Cualquier corrección espectral debe quedar registrada.
+
+\section{Símbolos nuevos y universo cambiante}
+
+\subsection{Problema}
+
+En small caps, el universo rota. Habrá símbolos nuevos con historia insuficiente, baja cobertura o metadatos incompletos. El módulo debe tratarlos de forma explícita.
+
+\subsection{Política por defecto para símbolos nuevos}
+
+La jerarquía correcta es:
+
+\begin{enumerate}[label=\arabic*.]
+    \item si existen características contemporáneas fiables, construir exposiciones estructurales con ellas;
+    \item si falta historia para beta temporal, usar proxy conservadora a nivel de sector o bucket de tamaño/liquidez;
+    \item asignar riesgo específico elevado o penalizado hasta acumular historia suficiente;
+    \item registrar el símbolo como \texttt{fallback\_used}.
+\end{enumerate}
+
+No debe asignarse una beta arbitraria o un riesgo específico bajo por ausencia de datos.
+
+\section{Política de NaN y cobertura}
+
+\subsection{Cobertura mínima}
+
+Antes de estimar cualquier objeto, el módulo debe verificar:
+
+\begin{itemize}
+    \item fracción de retornos observados por símbolo;
+    \item fracción de características válidas por factor;
+    \item cobertura de clasificación sectorial.
+\end{itemize}
+
+Si la cobertura efectiva cae por debajo del umbral configurado, el módulo debe emitir \texttt{warn} o abortar de forma controlada, según la severidad.
+
+\subsection{Prohibición de rellenos silenciosos}
+
+No se debe usar como política general:
+
+\begin{itemize}
+    \item \(\beta = 0\) por defecto cuando faltan exposiciones;
+    \item riesgo específico igual a cero cuando faltan residuos;
+    \item eliminación silenciosa de factores por NaN.
+\end{itemize}
+
+Toda imputación o exclusión debe ser trazable.
+
+\section{Algoritmo operativo}
+
+\begin{enumerate}[label=\arabic*.]
+    \item Cargar retornos, universo y características \emph{point-in-time}.
+    \item Aplicar filtros de cobertura y elegibilidad.
+    \item Construir exposiciones estructurales \(B_t\) por fecha.
+    \item Estimar, cuando proceda, betas temporales rolling para factores como mercado.
+    \item Estimar retornos factoriales \(f_t\) mediante regresión transversal diaria.
+    \item Calcular residuos \(\epsilon_{i,t}\).
+    \item Estimar riesgo específico con EWMA u otra política explícita.
+    \item Estimar \(\Omega_{f,t}\) y regularizarla si es necesario.
+    \item Construir:
+    \[
+    \Sigma_t = B_t \Omega_{f,t} B_t^\top + D_t.
+    \]
+    \item Aplicar simetrización y corrección PSD.
+    \item Persistir artefactos y diagnósticos.
+\end{enumerate}
+
+\section{Interacción con otros módulos}
+
+\subsection{Con \texttt{risk/cov\_shrinkage.py}}
+
+La covarianza factorial puede regularizarse usando la infraestructura común de shrinkage. Debe evitarse duplicar lógica de PSD, conditioning o targets si ya existe una capa estándar para ello.
+
+\subsection{Con \texttt{risk/exposure\_report.py}}
+
+La matriz \(B_t\) es la fuente canónica de exposiciones agregadas. \texttt{exposure\_report.py} no debe reconstruir betas localmente salvo en contingencia controlada.
+
+\subsection{Con \texttt{risk/stress\_tests.py}}
+
+Los escenarios factoriales y las perturbaciones de correlación deben apoyarse en \(\Omega_f\) y \(\Sigma\) generadas aquí. Este módulo debe entregar matrices válidas y auditables.
+
+\subsection{Con \texttt{portfolio/optimizer.py}}
+
+El optimizador consume \(\Sigma_t\) para riesgo ex--ante y, si procede, \(B_t\) para restricciones de neutralidad o penalización por exposición.
+
+\section{Métricas diagnósticas obligatorias}
+
+El módulo debe reportar al menos:
+
+\begin{itemize}
+    \item porcentaje de varianza explicada por el modelo;
+    \item distribución de varianzas específicas;
+    \item condición numérica de \(\Omega_f\) y \(\Sigma\);
+    \item cobertura de factores por activo;
+    \item número de factores activos en cada fecha;
+    \item estabilidad temporal de exposiciones;
+    \item número de símbolos en \emph{fallback};
+    \item norma del residuo agregado transversal.
+\end{itemize}
+
+Estas métricas son diagnósticas. No deben presentarse como prueba suficiente de capacidad predictiva ni de generación de alpha.
+
+\section{Pruebas mínimas de aceptación}
+
+\subsection{Test 1: consistencia dimensional}
+
+Deben cumplirse:
+
+\[
+B_t \in \mathbb{R}^{N \times K}, \qquad
+\Omega_{f,t} \in \mathbb{R}^{K \times K}, \qquad
+D_t \in \mathbb{R}^{N \times N}, \qquad
+\Sigma_t \in \mathbb{R}^{N \times N}.
+\]
+
+\subsection{Test 2: simetría y PSD}
+
+La matriz \(\Sigma_t\) final debe satisfacer:
+
+\[
+\|\Sigma_t - \Sigma_t^\top\|_\infty < \tau_{\text{sym}},
+\]
+y sus autovalores deben ser no negativos salvo tolerancia numérica pequeña.
+
+\subsection{Test 3: agregación factorial}
+
+Dado un conjunto sintético con factores y exposiciones conocidos, la regresión transversal debe recuperar \(f_t\) dentro de una tolerancia razonable.
+
+\subsection{Test 4: riesgo específico positivo}
+
+Para todo símbolo elegible:
+
+\[
+\sigma_{\epsilon,i,t}^2 \ge \varepsilon_D.
+\]
+
+\subsection{Test 5: símbolo nuevo}
+
+Un símbolo con historia insuficiente no debe recibir el mismo tratamiento que uno maduro sin que ello quede reflejado en diagnósticos.
+
+\subsection{Test 6: PIT}
+
+Cambiar información futura del dataset no debe alterar retroactivamente \(B_t\), \(f_t\) o \(\Sigma_t\) de fechas pasadas si el pipeline es realmente \emph{point-in-time}.
+
+\section{Pseudocódigo de referencia}
+
+\begin{lstlisting}[language=Python,basicstyle=\ttfamily\small,breaklines=true]
+# 1. Load PIT data
+returns = load_returns()
+features = load_pit_features()
+universe = load_universe()
+
+# 2. Build structural exposures B_t
+B = build_factor_exposures(features, universe)
+
+# 3. Estimate cross-sectional factor returns
+factor_returns = []
+for date in dates:
+    r = returns.loc[date, universe[date]]
+    X = B.loc[date, universe[date]]
+    f = solve_weighted_regression(X, r)
+    factor_returns.append(f)
+
+F = stack_factor_returns(factor_returns)
+
+# 4. Compute residuals
+residuals = returns_aligned - fitted_from(B, F)
+
+# 5. Estimate specific risk
+spec_var = ewma_variance(residuals, lam=0.97, floor=1e-8)
+D = diag_matrix(spec_var)
+
+# 6. Estimate factor covariance
+Omega_f = estimate_factor_cov(F, method="ledoit_wolf")
+
+# 7. Total covariance
+Sigma = B_current @ Omega_f @ B_current.T + D_current
+Sigma = make_psd(Sigma)
+
+# 8. Persist
+save_artifacts(B, F, D, Omega_f, Sigma)
+save_diagnostics(...)
 \end{lstlisting}
 
-\section{Backtest Élite Small Caps Swing}
-Universe Russell 2000, rebalance 10d:
+\section{Qué no debe hacer este módulo}
 
-\begin{table}[h]
-\centering
-\begin{tabular}{lccc}
-\toprule
-Métrica & Sin Model & Con Factors & Mejora \% \\
-\midrule
-Explained Var (\%) & 30 & 75 & +150 \\
-Idiosync. Vol (\%) & 25 & 12 & -52 \\
-Info Ratio & 0.3 & 0.7 & +133 \\
-Factor Cov Cond\# & 10k & 40 & -99.6 \\
-Small Cap Alpha (ann) & 2 & 5 & +150 \\
-\bottomrule
-\end{tabular}
-\caption{Backtest 2015-2026 $[web:42]$.}
-\end{table}
+La versión canónica no debe:
 
-\section{Integración}
-Upstream cov_shrinkage, downstream exposure_report/drawdown.
+\begin{itemize}
+    \item mezclar teoría APT, bibliografía, marketing y especificación en el mismo plano;
+    \item prometer mejoras de IR, Sharpe o alpha como si fueran propiedad directa del modelo;
+    \item introducir Kalman, PCA latente, GARCH multivariante o factores ML antes de cerrar la versión base;
+    \item dejar ambiguo si \(B\) es estructural, estadístico o híbrido;
+    \item ocultar problemas de cobertura con \emph{fallbacks} silenciosos.
+\end{itemize}
 
-\section{Próximos Pasos}
-Macro factors + sentiment para global swings.
+\section{Extensiones futuras razonables}
+
+Una vez estabilizada la versión base, pueden considerarse:
+
+\begin{itemize}
+    \item betas dinámicas mediante modelos de estado;
+    \item factores latentes adicionales;
+    \item riesgo específico condicional por régimen;
+    \item factores macro o de sentimiento;
+    \item regularización jerárquica de \(\Omega_f\);
+    \item neutralización respecto a benchmark.
+\end{itemize}
+
+Estas extensiones deben vivir detrás de flags experimentales o en investigación, no dentro del contrato mínimo.
+
+\section{Resumen ejecutivo}
+
+\texttt{risk/factor\_model.py} debe ser la fuente canónica de verdad para exposiciones, retornos factoriales, riesgo específico y covarianza estructurada del sistema.
+
+Su diseño correcto no consiste en parecer sofisticado, sino en responder con precisión a estas cuatro preguntas:
+
+\begin{enumerate}[label=\arabic*.]
+    \item qué factores existen y cómo se construyen;
+    \item cómo se estiman sus retornos;
+    \item cómo se mide el riesgo específico;
+    \item cómo se ensamblan todos los componentes en una covarianza válida.
+\end{enumerate}
+
+Si el módulo deja esas cuatro preguntas cerradas, ya está cerca de un estándar de documentación cuantitativa serio y programable.
 
 \end{document}

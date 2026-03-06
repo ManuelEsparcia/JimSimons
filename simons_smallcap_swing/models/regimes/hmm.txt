@@ -1,11 +1,12 @@
-\section{Hidden Markov Model (HMM) para detección de regímenes en swing trading}
+\section{Hidden Markov Model (HMM) para detección operativa de regímenes en swing trading}
 
 \subsection{Objetivo del módulo}
-El módulo \texttt{models/regimes/hmm.py} estima \textbf{estados latentes de mercado} mediante \textbf{Hidden Markov Models (HMM) gaussianos} sobre el vector de \texttt{regime_features}, con el objetivo de segmentar regímenes de mercado (p. ej. \emph{risk‑on}, \emph{risk‑off}, \emph{transitional}, \emph{crisis}) y habilitar una toma de decisiones adaptativa en un sistema de swing trading cuantitativo.
 
-Formalmente, sea \(\mathbf{X}_t \in \mathbb{R}^d\) el vector de \texttt{regime_features} observables en el día \(t\) y \(S_t \in \{0,1,\dots,K-1\}\) una variable latente discreta que representa el \textbf{estado inobservable} de mercado en el instante \(t\). El modelo HMM gaussiano asume:
+El módulo \texttt{models/regimes/hmm.py} implementa una capa de inferencia de \emph{market regimes} basada en \textbf{Hidden Markov Models gaussianos} aplicada sobre el vector temporal de \texttt{regime\_features}. Su función no es producir una taxonomía descriptiva de mercado, sino una \textbf{representación latente, estable y utilizable operativamente} del entorno de riesgo, de modo que los módulos downstream puedan condicionar selección de modelos, exposición, gross/net, turnover y permisividad de ejecución en función del estado estimado del mercado.
+
+Sea \(\mathbf{X}_t \in \mathbb{R}^d\) el vector observable de \texttt{regime\_features} en la fecha \(t\), ya construido bajo reglas estrictas point-in-time. Sea \(S_t \in \{0,1,\dots,K-1\}\) una variable latente discreta que representa el régimen de mercado vigente. El HMM gaussiano supone:
 \begin{equation}
-\mathbb{P}(S_0 = k) = \pi_k,
+\mathbb{P}(S_1 = k) = \pi_k,
 \end{equation}
 \begin{equation}
 \mathbb{P}(S_t = j \mid S_{t-1} = i) = A_{ij},
@@ -13,149 +14,402 @@ Formalmente, sea \(\mathbf{X}_t \in \mathbb{R}^d\) el vector de \texttt{regime_f
 \begin{equation}
 \mathbf{X}_t \mid S_t = k \sim \mathcal{N}(\boldsymbol{\mu}_k, \boldsymbol{\Sigma}_k),
 \end{equation}
-donde \(k, j \in \{0,\dots,K-1\}\), \(\boldsymbol{\pi} \in \mathbb{R}^K\) es el vector de probabilidades iniciales, \(\mathbf{A} \in \mathbb{R}^{K \times K}\) la matriz de transiciones, y \(\{\boldsymbol{\mu}_k, \boldsymbol{\Sigma}_k\}_{k=0}^{K-1}\) parámetros de emisión gaussiana. Este modelo permite:
+donde \(\boldsymbol{\pi}\) es el vector de probabilidades iniciales, \(\mathbf{A}\) la matriz de transición y \(\{\boldsymbol{\mu}_k,\boldsymbol{\Sigma}_k\}_{k=0}^{K-1}\) la familia de emisiones gaussianas.
+
+La interpretación económica del módulo es la siguiente: el mercado no se modela como una secuencia IID de observaciones, sino como un proceso con \textbf{persistencia de estado}, \textbf{transiciones discretas} y \textbf{superficies de riesgo condicional} diferentes según el régimen. Esta estructura es especialmente adecuada en swing trading porque la mayoría de las degradaciones severas de alpha no provienen de ruido de un día aislado, sino de cambios de entorno: expansión/compresión de volatilidad, deterioro de liquidez, concentración de correlaciones, pérdida de breadth o ruptura de tendencia sistémica.
+
+Por tanto, el objetivo del módulo no es maximizar únicamente el \emph{in-sample fit}, sino producir una secuencia \(\{\hat{S}_t\}\) y unas probabilidades \(\{\hat{p}_{t,k}\}\) que cumplan simultáneamente cuatro propiedades:
 \begin{itemize}
-  \item Segmentar dinámicamente el espacio de mercado en un número reducido de estados con características macroeconómicas bien definidas \cite{Hamilton1989, Ang2012}.
-  \item Soportar políticas de \emph{regime‑gating} en estrategias de swing trading, ajustando exposición y leverage según el estado estimado.
+  \item \textbf{Interpretabilidad económica}: cada estado debe corresponder a un entorno distinguible de riesgo/participación.
+  \item \textbf{Persistencia razonable}: el modelo no debe fragmentar el mercado en micro-estados inestables.
+  \item \textbf{Estabilidad inter-run}: el significado operativo de los estados debe mantenerse entre reentrenamientos.
+  \item \textbf{Utilidad downstream}: las probabilidades de régimen deben mejorar la toma de decisiones en \texttt{regime\_gating.py} sin introducir look-ahead ni excesivo chattering.
 \end{itemize}
 
-\subsection{Alcance del modelo}
+\subsection{Alcance del módulo}
+
 El módulo incluye:
 \begin{itemize}
-  \item Entrenamiento de un HMM gaussiano sobre \texttt{regime_features} mediante \emph{Baum‑Welch} (EM) con regularización.
-  \item Inferencia de probabilidades filtradas \(\mathbb{P}(S_t=k \mid \mathbf{X}_{1:t})\), suavizadas \(\mathbb{P}(S_t=k \mid \mathbf{X}_{1:T})\), y camino de estados vía \emph{Viterbi}.
-  \item Etiquetado semántico de estados basado en estadísticas de \(\{\boldsymbol{\mu}_k, \boldsymbol{\Sigma}_k\}\) (volatilidad, liquidez, tendencia, drawdown proxies).
-  \item Evaluación de estabilidad y persistencia de regímenes (duración media, estabilidad de \(\mathbf{A}\)).
-\end{itemize}
-No incluye:
-\begin{itemize}
-  \item Aplicación directa de una política de trading por estado (implementada en \texttt{regime_gating.py}).
-  \item Generación de \texttt{regime_features} (modularidad explícita hacia \texttt{regime_features.py}).
+  \item Entrenamiento de HMM gaussiano con EM/Baum--Welch sobre \texttt{regime\_features}.
+  \item Inferencia de probabilidades filtradas, suavizadas y camino Viterbi.
+  \item Selección controlada del número de estados \(K\) bajo criterios estadísticos y operativos.
+  \item Alineación semántica de estados entre reentrenamientos consecutivos.
+  \item Detección de degeneración, colapso de estados y cambios estructurales severos.
+  \item Persistencia de probabilidades, secuencias, parámetros, métricas de estabilidad y metadatos de entrenamiento.
 \end{itemize}
 
-\subsection{Dependencias aguas arriba/abajo}
-Upstream:
+No incluye:
 \begin{itemize}
-  \item \texttt{regime_features} outputs (matriz de features \(\mathbf{X}_{1:T} \in \mathbb{R}^{T \times d}\)).
-  \item Calendario temporal y \texttt{train_window_mode} (expanding/rolling).
-  \item Config HMM: \texttt{n\_states}, \texttt{covariance\_type}, \texttt{train\_window\_mode}, \texttt{min\_train\_length}, \texttt{regularization}, \texttt{random\_seed}, \texttt{state\_labeling\_policy}.
+  \item La construcción de \texttt{regime\_features} (responsabilidad de \texttt{regime\_features.py}).
+  \item La traducción final de probabilidades de estado a decisiones de riesgo o trading (responsabilidad de \texttt{regime\_gating.py}).
 \end{itemize}
-Downstream:
+
+\subsection{Rol arquitectónico}
+
+La carpeta \texttt{models/regimes} se concibe como una cadena causal:
+\[
+\texttt{regime\_features} \;\longrightarrow\; \texttt{hmm} \;\longrightarrow\; \texttt{regime\_gating}.
+\]
+
+En esta cadena, \texttt{hmm.py} ocupa la capa de \textbf{inferencia latente}. No produce señales de entrada/salida de mercado ni scores de alpha; produce un resumen probabilístico del entorno. Por ello, su criterio de calidad no es si “predice returns” de forma directa, sino si produce una segmentación suficientemente robusta del estado del sistema como para mejorar la decisión downstream.
+
+\subsection{Dependencias aguas arriba y aguas abajo}
+
+\paragraph{Upstream}
 \begin{itemize}
-  \item \texttt{models/regimes/regime_gating.py}: utiliza \(\mathbb{P}(S_t=k)\) para ajustar exposición.
-  \item \texttt{validation/walkforward\_bias.py}: analiza look‑ahead y estabilidad de regímenes.
-  \item \texttt{research/alpha\_discovery/regime\_detector.py}: investiga regímenes predictivos para alphas multi‑factor.
+  \item \texttt{regime\_features.parquet} con matriz \(\mathbf{X}_{1:T}\in\mathbb{R}^{T\times d}\).
+  \item Calendario de entrenamiento e inferencia.
+  \item Configuración de entrenamiento: \texttt{candidate\_n\_states}, \texttt{covariance\_type}, \texttt{train\_window\_mode}, \texttt{min\_train\_length}, \texttt{retrain\_freq}, \texttt{regularization}, \texttt{random\_seed}, \texttt{state\_alignment\_policy}, \texttt{model\_selection\_policy}, \texttt{structural\_break\_policy}.
+\end{itemize}
+
+\paragraph{Downstream}
+\begin{itemize}
+  \item \texttt{models/regimes/regime\_gating.py}: consume \(\hat{p}_{t,k}\), \(\hat{S}_t\), confianza de régimen y métricas de estabilidad.
+  \item \texttt{validation/walkforward\_bias.py}: verifica ausencia de leakage y coherencia temporal.
+  \item \texttt{validation/regime\_stability.py}: audita persistencia, reasignación de estados y drift semántico.
+  \item \texttt{research/alpha\_discovery/regime\_detector.py}: evaluación de heterogeneidad de alpha por estado.
 \end{itemize}
 
 \subsection{Contrato de entrada y salida}
+
+\paragraph{Entradas mínimas}
 \begin{itemize}
-  \item Entradas mínimas: \texttt{regime\_features\_path}, \texttt{hmm\_config\_path}, \texttt{run\_id}.
-  \item Salidas:
-    \begin{itemize}
-      \item \texttt{models/regimes/hmm/\{run\_id\}/state\_probs.parquet}: \((T \times K)\) con \(\mathbb{P}(S_t=k)\).
-      \item \texttt{state\_sequence.parquet}: camino Viterbi \(\hat{S}_{1:T}\).
-      \item \texttt{hmm\_params.json}: \(\boldsymbol{\pi}\), \(\mathbf{A}\), \(\{\boldsymbol{\mu}_k, \boldsymbol{\Sigma}_k\}\).
-      \item \texttt{hmm\_summary.json}: métricas de ajuste y validación.
-      \item \texttt{manifest.json}: metadatos de \texttt{run\_id}, ventana, features, etc.
-    \end{itemize}
-  \item Campos mínimos por fecha:
-    \begin{itemize}
-      \item \texttt{date}.
-      \item \texttt{state\_id}.
-      \item \texttt{p\_state\_0}…\texttt{p\_state\_k}.
-      \item \texttt{state\_confidence} \(= \max_k \mathbb{P}(S_t=k)\).
-      \item \texttt{run\_id}.
-    \end{itemize}
+  \item \texttt{regime\_features\_path}
+  \item \texttt{hmm\_config\_path}
+  \item \texttt{run\_id}
 \end{itemize}
 
-\subsection{Metodología base: HMM gaussiano y Baum‑Welch}
-Sea \(\mathcal{D} = \{\mathbf{x}_1,\dots,\mathbf{x}_T\}\) el conjunto de datos de entrenamiento. El likelihood del HMM gaussiano se define como:
+\paragraph{Salidas persistidas}
+\begin{itemize}
+  \item \texttt{state\_probs.parquet}: matriz \((T \times K)\) con probabilidades filtradas y, opcionalmente, suavizadas separadas por namespace.
+  \item \texttt{state\_sequence.parquet}: camino Viterbi y estado dominante filtrado.
+  \item \texttt{hmm\_params.json}: \(\boldsymbol{\pi}\), \(\mathbf{A}\), \(\{\boldsymbol{\mu}_k,\boldsymbol{\Sigma}_k\}\), configuración efectiva, criterio de selección de \(K\).
+  \item \texttt{hmm\_summary.json}: log-likelihood, AIC/BIC, entropía media, persistencia, estabilidad, colapsos, breaks, score de aceptabilidad operativa.
+  \item \texttt{state\_mapping.json}: correspondencia entre IDs internos del run actual y etiquetas semánticas persistentes.
+  \item \texttt{manifest.json}: huella completa del run.
+\end{itemize}
+
+\paragraph{Campos mínimos por fecha}
+\begin{itemize}
+  \item \texttt{date}
+  \item \texttt{dominant\_state\_filtered}
+  \item \texttt{p\_state\_0}, \dots, \texttt{p\_state\_\{K-1\}}
+  \item \texttt{state\_confidence} \(= \max_k \mathbb{P}(S_t=k\mid \mathbf{X}_{1:t})\)
+  \item \texttt{state\_entropy} \(= -\sum_k p_{t,k}\log p_{t,k}\)
+  \item \texttt{regime\_label}
+  \item \texttt{model\_accepted}
+  \item \texttt{run\_id}
+\end{itemize}
+
+\subsection{Formulación probabilística}
+
+Sea \(\mathcal{D}=\{\mathbf{x}_1,\dots,\mathbf{x}_T\}\). El likelihood completo del modelo es:
 \begin{equation}
-\mathcal{L}(\boldsymbol{\theta} \mid \mathcal{D}) = \sum_{\mathbf{s}_{1:T}} \pi_{s_1} \prod_{t=2}^T A_{s_{t-1} s_t} \prod_{t=1}^T \mathcal{N}(\mathbf{x}_t \mid \boldsymbol{\mu}_{s_t}, \boldsymbol{\Sigma}_{s_t}),
+\mathcal{L}(\boldsymbol{\theta}\mid \mathcal{D})
+=
+\sum_{s_{1:T}}
+\pi_{s_1}
+\prod_{t=2}^{T} A_{s_{t-1}s_t}
+\prod_{t=1}^{T}
+\mathcal{N}(\mathbf{x}_t\mid \boldsymbol{\mu}_{s_t},\boldsymbol{\Sigma}_{s_t}),
 \end{equation}
-donde \(\boldsymbol{\theta} = (\boldsymbol{\pi}, \mathbf{A}, \{\boldsymbol{\mu}_k, \boldsymbol{\Sigma}_k\})\). El \textbf{Baum‑Welch} (EM) calcula:
+donde
+\[
+\boldsymbol{\theta} = \left(\boldsymbol{\pi},\mathbf{A},\{\boldsymbol{\mu}_k,\boldsymbol{\Sigma}_k\}_{k=0}^{K-1}\right).
+\]
+
+El entrenamiento se realiza mediante EM/Baum--Welch. En la etapa E se computan:
 \begin{equation}
-\gamma_t(k) \propto \mathbb{P}(S_t=k \mid \mathcal{D}) = \frac{\alpha_t(k)\beta_t(k)}{\sum_{k'} \alpha_t(k')\beta_t(k')},
+\gamma_t(k) = \mathbb{P}(S_t=k\mid \mathcal{D}),
 \end{equation}
 \begin{equation}
-\xi_t(i,j) \propto \mathbb{P}(S_{t-1}=i, S_{t}=j \mid \mathcal{D}) = \frac{\alpha_{t-1}(i) A_{ij} \mathcal{N}(\mathbf{x}_t \mid \boldsymbol{\mu}_j, \boldsymbol{\Sigma}_j)\beta_t(j)}{\sum_{i,j} \alpha_{t-1}(i) A_{ij} \mathcal{N}(\mathbf{x}_t \mid \boldsymbol{\mu}_j, \boldsymbol{\Sigma}_j)\beta_t(j)},
+\xi_t(i,j)=\mathbb{P}(S_{t-1}=i,S_t=j\mid \mathcal{D}).
 \end{equation}
-y actualiza:
+
+En la etapa M se actualiza:
 \begin{align}
-\hat{\pi}_k & = \gamma_1(k), \\
-\hat{A}_{ij} & = \frac{\sum_{t=2}^T \xi_t(i,j)}{\sum_{t=2}^T \gamma_{t-1}(i)}, \\
-\hat{\boldsymbol{\mu}}_k & = \frac{\sum_{t=1}^T \gamma_t(k)\mathbf{x}_t}{\sum_{t=1}^T \gamma_t(k)}, \\
-\hat{\boldsymbol{\Sigma}}_k & = \frac{\sum_{t=1}^T \gamma_t(k)(\mathbf{x}_t - \hat{\boldsymbol{\mu}}_k)(\mathbf{x}_t - \hat{\boldsymbol{\mu}}_k)^\top}{\sum_{t=1}^T \gamma_t(k)}.
+\hat{\pi}_k &= \gamma_1(k), \\
+\hat{A}_{ij} &= \frac{\sum_{t=2}^{T}\xi_t(i,j)}{\sum_{t=2}^{T}\gamma_{t-1}(i)}, \\
+\hat{\boldsymbol{\mu}}_k &= \frac{\sum_{t=1}^{T}\gamma_t(k)\mathbf{x}_t}{\sum_{t=1}^{T}\gamma_t(k)}, \\
+\hat{\boldsymbol{\Sigma}}_k &= \frac{\sum_{t=1}^{T}\gamma_t(k)(\mathbf{x}_t-\hat{\boldsymbol{\mu}}_k)(\mathbf{x}_t-\hat{\boldsymbol{\mu}}_k)^\top}{\sum_{t=1}^{T}\gamma_t(k)}.
 \end{align}
-Para \texttt{covariance\_type} restringido (tied, diagonal, spherical) se añade una regularización tipo Tikhonov o \(\ell_2\) para evitar colapsos de estados y mejora robustez en muestras finitas \cite{Rabiner1989, Zucchini2016}.
+
+En producción, la implementación debe operar en log-espacio y/o con factores de escalado para evitar \emph{underflow} numérico. Además, la estimación de covarianzas incorpora regularización explícita:
+\begin{equation}
+\hat{\boldsymbol{\Sigma}}_k^{\text{reg}}
+=
+\hat{\boldsymbol{\Sigma}}_k + \lambda I,
+\end{equation}
+con \(\lambda > 0\) configurable, o bien restricciones estructurales mediante \texttt{covariance\_type} \(\in \{\texttt{full},\texttt{diag},\texttt{tied},\texttt{spherical}\}\).
 
 \subsection{Inferencia: filtrado, suavizado y Viterbi}
+
+\paragraph{Filtrado}
+Para uso live o walk-forward, únicamente se permiten probabilidades filtradas:
+\begin{equation}
+\alpha_t(k)
+=
+\mathbb{P}(X_{1:t},S_t=k)
+=
+\left(\sum_{i=0}^{K-1}\alpha_{t-1}(i)A_{ik}\right)
+\mathcal{N}(\mathbf{x}_t\mid \boldsymbol{\mu}_k,\boldsymbol{\Sigma}_k),
+\end{equation}
+y
+\begin{equation}
+\mathbb{P}(S_t=k\mid X_{1:t}) \propto \alpha_t(k).
+\end{equation}
+
+\paragraph{Suavizado}
+Para auditoría offline o análisis ex post:
+\begin{equation}
+\beta_t(k)
+=
+\sum_{j=0}^{K-1}
+A_{kj}
+\mathcal{N}(\mathbf{x}_{t+1}\mid \boldsymbol{\mu}_j,\boldsymbol{\Sigma}_j)\beta_{t+1}(j),
+\end{equation}
+con
+\begin{equation}
+\mathbb{P}(S_t=k\mid X_{1:T}) \propto \alpha_t(k)\beta_t(k).
+\end{equation}
+Las probabilidades suavizadas quedan prohibidas para decisiones live.
+
+\paragraph{Viterbi}
+Opcionalmente se calcula el camino más probable:
+\begin{equation}
+\hat{S}_{1:T}
+=
+\arg\max_{S_{1:T}}\mathbb{P}(S_{1:T}\mid X_{1:T}),
+\end{equation}
+útil para análisis estructural y visualización, pero no necesariamente para gating directo si la política downstream trabaja con probabilidades continuas y no con asignaciones duras.
+
+\subsection{Selección del número de estados \(K\)}
+
+Uno de los principales puntos débiles de los HMM aplicados de forma ingenua es tratar \(K\) como un hiperparámetro decorativo. En este módulo, \(K\) se selecciona mediante una política \textbf{mixta estadístico-operativa}, no únicamente por AIC/BIC.
+
+Sea \(\mathcal{K}_{\text{cand}}=\{2,3,\dots,K_{\max}\}\). Para cada \(K\) candidato se evalúan:
 \begin{itemize}
-  \item \textbf{Filtrado} (online): \(\mathbb{P}(S_t=k \mid \mathbf{X}_{1:t})\) usando el algoritmo \texttt{forward}:
-    \begin{equation}
-    \alpha_t(k) = \sum_{i=0}^{K-1} \alpha_{t-1}(i) A_{ik} \mathcal{N}(\mathbf{x}_t \mid \boldsymbol{\mu}_k, \boldsymbol{\Sigma}_k),
-    \end{equation}
-    \(\gamma_t(k) \propto \alpha_t(k)\). Útil para decisiones de trading en \texttt{t} real sin mirar al futuro.
-  \item \textbf{Suavizado} (offline analítico): \(\mathbb{P}(S_t=k \mid \mathbf{X}_{1:T})\) con \texttt{forward–backward}:
-    \begin{equation}
-    \beta_t(k) = \sum_{j=0}^{K-1} A_{kj} \mathcal{N}(\mathbf{x}_{t+1} \mid \boldsymbol{\mu}_j, \boldsymbol{\Sigma}_j)\beta_{t+1}(j),
-    \end{equation}
-    \(\gamma_t(k) \propto \alpha_t(k)\beta_t(k)\). Validado solo para análisis y debugging, no para política de trading.
-  \item \textbf{Viterbi path} (opcional): camino \(\hat{S}_{1:T}\) que maximiza \(\mathbb{P}(S_{1:T} \mid \mathbf{X}_{1:T})\), resuelto mediante programación dinámica \cite{Durbin1998}.
+  \item \textbf{Fit estadístico}: log-likelihood validado, AIC, BIC.
+  \item \textbf{Persistencia}: duración media y mediana por estado.
+  \item \textbf{Ocupación efectiva}: ningún estado debe absorber masa ínfima de forma persistente.
+  \item \textbf{Separación}: distancia entre emisiones \((\boldsymbol{\mu}_k,\boldsymbol{\Sigma}_k)\).
+  \item \textbf{Entropía}: el modelo no debe producir incertidumbre crónica excesiva.
+  \item \textbf{Estabilidad inter-run}: consistencia al reentrenar en ventanas solapadas.
+  \item \textbf{Utilidad downstream}: mejora del desempeño de \texttt{regime\_gating} en validación walk-forward.
 \end{itemize}
 
-\subsection{Etiquetado semántico de estados}
-Tras entrenamiento, cada estado \(k\) se caracteriza por:
-\begin{itemize}
-  \item \(\boldsymbol{\mu}_k\): niveles medios de \emph{volatilidad, liquidez, tendencia, drawdown proxies}.
-  \item \(\boldsymbol{\Sigma}_k\): volatilidad condicional y correlaciones cruzadas.
-\end{itemize}
-Un policy de \texttt{state\_labeling} puede mapear:
-\begin{itemize}
-  \item \textbf{Risk‑on}: \(\mathbb{E}[R \mid k] > 0\), baja volatilidad, alta liquidez, tendencia positiva.
-  \item \textbf{Risk‑off}: \(\mathbb{E}[R \mid k] < 0\), alta volatilidad, baja liquidez, tendencia negativa.
-  \item \textbf{Crisis}: volatilidad muy alta, correlaciones de liquidez “flight‑to‑quality”.
-  \item \textbf{Transitional/neutral}: régimen de transición, niveles intermedios.
-\end{itemize}
-La asignación automática mediante clustering o reglas de umbrales (e.g. \texttt{vol\_thresholds}, \texttt{trend\_thresholds}) se documenta en \texttt{hmm\_summary.json} y \texttt{state\_id} \(\to\) \texttt{regime\_label} persistido en \texttt{hmm\_params.json} \cite{Ang2012, Hamilton2010}.
+Se define una función de selección compuesta:
+\begin{equation}
+\text{Score}(K)
+=
+w_1 \cdot \text{Fit}(K)
++
+w_2 \cdot \text{Persistence}(K)
++
+w_3 \cdot \text{Stability}(K)
++
+w_4 \cdot \text{Utility}(K)
+-
+w_5 \cdot \text{DegeneracyPenalty}(K),
+\end{equation}
+donde los pesos se fijan por configuración. En producción, el valor elegido de \(K\) no debe ser el que maximiza únicamente el likelihood, sino el mayor \(K\) que siga siendo \textbf{estable, interpretable y accionable}. En la práctica, esto impide sobresegmentar el mercado en estados espurios con nulo valor operativo.
 
-\subsection{Reglas PIT y anti‑leakage}
+\subsection{Alineación semántica de estados entre reentrenamientos}
+
+Un problema central en producción es que los IDs internos del HMM no tienen semántica intrínseca: el estado \(2\) de un run puede no corresponder al estado \(2\) del run siguiente. Para evitar que \texttt{risk-off} cambie de identidad de una ventana a otra, el módulo implementa una política explícita de \textbf{state alignment}.
+
+Sea el conjunto de estados del run previo \(\mathcal{S}^{(old)}\) y del run actual \(\mathcal{S}^{(new)}\). Se construye una matriz de coste entre estados usando distancia entre emisiones y métricas económicas auxiliares:
+\begin{equation}
+C_{ij}
+=
+\lambda_\mu \|\mu_i^{(old)}-\mu_j^{(new)}\|_2
++
+\lambda_\Sigma \|\Sigma_i^{(old)}-\Sigma_j^{(new)}\|_F
++
+\lambda_r | \bar{r}_i^{(old)}-\bar{r}_j^{(new)} |
++
+\lambda_v | \bar{\sigma}_i^{(old)}-\bar{\sigma}_j^{(new)} |.
+\end{equation}
+
+Sobre esta matriz se resuelve una asignación óptima bipartita, por ejemplo con Hungarian matching. El resultado produce un mapeo:
+\[
+\texttt{state\_id\_internal} \longrightarrow \texttt{state\_id\_persistent}.
+\]
+
+Si el coste mínimo excede un umbral de tolerancia, el estado se considera \textbf{no alineable} y se marca como \texttt{new\_state\_candidate}. Esto evita falsas equivalencias semánticas en presencia de drift estructural.
+
+\subsection{Etiquetado semántico}
+
+Tras la alineación, cada estado persistente se etiqueta mediante una política explícita de \texttt{state\_labeling}. La etiqueta no se asigna por nombre arbitrario, sino por firmas económicas robustas:
 \begin{itemize}
-  \item En modo \emph{online} o \emph{walk‑forward} solo se usan \(\mathbb{P}(S_t=k \mid \mathbf{X}_{1:t})\). Nunca \(\mathbb{P}(S_t=k \mid \mathbf{X}_{1:T})\) con \(t < T\) conocido.
-  \item Si se usa \emph{smoothing} para análisis, se etiqueta claramente como \texttt{offline} / \texttt{lookahead} en \texttt{hmm\_summary.json} y metadatos.
-  \item En \texttt{config} se fuerza \texttt{inference\_mode} \(\in \{\text{filtered}, \text{smoothed}\}\) con flag de producción \texttt{prohibit\_smoothing\_in\_live}.
+  \item \textbf{Risk-on}: volatilidad baja o moderada, breadth razonable, liquidez sana, tendencia sistémica favorable.
+  \item \textbf{Risk-off}: volatilidad alta, deterioro de liquidez, aumento de correlación cross-sectional, presión bajista.
+  \item \textbf{Crisis / stress}: volatilidad extrema, colapso de breadth, correlaciones elevadas, spreads y fragilidad de ejecución.
+  \item \textbf{Neutral / transitional}: transición entre estructuras o mezcla de señales incompatibles.
 \end{itemize}
 
-\subsection{Flujo del proceso (alto nivel)}
+La asignación se documenta siempre en \texttt{state\_mapping.json}, separando tres niveles:
+\begin{itemize}
+  \item \texttt{internal\_state\_id}
+  \item \texttt{persistent\_state\_id}
+  \item \texttt{regime\_label}
+\end{itemize}
+
+\subsection{Tratamiento de cambios estructurales}
+
+Un buen módulo de regímenes no solo clasifica estados; también detecta cuándo la propia clasificación deja de ser fiable porque el proceso generador ha cambiado de forma material. Por ello, el HMM incorpora una política de \textbf{structural break handling}.
+
+Se considera que existe sospecha de cambio estructural si se observan uno o varios de los siguientes fenómenos:
+\begin{itemize}
+  \item caída abrupta del log-likelihood out-of-sample;
+  \item incremento persistente de entropía de estado;
+  \item pérdida severa de persistencia de los estados;
+  \item rotación semántica inestable en los mapeos entre runs;
+  \item aumento acusado de la distancia entre \(\mathbf{A}\) o entre emisiones de runs consecutivos.
+\end{itemize}
+
+Formalmente, pueden monitorizarse estadísticas como:
+\begin{equation}
+D_A^{(m,n)} = \|\mathbf{A}^{(m)}-\mathbf{A}^{(n)}\|_F,
+\end{equation}
+\begin{equation}
+D_\mu^{(m,n)} = \max_k \|\boldsymbol{\mu}_k^{(m)}-\boldsymbol{\mu}_{\pi(k)}^{(n)}\|_2,
+\end{equation}
+donde \(\pi\) es el matching óptimo entre estados.
+
+Si las métricas exceden umbrales configurados, el módulo puede:
+\begin{itemize}
+  \item continuar con el modelo actual pero marcar \texttt{model\_accepted = false};
+  \item activar una política de \texttt{degraded mode};
+  \item forzar reentrenamiento completo con mayor ventana o distinta regularización;
+  \item congelar temporalmente el mapping semántico previo y reducir la intensidad del gating downstream.
+\end{itemize}
+
+\subsection{Política de reinicio y continuidad operativa}
+
+No basta con “reentrenar otra vez” cuando el modelo falla. La especificación debe dejar clara la jerarquía de recuperación.
+
+\paragraph{Caso 1: colapso parcial}
+Si uno o varios estados presentan masa efectiva muy baja, covarianza degenerada o absorción anómala, se intenta:
+\begin{itemize}
+  \item aumentar regularización;
+  \item cambiar \texttt{covariance\_type};
+  \item relanzar con varios \texttt{random\_seed};
+  \item reducir \(K\) en una unidad si la degeneración persiste.
+\end{itemize}
+
+\paragraph{Caso 2: colapso semántico}
+Si el modelo converge, pero los estados dejan de ser interpretables o alineables:
+\begin{itemize}
+  \item se rechaza el run como modelo operativo;
+  \item se mantiene el último mapping persistente estable;
+  \item se envía bandera de precaución a \texttt{regime\_gating}.
+\end{itemize}
+
+\paragraph{Caso 3: break estructural severo}
+Si existe evidencia consistente de régimen nuevo no representado por la estructura previa:
+\begin{itemize}
+  \item se permite reinicialización completa de estados;
+  \item se crea nueva versión de \texttt{state\_mapping};
+  \item se obliga a periodo de observación antes de usar el nuevo mapping con máxima intensidad downstream.
+\end{itemize}
+
+La idea general es que el HMM debe ser \textbf{adaptativo sin ser errático}. En un sistema real, continuidad operativa importa tanto como capacidad de reacción.
+
+\subsection{Reglas point-in-time y anti-leakage}
+
+\begin{itemize}
+  \item En live y en backtest walk-forward solo se permite \(\mathbb{P}(S_t=k\mid X_{1:t})\).
+  \item El suavizado \(\mathbb{P}(S_t=k\mid X_{1:T})\) queda restringido a análisis offline, debugging o anotación histórica.
+  \item Toda salida persistida debe indicar \texttt{probability\_namespace} \(\in\) \{\texttt{filtered}, \texttt{smoothed}\}.
+  \item \texttt{prohibit\_smoothing\_in\_live = true} debe ser un \emph{hard guard}, no una convención blanda.
+  \item En reentrenamientos rolling/expanding, la ventana de fit debe cerrarse estrictamente antes o en \(t\), nunca después.
+\end{itemize}
+
+\subsection{Flujo operativo del proceso}
+
 \begin{enumerate}
-  \item \texttt{load\_hmm\_config} y \texttt{load\_regime\_features} construyen \(\mathcal{D} = \{\mathbf{x}_1,\dots,\mathbf{x}_T\}\).
-  \item División \texttt{train\_window\_mode} (expanding/rolling) con \texttt{min\_train\_length}.
-  \item \texttt{train\_hmm\_model} calibra \(\boldsymbol{\theta}\) mediante Baum‑Welch.
-  \item \texttt{infer\_state\_probabilities} computa \(\gamma_t(k)\) y (opcional) Viterbi.
-  \item \texttt{label\_states\_semantically} asigna \texttt{regime\_label} estructurado.
-  \item \texttt{evaluate\_state\_stability} comprueba persistencia y estabilidad de \(\mathbf{A}\).
-  \item \texttt{persist\_hmm\_outputs} serializa a \texttt{parquet} y \texttt{json} versiónados.
+  \item \texttt{load\_hmm\_config} y \texttt{load\_regime\_features}.
+  \item Validación temporal y de cobertura de \(\mathbf{X}_{1:T}\).
+  \item Definición de ventana efectiva según \texttt{train\_window\_mode}.
+  \item Entrenamiento multi-start para cada \(K\) candidato.
+  \item Selección del mejor modelo por política mixta estadístico-operativa.
+  \item Inferencia filtrada y, si procede, suavizada en namespace separado.
+  \item Evaluación de degeneración, persistencia, estabilidad y drift.
+  \item Alineación semántica frente al run anterior.
+  \item Etiquetado económico de estados persistentes.
+  \item Decisión final de aceptabilidad operativa.
+  \item Persistencia de outputs, métricas y manifiestos.
 \end{enumerate}
 
 \subsection{Métricas recomendadas}
+
+\paragraph{Métricas de ajuste}
 \begin{itemize}
-  \item \textbf{Log‑likelihood} train / valid, \textbf{AIC/BIC} para seleccionador de \texttt{n\_states} \cite{Bozdogan1987}:
-    \begin{equation}
-    \mathrm{BIC} = -2 \log \mathcal{L} + \log T \cdot \dim(\boldsymbol{\theta}).
-    \end{equation}
-  \item \textbf{State persistence}: duración media por estado \(\mathbb{E}[\text{chain\_length} \mid S_t=k]\).
-  \item \textbf{Transition matrix stability}: distancia (e.g. \(\|\mathbf{A}_i - \mathbf{A}_j\|_F\)) entre ventanas rolling.
-  \item \textbf{Confidence promedio}: \(\frac{1}{T} \sum_{t=1}^T \max_k \gamma_t(k)\).
+  \item log-likelihood train / validation;
+  \item AIC / BIC:
+  \begin{equation}
+  \mathrm{BIC} = -2 \log \mathcal{L} + \log(T)\,\dim(\boldsymbol{\theta});
+  \end{equation}
+  \item convergencia del EM y número de iteraciones.
 \end{itemize}
 
-\subsection{Validaciones mínimas y casos especiales}
+\paragraph{Métricas de estructura}
 \begin{itemize}
-  \item \(\sum_{k=0}^{K-1} \gamma_t(k) = 1 \pm \varepsilon\) (tolerancia numérica).
-  \item \texttt{n\_states\_effective} \(> 1\): detecta colapso a un solo estado dominante.
-  \item Transiciones plausibles: \(\max_{i} \max_{j} A_{ij} \leq \rho < 1\) (evita absorción completa).
-  \item Cobertura completa de fechas sin \texttt{NaN} en \texttt{state\_probs.parquet}.
-  \item \textbf{Casos especiales}:
-    \begin{itemize}
-      \item \emph{Colapso de estados}: relanzar con \texttt{random\_seed} diferente o aumentar regularización.
-      \item \emph{Features altamente correlacionadas}: opcional \texttt{PCA}/whitening antes de HMM.
-      \item \emph{Cambios estructurales fu
+  \item duración media y mediana por estado;
+  \item ocupación efectiva por estado;
+  \item entropía media de régimen;
+  \item distancia entre matrices de transición entre runs;
+  \item distancia entre emisiones alineadas.
+\end{itemize}
+
+\paragraph{Métricas de utilidad}
+\begin{itemize}
+  \item mejora de \texttt{regime\_gating} en validación walk-forward;
+  \item reducción de drawdown o mejora de convexidad de riesgo condicional;
+  \item capacidad del gating de desactivar exposición en estados adversos sin destruir exceso de alpha en estados normales.
+\end{itemize}
+
+\subsection{Criterios de aceptación y rechazo del modelo}
+
+El módulo no debe aceptar automáticamente todo run convergente. La convergencia numérica es condición necesaria, no suficiente. Un run se considera \texttt{accepted} solo si satisface simultáneamente:
+\begin{itemize}
+  \item normalización correcta de probabilidades;
+  \item \(K_{\text{effective}} \ge 2\);
+  \item ausencia de estados casi vacíos persistentes;
+  \item persistencia mínima por estado por encima de un umbral;
+  \item entropía media por debajo de un máximo admisible;
+  \item estabilidad inter-run suficiente;
+  \item alineación semántica satisfactoria;
+  \item mejora o, al menos, no deterioro material del comportamiento downstream en validación.
+\end{itemize}
+
+Si no se cumplen estos criterios, el modelo puede persistirse para auditoría, pero no debe marcarse como válido para producción.
+
+\subsection{Validaciones mínimas}
+
+\begin{itemize}
+  \item \(\sum_{k=0}^{K-1} p_{t,k} = 1 \pm \varepsilon\) para toda fecha.
+  \item No existen \texttt{NaN} ni fechas faltantes en outputs.
+  \item Las covarianzas regularizadas son definidas positivas o semidefinidas positivas admisibles según implementación.
+  \item Ningún estado presenta absorción espuria no justificada por datos.
+  \item El mapping entre runs queda completamente documentado o explícitamente rechazado.
+\end{itemize}
+
+\subsection{Consideraciones de implementación}
+
+La implementación debe priorizar robustez frente a elegancia académica:
+\begin{itemize}
+  \item operar en log-espacio;
+  \item soportar multi-start con selección del mejor óptimo local;
+  \item separar claramente entrenamiento, inferencia, alineación y persistencia;
+  \item permitir backfilling solo para auditoría, nunca para live decisions;
+  \item versionar exhaustivamente parámetros, ventanas, features y política de mapping;
+  \item evitar que un fallo del HMM provoque por sí mismo un fallo duro de todo el stack downstream.
+\end{itemize}
+
+\subsection{Interpretación final}
+
+Este módulo no debe entenderse como un clasificador ornamental de bull/bear market, sino como una \textbf{capa de estado latente de mercado} diseñada para operar bajo incertidumbre, con persistencia temporal, control de drift semántico y disciplina point-in-time. Su calidad no se mide únicamente por la elegancia de la formulación de Baum--Welch, sino por su capacidad para producir estados que sobrevivan a reentrenamientos, mantengan significado económico y puedan ser consumidos por \texttt{regime\_gating.py} sin introducir inestabilidad, leakage ni falsas transiciones.
+
+En un sistema cuantitativo serio, el valor de un HMM no está en “detectar regímenes” en abstracto, sino en reducir errores de decisión cuando el entorno de mercado cambia. Esa es la función de este módulo dentro de \texttt{simons\_smallcap\_swing}.

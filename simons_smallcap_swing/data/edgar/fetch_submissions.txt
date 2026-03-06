@@ -1,220 +1,544 @@
 \section{Módulo: \texttt{data/edgar/fetch\_submissions.py}}
 
-\subsection{Objetivo general del módulo}
+\subsection{Objetivo estratégico del módulo}
 
-El módulo \texttt{fetch\_submissions.py} descarga y almacena \emph{submissions} de EDGAR por CIK de forma \emph{incremental}, gestionando:
-\begin{itemize}
-  \item retries ante fallos de red y errores 429/5xx,
-  \item rate‑limiting para cumplir con los límites de la API de EDGAR,
-  \item y trazabilidad explícita por \texttt{run\_id} para auditoría.
-\end{itemize}
+El módulo \texttt{fetch\_submissions.py} implementa la capa de ingestión, historificación e integridad operativa de \emph{submissions metadata} desde EDGAR/SEC para un universo de emisores identificado por \texttt{CIK}. Su función no es simplemente descargar JSONs de filings, sino construir una \textbf{base raw versionada, incremental, idempotente y auditable} de eventos regulatorios que preserve el orden temporal observable de las presentaciones y pueda ser consumida con seguridad por las capas posteriores de \emph{point-in-time reconstruction}, \emph{filings flags}, enlazado documental y control de sesgo temporal.
 
-Su objetivo es construir una base de datos de \emph{filing metadata} que permita reconstruir la historia de presentaciones regulatorias de un CIK, necesaria para:
-\begin{itemize}
-  \item construir vistas \emph{point‑in‑time} (PIT),
-  \item enlazar company facts con documentos originales,
-  \item y evitar look‑ahead bias en pipelines de trading cuantitativo.
-\end{itemize}
+La tesis operativa del módulo es la siguiente:
 
-Matemáticamente, el módulo implementa una función de \emph{ingestión incremental}:
+\begin{quote}
+\emph{En un pipeline fundamental serio, la historia de presentaciones regulatorias no es un metadato accesorio, sino la estructura temporal que define cuándo un hecho contable, un filing o una revisión pasan a ser observables para el mercado.}
+\end{quote}
+
+Por tanto, este módulo debe diseñarse como una infraestructura de \textbf{event lineage}, no como un mero descargador HTTP.
+
+Formalmente, el módulo implementa una aplicación de ingestión incremental
+
 \[
-  \mathcal{I}_{\text{sub}}: \mathcal{C} \times \mathcal{T} \times \Theta \longrightarrow \mathcal{S},
+\mathcal{I}_{\mathrm{sub}} : (\mathcal{C}, \mathcal{T}, \theta, r, a) \longrightarrow (\mathcal{S}_{\mathrm{raw}}, \mathcal{F}, \mathcal{M}),
 \]
+
 donde:
+
 \begin{itemize}
-  \item \(\mathcal{C}\) es el conjunto de CIKs de entrada,
-  \item \(\mathcal{T} = [t_{\text{start}}, t_{\text{end}}]\) es el rango de tiempo opcional de filtrado,
-  \item \(\Theta\) son los parámetros de configuración (rate‑limit, retries, formato de salida),
-  \item \(\mathcal{S}\) es el conjunto de submissions en formato tabular, particionado por \texttt{asof}.
+    \item \(\mathcal{C}\) es el universo de \texttt{CIK} a procesar;
+    \item \(\mathcal{T}\) es la política temporal de filtrado o reconciliación;
+    \item \(\theta\) es la configuración de ingesta (\emph{rate limit}, \emph{retries}, concurrencia, persistencia, validaciones, estrategia incremental);
+    \item \(r\) es el \texttt{run\_id};
+    \item \(a\) es el \texttt{asof} lógico de la corrida;
+    \item \(\mathcal{S}_{\mathrm{raw}}\) es el repositorio de submissions persistido;
+    \item \(\mathcal{F}\) es el conjunto de fallos, incidencias y anomalías;
+    \item \(\mathcal{M}\) es el \emph{manifest} auditable de ejecución.
 \end{itemize}
 
-\subsection{Alcance del módulo}
+El objetivo económico real del módulo es permitir que el sistema downstream pueda responder, sin ambigüedad, preguntas del tipo:
+
+\begin{itemize}
+    \item ¿Qué filings eran observables por el mercado en una fecha \texttt{asof} dada?
+    \item ¿Cuándo apareció por primera vez un \texttt{10-K}, \texttt{10-Q}, \texttt{8-K} o un amendment?
+    \item ¿Qué emisores dejaron de presentar, presentaron tarde o modificaron filings previos?
+    \item ¿Cómo se debe enlazar cada \texttt{companyfact} con su filing y su orden temporal real?
+\end{itemize}
+
+\subsection{Posición dentro de la arquitectura EDGAR}
+
+Este módulo ocupa la capa de entrada de \emph{filing metadata} dentro del subsistema EDGAR. Se sitúa aguas abajo de la resolución de identidad regulatoria (\texttt{ticker\_cik}) y aguas arriba de:
+
+\begin{itemize}
+    \item \texttt{fetch\_companyfacts.py}, que descarga hechos financieros;
+    \item \texttt{parse\_xbrl.py}, que canoniza facts y resuelve semántica de tags;
+    \item \texttt{point\_in\_time.py}, que impone observabilidad estricta;
+    \item \texttt{filings\_flags.py}, que deriva señales de calidad y eventos regulatorios;
+    \item \texttt{edgar\_qc.py}, que valida el pipeline completo.
+\end{itemize}
+
+En esta arquitectura, \texttt{fetch\_submissions.py} no debe asumir responsabilidades que pertenecen a etapas posteriores. En particular, el módulo:
+
+\begin{itemize}
+    \item no decide la verdad económica del contenido del filing;
+    \item no resuelve el mapeo semántico final entre filings y facts;
+    \item no selecciona el hecho PIT definitivo;
+    \item no infiere señales cuantitativas finales.
+\end{itemize}
+
+Su responsabilidad es más elemental y más crítica: \textbf{capturar fielmente el orden temporal y la metadata observable del universo de filings.}
+
+\subsection{Objetivo técnico exacto}
+
+Para cada \(c \in \mathcal{C}\), el módulo descarga el endpoint de \emph{submissions} de la SEC, preserva el payload raw, extrae una representación tabular mínima de cada filing y mantiene un repositorio incremental que permita distinguir con precisión entre:
+
+\begin{itemize}
+    \item presentaciones nuevas;
+    \item presentaciones ya vistas;
+    \item late arrivals;
+    \item amendments o cambios sobre filings previos;
+    \item y fallos de cobertura o de disponibilidad del origen.
+\end{itemize}
+
+El diseño correcto del módulo exige una separación entre tres niveles:
+
+\begin{enumerate}
+    \item \textbf{nivel fuente}: payload original descargado;
+    \item \textbf{nivel evento}: tabla estructurada de submissions con los campos esenciales;
+    \item \textbf{nivel corrida}: manifest, cobertura, fallos y reconciliación incremental.
+\end{enumerate}
+
+Esta separación es obligatoria si se quiere que el pipeline sea reproducible y no dependa de heurísticas opacas embebidas en la capa de descarga.
+
+\subsection{Alcance funcional}
 
 El alcance del módulo incluye:
 
 \begin{itemize}
-  \item \textbf{Descarga} de submissions en formato JSON vía API EDGAR.
-  \item \textbf{Parseo mínimo} de metadata de filings (por ejemplo, \texttt{form\_type}, \texttt{filing\_date}, \texttt{acceptance\_datetime}).
-  \item \textbf{Persistencia raw} en formato Parquet, particionado por \texttt{asof}.
-  \item \textbf{Reporte de cobertura y fallos}: se lleva registro de qué CIKs/fechas se procesaron con éxito y qué llamadas fallaron.
+    \item descarga robusta del endpoint de submissions por \texttt{CIK};
+    \item persistencia raw del payload fuente;
+    \item extracción tabular mínima de metadata de filings;
+    \item control explícito de \emph{rate limit}, reintentos y timeouts;
+    \item versionado por \texttt{run\_id} y \texttt{asof};
+    \item soporte para estrategia incremental e idempotente;
+    \item registro formal de cobertura, fallos y reconciliación;
+    \item capacidad de alimentar capas PIT y de \emph{filings intelligence}.
 \end{itemize}
 
-Este módulo actúa como \emph{capa de entrada de metadata de filings} en el pipeline de datos fundamentales, similar a una capa de \emph{data ingestion} en arquitecturas de \emph{data mesh} financieras\cite{WorldbankDataQuality, SECDataQualityGuidelines}. Su correcta implementación es clave para garantizar que el sistema de swing trading tenga acceso a una historia auditada de presentaciones regulatorias.
+El alcance no incluye:
+
+\begin{itemize}
+    \item parseo del contenido económico del filing;
+    \item resolución XBRL profunda;
+    \item clasificación cuantitativa final de eventos;
+    \item imputación de ausencias regulatorias;
+    \item o construcción directa de features listas para modelos.
+\end{itemize}
 
 \subsection{Entradas del módulo}
 
 Las entradas del módulo son:
 
 \begin{itemize}
-  \item \texttt{cik\_list\_path}: ruta a un archivo \texttt{.parquet} que contiene el universo de CIKs a procesar.
-  \item \texttt{start\_date/end\_date} (opcional): filtros de tiempo para restringir el periodo de submissions a descargar.
-  \item \texttt{config\_path}: ruta a un archivo YAML de configuración con parámetros de rate‑limit, retries, chunking, etc.
-  \item \texttt{run\_id}: identificador único de la ejecución para replicabilidad y trazabilidad.
+    \item \texttt{cik\_list\_path}: ruta al universo de \texttt{CIK} objetivo;
+    \item \texttt{start\_date/end\_date} (opcionales): filtros temporales de trabajo;
+    \item \texttt{config\_path}: configuración externa de red, persistencia e incrementalidad;
+    \item \texttt{run\_id}: identificador único y auditable de ejecución;
+    \item \texttt{asof}: fecha/hora lógica de la corrida.
 \end{itemize}
 
-En notación formal, el conjunto de entradas es:
+En notación formal:
+
 \[
-  \mathcal{I} = \{ \mathcal{C}, \mathcal{T}, \theta_{\text{sub}}, r \},
+\mathcal{I} = \{\mathcal{C}, \mathcal{T}, \theta_{\mathrm{sub}}, r, a\},
 \]
+
 donde:
-\begin{itemize}
-  \item \(\mathcal{C}\) es el conjunto de CIKs,
-  \item \(\mathcal{T}\) es el rango de tiempo,
-  \item \(\theta_{\text{sub}}\) agrupa parámetros de ingesta (retries, concurrency, chunk size),
-  \item \(r\) es el \texttt{run\_id}.
-\end{itemize}
-
-\subsection{Salidas y artefactos}
-
-El módulo genera tres artefactos críticos:
 
 \begin{itemize}
-  \item \texttt{data/edgar/raw/submissions/date=\{asof\}/part-*.parquet}: datos raw de submissions, con metadata de filings estructurados en columnas.
-  \item \texttt{data/edgar/raw/submissions\_failures\_\{run\_id\}.parquet}: registro de llamadas o CIKs que fallaron durante la descarga o parseo.
-  \item \texttt{data/edgar/raw/submissions\_manifest\_\{run\_id\}.json}: metadatos de la ejecución (número de submissions procesados, tasa de éxito, timestamps, versiones, etc.).
+    \item \(\mathcal{C}\) es el conjunto de \texttt{CIK};
+    \item \(\mathcal{T}\) es la política temporal de ingesta o filtrado;
+    \item \(\theta_{\mathrm{sub}}\) contiene parámetros de red, persistencia, chunking, concurrencia, incrementalidad y tolerancias;
+    \item \(r\) es el \texttt{run\_id};
+    \item \(a\) es el timestamp lógico \texttt{asof}.
 \end{itemize}
 
-Estos artefactos permiten:
-\begin{itemize}
-  \item reconstruir exactamente la misma versión de datos a partir de \texttt{run\_id},
-  \item monitorizar la cobertura de submissions por CIK y por periodo de tiempo,
-  \item reintentar descargas de CIKs con fallos en ejecuciones posteriores.
-\end{itemize}
+\subsection{Contrato mínimo de entrada}
 
-En el contexto de trading cuantitativo, \texttt{submissions} raw se usan para:
-\begin{itemize}
-  \item sincronizar la fecha de corte \texttt{asof} con el \texttt{acceptance\_datetime},
-  \item construir features de frecuencia de reporting y timeliness de datos,
-  \item y detectar períodos de no presentación o cambios de formato de informes.
-\end{itemize}
-
-\subsection{Modelo de datos y campos mínimos}
-
-El módulo asegura que cada fila de submissions contenga al menos los siguientes campos:
+Antes de iniciar cualquier llamada al origen, el módulo debe validar:
 
 \begin{itemize}
-  \item \texttt{cik}: clave de identificación de la entidad.
-  \item \texttt{accession\_number}: identificador único del archivo de presentación en EDGAR.
-  \item \texttt{form\_type}: tipo de formulario (por ejemplo, \texttt{10-K}, \texttt{10-Q}, \texttt{8-K}).
-  \item \texttt{filing\_date}: fecha de presentación del filing.
-  \item \texttt{report\_date}: fecha de informe (si está disponible).
-  \item \texttt{acceptance\_datetime}: timestamp de aceptación en el sistema de la SEC.
-  \item \texttt{primary\_doc}: enlace al documento primario (por ejemplo, el archivo \texttt{.html} o \texttt{.txt}).
-  \item \texttt{source\_url}: URL completa del filing en EDGAR.
-  \item \texttt{run\_id}: identificador de la ejecución de ingesta.
+    \item que el universo de \texttt{CIK} existe y es legible;
+    \item que no hay \texttt{CIK} nulos o mal formados;
+    \item que todo \texttt{CIK} puede representarse en formato canónico con zero-padding;
+    \item que \texttt{run\_id} cumple el formato de auditoría del sistema;
+    \item que la configuración de concurrencia, rate-limit, retries y timeouts es válida;
+    \item que la política incremental seleccionada es consistente con el estado ya persistido.
 \end{itemize}
 
-En notación matemática, cada submission se representa como:
+Si cualquiera de estos prechecks falla, la corrida debe abortarse antes de iniciar la descarga. Un sistema institucional no debe producir artefactos parciales nacidos de una configuración inválida.
+
+\subsection{Representación de datos}
+
+El módulo debe trabajar con dos representaciones complementarias.
+
+\subsubsection{1. Payload raw}
+
+Para cada \texttt{CIK} \(c\), se preserva el payload fuente \(\omega_c\) junto con metadatos de captura:
+
 \[
-  s = (c, a, f, f_d, r_d, \alpha, p_d, s_u, r),
+\omega_c = (\texttt{cik}, \texttt{payload}, \texttt{http\_status}, \texttt{fetched\_at}, \texttt{run\_id}, \texttt{asof}).
 \]
+
+Esta capa es imprescindible para:
+
+\begin{itemize}
+    \item reproducibilidad exacta;
+    \item auditoría ex post;
+    \item detección de cambios del endpoint;
+    \item depuración de inconsistencias entre runs.
+\end{itemize}
+
+\subsubsection{2. Tabla de submissions}
+
+Cada filing extraído debe representarse como una tupla:
+
+\[
+s = (c, a_n, f, f_d, r_d, \alpha, p_d, s_u, i_x, r, a_s),
+\]
+
 donde:
-\begin{itemize}
-  \item \(c \in \mathcal{C}\) es el CIK,
-  \item \(a\) es el \texttt{accession\_number},
-  \item \(f\) es el \texttt{form\_type},
-  \item \(f_d\) es \texttt{filing\_date},
-  \item \(r_d\) es \texttt{report\_date},
-  \item \(\alpha\) es \texttt{acceptance\_datetime},
-  \item \(p_d\) es \texttt{primary\_doc},
-  \item \(s_u\) es \texttt{source\_url},
-  \item \(r\) es el \texttt{run\_id}.
-\end{itemize}
-
-\subsection{Checks de calidad implementados}
-
-El módulo aplica varios checks de calidad durante la descarga y el parseo:
 
 \begin{itemize}
-  \item \textbf{Accession parseable y único por CIK}:
-    \[
-      a \text{ es un string no vacío},
-    \]
-    y se verifica que no existan duplicados de \((c, a)\) en el conjunto de submissions procesados, asegurando unicidad de identificación por presentación.
-
-  \item \textbf{Fecha de presentación válida}:
-    \[
-      f_d \in \mathcal{T},
-    \]
-    donde \(\mathcal{T}\) es el conjunto de timestamps válidos con formato ISO. Fechas mal formadas se marcan como errores.
-
-  \item \textbf{Form type no nulo}:
-    \[
-      f \neq \emptyset,
-    \]
-    es decir, el campo \texttt{form\_type} debe estar presente; de lo contrario, el registro se considera inconsistente.
-
-  \item \textbf{Retries en 429/5xx}:
-    El módulo implementa una estrategia de reintentos exponenciales para errores de rate‑limit (429) y errores de servidor (5xx), según la recomendación de la SEC de no sobrecargar la API\cite{SECEDGARAPI}.
+    \item \(c\) es el \texttt{CIK};
+    \item \(a_n\) es el \texttt{accession\_number};
+    \item \(f\) es el \texttt{form\_type};
+    \item \(f_d\) es \texttt{filing\_date};
+    \item \(r_d\) es \texttt{report\_date}, si existe;
+    \item \(\alpha\) es \texttt{acceptance\_datetime};
+    \item \(p_d\) es \texttt{primary\_doc};
+    \item \(s_u\) es \texttt{source\_url};
+    \item \(i_x\) es un bloque opcional de campos auxiliares (\texttt{film\_number}, \texttt{act}, \texttt{file\_number}, flags de inline XBRL, etc.);
+    \item \(r\) es el \texttt{run\_id};
+    \item \(a_s\) es el \texttt{asof}.
 \end{itemize}
 
-Estos checks se alinean con las \emph{Data Quality Assurance Guidelines} de la SEC\cite{SECDataQualityGuidelines}, que exigen integridad, consistencia y disponibilidad de datos regulatorios para su uso en sistemas de análisis financiero.
+\subsection{Campos mínimos obligatorios}
+
+Toda fila válida de submissions debe contener al menos:
+
+\[
+(\texttt{cik}, \texttt{accession\_number}, \texttt{form\_type}, \texttt{filing\_date}, \texttt{acceptance\_datetime}, \texttt{run\_id}, \texttt{asof}).
+\]
+
+Campos de alta prioridad operativa:
+
+\[
+(\texttt{report\_date}, \texttt{primary\_doc}, \texttt{source\_url}, \texttt{film\_number}, \texttt{file\_number}, \texttt{is\_xbrl}, \texttt{is\_inline\_xbrl}).
+\]
+
+La regla correcta es: si faltan campos obligatorios, el registro no entra en la tabla válida; si faltan campos recomendados, el registro puede persistirse con incidencia explícita.
+
+\subsection{Principio de incrementalidad real}
+
+Una de las debilidades más habituales en documentos de ingestión es hablar de “incrementalidad” de forma vaga. Aquí la incrementalidad debe definirse operativamente.
+
+Sea \(\mathcal{S}^{(t)}\) el repositorio ya persistido hasta el instante lógico \(t\). Una nueva corrida en \(a\) debe:
+
+\begin{itemize}
+    \item identificar filings nuevos no presentes en \(\mathcal{S}^{(t)}\);
+    \item no reescribir innecesariamente filings ya materializados, salvo modo \texttt{refresh};
+    \item detectar y registrar late arrivals o cambios del origen;
+    \item permitir reconciliar diferencias entre el estado previo y el nuevo payload.
+\end{itemize}
+
+Formalmente, si \(\mathcal{S}_{\mathrm{new}}(a)\) es el conjunto observado en la corrida, debe poder descomponerse en:
+
+\[
+\mathcal{S}_{\mathrm{new}}(a)
+=
+\mathcal{S}_{\mathrm{seen}}
+\cup
+\mathcal{S}_{\mathrm{novel}}
+\cup
+\mathcal{S}_{\mathrm{late}}
+\cup
+\mathcal{S}_{\mathrm{changed}},
+\]
+
+donde:
+
+\begin{itemize}
+    \item \(\mathcal{S}_{\mathrm{seen}}\) son filings ya persistidos sin cambio material;
+    \item \(\mathcal{S}_{\mathrm{novel}}\) son filings nuevos;
+    \item \(\mathcal{S}_{\mathrm{late}}\) son eventos antiguos que aparecen tardíamente en la fuente o se recuperan por fallos previos;
+    \item \(\mathcal{S}_{\mathrm{changed}}\) son entradas cuya representación fuente difiere respecto a una versión previa.
+\end{itemize}
+
+Sin esta descomposición, la palabra “incremental” queda demasiado débil para un pipeline serio.
+
+\subsection{Idempotencia y reejecución}
+
+El módulo debe ser idempotente a nivel operativo. Esto implica que dos ejecuciones sobre el mismo universo, mismo estado observable de la fuente y misma configuración lógica deben producir resultados equivalentes o reconciliables sin duplicación espuria.
+
+Sea \(\Phi\) la ingestión y \(H\) el estado del endpoint. Se desea:
+
+\[
+\Phi(\mathcal{C}, \theta, r; H) \approx \Phi(\mathcal{C}, \theta, r; H),
+\]
+
+salvo diferencias en metadatos de ejecución o timestamps de captura.
+
+Las consecuencias operativas son:
+
+\begin{itemize}
+    \item no deben generarse duplicados de \((\texttt{cik}, \texttt{accession\_number})\);
+    \item un rerun parcial no debe sobrescribir silenciosamente resultados correctos previos;
+    \item debe existir un modo explícito para \texttt{force-refresh};
+    \item la lógica de persistencia debe distinguir claramente entre retry, rerun y refresh completo.
+\end{itemize}
+
+\subsection{Clave de identidad y deduplicación}
+
+La identidad operativa mínima de una submission viene dada por la clave:
+
+\[
+k_{\mathrm{sub}} = (\texttt{cik}, \texttt{accession\_number}).
+\]
+
+La política de deduplicación debe ser:
+
+\begin{enumerate}
+    \item eliminar duplicados exactos de \(k_{\mathrm{sub}}\) dentro de una misma corrida;
+    \item si la misma clave aparece con contenido distinto entre runs, clasificar el caso como \texttt{changed record};
+    \item si existe conflicto en campos esenciales para una misma clave, preservar ambas versiones raw y registrar incidencia crítica de reconciliación.
+\end{enumerate}
+
+Esto evita un error clásico: tratar como idénticos dos registros que comparten \texttt{accession\_number} pero difieren en metadata estructural relevante.
+
+\subsection{Política de red, rate limit y reintentos}
+
+La especificación de producción debe distinguir explícitamente las clases de error.
+
+Cada solicitud \(q(c)\) puede terminar en uno de los estados:
+
+\[
+\texttt{success}, \texttt{retryable\_failure}, \texttt{permanent\_failure}, \texttt{schema\_failure}.
+\]
+
+Se consideran al menos las siguientes categorías:
+
+\begin{itemize}
+    \item \textbf{errores transitorios}: timeouts, \texttt{429}, \texttt{5xx};
+    \item \textbf{errores permanentes}: \texttt{404} consistente, CIK inválido, recurso inexistente;
+    \item \textbf{errores de payload}: respuesta técnicamente válida pero incompatible con el contrato esperado;
+    \item \textbf{errores locales}: escritura fallida, corrupción de disco, interrupción del proceso.
+\end{itemize}
+
+La política correcta exige:
+
+\begin{itemize}
+    \item reintentar solo errores transitorios;
+    \item aplicar \emph{exponential backoff} con \emph{jitter};
+    \item respetar estrictamente el límite operativo definido por la SEC y por la configuración interna;
+    \item no enmascarar como éxito parcial una respuesta corrupta;
+    \item distinguir fallos del origen de fallos de persistencia local.
+\end{itemize}
+
+\subsection{Checks estructurales mínimos}
+
+Antes de aceptar un payload como válido, el módulo debe verificar:
+
+\begin{itemize}
+    \item que el JSON es parseable;
+    \item que contiene el bloque esperado de submissions recientes e historial, si aplica;
+    \item que los arrays críticos tienen longitud y alineación coherentes;
+    \item que \texttt{accession\_number}, \texttt{filing\_date}, \texttt{form\_type} y \texttt{acceptance\_datetime} pueden extraerse de forma consistente;
+    \item que las fechas son parseables y normalizables.
+\end{itemize}
+
+Si el payload falla estas condiciones, debe clasificarse como \texttt{schema\_failure}, no como un simple fallo fila a fila.
+
+\subsection{Consistencia temporal}
+
+Este módulo no construye la capa PIT final, pero sí es responsable de preservar correctamente el orden temporal de los eventos regulatorios. En particular, debe asegurarse que:
+
+\[
+\texttt{filing\_date} \le \texttt{acceptance\_datetime}
+\]
+
+cuando ambos campos existan con resolución comparable, salvo excepciones justificadas por convención del origen o parsing.
+
+Además, debe emitirse una incidencia si:
+
+\begin{itemize}
+    \item el \texttt{acceptance\_datetime} falta para filings relevantes;
+    \item el orden temporal aparente es inconsistente;
+    \item el filtrado por \texttt{start\_date/end\_date} elimina filings necesarios para reconstrucción histórica coherente.
+\end{itemize}
+
+El objetivo aquí es preservar el \emph{event ordering}, no todavía decidir la selección PIT.
+
+\subsection{Late arrivals y reconciliación}
+
+Una zona crítica que suele omitirse en especificaciones débiles es el tratamiento de \emph{late arrivals}. El módulo debe contemplar explícitamente que un filing antiguo pueda:
+
+\begin{itemize}
+    \item aparecer en una corrida posterior por fallo previo de descarga;
+    \item incorporarse por modificación del payload histórico;
+    \item o aflorar al reintentar un CIK antes marcado como fallido.
+\end{itemize}
+
+Cuando se detecte un registro \(s\) tal que:
+
+\[
+\texttt{filing\_date}(s) < a_{\mathrm{prev}}
+\quad \text{pero} \quad
+s \notin \mathcal{S}^{(a_{\mathrm{prev}})},
+\]
+
+el registro debe clasificarse como \texttt{late arrival} y registrarse separadamente. Esto es importante porque afecta tanto a la trazabilidad como a la interpretación de la cobertura histórica del pipeline.
+
+\subsection{Cobertura y métricas operativas}
+
+Sea \(\mathcal{C}\) el universo objetivo y \(\mathcal{C}_{\mathrm{ok}}\) el subconjunto descargado y validado con éxito. Definimos la cobertura principal como:
+
+\[
+\rho_{\mathrm{sub}} = \frac{|\mathcal{C}_{\mathrm{ok}}|}{|\mathcal{C}|}.
+\]
+
+Se deben computar además:
+
+\[
+\epsilon_{\mathrm{http}} = \frac{|\mathcal{C}_{\mathrm{http\_fail}}|}{|\mathcal{C}|},
+\qquad
+\epsilon_{\mathrm{schema}} = \frac{|\mathcal{C}_{\mathrm{schema\_fail}}|}{|\mathcal{C}|},
+\qquad
+\epsilon_{\mathrm{local}} = \frac{|\mathcal{C}_{\mathrm{local\_fail}}|}{|\mathcal{C}|}.
+\]
+
+También deben emitirse, como mínimo:
+
+\begin{itemize}
+    \item número total de submissions extraídas;
+    \item número medio y percentiles de filings por CIK;
+    \item distribución por \texttt{form\_type};
+    \item número de CIKs sin submissions útiles;
+    \item tasa de duplicados exactos eliminados;
+    \item número de late arrivals detectados;
+    \item número de changed records;
+    \item latencia media, p95 y p99 de descarga;
+    \item ratio de llamadas reintentadas;
+    \item porcentaje de cobertura por periodo temporal.
+\end{itemize}
+
+No basta con medir éxito HTTP. Lo que importa para un sistema cuantitativo es la riqueza y estabilidad del evento regulatorio capturado.
+
+\subsection{Artefactos de salida}
+
+El módulo debe generar, como mínimo, los siguientes artefactos:
+
+\begin{itemize}
+    \item \texttt{data/edgar/raw/submissions/date=\{asof\}/run\_id=\{run\_id\}/part-*.parquet}
+    \item \texttt{data/edgar/raw/submissions\_payloads/date=\{asof\}/run\_id=\{run\_id\}/part-*.parquet}
+    \item \texttt{data/edgar/raw/submissions\_failures\_\{run\_id\}.parquet}
+    \item \texttt{data/edgar/raw/submissions\_metrics\_\{run\_id\}.parquet}
+    \item \texttt{data/edgar/raw/submissions\_reconciliation\_\{run\_id\}.parquet}
+    \item \texttt{data/edgar/raw/submissions\_manifest\_\{run\_id\}.json}
+\end{itemize}
+
+El \emph{manifest} debe incluir como mínimo:
+
+\begin{itemize}
+    \item \texttt{run\_id};
+    \item \texttt{asof};
+    \item tamaño del universo objetivo;
+    \item número de CIKs con éxito;
+    \item fallos por clase;
+    \item número total de filings extraídas;
+    \item late arrivals;
+    \item changed records;
+    \item hash de configuración;
+    \item timestamps de inicio y fin;
+    \item paths de los artefactos generados.
+\end{itemize}
+
+\subsection{Precedencia de errores}
+
+No todos los fallos tienen la misma gravedad. La jerarquía operativa correcta es:
+
+\[
+\texttt{input/config failure}
+\succ
+\texttt{systemic source failure}
+\succ
+\texttt{coverage collapse}
+\succ
+\texttt{payload schema failure}
+\succ
+\texttt{record-level issue}.
+\]
+
+Esto implica:
+
+\begin{itemize}
+    \item una configuración inválida o un universo corrupto invalidan toda la corrida;
+    \item un fallo sistémico del origen no puede tratarse como suma de errores menores;
+    \item una caída fuerte de cobertura puede bloquear la utilidad downstream aunque algunos datos sean válidos;
+    \item errores fila a fila son menos graves si la cobertura y el linaje global siguen siendo robustos.
+\end{itemize}
 
 \subsection{Flujo de ejecución}
 
-El flujo del módulo se puede descomponer en cuatro pasos:
+El flujo correcto del módulo se compone de ocho fases:
 
 \begin{enumerate}
-  \item \textbf{Carga de CIKs}: se lee el archivo \texttt{cik\_list\_path} y se obtiene el universo \(\mathcal{C}\).
-
-  \item \textbf{Descarga de submissions con control de rate}:
-    Para cada CIK \(c \in \mathcal{C}\), y dentro del rango \(\mathcal{T}\) opcional, se realiza la llamada a la API EDGAR para obtener los submissions correspondientes. Se gestionan:
-    \begin{itemize}
-      \item timeouts,
-      \item retries exponenciales,
-      \item rate‑limiting según el límite de \texttt{60 req/min} recomendado por la SEC.
-    \end{itemize}
-
-  \item \textbf{Parseo de filings básicos}:
-    Se transforma el JSON de submissions en un esquema tabular con los campos mínimos definidos, filtrando por \texttt{start\_date/end\_date} si está configurado.
-
-  \item \textbf{Persistencia raw + failures + manifest}:
-    \begin{itemize}
-      \item Los submissions válidos se escriben en \texttt{data/edgar/raw/submissions/date=\{asof\}} en formato Parquet.
-      \item Los registros con errores se escriben en \texttt{submissions\_failures\_\{run\_id\}.parquet}.
-      \item Se genera un manifest JSON con resumen de ejecución.
-    \end{itemize}
+    \item validación de entradas y configuración;
+    \item canonización de \texttt{CIK} y carga del universo;
+    \item resolución de estado previo para incrementalidad;
+    \item planificación de lotes y control de concurrencia;
+    \item descarga robusta con \emph{rate limiting}, retries y clasificación de errores;
+    \item validación estructural del payload y extracción tabular mínima;
+    \item reconciliación incremental, deduplicación y clasificación de late arrivals / changed records;
+    \item persistencia auditable de raw, tabla válida, failures, metrics, reconciliation y manifest.
 \end{enumerate}
-
-Este flujo implementa un patrón de \emph{ETL batch incremental} para metadata de filings, donde cada \texttt{run\_id} apunta a un subconjunto de cambios en la base de datos de submissions, facilitando el mantenimiento y la auditoría\cite{CampbellEtAl2001, DePrado2018Advances}.
 
 \subsection{CLI y uso operativo}
 
-El módulo se invoca mediante la línea de comandos:
+La interfaz operativa debe ser explícita y reproducible:
 
 \begin{verbatim}
 python -m data.edgar.fetch_submissions ^
   --cik-list-path data/edgar/mappings/ticker_cik_current.parquet ^
   --config-path configs/data/edgar_fetch_submissions.yaml ^
-  --run-id fetch_submissions_20260305_001
+  --run-id fetch_submissions_20260305_001 ^
+  --asof 2026-03-05
 \end{verbatim}
 
-Esto permite:
-\begin{itemize}
-  \item integrar el módulo en pipelines CI/CD,
-  \item ejecutarlo periódicamente (por ejemplo, diariamente) para actualizar la base de datos de submissions,
-  \item mantener versiones reproducibles de datos mediante \texttt{run\_id}.
-\end{itemize}
+El \texttt{asof} no debe quedar implícito en la hora local del sistema cuando el objetivo es trazabilidad seria. Debe ser explícito o derivarse de forma determinista.
 
-\subsection{Definición de término (DoD)}
+\subsection{Reglas downstream}
 
-La definición de término del módulo establece que:
+La salida de este módulo se considera apta para consumo downstream solo si:
 
 \begin{itemize}
-  \item Las submissions deben estar descargadas de forma incremental, es decir, el módulo debe poder reanudar ejecuciones desde el último \texttt{asof} procesado sin sobrescribir datos previos.
-  \item Los datos deben estar almacenados en formato raw y estructurado, listos para ser consumidos por módulos de \texttt{parse\_xbrl} y \texttt{point\_in\_time}.
-  \item Debe existir un registro auditado de fallos y cobertura en los artefactos \texttt{submissions\_failures\_\{run\_id\}.parquet} y \texttt{submissions\_manifest\_\{run\_id\}.json}.
+    \item la cobertura supera el mínimo configurado;
+    \item el repositorio raw y tabular ha sido persistido íntegramente;
+    \item el manifest y el registro de fallos están completos;
+    \item la identidad por \((\texttt{cik}, \texttt{accession\_number})\) es estable;
+    \item late arrivals y changed records quedan explícitamente trazados.
 \end{itemize}
 
-\subsection{Conexión con estado del arte y literatura}
+Aun así, los datos de submissions no deben interpretarse todavía como capa PIT final. Su función es proporcionar la estructura temporal y documental que permitirá a módulos posteriores imponer observabilidad y derivar señales regulatorias.
 
-El diseño de \texttt{fetch\_submissions.py} se alinea con:
+\subsection{Tests mínimos obligatorios}
+
+Para que el módulo esté realmente cerrado a nivel de producción, su DoD debe exigir al menos:
 
 \begin{itemize}
-  \item \textbf{API de submissions de EDGAR}: la API de EDGAR expone los submissions de forma estructurada, permitiendo descargar la historia de presentaciones de un CIK en un solo endpoint, con timestamps de aceptación y links a documentos\cite{SECEDGARAPI, EdgarToolsAPI}.
-  \item \textbf{Ingestión de metadata de filings}: enfoques similares se usan en librerías como \texttt{edgartools}\cite{EdgarTools} y en pipelines de datos para análisis cuantitativo de datos regulatorios\cite{KaggleEDGARNotebook}.
-  \item \textbf{Gestión de retries y rate‑limit}: las prácticas de reintentos exponenciales y control de rate‑limit se alinean con recomendaciones de la SEC para consume sostenible de la API\cite{SECEDGARAPI}.
-  \item \textbf{Incrementalidad y auditabilidad}: el uso de \texttt{run\_id} y metadatos de manifest se alinea con mejores prácticas de \emph{reproducible research} y \emph{data lineage} en sistemas cuantitativos\cite{DePrado2018Advances, CampbellEtAl2001}.
+    \item test de canonización correcta de \texttt{CIK};
+    \item test de retry solo sobre errores transitorios;
+    \item test de no retry sobre error permanente;
+    \item test de detección de payload estructuralmente inválido;
+    \item test de unicidad por \((\texttt{cik}, \texttt{accession\_number})\);
+    \item test de clasificación correcta de late arrivals;
+    \item test de changed records entre runs;
+    \item test de persistencia idempotente;
+    \item test de escritura íntegra de manifest, failures y reconciliation;
+    \item test de consistencia temporal básica entre \texttt{filing\_date} y \texttt{acceptance\_datetime}.
 \end{itemize}
 
-En resumen, \texttt{fetch\_submissions.py} es la base de datos de metadata de filings de un sistema de swing trading cuantitativo: conecta el universo regulado de la SEC con un esquema tabular estructurado, listo para ser transformado en features de frecuencia de reporting, timeliness y estructura de riesgo de datos, y posteriormente utilizados en modelos de selección de activos y backtests estadísticamente rigurosos.
+\subsection{Definición de terminado (DoD)}
+
+El módulo se considera terminado únicamente si:
+
+\begin{itemize}
+    \item descarga robustamente submissions para el universo objetivo;
+    \item preserva el payload raw con trazabilidad completa;
+    \item extrae una tabla mínima consistente de filings;
+    \item soporta estrategia incremental real con reconciliación auditable;
+    \item distingue correctamente entre nuevos, vistos, late arrivals y changed records;
+    \item registra cobertura, fallos y manifest de forma completa;
+    \item y pasa los tests mínimos de robustez e idempotencia.
+\end{itemize}
+
+\subsection{Conclusión}
+
+\texttt{fetch\_submissions.py} no es un módulo auxiliar de ingestión, sino la capa que fija la cronología regulatoria observable del sistema. Si esta base temporal es débil, toda la cadena posterior ---company facts, PIT, flags, features, backtests y validación de señales--- queda expuesta a errores de cobertura, leakage temporal y falsos positivos metodológicos.
+
+Por tanto, su diseño debe ser equivalente al de cualquier infraestructura crítica de datos cuantitativos: \textbf{incrementalidad real, idempotencia, reconciliación, precedencia de errores, persistencia dual raw/evento, trazabilidad completa y disciplina formal de auditoría}. Su valor no está solo en bajar filings, sino en convertir la historia regulatoria en una estructura fiable sobre la que pueda descansar un sistema de trading estadísticamente serio.

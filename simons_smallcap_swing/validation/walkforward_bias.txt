@@ -1,88 +1,500 @@
-% Copiar y pegar en LaTeX (guarda como .txt)
+% Copiar y pegar en LaTeX (guardar como .txt)
 \documentclass{article}
 \usepackage[utf8]{inputenc}
-\usepackage{amsmath,amssymb}
-\usepackage{hyperref}
-\usepackage{booktabs}
+\usepackage[T1]{fontenc}
 \usepackage[spanish]{babel}
-\title{\textbf{WALK-FORWARD BIAS DETECTOR SOTA}}
-\author{Perplexity Quant Validation}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\title{Especificaci\'on Cuantitativa: validation/walkforward\_bias.py}
+\author{JimSimons Small Cap Swing --- Validation Research Note}
 \date{Marzo 2026}
+
 \begin{document}
 \maketitle
 
-\section{Resumen Ejecutivo}
-\textbf{Auditor WF Bias:} 18+ artefactos detectados en 75 configs. 
-62\% sesgo moderado-severo (overlap 23\%, boundary 17\%). 
-Filtrado: Sharpe 2.4$\to$2.1 real. \textcolor{green}{38\% PASS puro}.
+\section{Prop\'osito del m\'odulo}
 
-\section{Matem\'atica Walk-Forward Bias}
+El objetivo de \texttt{walkforward\_bias.py} no es ``mejorar'' el resultado del backtest ni
+resumir el protocolo walk-forward con un score cosm\'etico. Su funci\'on es verificar que la
+geometr\'ia temporal de entrenamiento, validaci\'on y test est\'a bien definida y que la propia
+construcci\'on del esquema walk-forward no introduce contaminaci\'on, dependencia indebida o una
+estimaci\'on artificialmente optimista del rendimiento fuera de muestra.
 
-\subsection{Overlap Contamination}
-\begin{equation}
-\text{Overlap} = \frac{|W_{\text{test}_i} \cap W_{\text{test}_j}|}{\min(|W_i|,|W_j|)} < 0.05
-\end{equation}
+En un pipeline cuantitativo, un walk-forward mal dise\~nado puede parecer m\'as realista que un
+split est\'atico y, sin embargo, seguir sobreestimando la evidencia si:
+\begin{itemize}[leftmargin=2em]
+    \item las ventanas de entrenamiento y test comparten informaci\'on por horizonte de label;
+    \item el gap entre folds es insuficiente;
+    \item la selecci\'on de hiperpar\'ametros se recicla sobre ventanas no verdaderamente independientes;
+    \item la geometr\'ia de folds induce efectos frontera o sensibilidad excesiva a la posici\'on temporal.
+\end{itemize}
 
-\subsection{Boundary Leakage}
-\begin{equation}
-\text{Boundary Bias} = \frac{1}{B} \sum_b (\text{Perf}_{\text{boundary}} - \text{Perf}_{\text{interior}})
-\end{equation}
+Por tanto, este m\'odulo debe auditar el \textbf{protocolo de evaluaci\'on}, no la calidad
+econ\'omica de la estrategia en s\'i misma.
 
-\subsection{Train-Test Gap}
-\begin{equation}
-\text{Gap Days}_i = t_{\text{train end}} - t_{\text{test start}} \geq 5-10
-\end{equation}
+\section{Marco formal}
 
-\section{Backtest 75 Configuraciones WF}
-\begin{table}[h]
-\centering
-\begin{tabular}{lcccc}
-\toprule
-\textbf{Bias Type} & \% Detectado & $\Delta$Sharpe & Gate & Corrige \\
-\midrule
-Overlap Leak & 23\% & +0.41 & FAIL 23\% & S\'{\i} \\
-Boundary Effect & 17\% & +0.28 & WARN 41\% & S\'{\i} \\
-Gap Violation & 12\% & +0.19 & FAIL 12\% & S\'{\i} \\
-Geometry Instab & 29\% & +0.33 & WARN 58\% & Parcial \\
-\midrule
-\textbf{Composite} & \textbf{62\%} & \textbf{+0.31} & \textbf{PASS 38\%} & \\
-\bottomrule
-\end{tabular}
-\caption{\textbf{Sesgo Detectado Swing Trading WF Analysis}}
-\end{table}
+Sea una serie temporal indexada por fechas $t \in \{1,\dots,T\}$. Un esquema walk-forward genera
+una sucesi\'on de folds
+\[
+\mathcal{F}_k = \big(\mathcal{I}_k^{\mathrm{train}},
+\mathcal{I}_k^{\mathrm{valid}},
+\mathcal{I}_k^{\mathrm{test}}\big),
+\qquad k = 1,\dots,K,
+\]
+donde cada fold contiene subconjuntos temporales ordenados cronol\'ogicamente.
 
-\section{Implementaci\'on Cr\'{\i}tica}
+Cada observaci\'on candidata en fecha $t$ est\'a asociada, en general, a:
+\begin{itemize}[leftmargin=2em]
+    \item un conjunto de informaci\'on usado para construir features;
+    \item un horizonte de label $h$;
+    \item un holding period o persistencia econ\'omica $L$;
+    \item una posible influencia serial adicional derivada de rebalanceos o smoothing.
+\end{itemize}
+
+La geometr\'ia walk-forward es v\'alida solo si garantiza que una observaci\'on usada para entrenar
+o seleccionar modelo en un fold no comparte informaci\'on futura relevante con observaciones del
+test de ese mismo fold.
+
+\section{Qu\'e entendemos por walk-forward bias}
+
+En este contexto, diremos que existe \textbf{walk-forward bias} cuando la estimaci\'on OOS derivada
+del protocolo queda distorsionada por defectos de geometr\'ia temporal, aun cuando el pipeline no
+tenga leakage cl\'asico en el sentido de usar expl\'icitamente datos futuros en las features.
+
+Esto incluye, entre otros, los siguientes mecanismos:
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Contaminaci\'on por solapamiento}: train/test o valid/test comparten informaci\'on
+    econ\'omicamente relevante debido a labels con horizonte, holdings persistentes o ventanas mal purgadas.
+    \item \textbf{Sesgo de frontera}: el rendimiento cerca de los l\'imites de las ventanas es
+    sistem\'aticamente distinto del rendimiento interior, sugiriendo artefactos inducidos por el propio fold.
+    \item \textbf{Gap insuficiente}: la separaci\'on temporal entre train y test no absorbe la dependencia
+    generada por el horizonte del label o por la persistencia de la se\~nal.
+    \item \textbf{Inestabilidad geom\'etrica}: peque\~nos cambios en el tama\~no o la posici\'on de las
+    ventanas alteran materialmente el resultado, indicando fragilidad del protocolo.
+    \item \textbf{Reuse bias}: el mismo bloque temporal se usa repetidamente para elegir arquitectura,
+    umbrales o hiperpar\'ametros, erosionando su car\'acter OOS.
+\end{enumerate}
+
+\section{Principio central de validez}
+
+Sea $h$ el horizonte del label y sea $e$ un embargo adicional. Para que una observaci\'on
+de entrenamiento con timestamp terminal $t_{\mathrm{train}}$ no contamine el test que comienza
+en $t_{\mathrm{test}}$, debe cumplirse:
+\[
+t_{\mathrm{train}} + h + e < t_{\mathrm{test}}.
+\]
+
+Si adem\'as la se\~nal genera inventario o impacto que persiste durante $L$ periodos, la condici\'on
+correcta puede requerir:
+\[
+t_{\mathrm{train}} + \max(h,L) + e < t_{\mathrm{test}}.
+\]
+
+Esta desigualdad debe tratarse como invariante estructural, no como sugerencia heur\'istica.
+
+\section{Checks nucleares del auditor}
+
+\subsection{Check 1: geometr\'ia cronol\'ogica}
+
+El auditor debe verificar que, para todo fold $k$:
+\[
+\max \mathcal{I}_k^{\mathrm{train}}
+<
+\min \mathcal{I}_k^{\mathrm{valid}}
+\le
+\max \mathcal{I}_k^{\mathrm{valid}}
+<
+\min \mathcal{I}_k^{\mathrm{test}},
+\]
+salvo que el dise\~no declare expl\'icitamente ausencia de bloque de validaci\'on intermedio.
+
+No debe permitirse ninguna permutaci\'on temporal disfrazada de split walk-forward.
+
+\subsection{Check 2: purga y embargo efectivos}
+
+Para cada fold, el auditor debe construir la regi\'on de exclusi\'on temporal necesaria en torno
+al bloque de test y verificar que el entrenamiento y la validaci\'on quedan fuera de ella.
+
+Definimos la regi\'on prohibida asociada al test del fold $k$ como:
+\[
+\mathcal{P}_k =
+\left[
+\min \mathcal{I}_k^{\mathrm{test}} - e - \ell_{\mathrm{pre}},
+\;
+\max \mathcal{I}_k^{\mathrm{test}} + h + \ell_{\mathrm{post}}
+\right],
+\]
+donde $\ell_{\mathrm{pre}}$ y $\ell_{\mathrm{post}}$ permiten absorber dependencias adicionales
+si las features usan ventanas rolling o si el PnL depende de inventario.
+
+Entonces debe cumplirse:
+\[
+\mathcal{I}_k^{\mathrm{train}} \cap \mathcal{P}_k = \varnothing,
+\qquad
+\mathcal{I}_k^{\mathrm{valid}} \cap \mathcal{P}_k = \varnothing,
+\]
+salvo que la arquitectura justifique otra convenci\'on de forma expl\'icita y reproducible.
+
+\subsection{Check 3: overlap contamination}
+
+No basta con mirar si dos ventanas comparten fechas visibles. El objeto correcto es el solapamiento
+de \emph{conjuntos de informaci\'on econ\'omica}. Sea $\mathcal{J}(t)$ el intervalo efectivo de
+informaci\'on relevante para la observaci\'on con timestamp $t$. Entonces, para dos observaciones
+$o_a$ y $o_b$, el solapamiento relevante es:
+\[
+\mathrm{Overlap}(o_a,o_b)
+=
+\frac{|\mathcal{J}(o_a)\cap \mathcal{J}(o_b)|}
+{\min(|\mathcal{J}(o_a)|,|\mathcal{J}(o_b)|)}.
+\]
+
+A nivel de fold, el m\'odulo debe resumir:
+\[
+\mathrm{OverlapRate}_k
+=
+\frac{1}{|\mathcal{T}_k||\mathcal{E}_k|}
+\sum_{o_a \in \mathcal{T}_k}
+\sum_{o_b \in \mathcal{E}_k}
+\mathbf{1}\{\mathrm{Overlap}(o_a,o_b)>0\},
+\]
+donde $\mathcal{T}_k$ y $\mathcal{E}_k$ representan observaciones de entrenamiento y test.
+
+La existencia de overlap positivo material en un protocolo que declara OOS estricto debe tratarse
+como fallo duro.
+
+\subsection{Check 4: boundary effects}
+
+El sesgo de frontera aparece cuando las observaciones cercanas al inicio o final de las ventanas
+presentan comportamiento sistem\'aticamente distinto del interior, no por econom\'ia de mercado
+sino por artefactos del esquema de evaluaci\'on.
+
+Sea $m_{k,t}$ una m\'etrica local del fold $k$ en la fecha $t$ (por ejemplo contribuci\'on al PnL,
+error de predicci\'on, score o hit-rate). Definimos un indicador de borde:
+\[
+b_{k,t} =
+\mathbf{1}\{t \in \mathrm{Edge}(\mathcal{I}_k^{\mathrm{test}},\delta)\},
+\]
+donde $\delta$ es el grosor de la zona frontera.
+
+Entonces el contraste natural es:
+\[
+\Delta_k^{\mathrm{boundary}}
+=
+\mathbb{E}[m_{k,t}\mid b_{k,t}=1]
+-
+\mathbb{E}[m_{k,t}\mid b_{k,t}=0].
+\]
+
+El auditor debe reportar la distribuci\'on de $\Delta_k^{\mathrm{boundary}}$ sobre folds y evaluar
+si existe una desviaci\'on sistem\'atica consistente en signo y magnitud. Este check es diagn\'ostico;
+por s\'i solo no prueba contaminaci\'on causal, pero s\'i una posible mala especificaci\'on geom\'etrica.
+
+\subsection{Check 5: gap sufficiency}
+
+La separaci\'on entre train y test no debe definirse con un n\'umero fijo tipo ``5--10 d\'ias''
+sin contexto. El gap correcto es funci\'on de:
+\begin{itemize}[leftmargin=2em]
+    \item horizonte del label;
+    \item holding period esperado;
+    \item persistencia de features;
+    \item frecuencia de rebalanceo;
+    \item grado de autocorrelaci\'on y solapamiento econ\'omico.
+\end{itemize}
+
+Por tanto, el auditor debe comparar el gap observado en cada fold:
+\[
+g_k = \min \mathcal{I}_k^{\mathrm{test}} - \max \mathcal{I}_k^{\mathrm{train}},
+\]
+frente al gap requerido:
+\[
+g_k^{\mathrm{req}} = f(h,L,\text{feature lookbacks},\text{rebalance cadence},\text{embargo rules}).
+\]
+
+La condici\'on estructural es:
+\[
+g_k \ge g_k^{\mathrm{req}}.
+\]
+
+\subsection{Check 6: geometric stability}
+
+Un esquema walk-forward serio no deber\'ia cambiar radicalmente de conclusi\'on bajo perturbaciones
+moderadas de su propia geometr\'ia. El auditor debe generar variantes cercanas del protocolo:
+\begin{itemize}[leftmargin=2em]
+    \item cambiar ligeramente longitud de train;
+    \item cambiar ligeramente longitud de test;
+    \item desplazar el origen del primer fold;
+    \item variar embargo dentro de un rango razonable.
+\end{itemize}
+
+Sea $U(\mathcal{F})$ una utilidad o m\'etrica resumen del candidato bajo una geometr\'ia de folds
+dada. Entonces una medida de inestabilidad puede expresarse como:
+\[
+\mathrm{Instab}
+=
+\mathrm{Dispersion}\left(
+\{U(\mathcal{F}^{(1)}),\dots,U(\mathcal{F}^{(J)})\}
+\right),
+\]
+con dispersi\'on definida ex ante, por ejemplo desviaci\'on robusta, rango intercuart\'ilico o
+sensibilidad relativa frente al baseline.
+
+Una inestabilidad alta no es necesariamente leakage, pero s\'i evidencia fr\'agil o protocolo
+poco bien condicionado.
+
+\subsection{Check 7: reuse of OOS windows}
+
+El sesgo walk-forward tambi\'en puede surgir cuando el mismo conjunto de ventanas OOS se utiliza
+iterativamente para:
+\begin{itemize}[leftmargin=2em]
+    \item elegir hiperpar\'ametros;
+    \item redise\~nar features;
+    \item redefinir thresholds;
+    \item descartar variantes fallidas hasta encontrar una que ``encaje''.
+\end{itemize}
+
+Este problema no siempre es detectable desde precios o timestamps; requiere metadatos de research.
+El auditor debe, al menos, registrar:
+\begin{itemize}[leftmargin=2em]
+    \item n\'umero de iteraciones sobre el mismo protocolo;
+    \item familias de configuraciones comparadas;
+    \item si el OOS usado en la promoci\'on final fue tambi\'en usado para selecci\'on previa.
+\end{itemize}
+
+Si el mismo OOS se ha reciclado extensivamente, el resultado debe degradarse a \texttt{WARN} o
+\texttt{FAIL} seg\'un severidad, aunque no haya overlap temporal duro.
+
+\section{Governance: l\'ogica correcta de decisi\'on}
+
+El m\'odulo no debe reducirse a una f\'ormula lineal del tipo
+\[
+0.4\cdot \mathrm{Overlap}
++0.3\cdot |\mathrm{Boundary}|
++0.2\cdot \mathrm{GapRate}
++0.1\cdot \mathrm{Instability},
+\]
+porque ese esquema permite compensar una violaci\'on estructural grave con se\~nales benignas en
+otros diagn\'osticos.
+
+La gobernanza correcta debe ser jer\'arquica.
+
+\subsection{Fallos estructurales}
+
+El resultado debe ser \texttt{FAIL} inmediato si ocurre cualquiera de los siguientes:
+\begin{itemize}[leftmargin=2em]
+    \item overlap material entre informaci\'on de train/valid y test;
+    \item gap insuficiente respecto al horizonte real del label;
+    \item purga/embargo incompatibles con la geometr\'ia declarada;
+    \item uso no registrado del mismo OOS para selecci\'on reiterada en grado severo.
+\end{itemize}
+
+\subsection{Se\~nales blandas de fragilidad}
+
+Pueden producir \texttt{WARN}:
+\begin{itemize}[leftmargin=2em]
+    \item boundary effects persistentes;
+    \item alta sensibilidad de la m\'etrica a peque\~nas perturbaciones de geometr\'ia;
+    \item dependencia excesiva de uno o dos folds;
+    \item gap suficiente en teor\'ia pero demasiado ajustado al l\'imite operativo.
+\end{itemize}
+
+\subsection{Decisi\'on global}
+
+Una l\'ogica simple y auditable es:
+\[
+\texttt{FAIL}
+\iff
+N_{\mathrm{hard}} \ge 1,
+\]
+\[
+\texttt{WARN}
+\iff
+N_{\mathrm{hard}} = 0 \;\; \text{y} \;\; N_{\mathrm{soft}} \ge \tau_{\mathrm{warn}},
+\]
+\[
+\texttt{PASS}
+\iff
+N_{\mathrm{hard}} = 0 \;\; \text{y} \;\; N_{\mathrm{soft}} < \tau_{\mathrm{warn}}.
+\]
+
+Aqu\'i $N_{\mathrm{hard}}$ cuenta violaciones estructurales y $N_{\mathrm{soft}}$ resume alertas
+diagn\'osticas. Esta formulaci\'on es preferible a un score compuesto opaco.
+
+\section{Sobre los umbrales}
+
+Umbrales del tipo
+\[
+\mathrm{Overlap} < 0.05,
+\qquad
+|\Delta^{\mathrm{boundary}}| < 0.2,
+\qquad
+g_k \ge 5\text{ d\'ias}
+\]
+no deben presentarse como universales. Pueden servir como \emph{defaults operativos provisionales},
+pero deben calibrarse en funci\'on de:
+\begin{itemize}[leftmargin=2em]
+    \item horizonte del label;
+    \item horizonte de tenencia;
+    \item granularidad temporal de datos;
+    \item tipo de features usadas;
+    \item frecuencia de rebalanceo;
+    \item severidad deseada del pipeline.
+\end{itemize}
+
+Lo importante es que cada umbral quede documentado y versionado, no que parezca ``institucional''.
+
+\section{Casos l\'imite que el auditor debe cubrir}
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Features rolling largas.} Un split aparentemente limpio puede seguir contaminado si
+    las features usan ventanas largas que tocan el test.
+    \item \textbf{Labels solapados.} Incluso sin overlap de fechas, los horizontes de retorno pueden
+    compartir informaci\'on econ\'omica.
+    \item \textbf{Holding persistence.} La posici\'on abierta por una se\~nal entrenada puede afectar
+    el test si no se purga inventario o no se controla la continuidad de holdings.
+    \item \textbf{Folds muy pocos o muy homog\'eneos.} Un protocolo con poca diversidad temporal puede
+    parecer estable por falta de potencia diagn\'ostica.
+    \item \textbf{Reutilizaci\'on de un mismo periodo de mercado.} Un OOS repetido muchas veces deja de
+    ser una estimaci\'on limpia de generalizaci\'on.
+    \item \textbf{Dependencia por universe selection.} Cambiar el universo por informaci\'on observada
+    durante los folds tambi\'en puede inducir sesgo walk-forward.
+\end{enumerate}
+
+\section{Invariantes de implementaci\'on}
+
+El m\'odulo debe respetar, como m\'inimo, los siguientes invariantes:
+
+\begin{itemize}[leftmargin=2em]
+    \item ninguna observaci\'on de train/valid puede compartir informaci\'on futura relevante con el test;
+    \item el gap requerido debe derivarse de la especificaci\'on del experimento, no de un n\'umero fijo;
+    \item los diagn\'osticos blandos nunca pueden neutralizar un fallo duro;
+    \item el reporte debe identificar el fold, la causa y la localizaci\'on exacta de cada incidencia;
+    \item toda decisi\'on debe ser reproducible desde la configuraci\'on del protocolo walk-forward.
+\end{itemize}
+
+\section{Salida recomendada del m\'odulo}
+
+La salida debe ser granular y auditable, por ejemplo:
+
 \begin{verbatim}
-def overlap_ratio(w1, w2):
-    return len(set(w1)&set(w2))/min(len(w1),len(w2))
-
-def boundary_bias(windows, perfs):
-    boundary = [perfs[0], perfs[-1]]
-    return np.mean(np.array(boundary)-np.mean(perfs[1:-1]))
-
-flags = {'overlap': overlap_ratio>0.05, 
-         'boundary': abs(boundary_bias)>0.2}
+{
+  "gate": "PASS|WARN|FAIL",
+  "hard_failures": [...],
+  "soft_flags": [...],
+  "fold_summaries": [
+    {
+      "fold_id": ...,
+      "train_range": [...],
+      "valid_range": [...],
+      "test_range": [...],
+      "gap_observed": ...,
+      "gap_required": ...,
+      "overlap_rate": ...,
+      "boundary_effect": ...,
+      "notes": [...]
+    }
+  ],
+  "geometry_stability": {...},
+  "reuse_audit": {...},
+  "binding_failure": "...",
+  "recommended_action": "..."
+}
 \end{verbatim}
 
-\section{WF Bias Score}
-\begin{equation}
-\text{WFBS} = 0.4\cdot\text{Overlap} + 0.3\cdot|\text{Boundary}| + 
-              0.2\cdot\text{Gap Rate} + 0.1\cdot\text{Instability}
-\end{equation}
-\begin{equation}
-\text{Gate WFBS} =
-\begin{cases}
-\text{PASS} & <0.20 \\
-\text{WARN} & [0.20, 0.50) \\
-\text{FAIL} & \geq 0.50
-\end{cases}
-\end{equation}
+\section{Esqueleto de implementaci\'on}
 
-\section{Referencias Especializadas}
-\begin{itemize}
-\item Pardo (2019). Walk-Forward Analysis Revisited.
-\item Bailey/L\'opez de Prado (2016). Temporal Stability.
-\item Chan (2020). Cap. 10 WF Pitfalls.
-\end{itemize}
+\begin{verbatim}
+def audit_walkforward_bias(protocol, dataset_meta, strategy_meta, config):
+    report = init_report(protocol, config)
+
+    fold_summaries = []
+    hard_failures = []
+    soft_flags = []
+
+    for fold in protocol.folds:
+        geom = check_fold_geometry(fold, config)
+        purge = check_purge_and_embargo(fold, strategy_meta, config)
+        overlap = compute_information_overlap(fold, dataset_meta, strategy_meta, config)
+        boundary = estimate_boundary_effect(fold, dataset_meta, strategy_meta, config)
+
+        fold_report = merge_fold_checks(geom, purge, overlap, boundary)
+        fold_summaries.append(fold_report)
+
+        hard_failures.extend(extract_hard_failures(fold_report))
+        soft_flags.extend(extract_soft_flags(fold_report))
+
+    stability = run_geometry_perturbation_audit(protocol, dataset_meta, strategy_meta, config)
+    reuse = audit_oos_reuse(protocol, strategy_meta, config)
+
+    hard_failures.extend(stability.get("hard_failures", []))
+    hard_failures.extend(reuse.get("hard_failures", []))
+    soft_flags.extend(stability.get("soft_flags", []))
+    soft_flags.extend(reuse.get("soft_flags", []))
+
+    gate, binding_failure = apply_wf_governance(hard_failures, soft_flags, config)
+
+    report["fold_summaries"] = fold_summaries
+    report["geometry_stability"] = stability
+    report["reuse_audit"] = reuse
+    report["hard_failures"] = hard_failures
+    report["soft_flags"] = soft_flags
+    report["gate"] = gate
+    report["binding_failure"] = binding_failure
+    report["recommended_action"] = map_action(gate, binding_failure)
+
+    return report
+\end{verbatim}
+
+\section{Interpretaci\'on correcta}
+
+La lectura correcta de \texttt{walkforward\_bias.py} no es:
+\begin{quote}
+``hemos construido un score WFBS y las estrategias con score bajo parecen m\'as cre\'ibles''.
+\end{quote}
+
+La lectura correcta es:
+\begin{quote}
+``hemos auditado si el protocolo walk-forward produce una estimaci\'on OOS temporalmente v\'alida,
+si sus folds est\'an geom\'etricamente bien separados y si la supuesta generalizaci\'on no depende
+de artefactos de solapamiento, frontera o reutilizaci\'on de ventanas''.
+\end{quote}
+
+Ese cambio de enfoque es fundamental: el m\'odulo no existe para adornar el backtest, sino para
+verificar si el propio esquema de validaci\'on merece credibilidad.
+
+\section{Referencias orientativas}
+
+\begin{thebibliography}{9}
+
+\bibitem{pardo}
+Pardo, R. (distintas ediciones).
+Trabajos sobre walk-forward analysis y evaluaci\'on robusta de sistemas de trading.
+
+\bibitem{lopez}
+L\'opez de Prado, M. (2018).
+\emph{Advances in Financial Machine Learning}.
+Wiley.
+
+\bibitem{bailey}
+Bailey, D. H. y coautores.
+Trabajos sobre overfitting, validaci\'on temporal y fragilidad estad\'istica.
+
+\bibitem{chan}
+Chan, E. P. (distintas ediciones).
+Trabajos sobre dise\~no, validaci\'on y pitfalls en estrategias cuantitativas.
+
+\end{thebibliography}
+
+\section{Conclusi\'on}
+
+Un auditor serio de walk-forward bias no deber\'ia abrir con ``38\% PASS puro'' ni con
+una ca\'ida decorativa de Sharpe. Su responsabilidad es m\'as rigurosa: demostrar que la
+estimaci\'on OOS derivada del protocolo walk-forward no est\'a contaminada por solapamientos,
+gaps insuficientes, fronteras mal tratadas o reutilizaci\'on indebida del mismo OOS. Si esa base
+no se sostiene, la aparente robustez del sistema es solo una ilusi\'on de procedimiento.
 
 \end{document}

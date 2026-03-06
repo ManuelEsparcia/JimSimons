@@ -1,244 +1,545 @@
 \section{Módulo: \texttt{data/edgar/ticker\_cik.py}}
 
-\subsection{Objetivo general del módulo}
+\subsection{Objetivo estratégico del módulo}
 
-El módulo \texttt{ticker\_cik.py} construye y mantiene un \emph{mapping versiónado} entre \texttt{ticker} y \texttt{CIK}, así como otros identificadores relacionados (por ejemplo, \texttt{source}, \texttt{exchange}, \texttt{sector}), de forma \emph{trazable} y \emph{historificada}, para enlazar el universo de acciones negociables con la base de datos EDGAR de la SEC.
+El módulo \texttt{ticker\_cik.py} implementa la capa formal de \emph{identity resolution}, \emph{historificación de identificadores} y \emph{crosswalk point-in-time safe} entre el universo negociable del sistema y la identidad regulatoria EDGAR de la SEC. Su función no es únicamente construir una tabla \texttt{ticker} \(\leftrightarrow\) \texttt{CIK}, sino producir una \textbf{fuente maestra de identidad} auditable, versionada, sin solapamientos activos ilegítimos y utilizable downstream en contextos donde un error de identificación puede contaminar tanto el research como la validez del backtest.
 
-Formalmente, el módulo define una función de \emph{mapping master}:
+El principio rector del módulo es el siguiente:
+
+\begin{quote}
+\emph{Un dato fundamental solo es utilizable si puede enlazarse de forma determinista y temporalmente correcta con el activo negociable correspondiente. Un fallo de identidad no es un error administrativo menor, sino una fuente primaria de leakage, de contaminación cross-entity y de falsos resultados en sistemas cuantitativos.}
+\end{quote}
+
+Formalmente, el módulo define un operador de resolución maestra:
+
 \[
-  \mathcal{M}: \mathcal{U}_{\text{raw}} \times \Theta_{\text{map}} \longrightarrow \mathcal{H} \times \mathcal{C},
+\mathcal{R}_{\mathrm{id}} :
+(\mathcal{U}_{\mathrm{sec}}, \mathcal{U}_{\mathrm{int}}, \Theta, r, a)
+\longrightarrow
+(\mathcal{H}, \mathcal{C}, \mathcal{E}, \mathcal{M}),
 \]
+
 donde:
-\begin{itemize}
-  \item \(\mathcal{U}_{\text{raw}}\) es el conjunto de mappings crudos de entrada (SEC y mappers internos),
-  \item \(\Theta_{\text{map}}\) es el conjunto de parámetros de validación y dedupe,
-  \item \(\mathcal{H}\) es el historial versionado de mappings \texttt{ticker}<->\texttt{CIK},
-  \item \(\mathcal{C}\) es el snapshot \texttt{current} del mapping vigente.
-\end{itemize}
-
-Este módulo es la \emph{capa de resolución de identidad} entre el universo cuantitativo (ticker/asset) y la base de datos regulatoria (CIK/filer), crítica para evitar \emph{mismatches} y \emph{leakage} al cruzar series de cotización con series de datos fundamentales\cite{DePrado2018Advances, SECEDGARAPI}.
-
-\subsection{Alcance del módulo}
-
-El alcance incluye:
 
 \begin{itemize}
-  \item \textbf{Ingestión de fuentes de mapping}:
-    \begin{itemize}
-      \item fuentes oficiales de la SEC (por ejemplo, JSON de \texttt{ticker}<->\texttt{CIK}),
-      \item y mappers internos (\texttt{internal\_symbol\_master}) con información adicional (exchange, sector, etc.).
-    \end{itemize}
-  \item \textbf{Normalización de formatos}:
-    \begin{itemize}
-      \item \texttt{ticker} en mayúsculas y sin espacios extras,
-      \item \texttt{CIK} en formato \emph{zero‑padded} (10 dígitos),
-      \item y campos de metadatos (como \texttt{source}) bien tipados.
-    \end{itemize}
-  \item \textbf{Dedupe y resolución de conflictos}:
-    \begin{itemize}
-      \item eliminación de duplicados activos \texttt{symbol}->\texttt{CIK} solapados en tiempo,
-      \item y resolución de discrepancias de \texttt{CIK} para el mismo \texttt{symbol} en distintas fuentes.
-    \end{itemize}
-  \item \textbf{Histórico versionado de cambios}:
-    \begin{itemize}
-      \item cada cambio en la asociación \texttt{ticker}<->\texttt{CIK} queda registrado con \texttt{effective\_from}, \texttt{effective\_to}, y \texttt{is\_active}.
-    \end{itemize}
-  \item \textbf{Snapshot \texttt{current}}:
-    \begin{itemize}
-      \item una vista actualizada del mapping vigente para el universo completo.
-    \end{itemize}
+  \item \(\mathcal{U}_{\mathrm{sec}}\) es el universo bruto de mappings procedentes de la SEC;
+  \item \(\mathcal{U}_{\mathrm{int}}\) es el universo interno de símbolos, identificadores auxiliares y metadatos de trading;
+  \item \(\Theta\) es la configuración de normalización, prioridad de fuentes, arbitraje y políticas PIT;
+  \item \(r\) es el \texttt{run\_id};
+  \item \(a\) es la fecha lógica de snapshot o \texttt{asof}, cuando aplique;
+  \item \(\mathcal{H}\) es el historial versionado del mapping;
+  \item \(\mathcal{C}\) es el snapshot \texttt{current} vigente;
+  \item \(\mathcal{E}\) es el conjunto de conflictos, rechazos e incidencias;
+  \item \(\mathcal{M}\) es el \emph{manifest} auditable de ejecución.
 \end{itemize}
 
-El módulo se alinea con prácticas de \emph{master reference data} en sistemas de \emph{data mesh} financieros, donde se mantiene un historial de cambios de identificación para evitar \emph{entity matching errors} en backtesting\cite{DePrado2018Advances, WorldbankDataQuality}.
+Este módulo es, por tanto, la \textbf{capa de referencia maestra} entre dos ontologías diferentes del sistema:
+
+\[
+\text{universo cuantitativo de activos}
+\quad \longleftrightarrow \quad
+\text{universo regulatorio de filers}.
+\]
+
+Si esta capa es débil, el pipeline completo puede parecer correcto a nivel sintáctico y, sin embargo, estar cruzando precios de una entidad con fundamentales de otra.
+
+\subsection{Rol dentro de la arquitectura EDGAR}
+
+\texttt{ticker\_cik.py} se sitúa al inicio del subsistema EDGAR y aguas arriba de:
+
+\begin{itemize}
+  \item \texttt{fetch\_submissions.py}, que necesita \texttt{CIK} correctos por emisor;
+  \item \texttt{fetch\_companyfacts.py}, que descarga \emph{companyfacts} por \texttt{CIK};
+  \item \texttt{point\_in\_time.py}, que debe resolver identidad histórica sin leakage;
+  \item \texttt{edgar\_qc.py}, que valida cobertura y consistencia de la cadena completa.
+\end{itemize}
+
+Su responsabilidad no es solamente “normalizar un cruce”, sino imponer una disciplina formal de identidad sobre el universo fundamental. En particular, el módulo debe:
+
+\begin{itemize}
+  \item resolver conflictos entre fuentes oficiales e internas;
+  \item versionar cambios históricos de identificadores;
+  \item impedir solapamientos activos inconsistentes;
+  \item permitir reconstrucción PIT-safe del símbolo vigente para una fecha dada;
+  \item y exponer suficiente trazabilidad para auditoría y depuración downstream.
+\end{itemize}
+
+Pero el módulo no debe:
+
+\begin{itemize}
+  \item inventar mappings no sustentados por evidencia explícita sin marcarlos como heurísticos;
+  \item colapsar automáticamente entidades ambiguas;
+  \item ni resolver vía conveniencia operativa conflictos que requieren arbitraje formal o exclusión.
+\end{itemize}
+
+\subsection{Alcance funcional}
+
+El alcance del módulo incluye, como mínimo:
+
+\begin{enumerate}
+  \item \textbf{Ingestión multi-fuente de identidad}: fuentes oficiales SEC y fuentes internas del sistema.
+  \item \textbf{Normalización canónica}: \texttt{symbol}, \texttt{CIK}, campos auxiliares y metadatos de procedencia.
+  \item \textbf{Resolución de conflictos}: arbitraje formal entre mappings competidores.
+  \item \textbf{Historificación}: conservación del historial de cambios con ventanas de vigencia.
+  \item \textbf{Snapshot vigente}: construcción de una vista \texttt{current} consistente y sin ambigüedad.
+  \item \textbf{Soporte PIT}: posibilidad de resolver el mapping correcto para cualquier fecha relevante de backtest o research.
+  \item \textbf{Persistencia auditable}: artefactos reproducibles bajo \texttt{run\_id}.
+\end{enumerate}
+
+El alcance \textbf{no} incluye:
+
+\begin{itemize}
+  \item reconciliación económica profunda de grupos empresariales;
+  \item inferencia jurídica de fusiones complejas a partir de datos incompletos;
+  \item sustitución de un security master institucional completo;
+  \item ni construcción directa de universos de inversión finales.
+\end{itemize}
+
+Aun así, dentro del subsistema EDGAR, debe comportarse como un \textbf{security/reference master de grado institucional}.
 
 \subsection{Entradas del módulo}
 
-Las entradas del módulo son:
+Las entradas son:
 
 \begin{itemize}
-  \item \texttt{sec\_ticker\_source\_path/api}: ruta o API a la fuente oficial de mapeo \texttt{ticker}<->\texttt{CIK} de la SEC (por ejemplo, un archivo JSON o un endpoint REST).
-  \item \texttt{internal\_symbol\_master\_path} (opcional): ruta a un mapeo interno de símbolos con metadatos adicionales (exchange, sector, etc.).
-  \item \texttt{config\_path}: ruta a un archivo YAML de configuración con reglas de normalización, pesaje de fuentes y políticas de dedupe.
-  \item \texttt{run\_id}: identificador único de la ejecución para trazabilidad y replicabilidad.
+  \item \texttt{sec\_ticker\_source\_path/api}: fuente oficial SEC de mapeo \texttt{ticker} \(\leftrightarrow\) \texttt{CIK}.
+  \item \texttt{internal\_symbol\_master\_path} (opcional pero muy recomendable): maestro interno de símbolos con metadatos auxiliares.
+  \item \texttt{config\_path}: archivo YAML con reglas de normalización, prioridad de fuentes, políticas de conflicto y validaciones.
+  \item \texttt{run\_id}: identificador único y auditable de ejecución.
+  \item \texttt{asof} (opcional): fecha lógica de snapshot, cuando se quiera materializar una vista temporalmente consistente.
 \end{itemize}
 
-En notación formal, el conjunto de entradas es:
+En notación formal:
+
 \[
-  \mathcal{I} = \{ \mathcal{U}_{\text{sec}}, \mathcal{U}_{\text{int}}, \Theta_{\text{map}}, r \},
+\mathcal{I}
+=
+\{
+\mathcal{U}_{\mathrm{sec}},
+\mathcal{U}_{\mathrm{int}},
+\Theta_{\mathrm{id}},
+r,
+a
+\},
 \]
+
 donde:
-\begin{itemize}
-  \item \(\mathcal{U}_{\text{sec}}\) es el universo de mappings de la SEC,
-  \item \(\mathcal{U}_{\text{int}}\) es el universo interno de símbolos,
-  \item \(\Theta_{\text{map}}\) es el conjunto de parámetros de resolución de conflictos,
-  \item \(r\) es el \texttt{run\_id}.
-\end{itemize}
-
-\subsection{Salidas y artefactos}
-
-El módulo genera tres artefactos clave:
 
 \begin{itemize}
-  \item \texttt{data/edgar/mappings/ticker\_cik\_history.parquet}: tabla de histórico de mappings \texttt{ticker}<->\texttt{CIK} con ventana temporal \texttt{effective\_from}--\texttt{effective\_to}.
-  \item \texttt{data/edgar/mappings/ticker\_cik\_current.parquet}: snapshot del mapping vigente por \texttt{symbol} y \texttt{CIK}.
-  \item \texttt{data/edgar/mappings/ticker\_cik\_manifest\_\{run\_id\}.json}: metadatos de la ejecución (fuentes utilizadas, fecha de ingestión, etc.).
+  \item \(\mathcal{U}_{\mathrm{sec}}\) es el universo SEC;
+  \item \(\mathcal{U}_{\mathrm{int}}\) es el universo interno;
+  \item \(\Theta_{\mathrm{id}}\) contiene reglas de identidad;
+  \item \(r\) es el \texttt{run\_id};
+  \item \(a\) es el \texttt{asof} lógico.
 \end{itemize}
 
-Estos artefactos permiten:
-\begin{itemize}
-  \item reconstruir exactamente el mismo snapshot de mappings a partir de \texttt{run\_id},
-  \item monitorear cambios históricos de \texttt{ticker} y \texttt{CIK} (por ejemplo, cambios de ticker, reestructuraciones de empresas),
-  \item y usar \texttt{ticker\_cik\_history} para cruzar cotizaciones y datos fundamentales en \emph{point‑in‑time} de forma consistente\cite{SECEDGARAPI, DePrado2018Advances}.
-\end{itemize}
+\subsection{Contrato mínimo de entrada}
 
-\subsection{Modelo de datos y campos mínimos}
-
-El módulo asegura que cada fila de mapping contenga al menos los siguientes campos:
+Antes de resolver ningún mapping, el módulo debe validar:
 
 \begin{itemize}
-  \item \texttt{symbol}: símbolo de la acción en notación \texttt{UPPERCASE} y sin espacios superfluos.
-  \item \texttt{cik}: CIK de 10 dígitos, con \emph{zero‑padding} consistente.
-  \item \texttt{source}: identificador de la fuente (por ejemplo, \texttt{SEC\_TICKER\_CIK}, \texttt{INTERNAL\_MASTER}).
-  \item \texttt{effective\_from}: fecha de inicio de vigencia de la asociación \texttt{symbol}<->\texttt{CIK}.
-  \item \texttt{effective\_to}: fecha de fin de vigencia (o \texttt{NULL} si es vigente).
-  \item \texttt{is\_active}: flag que indica si la asociación es vigente en la fecha de \texttt{run\_id}.
-  \item \texttt{run\_id}: identificador de la ejecución.
-  \item \texttt{ingest\_ts\_utc}: timestamp UTC de ingestión del registro.
+  \item legibilidad y existencia de las fuentes declaradas;
+  \item presencia de campos mínimos en la fuente SEC y en la fuente interna;
+  \item parseabilidad de \texttt{CIK} y posibilidad de llevarlo a formato canónico;
+  \item consistencia básica de tipos de datos;
+  \item validez sintáctica y semántica del archivo de configuración;
+  \item ausencia de corrupción estructural que impida reconstruir el linaje del mapping.
 \end{itemize}
 
-En notación matemática, cada registro de mapping se representa como:
+Si falla este contrato, la corrida no debe producir un snapshot parcial silencioso. Debe abortarse o marcarse como inválida según política explícita.
+
+\subsection{Unidad de observación}
+
+La unidad elemental del módulo no es simplemente el par \((\texttt{symbol}, \texttt{CIK})\), sino un \textbf{registro de asociación vigente en un intervalo temporal}:
+
 \[
-  m = (s, c, \sigma, f, t, a, r, \tau),
+m = (s, c, \sigma, \rho, f, t, a, \kappa, \ell, r, \tau),
 \]
+
 donde:
+
 \begin{itemize}
-  \item \(s\) es el \texttt{symbol},
-  \item \(c\) es el \texttt{CIK},
-  \item \(\sigma\) es el \texttt{source},
-  \item \(f\) es \texttt{effective\_from},
-  \item \(t\) es \texttt{effective\_to},
-  \item \(a\) es \texttt{is\_active},
-  \item \(r\) es el \texttt{run\_id},
+  \item \(s\) es el \texttt{symbol};
+  \item \(c\) es el \texttt{CIK};
+  \item \(\sigma\) es la fuente de origen;
+  \item \(\rho\) es el \texttt{resolution\_status};
+  \item \(f\) es \texttt{effective\_from};
+  \item \(t\) es \texttt{effective\_to};
+  \item \(a\) es \texttt{is\_active};
+  \item \(\kappa\) es un \texttt{confidence\_score} o prioridad de mapping;
+  \item \(\ell\) es información de linaje o evidencia;
+  \item \(r\) es el \texttt{run\_id};
   \item \(\tau\) es \texttt{ingest\_ts\_utc}.
 \end{itemize}
 
-\subsection{Checks y validaciones}
+Esta definición eleva el módulo desde una tabla estática de cruce a una verdadera capa de \emph{entity identity lifecycle}.
 
-El módulo aplica varios checks obligatorios:
+\subsection{Modelo de datos y campos mínimos}
+
+Cada registro válido del mapping debe contener, como mínimo:
+
+\[
+(
+\texttt{symbol},
+\texttt{cik},
+\texttt{source},
+\texttt{effective\_from},
+\texttt{effective\_to},
+\texttt{is\_active},
+\texttt{run\_id},
+\texttt{ingest\_ts\_utc}
+).
+\]
+
+Campos altamente recomendados para una spec más fuerte:
 
 \begin{itemize}
-  \item \textbf{Formato canonico de CIK}:
-    \[
-      c \in \{0,1,\dots,9\}^{10},
-    \]
-    es decir, el CIK debe ser exactamente 10 dígitos, comprensible con la definición de CIK de la SEC\cite{SECEDGARAPI, SECEDGARDataQuality}.
+  \item \texttt{source\_priority};
+  \item \texttt{resolution\_status} \(\in\{\texttt{exact},\texttt{preferred},\texttt{heuristic},\texttt{rejected}\}\);
+  \item \texttt{confidence\_score};
+  \item \texttt{exchange};
+  \item \texttt{sector};
+  \item \texttt{issuer\_name};
+  \item \texttt{share\_class};
+  \item \texttt{conflict\_class};
+  \item \texttt{evidence\_hash};
+  \item \texttt{mapping\_version}.
+\end{itemize}
 
-  \item \textbf{Normalización de \texttt{symbol}}:
-    \[
-      s \leftarrow \texttt{UPPER}( \texttt{TRIM}(s) ),
-    \]
-    garantizando consistencia de notación a lo largo de fuentes dispares (SEC, API externas, bases internas).
+El punto importante es que la salida no solo diga ``qué mapping quedó'', sino \textbf{por qué quedó} y \textbf{con qué nivel de confianza}.
 
-  \item \textbf{No duplicados activos de \texttt{symbol}->\texttt{CIK} simultáneos}:
-    \[
-      \forall (s, c_1, c_2) \text{ con } c_1 \ne c_2, \ \nexists t \text{ tal que } t \in [f_1, t_1] \cap [f_2, t_2] \text{ y } a = 1,
-    \]
-    donde \(f_i, t_i\) son los intervalos de \texttt{effective\_from}--\texttt{effective\_to} para cada asociación. Esto evita \emph{overlapping} activos de \texttt{ticker}<->\texttt{CIK}.
+\subsection{Normalización canónica}
 
-  \item \textbf{Versionado de cambios históricos}:
-    Las actualizaciones de \texttt{CIK} se manejan mediante:
-    \begin{itemize}
-      \item cierre de \texttt{effective\_to} del registro anterior,
-      \item y apertura de \texttt{effective\_from} del nuevo registro,
-      manteniendo así un historial continuo de cambios.
-    \end{itemize}
+El módulo debe aplicar una normalización determinista sobre los identificadores:
+
+\begin{itemize}
+  \item \texttt{symbol}:
+  \[
+  s^{\star} = \mathrm{UPPER}(\mathrm{TRIM}(s)),
+  \]
+  con reglas adicionales configurables para sufijos, separadores y símbolos especiales cuando proceda.
+  \item \texttt{CIK}:
+  \[
+  c^{\star} \in \{0,\dots,9\}^{10},
+  \]
+  es decir, representación canónica de 10 dígitos con \emph{zero-padding}.
+\end{itemize}
+
+No obstante, en una especificación fuerte esta normalización no debe ser puramente sintáctica. Debe contemplar también:
+
+\begin{itemize}
+  \item símbolos retirados o reciclados históricamente;
+  \item share classes potencialmente distintas bajo patrones similares;
+  \item fuentes que usan el mismo símbolo con convenciones diferentes;
+  \item necesidad de distinguir \texttt{display symbol} de \texttt{canonical trading symbol}.
+\end{itemize}
+
+\subsection{Jerarquía de fuentes y precedencia}
+
+Uno de los puntos más importantes que faltaba endurecer es la precedencia entre fuentes. El módulo no debe resolver conflictos con una lógica vaga tipo “last writer wins” salvo que dicha política esté explícitamente documentada y solo opere como último recurso.
+
+Debe existir una jerarquía de confiabilidad como:
+
+\[
+\texttt{official SEC mapping}
+\succ
+\texttt{trusted internal master}
+\succ
+\texttt{heuristic inferred mapping}.
+\]
+
+Esto implica que, si dos fuentes compiten para el mismo \texttt{symbol} en el mismo intervalo temporal:
+
+\begin{enumerate}
+  \item se prioriza la de mayor jerarquía;
+  \item si la jerarquía es igual, se evalúan reglas auxiliares de consistencia;
+  \item si persiste el conflicto, el caso no debe resolverse silenciosamente, sino pasar a arbitraje explícito o rechazo.
+\end{enumerate}
+
+\subsection{Clave de integridad temporal}
+
+Para una identidad robusta, el módulo debe imponer una restricción de no solapamiento activo ilegítimo. Sea \(m_1, m_2\) dos registros del mismo símbolo \(s\) con CIK distintos \(c_1 \neq c_2\). Entonces no puede existir un instante \(t\) tal que ambos sean vigentes simultáneamente, salvo excepciones configuradas y justificadas:
+
+\[
+\forall s,\ \forall c_1 \neq c_2,\ 
+\neg \exists t \in [f_1,t_1] \cap [f_2,t_2]
+\quad \text{con ambos activos}.
+\]
+
+Dicho de otra forma: un símbolo no puede apuntar a dos entidades regulatorias distintas en el mismo intervalo temporal operativo, salvo que la configuración permita una clase especial de ambigüedad y dicha ambigüedad sea marcada como no consumible downstream.
+
+\subsection{Casos especiales obligatorios}
+
+Una spec >95 no puede limitarse a duplicados genéricos. Debe contemplar explícitamente varios casos límite.
+
+\subsubsection{1. Ticker changes}
+
+Si una misma entidad cambia de \texttt{symbol} manteniendo el mismo \texttt{CIK}, el histórico debe reflejar:
+
+\begin{itemize}
+  \item cierre del intervalo del símbolo anterior;
+  \item apertura del intervalo del símbolo nuevo;
+  \item preservación del mismo \texttt{CIK};
+  \item trazabilidad de que se trata de un cambio de identidad de mercado, no de emisor regulatorio.
+\end{itemize}
+
+\subsubsection{2. Delistings y re-listings}
+
+El módulo debe poder cerrar intervalos de vigencia sin perder el historial. Si un símbolo deja de ser operativo y más tarde reaparece:
+
+\begin{itemize}
+  \item el nuevo intervalo no debe fusionarse automáticamente con el anterior;
+  \item debe registrarse una discontinuidad temporal;
+  \item y la política de reactivación debe ser explícita.
+\end{itemize}
+
+\subsubsection{3. Mergers y corporate actions}
+
+Si dos mappings compiten como consecuencia de una fusión, absorción o reestructuración, el módulo no debe inferir de forma agresiva equivalencia económica automática. Debe:
+
+\begin{itemize}
+  \item conservar el historial de identidad anterior;
+  \item abrir el nuevo mapping cuando exista evidencia suficiente;
+  \item y registrar la transición como cambio estructural si la configuración lo permite.
+\end{itemize}
+
+\subsubsection{4. Share classes}
+
+Cuando un emisor tenga múltiples clases de acciones o símbolos relacionados, el módulo no debe colapsarlos automáticamente al mismo \texttt{symbol} canónico salvo política explícita y segura. En caso de ambigüedad, debe preservarse la distinción o marcarse el conflicto.
+
+\subsection{Resolución de conflictos}
+
+La resolución de conflictos debe ser determinista y auditable. Para cada conjunto de candidatos competidores \(\mathcal{M}(s,\Delta)\) para un símbolo \(s\) en una ventana temporal \(\Delta\), el módulo debe ordenar candidatos por la tupla:
+
+\[
+\Big(
+\texttt{source\_priority},
+\texttt{confidence\_score},
+\texttt{temporal\_consistency},
+\texttt{metadata\_consistency},
+\texttt{ingest\_ts\_utc}
+\Big).
+\]
+
+Esto implica:
+
+\begin{enumerate}
+  \item preferir fuente de mayor jerarquía;
+  \item preferir mapping con mayor score de confianza;
+  \item preferir la solución que no rompa continuidad temporal ya establecida;
+  \item preferir la que sea consistente con metadatos auxiliares relevantes;
+  \item y, solo como último recurso, usar la más reciente con trazabilidad explícita.
+\end{enumerate}
+
+Si tras aplicar esta regla persiste la ambigüedad, el caso debe clasificarse como:
+
+\[
+\texttt{conflict\_class} \in
+\{
+\texttt{source\_conflict},
+\texttt{temporal\_overlap},
+\texttt{share\_class\_ambiguity},
+\texttt{unresolved\_identity}
+\},
+\]
+
+y no debe pasar a \texttt{current} como mapping limpio.
+
+\subsection{Historificación formal}
+
+El histórico debe implementarse como una dimensión lentamente cambiante de tipo temporal. Cada transición debe respetar:
+
+\begin{itemize}
+  \item cierre de \texttt{effective\_to} del registro anterior;
+  \item apertura de \texttt{effective\_from} del nuevo registro;
+  \item continuidad temporal salvo discontinuidad explícita;
+  \item imposibilidad de que dos mappings vigentes para el mismo símbolo queden abiertos sin arbitraje.
+\end{itemize}
+
+La historificación no es un extra documental: es el mecanismo que permite a \texttt{point\_in\_time.py} saber qué identidad era válida en cada fecha.
+
+\subsection{Snapshot \texttt{current}}
+
+La tabla \texttt{ticker\_cik\_current.parquet} no debe definirse solo como “registros con \texttt{effective\_to = NULL}”. Debe construirse como el conjunto de mappings:
+
+\[
+\mathcal{C}
+=
+\{m \in \mathcal{H}: m \text{ es vigente y no ambiguo bajo la política actual}\}.
+\]
+
+Esto significa que un registro abierto pero conflictivo no debe entrar automáticamente en el snapshot \texttt{current}. El snapshot debe ser \textbf{consumible}, no solo “último”.
+
+\subsection{PIT-safe identity}
+
+Uno de los mayores saltos de calidad es formular expresamente que este módulo no sirve solo para un snapshot actual, sino para resolver identidad \emph{point-in-time safe}. Para una fecha \(d\), la identidad válida de un símbolo \(s\) debe venir dada por:
+
+\[
+\mathcal{R}_{\mathrm{PIT}}(s,d)
+=
+\{m \in \mathcal{H}: \texttt{effective\_from}(m)\le d < \texttt{effective\_to}(m)\},
+\]
+
+ajustando la desigualdad final cuando \texttt{effective\_to} sea nulo.
+
+La política correcta es:
+
+\begin{itemize}
+  \item si \(|\mathcal{R}_{\mathrm{PIT}}(s,d)| = 1\), la identidad queda resuelta;
+  \item si \(|\mathcal{R}_{\mathrm{PIT}}(s,d)| = 0\), no existe mapping PIT utilizable;
+  \item si \(|\mathcal{R}_{\mathrm{PIT}}(s,d)| > 1\), hay ambigüedad y debe elevarse incidencia crítica.
+\end{itemize}
+
+\subsection{Quality score del mapping}
+
+Para reforzar el uso downstream, conviene que cada mapping resuelto lleve un \texttt{confidence\_score}. No sustituye la lógica de arbitraje, pero ayuda a distinguir mappings exactos de mappings aceptados con reservas.
+
+Una formulación simple puede ser:
+
+\[
+q(m)
+=
+w_{\sigma}\,q_{\sigma}(m)
++
+w_{\tau}\,q_{\tau}(m)
++
+w_{\mu}\,q_{\mu}(m)
++
+w_{\ell}\,q_{\ell}(m),
+\qquad
+q(m)\in[0,1],
+\]
+
+donde los componentes reflejan calidad de la fuente, consistencia temporal, consistencia de metadatos y robustez del linaje.
+
+\subsection{Artefactos de salida}
+
+El módulo debe generar, como mínimo:
+
+\begin{itemize}
+  \item \texttt{data/edgar/mappings/ticker\_cik\_history.parquet}
+  \item \texttt{data/edgar/mappings/ticker\_cik\_current.parquet}
+  \item \texttt{data/edgar/mappings/ticker\_cik\_conflicts\_\{run\_id\}.parquet}
+  \item \texttt{data/edgar/mappings/ticker\_cik\_metrics\_\{run\_id\}.parquet}
+  \item \texttt{data/edgar/mappings/ticker\_cik\_manifest\_\{run\_id\}.json}
+\end{itemize}
+
+El artefacto de conflictos es importante: una spec seria no oculta los casos irresolubles dentro del snapshot final.
+
+\subsection{Manifest y métricas}
+
+El \emph{manifest} debe incluir, como mínimo:
+
+\begin{itemize}
+  \item \texttt{run\_id};
+  \item fecha lógica de ejecución;
+  \item fuentes consumidas;
+  \item número total de registros de entrada;
+  \item número de mappings resueltos;
+  \item número de conflictos por clase;
+  \item número de cambios históricos detectados;
+  \item hash de configuración;
+  \item timestamps de inicio y fin.
+\end{itemize}
+
+Además, deben emitirse métricas como:
+
+\begin{itemize}
+  \item cobertura de \texttt{CIK} sobre el universo de símbolos;
+  \item número de símbolos con mapping único;
+  \item número de símbolos con ambigüedad;
+  \item número de ticker changes detectados;
+  \item distribución de \texttt{confidence\_score};
+  \item porcentaje de mappings resueltos por fuente principal;
+  \item tasa de conflictos temporales.
 \end{itemize}
 
 \subsection{Flujo de ejecución}
 
-El flujo del módulo se puede descomponer en cinco pasos:
+El flujo correcto del módulo se compone de siete etapas:
 
 \begin{enumerate}
-  \item \textbf{Cargar fuente SEC y mappings internos}:
-    \begin{itemize}
-      \item Se descarga o lee la fuente \texttt{sec\_ticker\_source\_path/api}.
-      \item Se carga \texttt{internal\_symbol\_master\_path} si está disponible.
-    \end{itemize}
-
-  \item \textbf{Normalizar campos}:
-    \begin{itemize}
-      \item \texttt{symbol} se lleva a \texttt{UPPERCASE} y se limpian espacios.
-      \item \texttt{CIK} se rellena a 10 dígitos.
-      \item Se unifican esquemas de campos (por ejemplo, \texttt{ingest\_ts\_utc} se genera para todos los registros).
-    \end{itemize}
-
-  \item \textbf{Resolver conflictos y deduplicar}:
-    \begin{itemize}
-      \item Se detectan \texttt{ticker}s con múltiples \texttt{CIK} vigentes en el mismo intervalo temporal.
-      \item Se aplican reglas de resolución de conflicto (por ejemplo, preferir \texttt{source} SEC sobre \texttt{INTERNAL\_MASTER}, o aplicar \emph{last writer wins} con trazabilidad).
-    \end{itemize}
-
-  \item \textbf{Construir \texttt{history} y \texttt{current}}:
-    \begin{itemize}
-      \item \texttt{ticker\_cik\_history} almacena todas las asociaciones con \texttt{effective\_from}--\texttt{effective\_to}.
-      \item \texttt{ticker\_cik\_current} es el subconjunto donde \texttt{effective\_to = NULL} o donde \texttt{is\_active = 1}.
-    \end{itemize}
-
-  \item \textbf{Persistir outputs}:
-    \begin{itemize}
-      \item Se guarda \texttt{ticker\_cik\_history.parquet}.
-      \item Se guarda \texttt{ticker\_cik\_current.parquet}.
-      \item Se genera \texttt{ticker\_cik\_manifest\_\{run\_id\}.json} con metadatos de la ejecución.
-    \end{itemize}
+  \item \textbf{Carga y validación de inputs}: fuentes SEC, maestro interno y configuración.
+  \item \textbf{Normalización}: canonización de \texttt{symbol}, \texttt{CIK} y metadatos.
+  \item \textbf{Construcción de candidatos}: unificación de mappings procedentes de múltiples fuentes.
+  \item \textbf{Arbitraje}: resolución de conflictos mediante jerarquía de fuentes y consistencia temporal.
+  \item \textbf{Historificación}: apertura/cierre de ventanas \texttt{effective\_from}--\texttt{effective\_to}.
+  \item \textbf{Materialización}: construcción de \texttt{history} y \texttt{current}.
+  \item \textbf{Persistencia}: escritura de outputs, métricas, conflictos y manifest.
 \end{enumerate}
 
-Este flujo reproduce el patrón estándar de \emph{historical mapping} para identificadores de entidades, similar a \emph{CIK mapping services} y \emph{ticker‑CIK crosswalks} usados en pipelines de datos fundamentales\cite{sec_cik_mapper, cik-mapping-SEC}.
+\subsection{Precedencia de errores}
+
+No todos los fallos tienen la misma gravedad. La jerarquía correcta debe ser:
+
+\[
+\texttt{schema/config failure}
+\succ
+\texttt{unresolved identity conflict}
+\succ
+\texttt{temporal overlap conflict}
+\succ
+\texttt{coverage gap}
+\succ
+\texttt{row-level normalization issue}.
+\]
+
+Esto implica:
+
+\begin{itemize}
+  \item un fallo estructural invalida toda la corrida;
+  \item un conflicto de identidad no resuelto pesa más que una pequeña pérdida de cobertura;
+  \item solapamientos temporales activos son especialmente graves porque contaminan cualquier uso PIT;
+  \item problemas menores de normalización no deben ocultar fallos estructurales.
+\end{itemize}
 
 \subsection{CLI y uso operativo}
 
-El módulo se invoca mediante la línea de comandos:
+La interfaz operativa recomendada es:
 
 \begin{verbatim}
 python -m data.edgar.ticker_cik ^
   --source-path data/edgar/source/ticker_cik_raw.parquet ^
+  --internal-master-path data/reference/internal_symbol_master.parquet ^
   --config-path configs/data/edgar_ticker_cik.yaml ^
-  --run-id ticker_cik_20260305_001
+  --run-id ticker_cik_20260305_001 ^
+  --asof 2026-03-05
 \end{verbatim}
 
-Esto permite:
+El uso explícito de \texttt{asof} es recomendable cuando se quiera construir un snapshot temporalmente consistente y alineado con el resto del subsistema.
+
+\subsection{Tests mínimos obligatorios}
+
+Para que el módulo quede realmente cerrado a nivel de producción, su DoD debe exigir al menos:
+
 \begin{itemize}
-  \item integrar el módulo en pipelines de construcción de datos fundamentales,
-  \item actualizar periódicamente el mapping conforme cambian \texttt{ticker}s y \texttt{CIK}s en la base de datos de la SEC,
-  \item y mantener versiones reproducibles de mapeos para cada \texttt{run\_id}.
+  \item test de canonización correcta de \texttt{CIK} a 10 dígitos;
+  \item test de normalización de \texttt{symbol};
+  \item test de precedencia SEC frente a fuente interna en conflicto simple;
+  \item test de detección de solapamiento temporal ilegítimo;
+  \item test de ticker change con cierre y reapertura correctos;
+  \item test de construcción PIT-safe de identidad por fecha;
+  \item test de exclusión de conflicto irresuelto del snapshot \texttt{current};
+  \item test de persistencia de \texttt{history}, \texttt{current}, \texttt{conflicts} y \texttt{manifest};
+  \item test de estabilidad bajo misma entrada y misma configuración;
+  \item test de clasificación correcta de \texttt{conflict\_class}.
 \end{itemize}
 
-\subsection{Definición de término (DoD)}
+\subsection{Definición de terminado (DoD)}
 
-La definición de término del módulo establece que:
+El módulo se considera terminado únicamente si:
 
 \begin{itemize}
-  \item El mapping \texttt{ticker}<->\texttt{CIK} debe ser \emph{estable}:
-    \begin{itemize}
-      \item sin duplicados activos solapados temporalmente,
-      \item y con formato consistente de \texttt{CIK} y \texttt{symbol}.
-    \end{itemize}
-  \item El mapping debe ser \emph{trazable}:
-    \begin{itemize}
-      \item se debe poder recuperar el historial de cambios de \texttt{ticker}<->\texttt{CIK} desde \texttt{ticker\_cik\_history.parquet},
-      \item y se debe poder reproducir exactamente el \texttt{current} snapshot por \texttt{run\_id}.
-    \end{itemize}
-  \item El módulo debe generar outputs listos para ser consumidos por:
-    \begin{itemize}
-      \item \texttt{point\_in\_time} (para cruces \texttt{ticker}<->\texttt{CIK} PIT),
-      \item y \texttt{edgar\_qc} (para validación de cobertura de CIK sobre el universo de símbolos).
-    \end{itemize}
+  \item resuelve mappings \texttt{symbol} \(\leftrightarrow\) \texttt{CIK} con reglas explícitas y versionadas;
+  \item preserva un historial temporal sin solapamientos activos ilegítimos;
+  \item genera un snapshot \texttt{current} limpio y consumible;
+  \item expone conflictos e incidencias de forma auditable;
+  \item soporta resolución PIT-safe de identidad;
+  \item y supera los tests mínimos de robustez temporal y de arbitraje.
 \end{itemize}
 
-\subsection{Conexión con estado del arte y literatura}
+\subsection{Conclusión}
 
-El diseño de \texttt{ticker\_cik.py} se alinea con:
+\texttt{ticker\_cik.py} no debe verse como una utilidad auxiliar de carga, sino como el \textbf{núcleo de identidad} del subsistema EDGAR. Su misión es garantizar que el universo de activos negociables y el universo regulatorio puedan enlazarse sin ambigüedad, sin contaminación temporal y sin errores silenciosos de entidad. En un sistema cuantitativo, ese problema no es menor: un solo error de mapping puede producir backtests aparentemente válidos con información de la empresa equivocada.
 
-\begin{itemize}
-  \item \textbf{Mapping de ticker<->CIK de la SEC}: la SEC y terceros mantienen tablas de \texttt{ticker} a \texttt{CIK} en formato \emph{crosswalk} para facilitar el acceso a filings\cite{SECEDGARAPI, sec_cik_mapper}.
-  \item \textbf{Historización de cambios de identidad}: el uso de \texttt{effective\_from}--\texttt{effective\_to} y \texttt{is\_active} se inspira en prácticas de \emph{slowly changing dimensions} (SCD) en sistemas de datos financieros, donde se preserva la historia de cambios de identificación para evitar \emph{entity matching errors} en series de tiempo\cite{KimballSCD, DePrado2018Advances}.
-  \item \textbf{Calidad de datos de referencia}: el módulo implementa reglas de validación de \texttt{CI
+Por ello, el estándar de diseño del módulo debe ser equivalente al de cualquier infraestructura crítica de referencia: \textbf{normalización determinista, precedencia explícita de fuentes, historificación formal, arbitraje auditable, soporte PIT-safe y exposición transparente de conflictos}. Bien implementado, este módulo convierte una tabla de crosswalk en una verdadera capa maestra de identidad. Mal implementado, introduce uno de los errores más costosos y menos visibles de todo el pipeline fundamental.

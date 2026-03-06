@@ -1,6 +1,8 @@
 \documentclass[12pt,a4paper]{article}
+
 \usepackage[utf8]{inputenc}
-\usepackage[spanish]{babel}
+\usepackage[spanish,es-nodecimaldot]{babel}
+\usepackage[T1]{fontenc}
 \usepackage{lmodern}
 \usepackage[
   lmargin=2.5cm,
@@ -8,18 +10,20 @@
   tmargin=2.5cm,
   bmargin=2.5cm
 ]{geometry}
-\usepackage{amsmath,amssymb,amsthm}
-\usepackage{graphicx}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{bm}
 \usepackage{booktabs}
-\usepackage{listings}
+\usepackage{array}
 \usepackage{float}
+\usepackage{enumitem}
 \usepackage{csquotes}
-\usepackage{natbib}
-\usepackage[colorlinks=true,linkcolor=blue]{hyperref}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
 
-\title{Análisis de \texttt{train\_ridge.py} \\
-Baseline de regresión Ridge para targets continuos}
-\author{Baseline de regresión lineal regularizada L2 con CV temporal purged}
+\title{\textbf{Análisis de \texttt{train\_ridge.py}}\\
+Especificación research-industrial de una baseline Ridge\\
+para targets continuos en trading temporal}
+\author{Baseline lineal regularizada L2 con validación temporal \textit{purged}}
 \date{\today}
 
 \begin{document}
@@ -27,224 +31,600 @@ Baseline de regresión Ridge para targets continuos}
 \maketitle
 
 \begin{abstract}
-Este documento analiza el módulo \texttt{models/baselines/train\_ridge.py}, que entrena una \textbf{regresión lineal regularizada L2 (Ridge)} para targets continuos como referencia estable y explicable frente a modelos más complejos (GBDT, etc.) en un sistema de trading cuantitativo. Se discute la formulación de Ridge, la selección de \texttt{alpha} mediante \textbf{validación cruzada temporal purged}, las métricas de calidad OOF/OOS y cómo este baseline contribuye a un ecosistema de modelos de nivel industrial, conectando con estado del arte académico (Ridge, CV temporal, multicolinealidad).
+Este documento especifica el módulo \texttt{models/baselines/train\_ridge.py}, responsable de entrenar una baseline de \textbf{regresión Ridge} para targets continuos dentro de un sistema de \emph{small-cap swing trading}. El propósito del módulo no es únicamente ajustar una regresión lineal regularizada, sino establecer una referencia metodológicamente limpia, estable, interpretable y auditable frente a modelos más complejos. La especificación cubre formulación matemática, validación temporal \emph{purged}, preprocesado estrictamente \emph{train-only}, selección de hiperparámetros, manejo de \emph{missing values}, posible uso de \emph{sample weights}, evaluación predictiva y estructural, persistencia de artefactos por \texttt{run\_id} y criterios de aceptación del experimento.
 \end{abstract}
 
-\section{Objetivo y contexto del módulo}
+\tableofcontents
 
-El script \texttt{train\_ridge.py} pertenece al subpaquete \texttt{models/baselines} del repositorio \texttt{JimSimons}. Su objetivo principal es:
+\section{Propósito del módulo}
 
-\begin{itemize}
-  \item Entrenar un modelo de \textbf{regresión lineal regularizada L2 (Ridge)} para targets continuos (por ejemplo, retornos raw, retornos normalizados, señales continuas).
-  \item Proporcionar una \textbf{referencia interpretable y estable} sobre la que comparar modelos no lineales (GBDT, XGBoost, redes neuronales).
-  \item Establecer un \textbf{baseline de regresión lineal} útil para:
-    \begin{itemize}
-      \item Evaluación de ganancia incremental de modelos complejos.
-      \item Análisis de importancia de variables (a través de coeficientes \( \beta_j \)).
-    \end{itemize}
-\end{itemize}
+El módulo \texttt{train\_ridge.py} implementa una baseline de regresión continua con penalización L2. Su papel dentro del sistema debe entenderse de forma estratégica y no meramente académica. Cumple al menos cinco funciones:
 
-En el contexto de swing trading, Ridge actúa como \textbf{baseline de regresión continua} con buena robustez frente a multicolinealidad y una explicación directa de la relación lineal entre features y target. [web:68][web:71]
-
-\section{Formulación matemática de Ridge}
-
-Sea \( X \in \mathbb{R}^{n \times p} \) la matriz de features, \( y \in \mathbb{R}^n \) el target continuo y \( \beta \in \mathbb{R}^p \) el vector de coeficientes. El estimador de Ridge se define como:
-
-\[
-  \hat{\beta}_{\text{Ridge}}(\alpha)
-  = \arg\min_{\beta} \left\{
-    \| y - X\beta \|^2_2
-    + \alpha \|\beta\|_2^2
-  \right\},
-\]
-
-donde:
-\begin{itemize}
-  \item \( \|\beta\|_2^2 = \sum_{j=1}^p \beta_j^2 \) es la penalización L2.
-  \item \( \alpha \ge 0 \) es el parámetro de regularización (“shrinkage parameter”).
-\end{itemize}
-
-La solución cerrada de Ridge viene dada por:
-
-\[
-  \hat{\beta}_{\text{Ridge}}(\alpha) = (X^\top X + \alpha I)^{-1} X^\top y.
-\]
-
-Cuando \( \alpha \to 0 \), el estimador se aproxima al de mínimos cuadrados ordinarios (OLS); cuando \( \alpha \to \infty \), todos los coeficientes se contraen hacia 0. [web:68][web:67]
-
-\subsection{Ventajas de Ridge frente a OLS}
-
-\begin{itemize}
-  \item \textbf{Mejora de condicionamiento}: Ridge “stabiliza” el sistema cuando \( X^\top X \) está mal condicionada (alta multicolinealidad).
-  \item \textbf{Trade‑off sesgo/varianza}: introduce un pequeño \emph{bias} a cambio de una reducción importante de la varianza de los coeficientes.
-  \item \textbf{Comportamiento predecible}: la solución de Ridge es única y continua en \( \alpha \) y adecuada para CV temporal y tracking de coeficientes por fold. [web:68]
-\end{itemize}
-
-\section{Alcance funcional del módulo}
-
-\subsection{Entrenamiento temporal purged}
-
-El módulo emplea \textbf{CV temporal purged} para evitar \emph{data leakage} en targets construidos a partir de ventanas temporales:
-
-\begin{itemize}
-  \item Se cargan \texttt{features}, \texttt{labels} y \texttt{labels/splits/purged\_splits\_latest.parquet}.
-  \item Cada fold mantiene el orden temporal y excluye obervaciones contaminadas por el rango de test.
-  \item Opcionalmente se puede introducir \textbf{embargo} tras el test para evitar interferencias de efecto de ventana. [web:66][web:57]
-\end{itemize}
-
-Esto asegura que el modelo nunca “ve” future leakage en el label ni en el feature.
-
-\subsection{Selección/calibración de \(\alpha\)}
-
-\begin{itemize}
-  \item El módulo permite una \texttt{alpha\_grid} (p. ej. \( [10^{-6}, 10^{-4}, 10^{-2}, 1] \)) o un \texttt{alpha\_fixed}.
-  \item Mediante \texttt{RidgeCV} o \texttt{GridSearchCV} sobre \texttt{alpha} se selecciona el valor óptimo por fold o globalmente, minimizando RMSE/MSE en validación temporal.
-\end{itemize}
-
-La literatura muestra que la selección de \( \alpha \) por CV temporal contribuye a un buen \textbf{trade‑off entre overfitting y underfitting}, incluso en contextos de alto número de variables. [web:69][web:75]
-
-\section{Entradas y salidas}
-
-\subsection{Entradas}
-
-El módulo recibe:
-\begin{itemize}
-  \item \texttt{features\_path}: ruta a features preprocesadas (\texttt{features/store}).
-  \item \texttt{labels\_path}: ruta a targets continuos (\texttt{labels/store}).
-  \item \texttt{splits\_path}: splits temporales \textbf{purged} (\texttt{labels/splits/purged\_splits\_latest.parquet}).
-  \item \texttt{config\_path}: configuración YAML (\texttt{configs/models/ridge.yaml}).
-  \item \texttt{run\_id}: identificador de la corrida (p. ej. \texttt{train\_ridge\_20260305\_001}).
-\end{itemize}
-
-\subsection{Salidas}
-
-Por cada \texttt{run\_id}:
-
-\begin{itemize}
-  \item Modelos por fold:
-    \texttt{models/artifacts/baselines/ridge/{run\_id}/fold\_{k}/model.pkl}
-  \item Predicciones OOF:
-    \texttt{models/predictions/baselines/ridge/{run\_id}/oof.parquet}
-  \item Informes de métricas:
-    \texttt{models/reports/baselines/ridge/{run\_id}/metrics\_summary.json}
-  \item Manifesto de ejecución:
-    \texttt{models/reports/baselines/ridge/{run\_id}/manifest.json}
-\end{itemize}
-
-\section{Parámetros clave y configuración}
-
-\begin{itemize}
-  \item \texttt{alpha\_grid} o \texttt{alpha\_fixed}: valores de regularización explorados.
-  \item \texttt{fit\_intercept}: si se ajusta el intercepto \( \beta_0 \) o se asume que \( X \) está centrado.
-  \item \texttt{standardize\_features}: si se aplica \texttt{StandardScaler} a \( X \) antes de entrenar.
-  \item \texttt{sample\_weight\_mode}: modo de ponderación de muestras (por ejemplo, por volumen o por volatilidad).
-  \item \texttt{target\_column}: columna específica del dataset de labels que se usa como \( y \).
-\end{itemize}
-
-El uso de \texttt{standardize\_features=True} hace que los coeficientes sean comparables y robustos frente a escalas distintas de las variables. [web:70][web:79]
-
-\section{Reglas de PIT y buenas prácticas}
-
-\begin{itemize}
-  \item \textbf{Entrenamiento solo en train folds purged}: ningún dato de valid/test es usado para estimar \( \beta \).
-  \item \textbf{Valid/test fuera del ajuste de hiperparámetros}: el conjunto de test final se mantiene oculto para la selección de \texttt{alpha}.
-  \item \textbf{Sin leakage entre fechas}: se respeta la estructura temporal de etiquetas (p. ej. retornos, eventos de mercado).
-\end{itemize}
-
-Esto garantiza que las métricas OOF/OOS son una estimación honesta del rendimiento futuro en datos nuevos. [web:51][web:66]
-
-\section{Flujo de ejecución}
-
-\begin{enumerate}
-  \item \textbf{Cargar datos y alinear por \((date, symbol)\)}:
-    \begin{itemize}
-      \item Se cargan \texttt{features} y \texttt{labels} y se alinean por índice temporal y símbolo.
-      \item Se verifica que cada fecha/símbolo tiene su correspondiente label.
-    \end{itemize}
-  \item \textbf{Preparar matriz \( X,y \) por fold}:
-    \begin{itemize}
-      \item Para cada fold, se crea un subconjunto \( X_{\text{train}}, y_{\text{train}} \) y \( X_{\text{test}}, y_{\text{test}} \).
-    \end{itemize}
-  \item \textbf{Escalado de features}:
-    \begin{itemize}
-      \item Si \texttt{standardize\_features=True}, se aplica \texttt{StandardScaler} ajustado solo sobre el \texttt{train} de cada fold.
-    \end{itemize}
-  \item \textbf{Entrenar Ridge y evaluar OOF/OOS}:
-    \begin{itemize}
-      \item Se entrena \texttt{Ridge} o \texttt{RidgeCV} sobre \texttt{alpha\_grid}.
-      \item Se guardan coeficientes, predicciones y métricas.
-    \end{itemize}
-  \item \textbf{Persistir modelos y reportes}:
-    \begin{itemize}
-      \item \texttt{model.pkl}, \texttt{oof.parquet}, \texttt{metrics\_summary.json} y \texttt{manifest.json}.
-    \end{itemize}
+\begin{enumerate}[label=\arabic*)]
+    \item \textbf{Proveer una referencia lineal robusta} frente a modelos no lineales o de mayor complejidad funcional.
+    \item \textbf{Capturar relaciones lineales agregadas} entre features y target continuo sin la fragilidad típica de OLS en presencia de colinealidad.
+    \item \textbf{Reducir varianza paramétrica} mediante contracción L2, mejorando estabilidad fuera de muestra.
+    \item \textbf{Ofrecer interpretabilidad estructurada} a través de coeficientes comparables sobre features escaladas.
+    \item \textbf{Servir como control científico} del pipeline: si modelos más complejos no mejoran a Ridge bajo el mismo régimen experimental, su complejidad no está justificada.
 \end{enumerate}
 
-\section{Métricas recomendadas}
+Por tanto, Ridge no debe verse aquí como una baseline “simple”, sino como una \textbf{línea base institucional de referencia} para el ecosistema de modelos continuos del repositorio.
 
-\begin{itemize}
-  \item \textbf{RMSE}:
-    \[
-      \text{RMSE} = \sqrt{\frac{1}{n} \sum_{i=1}^n (y_i - \hat{y}_i)^2}
-    \]
-  \item \textbf{MAE}:
-    \[
-      \text{MAE} = \frac{1}{n} \sum_{i=1}^n |y_i - \hat{y}_i|
-    \]
-  \item \textbf{Correlación} entre \texttt{y} e \texttt{pred}:
-    \[
-      \rho(y, \hat{y}) = \text{Corr}(y, \hat{y})
-    \]
-  \item \textbf{R²} (explicación de varianza):
-    \[
-      R^2 = 1 - \frac{\sum (y_i - \hat{y}_i)^2}{\sum (y_i - \bar{y})^2}
-    \]
+\section{Contexto cuantitativo}
+
+En \emph{small caps} y, en general, en predicción financiera con variables técnicas, fundamentales y cross-sectional, aparecen de forma recurrente varios problemas:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item fuerte multicolinealidad entre bloques de features;
+    \item ruido elevado y baja relación señal-ruido;
+    \item inestabilidad temporal de las relaciones lineales;
+    \item sensibilidad excesiva de OLS a perturbaciones pequeñas en muestra;
+    \item distribuciones no gaussianas, colas pesadas y posibles episodios de régimen.
 \end{itemize}
 
-Estas métricas permiten comparar Ridge con modelos más complejos y evaluar cuánto valor añadido aporta la no linealidad frente a una referencia lineal simple. [web:68][web:71]
-
-\section{Validaciones y calidad del pipeline}
-
-\begin{itemize}
-  \item \textbf{Columnas requeridas presentes}:
-    \begin{itemize}
-      \item Verificar que existen \texttt{date, symbol, target\_column} y todas las features necesarias.
-    \end{itemize}
-  \item \textbf{Sin NaN/inf tras preprocessing}:
-    \begin{itemize}
-      \item Lanzar error si aparecen \texttt{NaN} o \texttt{inf} en \texttt{X} o \texttt{y}.
-    \end{itemize}
-  \item \textbf{Métricas por fold completas}:
-    \begin{itemize}
-      \item Que cada fold tenga métricas asociadas (RMSE, MAE, R², etc.).
-      \item Sin folds “vacíos” ni divisiones temporales corruptas.
-    \end{itemize}
+En ese entorno, una regresión OLS puede producir:
+\begin{itemize}[leftmargin=1.5em]
+    \item coeficientes con magnitud artificialmente inflada;
+    \item signos inestables entre folds;
+    \item mala generalización OOF/OOS;
+    \item interpretaciones engañosas cuando varias variables compiten por representar la misma fuente latente de señal.
 \end{itemize}
 
-\section{Estado del arte académico e industrial}
-
-\subsection{Ridge regression y finanzas cuantitativas}
-
-\begin{itemize}
-  \item Ridge es ampliamente utilizado como método de regresión lineal regularizada para:
-    \begin{itemize}
-      \item Predicción de retornos continuos.
-      \item Modelos de rendimiento de carteras y factores.
-    \end{itemize}
-    [web:68][web:69]
-  \item En contextos de trading, se usa como base para:
-    \begin{itemize}
-      \item \textbf{Baselines lineales} para sistemas de momentum y mean‑reversion.
-      \item \textbf{Rolling Ridge} con ventanas móviles que se ajustan a la dinámica temporal del mercado. [web:71][web:74]
-    \end{itemize}
+Ridge responde a este problema añadiendo una penalización L2 que:
+\begin{itemize}[leftmargin=1.5em]
+    \item estabiliza la inversión implícita del sistema lineal;
+    \item reduce la varianza del estimador;
+    \item mantiene activas todas las variables, pero contrayendo su magnitud;
+    \item suele comportarse mejor que OLS cuando el objetivo es predicción robusta y no interpretación causal.
 \end{itemize}
 
-\subsection{Regresión lineal regularizada y CV temporal}
+\section{Formulación matemática}
 
-\begin{itemize}
-  \item Métodos de \textbf{Purged CV} y \textbf{Combinatorial Purged CV} se han desarrollado específicamente para ML financiero, para evitar \emph{look‑ahead bias} en estrategias temporales. [web:66][web:54]
-  \item Ridge con selección de \( \alpha \) por CV temporal proporciona una referencia robusta de rendimiento, que se puede usar como “piso” para comparar modelos más complejos.
+Sea:
+\begin{itemize}[leftmargin=1.5em]
+    \item \(X \in \mathbb{R}^{n \times p}\) la matriz de features;
+    \item \(y \in \mathbb{R}^n\) el target continuo;
+    \item \(\beta \in \mathbb{R}^p\) el vector de coeficientes;
+    \item \(\beta_0 \in \mathbb{R}\) el intercepto.
 \end{itemize}
-[web:67][web:69]
 
+La estimación Ridge puede escribirse como:
+
+\begin{equation}
+\hat{\beta}_0,\hat{\beta}
+=
+\arg\min_{\beta_0,\beta}
+\left\{
+\frac{1}{2n}\|y-\beta_0\mathbf{1}-X\beta\|_2^2
++
+\alpha \|\beta\|_2^2
+\right\},
+\label{eq:ridge}
+\end{equation}
+
+donde:
+\begin{itemize}[leftmargin=1.5em]
+    \item \(\|\beta\|_2^2 = \sum_{j=1}^{p}\beta_j^2\);
+    \item \(\alpha \ge 0\) controla la intensidad de regularización.
+\end{itemize}
+
+Cuando \(\alpha \to 0\), la solución se aproxima a OLS; cuando \(\alpha\) crece, los coeficientes se contraen hacia cero.
+
+\subsection{Solución cerrada}
+
+En la formulación centrada, la solución clásica puede escribirse como:
+
+\[
+\hat{\beta}_{\text{Ridge}}(\alpha)
+=
+(X^\top X + \lambda I)^{-1}X^\top y,
+\]
+
+donde \(\lambda\) representa la intensidad de penalización en la parametrización matricial elegida. En implementación práctica, lo relevante no es la forma cerrada en sí, sino entender que la regularización desplaza los autovalores del sistema y mejora el condicionamiento numérico.
+
+\subsection{Interpretación cuantitativa}
+
+Ridge implementa explícitamente un \textbf{trade-off sesgo-varianza}:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item más \(\alpha\) \(\Rightarrow\) más sesgo pero menos varianza;
+    \item menos \(\alpha\) \(\Rightarrow\) solución más flexible pero más inestable;
+    \item en presencia de grupos de variables correlacionadas, Ridge distribuye peso entre ellas en vez de producir eliminaciones bruscas.
+\end{itemize}
+
+Esta última propiedad lo hace especialmente útil como baseline estable cuando el objetivo es comparar arquitecturas más complejas contra una referencia lineal limpia y difícil de romper.
+
+\section{Objetivo exacto del entrenamiento}
+
+El módulo no debe optimizar una única métrica de forma miope. Su objetivo institucional es producir una baseline que sea simultáneamente:
+
+\begin{enumerate}[label=\alph*)]
+    \item \textbf{predictiva}, con buen desempeño fuera de muestra;
+    \item \textbf{estable}, con coeficientes razonablemente consistentes entre folds;
+    \item \textbf{reproducible}, con experimentos reconstruibles por \texttt{run\_id};
+    \item \textbf{interpretable}, con trazabilidad de coeficientes y parámetros;
+    \item \textbf{comparable}, usando el mismo régimen de validación que el resto del stack.
+\end{enumerate}
+
+Es decir, Ridge no está aquí para maximizar una cifra aislada, sino para establecer un suelo científico robusto contra el cual juzgar mejoras de complejidad.
+
+\section{Entradas del módulo}
+
+El contrato de entrada debe quedar completamente definido. El módulo espera:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{features\_path}: dataset versionado de features;
+    \item \texttt{labels\_path}: dataset de targets continuos alineados temporalmente;
+    \item \texttt{splits\_path}: archivo con \emph{splits} temporales \emph{purged} y embargo si procede;
+    \item \texttt{config\_path}: configuración YAML del experimento;
+    \item \texttt{run\_id}: identificador único de la corrida;
+    \item selector de features o lista explícita de columnas, si no se usan todas.
+\end{itemize}
+
+\subsection{Validaciones previas obligatorias}
+
+Antes del entrenamiento, el módulo debe verificar:
+
+\begin{enumerate}[label=\arabic*)]
+    \item alineación exacta entre features y labels;
+    \item unicidad del índice lógico \((date, asset)\) o equivalente;
+    \item consistencia temporal de los \emph{splits};
+    \item presencia de todas las columnas requeridas;
+    \item ausencia de columnas completamente nulas o constantes en train;
+    \item ausencia de \texttt{NaN}/\texttt{inf} tras preprocesado;
+    \item cardinalidad suficiente en cada fold para entrenar y evaluar.
+\end{enumerate}
+
+Si alguna de estas condiciones falla, el entrenamiento debe abortar con error explícito y quedar registrado en \texttt{manifest.json}.
+
+\section{Preprocesado: reglas no negociables}
+
+Uno de los puntos donde una \emph{spec} mediocre se rompe es el preprocesado. En esta baseline, todo transformador estadístico debe ajustarse \textbf{solo con el conjunto de entrenamiento del fold}.
+
+\subsection{Pipeline por fold}
+
+Para cada fold externo, el pipeline recomendado es:
+
+\begin{enumerate}[label=\arabic*)]
+    \item seleccionar columnas válidas usando únicamente el train del fold;
+    \item imputar \emph{missing values} con parámetros aprendidos solo en train;
+    \item opcionalmente aplicar clipping o \emph{winsorization} robusta solo con estadísticas de train;
+    \item estandarizar las features usando parámetros del train;
+    \item entrenar Ridge sobre la matriz transformada;
+    \item aplicar el pipeline ya fijado al tramo externo del fold;
+    \item generar predicciones OOF para ese tramo.
+\end{enumerate}
+
+\subsection{Tratamiento de \emph{missing values}}
+
+La política de \emph{missingness} debe quedar cerrada en configuración y registrada en el manifiesto. Como mínimo, el módulo debe soportar:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item imputación por mediana de train;
+    \item imputación por cero solo cuando la semántica económica de la variable lo justifique;
+    \item descarte de variables cuya tasa de \emph{missingness} en train supere un umbral;
+    \item indicadores de missing opcionales, si se decide que aportan información.
+\end{itemize}
+
+Nunca debe usarse información del bloque de validación/test para estimar parámetros de imputación.
+
+\subsection{Estandarización}
+
+La estandarización no es un detalle cosmético. En Ridge, la magnitud de la penalización depende de la escala de las variables. La regla por defecto debe ser:
+
+\[
+X^{\text{std}}_j
+=
+\frac{X_j - \mu_j^{\text{train}}}{\sigma_j^{\text{train}}+\varepsilon},
+\]
+
+donde \(\mu_j^{\text{train}}\) y \(\sigma_j^{\text{train}}\) se calculan exclusivamente sobre el train del fold.
+
+Sin esta etapa:
+\begin{itemize}[leftmargin=1.5em]
+    \item \(\alpha\) deja de ser comparable entre columnas;
+    \item los coeficientes pierden interpretabilidad relativa;
+    \item la regularización puede castigar artificialmente más a unas variables que a otras por simple diferencia de unidades.
+\end{itemize}
+
+\section{Validación temporal \emph{purged}}
+
+\subsection{Justificación}
+
+En datos financieros temporales, muchas etiquetas se construyen a partir de ventanas futuras y muchas features usan ventanas móviles históricas. Si se usa CV estándar aleatoria, aparece fuga informacional de forma directa o indirecta. Por ello, la validación debe respetar:
+
+\begin{enumerate}[label=\arabic*)]
+    \item orden temporal;
+    \item \emph{purging} de observaciones con solapamiento informacional;
+    \item embargo opcional tras el bloque de test.
+\end{enumerate}
+
+\subsection{Definición operativa}
+
+Para cada fold \(k\):
+\begin{itemize}[leftmargin=1.5em]
+    \item se define un bloque temporal externo \(\mathcal{I}^{(k)}_{\text{test}}\);
+    \item el train \(\mathcal{I}^{(k)}_{\text{train}}\) excluye observaciones cuyo conjunto informacional se solape con el test;
+    \item opcionalmente se aplica un embargo temporal adicional posterior.
+\end{itemize}
+
+Formalmente:
+\[
+\mathcal{I}^{(k)}_{\text{train}}
+\cap
+\mathrm{InfoSet}\bigl(\mathcal{I}^{(k)}_{\text{test}}\bigr)
+=
+\varnothing.
+\]
+
+\subsection{Comparabilidad entre modelos}
+
+Los mismos \texttt{splits\_path} deben reutilizarse para Ridge, ElasticNet, modelos logísticos comparables y cualquier arquitectura más compleja. Si cada modelo usa una partición distinta, la comparación deja de ser científicamente limpia.
+
+\section{Selección de hiperparámetros}
+
+\subsection{Espacio de búsqueda}
+
+La configuración debe fijar explícitamente:
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{alpha\_grid}, idealmente en escala logarítmica;
+    \item o bien \texttt{alpha\_fixed} si se trata de una corrida totalmente determinada;
+    \item \texttt{fit\_intercept};
+    \item \texttt{standardize\_features};
+    \item \texttt{sample\_weight\_mode}, si procede.
+\end{itemize}
+
+Una \emph{grid} razonable puede cubrir varios órdenes de magnitud, por ejemplo:
+\[
+\alpha \in \{10^{-6},10^{-5},10^{-4},10^{-3},10^{-2},10^{-1},1,10,100\}.
+\]
+
+\subsection{Regla correcta de selección}
+
+La especificación debe dejar cerrado si \(\alpha\):
+\begin{enumerate}[label=\arabic*)]
+    \item se selecciona por fold mediante validación interna temporal sobre el train del fold externo; o
+    \item se fija globalmente antes del entrenamiento final de los folds externos.
+\end{enumerate}
+
+La recomendación institucional es:
+
+\begin{quote}
+\textbf{realizar tuning temporal interno dentro del train de cada fold externo, de forma que la selección de \(\alpha\) no vea nunca el bloque externo de validación/test.}
+\end{quote}
+
+Si por razones de simplicidad computacional se opta por un \(\alpha\) global, debe declararse explícitamente en el manifiesto.
+
+\subsection{Métrica principal y desempates}
+
+La \emph{spec} debe fijar una métrica primaria de selección:
+\[
+\texttt{selection\_metric} \in \{\texttt{rmse},\texttt{mae},\texttt{spearman\_ic}\}.
+\]
+
+Recomendación:
+\begin{itemize}[leftmargin=1.5em]
+    \item usar \texttt{spearman\_ic} como métrica principal si el uso downstream depende del ranking relativo;
+    \item usar RMSE o MAE como métrica principal si el target tiene interpretación numérica directa.
+\end{itemize}
+
+En caso de empate material entre varios valores de \(\alpha\), el módulo debe aplicar una regla explícita:
+\begin{enumerate}[label=\arabic*)]
+    \item preferir la solución más estable entre folds;
+    \item preferir la más parsimoniosa en norma efectiva;
+    \item evitar sobre-reaccionar a diferencias marginales no robustas;
+    \item opcionalmente aplicar una regla tipo \emph{one-standard-error}.
+\end{enumerate}
+
+\section{Sample weights}
+
+Éste es uno de los puntos que conviene cerrar y que en una spec floja suele quedar ambiguo.
+
+\subsection{Uso permitido}
+
+El módulo puede admitir \texttt{sample\_weight\_mode} para ponderar observaciones, por ejemplo:
+\begin{itemize}[leftmargin=1.5em]
+    \item pesos uniformes;
+    \item pesos por liquidez o volumen;
+    \item pesos inversamente proporcionales a volatilidad;
+    \item pesos por importancia temporal o cobertura del universo.
+\end{itemize}
+
+\subsection{Reglas metodológicas}
+
+Si se usan pesos:
+\begin{itemize}[leftmargin=1.5em]
+    \item deben calcularse sin fuga temporal;
+    \item deben quedar registrados en el manifiesto;
+    \item la métrica de selección debe ser consistente con el uso o no de esos pesos;
+    \item debe especificarse si las métricas reportadas son ponderadas o no ponderadas.
+\end{itemize}
+
+\subsection{Advertencia}
+
+Los pesos pueden mejorar la alineación económica del entrenamiento, pero también pueden distorsionar la interpretación de coeficientes y comparaciones entre corridas si no se documentan de forma rigurosa.
+
+\section{Métricas de evaluación}
+
+Las métricas deben registrarse por fold y de forma agregada a nivel \texttt{run\_id}.
+
+\subsection{Métricas predictivas}
+
+\paragraph{RMSE}
+\[
+\mathrm{RMSE}
+=
+\sqrt{
+\frac{1}{n}
+\sum_{i=1}^{n}(y_i-\hat{y}_i)^2
+}.
+\]
+
+\paragraph{MAE}
+\[
+\mathrm{MAE}
+=
+\frac{1}{n}
+\sum_{i=1}^{n}|y_i-\hat{y}_i|.
+\]
+
+\paragraph{Coeficiente de determinación}
+\[
+R^2
+=
+1
+-
+\frac{\sum_{i}(y_i-\hat{y}_i)^2}{\sum_i(y_i-\bar{y})^2}.
+\]
+
+\paragraph{Correlación lineal}
+\[
+\rho(y,\hat{y}) = \mathrm{Corr}(y,\hat{y}).
+\]
+
+\paragraph{Information Coefficient de Spearman}
+Cuando el uso natural del modelo sea ranking transversal por fecha, conviene añadir:
+\[
+\mathrm{IC}_{\mathrm{Spearman}} = \rho_s(\hat{y}, y).
+\]
+
+También es recomendable registrar:
+\begin{itemize}[leftmargin=1.5em]
+    \item media temporal del IC por fecha;
+    \item desviación estándar;
+    \item t-stat del IC medio, si procede.
+\end{itemize}
+
+\subsection{Métricas estructurales}
+
+Una spec institucional no debe quedarse solo en error predictivo. También debe medir estabilidad estructural.
+
+\paragraph{Norma de coeficientes}
+\[
+\|\hat{\beta}\|_2
+=
+\sqrt{\sum_{j=1}^{p}\hat{\beta}_j^2}.
+\]
+
+\paragraph{Dispersión entre folds}
+Para cada feature \(j\), puede definirse:
+\[
+\mathrm{CoefStd}_j
+=
+\operatorname{std}\left(\hat{\beta}^{(1)}_j,\dots,\hat{\beta}^{(K)}_j\right).
+\]
+
+\paragraph{Consistencia de signo}
+\[
+\mathrm{SignConsistency}_j
+=
+\frac{
+\left|
+\sum_{k=1}^{K}\operatorname{sign}(\hat{\beta}^{(k)}_j)\mathbf{1}\{|\hat{\beta}^{(k)}_j|>\tau\}
+\right|
+}{
+|\{k: |\hat{\beta}^{(k)}_j|>\tau\}|+\varepsilon
+}.
+\]
+
+Aunque Ridge no induce sparsidad exacta como ElasticNet, sigue siendo útil medir:
+\begin{itemize}[leftmargin=1.5em]
+    \item estabilidad de signo;
+    \item dispersión de magnitudes;
+    \item ranking medio de importancia absoluta.
+\end{itemize}
+
+\section{Interpretación de coeficientes}
+
+Los coeficientes de Ridge son interpretables solo bajo ciertas reglas:
+
+\begin{enumerate}[label=\arabic*)]
+    \item deben leerse sobre features escaladas;
+    \item no deben interpretarse causalmente;
+    \item en presencia de grupos correlacionados, el peso puede repartirse entre variables relacionadas;
+    \item la interpretación debe apoyarse en estabilidad entre folds, no en una sola estimación puntual.
+\end{enumerate}
+
+Por ello, el módulo debe exportar tablas de coeficientes por fold y resúmenes agregados de persistencia y estabilidad.
+
+\section{Artefactos de salida}
+
+Por cada \texttt{run\_id}, el módulo debe persistir una estructura completa y auditable.
+
+\subsection{Modelos por fold}
+
+\[
+\texttt{models/artifacts/baselines/ridge/\{run\_id\}/fold\_\{k\}/model.pkl}
+\]
+
+Cada artefacto debe incluir:
+\begin{itemize}[leftmargin=1.5em]
+    \item modelo ajustado;
+    \item pipeline de preprocesado;
+    \item lista exacta de features usadas;
+    \item valor final de \(\alpha\);
+    \item política de sample weights, si aplica;
+    \item metadatos de versión relevantes.
+\end{itemize}
+
+\subsection{Predicciones OOF}
+
+\[
+\texttt{models/predictions/baselines/ridge/\{run\_id\}/oof.parquet}
+\]
+
+Debe contener, al menos:
+\begin{itemize}[leftmargin=1.5em]
+    \item índice temporal y activo;
+    \item target real;
+    \item predicción OOF;
+    \item fold de procedencia;
+    \item timestamp lógico del experimento;
+    \item hiperparámetro usado en ese fold.
+\end{itemize}
+
+\subsection{Coeficientes}
+
+\[
+\texttt{models/reports/baselines/ridge/\{run\_id\}/coefficients.parquet}
+\]
+
+Debe incluir:
+\begin{itemize}[leftmargin=1.5em]
+    \item feature;
+    \item fold;
+    \item coeficiente;
+    \item magnitud absoluta;
+    \item ranking por fold;
+    \item estadísticas agregadas entre folds si se genera tabla consolidada.
+\end{itemize}
+
+\subsection{Resumen de métricas}
+
+\[
+\texttt{models/reports/baselines/ridge/\{run\_id\}/metrics\_summary.json}
+\]
+
+Debe incluir:
+\begin{itemize}[leftmargin=1.5em]
+    \item métricas por fold;
+    \item medias, medianas y dispersión;
+    \item valor(es) seleccionados de \(\alpha\);
+    \item métricas estructurales de coeficientes;
+    \item cobertura efectiva y número de observaciones por fold.
+\end{itemize}
+
+\subsection{Manifiesto}
+
+\[
+\texttt{models/reports/baselines/ridge/\{run\_id\}/manifest.json}
+\]
+
+Debe actuar como contrato de auditoría del experimento e incluir:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{run\_id};
+    \item rutas de entrada;
+    \item hashes/versiones de datasets si existen;
+    \item configuración completa;
+    \item política de imputación;
+    \item política de escalado;
+    \item política de sample weights;
+    \item criterio de selección de \(\alpha\);
+    \item número de folds;
+    \item purging y embargo;
+    \item timestamp;
+    \item versión de dependencias;
+    \item estado final de la corrida.
+\end{itemize}
+
+\section{Flujo de ejecución de alto nivel}
+
+El flujo correcto del módulo debe ser:
+
+\begin{enumerate}[label=\arabic*)]
+    \item cargar features, labels, \emph{splits} y configuración;
+    \item validar integridad, tipos y alineación;
+    \item para cada fold externo:
+    \begin{enumerate}[label=\roman*)]
+        \item separar train y test externo;
+        \item ajustar imputación y escalado solo en train;
+        \item ejecutar tuning temporal interno de \(\alpha\), si está habilitado;
+        \item reentrenar el modelo final del fold;
+        \item generar predicciones OOF del bloque externo;
+        \item guardar artefactos del fold y coeficientes.
+    \end{enumerate}
+    \item consolidar OOF global;
+    \item consolidar métricas predictivas y estructurales;
+    \item escribir \texttt{metrics\_summary.json} y \texttt{manifest.json};
+    \item finalizar con éxito solo si todos los artefactos críticos han sido persistidos.
+\end{enumerate}
+
+\section{Buenas prácticas obligatorias}
+
+\subsection{No fuga de información}
+
+Está prohibido:
+\begin{itemize}[leftmargin=1.5em]
+    \item imputar usando estadísticas globales;
+    \item escalar con información del test externo;
+    \item seleccionar \(\alpha\) mirando resultados OOF externos;
+    \item mezclar folds o horizontes de label sin declararlo explícitamente.
+\end{itemize}
+
+\subsection{Reproducibilidad}
+
+Toda ejecución debe poder reconstruirse a nivel de:
+\begin{itemize}[leftmargin=1.5em]
+    \item datos de entrada;
+    \item configuración;
+    \item \emph{splits};
+    \item tuning;
+    \item artefactos serializados;
+    \item métricas agregadas.
+\end{itemize}
+
+\subsection{Calidad mínima del pipeline}
+
+El módulo debe fallar si:
+\begin{itemize}[leftmargin=1.5em]
+    \item faltan columnas esenciales;
+    \item el preprocesado produce \texttt{NaN}/\texttt{inf};
+    \item existe algún fold inválido o vacío;
+    \item no pueden persistirse los artefactos críticos.
+\end{itemize}
+
+\section{Por qué esta baseline es valiosa}
+
+Ridge ocupa una posición especialmente útil dentro del stack:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item frente a OLS, reduce fragilidad paramétrica;
+    \item frente a ElasticNet, ofrece una solución más suave y estable cuando no interesa inducir sparsidad agresiva;
+    \item frente a GBDT o redes, establece una referencia lineal rápida, interpretable y difícil de sobre-explicar;
+    \item como baseline institucional, obliga al sistema a ser riguroso en validación temporal, preprocesado y gobernanza experimental.
+\end{itemize}
+
+En un entorno cuantitativo serio, esa función de “control limpio” es extremadamente valiosa: impide confundir complejidad con mejora real.
+
+\section{Criterios de aceptación}
+
+El módulo debe considerarse correctamente implementado solo si:
+
+\begin{enumerate}[label=\arabic*)]
+    \item todos los folds externos son temporalmente válidos y \emph{purged};
+    \item el preprocesado es estrictamente \emph{train-only};
+    \item la selección de \(\alpha\) está completamente documentada;
+    \item las predicciones OOF están persistidas y auditables;
+    \item existen métricas por fold y agregadas;
+    \item los coeficientes y su estabilidad pueden analizarse;
+    \item el manifiesto permite reconstruir la corrida completa;
+    \item la comparación con otros modelos puede realizarse en igualdad metodológica.
+\end{enumerate}
+
+\section{Conclusión}
+
+\texttt{train\_ridge.py} no debe entenderse como un simple ajuste de regresión lineal regularizada, sino como una \textbf{baseline continua institucional} para el sistema de \emph{small-cap swing trading}. Su valor reside en ofrecer una referencia científicamente limpia, operativamente reproducible y estructuralmente interpretable frente a la cual juzgar cualquier ganancia de complejidad posterior.
+
+Cuando esta baseline está bien especificada, aporta mucho más que una métrica: aporta disciplina experimental. Obliga a cerrar correctamente el preprocesado, la validación temporal, la selección de hiperparámetros, la persistencia de artefactos y la interpretación de coeficientes. Y en un stack cuantitativo serio, esa disciplina vale tanto como el propio modelo.
 \end{document}

@@ -1,137 +1,516 @@
 \documentclass[11pt,a4paper]{article}
+
 \usepackage[utf8]{inputenc}
 \usepackage[spanish]{babel}
-\usepackage{amsmath, amssymb, amssymb, amsthm}
-\usepackage{amsfonts}
+\usepackage{amsmath,amssymb,amsthm,amsfonts}
 \usepackage{graphicx}
 \usepackage{hyperref}
 \usepackage{booktabs}
 \usepackage{siunitx}
-\usepackage{natbib}
-\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue}
+\usepackage{array}
+\usepackage{geometry}
+\geometry{margin=2.5cm}
 
-\title{Estimación de Capacidad Operable para Estrategias de Swing Trading: Módulo \texttt{portfolio/capacity.py}}
-\author{Análisis Técnico Cuantitativo}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\title{Especificación Operativa de Capacidad para Estrategias de Swing Trading\\
+\large Módulo \texttt{portfolio/capacity.py}}
+\author{Quantitative Research Specification}
 \date{Marzo 2026}
 
 \begin{document}
 
 \maketitle
-
 \tableofcontents
 \newpage
 
-\section{Introducción}
+\section{Objetivo del módulo}
 
-El módulo \texttt{portfolio/capacity.py} tiene como objetivo principal estimar la \emph{capacidad operable} (AUM máximo razonable) de una estrategia de swing trading cuantitativa, considerando restricciones clave de liquidez, rotación de cartera (turnover), impacto de mercado y concentración de posiciones. 
+El módulo \texttt{portfolio/capacity.py} estima la \emph{capacidad operable} de la estrategia, entendida como el mayor nivel de AUM para el cual la estrategia sigue siendo ejecutable sin violar restricciones de liquidez, participación de mercado, días para liquidar y degradación mínima aceptable del retorno neto.
 
-En el contexto de swing trading, donde las posiciones se mantienen típicamente de días a semanas, la capacidad es crítica porque el universo de activos (probablemente mid/small caps o activos con liquidez moderada) limita rápidamente la escalabilidad sin degradar el alpha neto por fricciones de ejecución. Este análisis formaliza la estimación de degradación esperada del retorno neto al escalar el notional bajo escenarios de AUM crecientes, generando una recomendación accionable de \texttt{capacity\_limit}.
-
-El enfoque sigue las mejores prácticas de la industria cuantitativa, como las descritas en \citet{kissell2006optimal} para modelado de costes de transacción y \citet{lprado2018advances} para validación de capacidad en estrategias de frecuencia media.
-
-\section{Estado del Arte: Capacidad en Trading Cuantitativo}
-
-\subsection{Libros y Referencias Industriales}
-- \textbf{Algorithmic Trading and DMA} (Kissell, 2010/2020): Marco completo para modelado de impacto temporal y permanente, participación de mercado y días para liquidar (DTL).
-- \textbf{Advances in Financial Machine Learning} (López de Prado, 2018): Capítulos sobre backtesting robusto, incluyendo capacity estimation vía Monte Carlo y degradación por slippage.
-- \textbf{Quantitative Trading} (Chan, 2021): Discusión práctica de turnover y liquidez en estrategias de swing/mean-reversion.
-- \textbf{Quantitative Equity Portfolio Management} (Gauder y Pedersen, 2021): Modelos de optimización con constraints de liquidez y concentración.
-
-\subsection{Papers Académicos Relevantes}
-- \citet{almgren2005optimal}: Modelo clásico de impacto de mercado $\mathrm{Impact} = Y \cdot \sigma \cdot \sqrt{V} \cdot N^{-\eta}$, donde $Y$ es coeficiente de impacto, $\sigma$ volatilidad, $V$ volumen, $N$ órdenes.
-- \citet{buhler2011optimal}: Estimación de capacidad vía participación óptima y DTL.
-- \citet{kyle1985continuous}: Foundation teórica del impacto permanente vs. temporal.
-- Estado del arte reciente: \citet{stockformer2024} (StockFormer) integra STL decomposition para swing trading, con extensiones a capacity vía reinforcement learning en \citet{reinforce2022}.
-
-En industria (Renaissance, Two Sigma, DE Shaw), capacity se estima simulando fills realistas con modelos de mercado microstructure (Avellaneda-Stoikov, etc.).
-
-\section{Formulación Matemática}
-
-\subsection{Definiciones Clave}
-Sea $\mathcal{P}_t$ el portfolio en tiempo $t$, con posiciones $w_i$ (pesos), universo $\mathcal{U}$.
-
-- \textbf{AUM Escenario}: $A_k = k \cdot A_0$, $k \in [0.5, 5]$, escalado desde baseline $A_0$.
-- \textbf{Participación de Mercado} (Participation Rate): 
-  \[
-  \mathrm{Part}_t = \frac{\mathrm{OrderSize}_t}{\mathrm{ADV}_i} \leq \mathrm{PartCap}_{p95} \quad (p95 \text{ percentil})
-  \]
-  donde $\mathrm{ADV}_i$ es Average Daily Volume del activo $i$.
-- \textbf{Días para Liquidar} (DTL):
-  \[
-  \mathrm{DTL}_{p95} = \frac{\sum_i |w_i| \cdot A}{\sum_i \mathrm{ADV}_i \cdot \mathrm{PartCap}} \leq \mathrm{MaxDTL}
-  \]
-- \textbf{Coste Estimado} (bps):
-  \[
-  \mathrm{CostBPS} = \mathrm{SpreadCost} + \mathrm{MarketImpact} + \mathrm{Other}
-  \]
-  \[
-  \mathrm{Impact} = \eta \cdot \mathrm{Part}^\gamma \cdot \mathrm{ADV}^\delta, \quad \gamma \approx 0.5
-  \]
-  Modelo Almgren-Chriss adaptado \citep{almgren2005optimal}.
-- \textbf{Retorno Neto Estimado}:
-  \[
-  r_{\mathrm{net},k} = r_{\mathrm{gross},0} - f(\mathrm{Turnover}_k, \mathrm{CostBPS}_k)
-  \]
-  donde $f(\cdot)$ es función de degradación (lineal o convexa).
-
-\subsection{Reglas de Decisión}
-El límite de capacidad se define como:
+La salida del módulo no es una opinión cualitativa sobre si la estrategia ``escala bien'', sino una decisión operativa reproducible:
 \[
-\mathrm{CapLimit} = \max \{ A_k \mid \mathrm{Part}_{p95,k} \leq c_p, \, \mathrm{DTL}_{p95,k} \leq d_{\max}, \, r_{\mathrm{net},k} \geq \theta_r, \, \mathrm{CostBPS}_k \leq c_{\mathrm{bps}} \}
+\texttt{capacity\_limit} = \max \{ A_k \in \mathcal{A} \;:\; \text{todas las reglas duras se satisfacen} \}.
 \]
 
-\section{Implementación Algorítmica: Flujo del Módulo}
+Este módulo \textbf{no} reentrena señales, \textbf{no} modifica el universo y \textbf{no} rediseña el rebalanceo. Su función es estrictamente medir cuánto capital puede absorber la estrategia \emph{manteniendo fijo} el comportamiento observado o simulado del pipeline de portfolio/execution.
 
-El proceso sigue el flujo descrito en el .txt:
+\section{Alcance y principios de diseño}
+
+La estimación de capacidad se construye bajo cuatro principios:
 
 \begin{enumerate}
-\item \textbf{Carga de Datos}: Baseline backtest (posiciones históricas), liquidez (ADV, spreads), config (escenarios $A_k$, umbrales).
-\item \textbf{Escalado}: Para cada $k$, $\mathbf{w}_k = k \cdot \mathbf{w}_0$, órdenes escaladas proporcionalmente.
-\item \textbf{Recálculo de Métricas}:
-   - Simular fills con modelo de impacto.
-   - Computar percentil 95 de Part y DTL sobre ventana histórica.
-   - Estimar $\mathrm{CostBPS}_k$ vía regresión o lookup.
-   - $r_{\mathrm{net},k} = r_{\mathrm{gross}} \cdot (1 - \mathrm{CostBPS}_k / 10000)$.
-\item \textbf{Decisión}: Buscar max $A_k$ que cumpla reglas.
-\item \textbf{Persistencia}: Parquet con escenarios, JSON con summary y límite.
+    \item \textbf{Point-in-time:} toda métrica de liquidez, spread, volatilidad y universo debe ser PIT en cada fecha de rebalanceo.
+    \item \textbf{Condicionalidad:} la capacidad se estima \emph{condicional a} la lógica actual de selección, sizing, constraints, rebalanceo y ejecución.
+    \item \textbf{Monotonicidad:} al aumentar el AUM, las métricas de fricción no pueden mejorar estructuralmente; si el ruido empírico genera pequeñas no monotonicidades, se regularizan antes de decidir.
+    \item \textbf{Separación de responsabilidades:} \texttt{capacity.py} mide escalabilidad; no sustituye a \texttt{rebalance.py}, \texttt{execution/impact.py} ni \texttt{optimizer.py}.
 \end{enumerate}
 
-Dependencias implícitas: Pandas para datos, NumPy para vectorización, posiblemente SciPy para percentilos y optimización.
+\section{Contrato exacto del módulo}
 
-\section{Backtest y Validaciones}
+\subsection{Entradas obligatorias}
 
-\subsection{Métricas de Capacidad}
-Para un backtest baseline con $A_0$, simular forward:
+El módulo recibe las siguientes entradas ya construidas por etapas anteriores del sistema:
 
-| Escenario | AUM (\$M) | Part p95 (\%) | DTL p95 (días) | Cost BPS | Net Return (\%) | Breach |
-|-----------|-----------|---------------|----------------|----------|-----------------|--------|
-| 1         | 10        | 5.2           | 1.8            | 2.1      | 12.3            | No     |
-| 2         | 50        | 12.4          | 3.2            | 5.8      | 9.1             | Sí     |
+\subsubsection*{1. Tape histórico de rebalanceos}
+Un \texttt{DataFrame} o \texttt{Parquet} con una fila por activo y fecha de rebalanceo, con columnas mínimas:
 
-Validaciones:
-- Monotonía: $\partial \mathrm{Cost}/\partial A > 0$.
-- Consistencia: $\mathrm{CapLimit} \geq A_0$.
-- Sanity: No huecos en escenarios.
+\begin{center}
+\begin{tabular}{>{\ttfamily}m{4.0cm} m{9.2cm}}
+\toprule
+\textnormal{Campo} & \textnormal{Descripción} \\
+\midrule
+date & Fecha de rebalanceo \\
+asset\_id & Identificador único del activo \\
+price & Precio ejecutable o precio de referencia \\
+w\_current & Peso antes del rebalanceo \\
+w\_target & Peso objetivo tras optimizer / constraints \\
+delta\_w & Cambio de peso, \( \Delta w_{i,t} = w^{\text{target}}_{i,t} - w^{\text{current}}_{i,t} \) \\
+abs\_delta\_w & \( |\Delta w_{i,t}| \) \\
+w\_post & Peso final tras reglas de rebalanceo efectivas \\
+\bottomrule
+\end{tabular}
+\end{center}
 
-\subsection{Esquema de Validación Robusta}
-- Walk-forward: Reentrenar liquidez cada 6 meses.
-- Stress test: Escenarios de baja liquidez (vol crisis).
-- Monte Carlo: Variabilidad en ADV $\sim \log\mathcal{N}$.
+\subsubsection*{2. Datos de liquidez PIT}
+Para cada activo y fecha:
 
-\section{Mejoras y Extensiones al Estado del Arte}
+\begin{center}
+\begin{tabular}{>{\ttfamily}m{4.0cm} m{9.2cm}}
+\toprule
+\textnormal{Campo} & \textnormal{Descripción} \\
+\midrule
+adv\_usd & Average Daily Dollar Volume usable en USD \\
+spread\_bps & Spread efectivo estimado en bps \\
+vol\_20d & Volatilidad histórica reciente \\
+tradable\_flag & Indicador de activo elegible para trading \\
+halt\_flag & Indicador de suspensión / no negociable \\
+\bottomrule
+\end{tabular}
+\end{center}
 
-1. **Modelo de Impacto Avanzado**: Integrar Avellaneda-Stoikov (2019) para HFT-adaptado a swing:
-   \[
-   r(s,q) = \frac{1}{2} \gamma \sigma^2 T + \frac{1}{\gamma} \log\left(1 + \gamma \frac{q}{k}\right)
-   \]
-2. **Optimización Dinámica**: Usar QP con constraints de liquidez (CVXPY).
-3. **ML para Predicción de Liquidez**: LSTM/Transformer sobre LOB data \citep{stockformer2024}.
-4. **Incorporar Eventos**: Ajustes por earnings, macro.
-5. **Capacity Dinámica**: Recalcular mensualmente con live fills.
+\subsubsection*{3. Configuración}
+Archivo \texttt{YAML/JSON} con parámetros de capacidad:
 
-Esto eleva el módulo a nivel industrial, comparable a fondos quant top-tier.
+\begin{itemize}
+    \item \texttt{aum\_reference}
+    \item \texttt{scenario\_multipliers}
+    \item \texttt{usable\_adv\_fraction}
+    \item \texttt{participation\_cap\_p95}
+    \item \texttt{trade\_dtl\_cap\_p95}
+    \item \texttt{position\_dtl\_cap\_p95}
+    \item \texttt{max\_single\_name\_participation}
+    \item \texttt{impact\_eta}
+    \item \texttt{impact\_gamma}
+    \item \texttt{fee\_bps}
+    \item \texttt{min\_return\_retention}
+    \item \texttt{min\_net\_return}
+\end{itemize}
 
-\bibliographystyle{plainnat}
-\bibliography{refs} % Asume refs.bib con las citas
+\subsection{Salidas obligatorias}
+
+El módulo persiste dos artefactos:
+
+\subsubsection*{1. Tabla de escenarios}
+Un \texttt{Parquet} con una fila por escenario \(A_k\), incluyendo como mínimo:
+
+\begin{center}
+\begin{tabular}{>{\ttfamily}m{4.8cm} m{8.4cm}}
+\toprule
+\textnormal{Campo} & \textnormal{Descripción} \\
+\midrule
+scenario\_id & Identificador del escenario \\
+aum & AUM del escenario \\
+multiplier & Multiplicador sobre \(A_{\mathrm{ref}}\) \\
+part\_p50 / part\_p95 / part\_max & Participación agregada \\
+trade\_dtl\_p95 / trade\_dtl\_max & Días para ejecutar órdenes \\
+position\_dtl\_p95 / position\_dtl\_max & Días para liquidar posiciones \\
+avg\_cost\_bps & Coste medio por dólar negociado \\
+annualized\_cost\_bps & Coste anualizado por turnover \\
+net\_return & Retorno neto estimado \\
+return\_retention & Retención relativa frente al baseline \\
+hard\_pass & Indicador de cumplimiento de reglas duras \\
+breach\_reason & Primera causa de violación \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection*{2. Resumen JSON}
+Debe contener, como mínimo:
+
+\begin{itemize}
+    \item \texttt{capacity\_limit}
+    \item \texttt{capacity\_multiplier}
+    \item \texttt{baseline\_feasible}
+    \item \texttt{first\_breach\_scenario}
+    \item \texttt{first\_breach\_metric}
+    \item \texttt{config\_hash}
+    \item \texttt{data\_window}
+    \item \texttt{created\_utc}
+\end{itemize}
+
+\section{Supuestos no negociables}
+
+La estimación de capacidad es válida solo bajo los siguientes supuestos:
+
+\begin{enumerate}
+    \item Los pesos objetivo por fecha provienen del pipeline real de la estrategia.
+    \item El turnover porcentual de la estrategia no cambia estructuralmente al escalar el AUM; lo que cambia es el tamaño monetario de las órdenes.
+    \item La liquidez utilizable de cada activo se aproxima por una fracción estable de su \(ADV\) PIT.
+    \item El modelo de impacto es parsimonioso y monotónico; si en el futuro se mejora, debe conservar interfaz y semántica.
+\end{enumerate}
+
+En consecuencia, este módulo \textbf{no} incorpora en su versión base ni LSTM, ni reinforcement learning, ni modelos de microestructura de alta frecuencia. Esas extensiones pueden existir como módulos separados, pero no forman parte del contrato mínimo necesario para una estimación robusta y reproducible de capacidad.
+
+\section{Definiciones matemáticas}
+
+\subsection{Escenarios de AUM}
+
+Sea \(A_{\mathrm{ref}}\) el AUM de referencia del backtest base y sea
+\[
+\mathcal{M} = \{m_1, m_2, \dots, m_K\}
+\]
+el conjunto ordenado de multiplicadores. Entonces:
+\[
+A_k = m_k \, A_{\mathrm{ref}}, \qquad k = 1,\dots,K.
+\]
+
+\subsection{Tamaño monetario de orden}
+
+Para cada activo \(i\) y fecha de rebalanceo \(t\), el tamaño monetario absoluto de orden bajo el escenario \(A_k\) es:
+\[
+q_{i,t}(A_k) = A_k \, |\Delta w_{i,t}|.
+\]
+
+Si una etapa previa de rebalanceo ha aplicado thresholds, lotes o skipping, el módulo debe usar la orden \emph{efectivamente rebalanceada}, no la orden teórica previa.
+
+\subsection{Liquidez utilizable}
+
+Definimos la liquidez utilizable del activo \(i\) en \(t\) como:
+\[
+L_{i,t} = \phi \cdot ADV_{i,t}^{USD},
+\]
+donde \(0 < \phi \leq 1\) es la fracción de \(ADV\) que el sistema considera razonablemente accesible sin asumir un comportamiento irreal de ejecución.
+
+\subsection{Participación de mercado}
+
+La participación de mercado por orden es:
+\[
+\pi_{i,t}(A_k) = \frac{q_{i,t}(A_k)}{L_{i,t}}.
+\]
+
+La métrica primaria de control es el percentil 95 agregado sobre todas las observaciones válidas:
+\[
+\pi_{p95}(A_k) = \mathrm{Percentil}_{95}\left( \{\pi_{i,t}(A_k)\}_{i,t} \right).
+\]
+
+\subsection{Días para ejecutar órdenes}
+
+Definimos los días para completar una orden rebalanceada como:
+\[
+DTL^{\mathrm{trade}}_{i,t}(A_k) = \frac{q_{i,t}(A_k)}{L_{i,t}}.
+\]
+
+Obsérvese que, bajo esta parametrización, participación y días para ejecutar quedan relacionados por la unidad temporal implícita del \(ADV\) diario. En implementación, se reportan ambos porque responden a restricciones operativas distintas.
+
+\subsection{Días para liquidar posiciones}
+
+Para medir riesgo de salida de cartera, definimos:
+\[
+DTL^{\mathrm{pos}}_{i,t}(A_k) = \frac{A_k \, |w^{\mathrm{post}}_{i,t}|}{L_{i,t}}.
+\]
+
+La métrica relevante vuelve a ser el percentil 95:
+\[
+DTL^{\mathrm{trade}}_{p95}(A_k), \qquad DTL^{\mathrm{pos}}_{p95}(A_k).
+\]
+
+\subsection{Modelo de coste de ejecución}
+
+El coste total por orden, en bps, se define como:
+\[
+c_{i,t}(A_k) = c^{\mathrm{spread}}_{i,t} + c^{\mathrm{fees}}_{i,t} + c^{\mathrm{impact}}_{i,t}(A_k),
+\]
+donde:
+\[
+c^{\mathrm{spread}}_{i,t} = \frac{1}{2}\,\mathrm{spread\_bps}_{i,t},
+\]
+\[
+c^{\mathrm{fees}}_{i,t} = \mathrm{fee\_bps},
+\]
+\[
+c^{\mathrm{impact}}_{i,t}(A_k) = \eta \cdot \pi_{i,t}(A_k)^{\gamma},
+\qquad \eta > 0,\ \gamma \in [0.5,1].
+\]
+
+El coste medio por dólar negociado en el escenario \(A_k\) es:
+\[
+\overline{c}(A_k)
+=
+\frac{\sum_{t}\sum_{i} q_{i,t}(A_k)\, c_{i,t}(A_k)}
+{\sum_{t}\sum_{i} q_{i,t}(A_k)}.
+\]
+
+\subsection{Coste anualizado y retorno neto}
+
+Sea \(TO_{\mathrm{ann}}\) el turnover anualizado del baseline, definido de forma consistente con \texttt{rebalance.py}. El drag anualizado por transacción es:
+\[
+C_{\mathrm{ann}}(A_k) = TO_{\mathrm{ann}} \cdot \overline{c}(A_k).
+\]
+
+Si \(r^{\mathrm{gross}}_{\mathrm{ann}}\) es el retorno bruto anualizado de referencia, el retorno neto estimado del escenario es:
+\[
+r^{\mathrm{net}}_{\mathrm{ann}}(A_k)
+=
+r^{\mathrm{gross}}_{\mathrm{ann}}
+-
+\frac{C_{\mathrm{ann}}(A_k)}{10^4}.
+\]
+
+Adicionalmente, definimos la retención relativa del retorno:
+\[
+\rho(A_k) =
+\frac{r^{\mathrm{net}}_{\mathrm{ann}}(A_k)}
+{r^{\mathrm{net}}_{\mathrm{ann}}(A_{\mathrm{ref}})}.
+\]
+
+\section{Reglas de decisión}
+
+Un escenario \(A_k\) es \emph{factible} si y solo si satisface simultáneamente:
+
+\[
+\pi_{p95}(A_k) \leq \pi_{\max}^{p95},
+\]
+\[
+DTL^{\mathrm{trade}}_{p95}(A_k) \leq d^{\mathrm{trade}}_{\max},
+\]
+\[
+DTL^{\mathrm{pos}}_{p95}(A_k) \leq d^{\mathrm{pos}}_{\max},
+\]
+\[
+\max_{i,t}\pi_{i,t}(A_k) \leq \pi^{\mathrm{single}}_{\max},
+\]
+\[
+r^{\mathrm{net}}_{\mathrm{ann}}(A_k) \geq r^{\mathrm{net}}_{\min},
+\]
+\[
+\rho(A_k) \geq \rho_{\min}.
+\]
+
+Por tanto:
+\[
+\texttt{capacity\_limit}
+=
+\max \left\{ A_k \in \mathcal{A} \;:\; A_k \text{ es factible} \right\}.
+\]
+
+\subsection{Precedencia de reglas}
+
+La precedencia es estricta:
+
+\begin{enumerate}
+    \item \textbf{Validez de datos}
+    \item \textbf{Reglas duras de liquidez y participación}
+    \item \textbf{Reglas duras de retorno neto}
+    \item \textbf{Criterios blandos de reporting}
+\end{enumerate}
+
+Si falla una regla de nivel superior, las inferiores no pueden rescatar el escenario.
+
+\section{Algoritmo exacto del módulo}
+
+\subsection{Paso 1. Validación de inputs}
+
+Antes de simular escenarios, el módulo debe comprobar:
+
+\begin{itemize}
+    \item ausencia de duplicados por \texttt{(date, asset\_id)},
+    \item existencia de todas las columnas obligatorias,
+    \item \(ADV_{i,t}^{USD} > 0\) para toda observación operable,
+    \item \(\mathrm{spread\_bps}_{i,t} \geq 0\),
+    \item \(|w^{\mathrm{post}}_{i,t}| \leq 1\) y coherencia con el output previo de portfolio,
+    \item orden estricto creciente de \texttt{scenario\_multipliers}.
+\end{itemize}
+
+Si falta liquidez o spread para un activo operable, la observación se marca como inválida. Si el porcentaje de notional inválido supera el umbral configurado, el módulo debe abortar con error y no inferir capacidad.
+
+\subsection{Paso 2. Construcción de escenarios}
+
+Para cada \(A_k\):
+
+\begin{enumerate}
+    \item escalar el notional de cada orden:
+    \[
+    q_{i,t}(A_k)=A_k|\Delta w_{i,t}|;
+    \]
+    \item recalcular \( \pi_{i,t}(A_k) \), \(DTL^{\mathrm{trade}}_{i,t}(A_k)\) y \(DTL^{\mathrm{pos}}_{i,t}(A_k)\);
+    \item calcular \(c_{i,t}(A_k)\) y \(\overline{c}(A_k)\);
+    \item obtener \(C_{\mathrm{ann}}(A_k)\), \(r^{\mathrm{net}}_{\mathrm{ann}}(A_k)\) y \(\rho(A_k)\);
+    \item agregar percentiles y máximos.
+\end{enumerate}
+
+\subsection{Paso 3. Regularización monotónica}
+
+Dado que el ruido muestral puede generar pequeñas violaciones de monotonicidad, antes de aplicar reglas finales el módulo debe imponer:
+
+\[
+\pi_{p95}(A_{k+1}) \geq \pi_{p95}(A_k),
+\]
+\[
+DTL^{\mathrm{trade}}_{p95}(A_{k+1}) \geq DTL^{\mathrm{trade}}_{p95}(A_k),
+\]
+\[
+DTL^{\mathrm{pos}}_{p95}(A_{k+1}) \geq DTL^{\mathrm{pos}}_{p95}(A_k),
+\]
+\[
+\overline{c}(A_{k+1}) \geq \overline{c}(A_k).
+\]
+
+En implementación, esto puede hacerse mediante \emph{cumulative max} sobre métricas agregadas o mediante una regularización isotónica equivalente. La decisión de capacidad debe tomarse \emph{después} de esta regularización, no antes.
+
+\subsection{Paso 4. Evaluación de factibilidad}
+
+Para cada escenario, el módulo genera:
+
+\begin{itemize}
+    \item \texttt{hard\_pass = True/False},
+    \item \texttt{breach\_reason},
+    \item \texttt{first\_breach\_metric},
+    \item \texttt{first\_breach\_value},
+    \item \texttt{first\_breach\_threshold}.
+\end{itemize}
+
+\subsection{Paso 5. Selección del límite}
+
+La regla de selección es conservadora:
+
+\begin{enumerate}
+    \item si el escenario baseline ya es infactible, entonces
+    \[
+    \texttt{baseline\_feasible} = \texttt{False},
+    \]
+    y el módulo devuelve \texttt{capacity\_limit = null};
+    \item si el baseline es factible, se toma el mayor escenario factible \emph{contiguo} hacia arriba;
+    \item una vez aparece el primer fallo tras la regularización monotónica, todos los escenarios superiores quedan descartados por construcción.
+\end{enumerate}
+
+\section{Parámetros por defecto}
+
+Hasta disponer de calibración empírica interna, los defaults del módulo deben ser conservadores y explícitos:
+
+\begin{center}
+\begin{tabular}{m{7.2cm} m{5.0cm}}
+\toprule
+\textnormal{Parámetro} & \textnormal{Default} \\
+\midrule
+\texttt{scenario\_multipliers} & \(\{0.50, 0.75, 1.00, 1.25, 1.50, 2.00, 3.00, 4.00, 5.00\}\) \\
+\texttt{usable\_adv\_fraction} & \(0.10\) \\
+\texttt{participation\_cap\_p95} & \(10\%\) \\
+\texttt{trade\_dtl\_cap\_p95} & \(1.0\) día \\
+\texttt{position\_dtl\_cap\_p95} & \(5.0\) días \\
+\texttt{max\_single\_name\_participation} & \(20\%\) \\
+\texttt{impact\_gamma} & \(0.50\) \\
+\texttt{fee\_bps} & \(1.0\) bps \\
+\texttt{min\_return\_retention} & \(0.80\) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Estos defaults no son ``verdades del mercado''; son puntos de partida controlados. Toda calibración posterior debe poder trazarse y versionarse.
+
+\section{Integración con el resto del sistema}
+
+\subsection{Dependencias aguas arriba}
+
+\texttt{capacity.py} depende directamente de:
+
+\begin{itemize}
+    \item \texttt{portfolio/rebalance.py}: para órdenes efectivas y turnover consistente;
+    \item \texttt{execution/*}: para el modelo de coste y fill assumptions;
+    \item \texttt{backtest/*}: para el retorno bruto anualizado baseline;
+    \item \texttt{data/liquidity/*}: para \(ADV\), spreads y flags PIT.
+\end{itemize}
+
+\subsection{Semántica de integración}
+
+El módulo \textbf{no} debe reestimar por su cuenta cantidades que ya tienen definición canónica en el sistema. En particular:
+
+\begin{itemize}
+    \item el turnover debe venir definido exactamente igual que en rebalance/backtest;
+    \item los pesos post-rebalance deben coincidir con los usados para medir performance;
+    \item el modelo de coste debe compartir parámetros con execution, salvo override explícito y trazado.
+\end{itemize}
+
+\section{Invariantes que siempre deben cumplirse}
+
+Tras ejecutar el módulo, deben cumplirse los siguientes invariantes:
+
+\begin{enumerate}
+    \item \(A_{k+1} > A_k\) para todo \(k\),
+    \item \(\pi_{p95}(A_k) \geq 0\),
+    \item \(DTL^{\mathrm{trade}}_{p95}(A_k) \geq 0\),
+    \item \(DTL^{\mathrm{pos}}_{p95}(A_k) \geq 0\),
+    \item \(\overline{c}(A_k) \geq 0\),
+    \item tras regularización, las métricas de fricción son no decrecientes en \(A_k\),
+    \item si \texttt{hard\_pass=False} para un escenario, entonces \texttt{capacity\_limit} no puede seleccionarlo.
+\end{enumerate}
+
+\section{Tests mínimos obligatorios}
+
+El módulo no debe considerarse listo sin, al menos, los siguientes tests:
+
+\subsection*{1. Test de monotonía}
+Al escalar un tape sintético simple, participación, DTL y coste deben crecer monótonamente.
+
+\subsection*{2. Test de baseline factible}
+Si todos los límites están holgados en el baseline, \texttt{baseline\_feasible} debe ser \texttt{True}.
+
+\subsection*{3. Test de baseline infactible}
+Si el baseline viola una regla dura, \texttt{capacity\_limit} debe ser \texttt{null} y la razón debe registrarse.
+
+\subsection*{4. Test de datos faltantes}
+Si falta \(ADV\) o spread en una fracción material del notional, el módulo debe fallar de forma explícita.
+
+\subsection*{5. Test de consistencia de agregación}
+La suma de notional usado para coste debe coincidir con la suma de \(q_{i,t}(A_k)\) sobre observaciones válidas.
+
+\subsection*{6. Test de persistencia}
+El \texttt{Parquet} y el \texttt{JSON} deben contener todas las columnas/keys obligatorias.
+
+\section{Qué no hace este módulo}
+
+Para evitar deriva de alcance, \texttt{capacity.py} no hace ninguna de las siguientes tareas:
+
+\begin{itemize}
+    \item optimizar pesos,
+    \item neutralizar exposiciones,
+    \item alterar el calendario de rebalanceo,
+    \item predecir liquidez futura con modelos complejos,
+    \item reemplazar el simulador de ejecución.
+\end{itemize}
+
+Si alguna de esas funciones se desea, debe implementarse en módulos distintos y \texttt{capacity.py} debe consumir sus outputs, no duplicarlos.
+
+\section{Resumen ejecutivo}
+
+El criterio correcto de capacidad no es ``cuánto capital cabe en teoría'', sino \emph{cuánto capital cabe manteniendo ejecutabilidad, liquidez suficiente y preservación razonable del retorno neto}. Por ello, \texttt{portfolio/capacity.py} debe comportarse como un evaluador disciplinado de escalabilidad, no como un contenedor de extensiones experimentales.
+
+La definición final del módulo es deliberadamente cerrada:
+
+\begin{enumerate}
+    \item toma órdenes efectivas y datos PIT,
+    \item escala monetariamente el rebalanceo bajo una rejilla de AUM,
+    \item recalcula participación, DTL, coste e impacto,
+    \item impone monotonicidad,
+    \item selecciona el mayor escenario factible,
+    \item persiste una salida auditable.
+\end{enumerate}
+
+Eso convierte la capacidad en una magnitud verificable, comparable entre versiones y utilizable de forma directa por portfolio construction, risk review y decisión de despliegue.
 
 \end{document}

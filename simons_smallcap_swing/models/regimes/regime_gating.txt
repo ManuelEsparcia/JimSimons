@@ -1,166 +1,516 @@
-\section{Regime Gating: modulación adaptativa de modelos y riesgo por estado de mercado}
+\section{Regime Gating: capa operativa de adaptación de modelos, riesgo y ejecución por estado de mercado}
 
 \subsection{Objetivo del módulo}
-El módulo \texttt{models/regimes/regime\_gating.py} aplica \textbf{políticas adaptativas por régimen} para:
-\begin{itemize}
-  \item \textbf{Gategear modelos y alphas} según el estado de mercado inferido (HMM u otros).
-  \item \textbf{Reponderar pesos de conjunto} (\textit{ensemble weighting}) condicional al régimen.
-  \item \textbf{Ajustar riesgo de cartera}: \textit{gross/net exposure}, \textit{turnover}, \textit{leverage caps} y \textit{short constraints}.
-  \item Generar \texttt{y\_pred\_gated} listos para \texttt{portfolio/sizing.py} y backtest industriales \cite{Hamilton2010, Ang2012, Briner2019}.
-\end{itemize}
-Sea \(\mathcal{S}_t\) el conjunto de estados de mercado (e.g. \texttt{risk\_on}, \texttt{risk\_off}, \texttt{crisis}) y \(\boldsymbol{\pi}_t \in \Delta^{K-1}\) el vector de probabilidades de estado en \(t\). El módulo implementa:
-\begin{align}
-\mathbf{w}_{t}^{\text{model}} & \mapsto \tilde{\mathbf{w}}_{t}^{\text{model}}(\boldsymbol{\pi}_t), \\
-\text{risk\_cap}_t & \mapsto \text{risk\_cap}_t(\boldsymbol{\pi}_t), \\
-\text{trade\_gates}_t & \mapsto \text{trade\_gates}_t(\boldsymbol{\pi}_t),
-\end{align}
-donde \(\tilde{\mathbf{w}}_{t}\) y \(\text{risk\_cap}_t\) son funciones parametrizadas por una \texttt{gating\_config} diseñada para mejorar drawdown y \textit{risk/reward} condicional al régimen \cite{Ang2012, Baillie2015}.
 
-\subsection{Tipos de \textit{gating} soportados}
+El módulo \texttt{models/regimes/regime\_gating.py} constituye la capa de \textbf{traducción operativa} entre la inferencia de régimen y la acción cuantitativa efectiva sobre el stack de predicción, riesgo y ejecución. Su función no es detectar regímenes ---eso corresponde a \texttt{hmm.py}--- sino convertir una distribución de probabilidad sobre estados de mercado en una política causal, estable y auditables de:
+
 \begin{itemize}
-  \item \textbf{Model gating}:
-    \begin{itemize}
-      \item \(\text{mask}_{t}^{(m)} = \mathbb{I}(\text{regime\_label}_t \in \mathcal{R}_m)\), encendido/apagado de modelo \(m\) por régimen \(\mathcal{R}_m\) \cite{Philippas2019}.
-    \end{itemize}
-  \item \textbf{Weight gating}:
-    \begin{itemize}
-      \item \(\tilde{w}_{t}^{(m)} = w_{t}^{(m)} \cdot g^{(m)}(\pi_k)\) con \(g^{(m)}\) función de \texttt{regime\_weight\_policy} (p. ej. multiplicativa por \(\pi_{\text{risk\_on}}\)).
-      \item Blending condicional: \(\hat{y}_t = \sum_{m} w_{t}^{(m)}(\boldsymbol{\pi}_t) \cdot y_t^{(m)}\), con \(\sum_m w_{t}^{(m)}(\boldsymbol{\pi}_t)=1\).
-    \end{itemize}
-  \item \textbf{Risk gating}:
-    \begin{itemize}
-      \item \(\text{gross\_cap}_t = \text{base\_gross} \cdot \kappa_{\text{gross}}(\boldsymbol{\pi}_t)\), \(\text{net\_cap}_t = \text{base\_net} \cdot \kappa_{\text{net}}(\boldsymbol{\pi}_t)\).
-      \item \(\text{turnover\_cap}_t = \text{base\_turnover} \cdot \kappa_{\text{turnover}}(\boldsymbol{\pi}_t)\), con \(\kappa_{\cdot}(\boldsymbol{\pi}_t) \leq 1\) en \texttt{stress} / \texttt{crisis} \cite{Briner2019}.
-    \end{itemize}
-  \item \textbf{Trade gating}:
-    \begin{itemize}
-      \item \(\text{no\_shorts}(\text{regime\_label}_t) = \texttt{True}\) en \texttt{risk\_off}/\texttt{crisis}.
-      \item \(\text{size\_reduction\_factor}(\text{regime\_confidence}_t)\) descendente cuando \(\text{confidence} < \texttt{confidence\_min}\).
-    \end{itemize}
+  \item activación o desactivación de modelos y alphas;
+  \item reponderación de ensembles y blending dinámico;
+  \item modulación de exposición bruta y neta;
+  \item ajuste de caps de turnover, leverage y constraints de ejecución;
+  \item restricción o veto de determinadas clases de trades bajo entornos adversos;
+  \item reducción controlada de actividad cuando la incertidumbre de régimen es elevada.
+\end{itemize}
+
+Sea \(\boldsymbol{\pi}_t = (\pi_{t,0},\dots,\pi_{t,K-1}) \in \Delta^{K-1}\) el vector de probabilidades filtradas de régimen en la fecha \(t\), y sea \(r_t^{\star}\) el \emph{operational regime} resuelto por este módulo tras aplicar reglas de confianza, hysteresis y persistencia. El gating implementa una familia de aplicaciones causales:
+\begin{align}
+\mathbf{y}_{t,s}^{\text{raw}} &\mapsto \mathbf{y}_{t,s}^{\text{gated}}, \\
+\mathbf{w}^{\text{model}}_{t} &\mapsto \tilde{\mathbf{w}}^{\text{model}}_{t}(r_t^{\star}, \boldsymbol{\pi}_t), \\
+\mathcal{R}^{\text{base}}_t &\mapsto \mathcal{R}^{\text{eff}}_t(r_t^{\star}, \boldsymbol{\pi}_t), \\
+\mathcal{A}^{\text{trade}}_t &\mapsto \tilde{\mathcal{A}}^{\text{trade}}_t(r_t^{\star}, \boldsymbol{\pi}_t),
+\end{align}
+donde:
+\begin{itemize}
+  \item \(\mathbf{y}_{t,s}^{\text{raw}}\) representa scores o predicciones raw por símbolo \(s\);
+  \item \(\tilde{\mathbf{w}}^{\text{model}}_{t}\) son pesos efectivos de ensemble;
+  \item \(\mathcal{R}^{\text{base}}_t\) resume los límites de riesgo base;
+  \item \(\tilde{\mathcal{A}}^{\text{trade}}_t\) define el conjunto de acciones permitidas de trading.
+\end{itemize}
+
+El criterio de éxito del módulo no es “hacer algo distinto según el régimen”, sino \textbf{mejorar la geometría del riesgo realizado} del sistema: contener drawdowns, reducir exposición ineficiente en entornos hostiles, preservar convexidad y evitar que ruido de régimen destruya alpha útil mediante sobre-reacción.
+
+\subsection{Principio económico del gating}
+
+La motivación económica es que una misma señal de alpha no tiene el mismo valor marginal en todos los estados del mercado. En entornos de volatilidad comprimida, breadth amplio y liquidez razonable, el sistema puede tolerar mayor participación, turnover y exposición. En cambio, en entornos de correlación elevada, fragilidad de ejecución, colapso de breadth o stress sistémico, incluso señales con calidad similar ex ante pueden tener peor realización ex post por slippage, gap risk, crowding o breakdown de la estructura cross-sectional.
+
+Por ello, el gating no debe entenderse como una “capa prudencial externa”, sino como una \textbf{función de transferencia dependiente del entorno}. En términos formales, el retorno y riesgo condicionales de una señal dependen del régimen:
+\begin{equation}
+\mathbb{E}[R_{t+1} \mid \text{signal}_t, \mathcal{F}_t] 
+\neq 
+\mathbb{E}[R_{t+1} \mid \text{signal}_t, \mathcal{F}_t, S_t = k],
+\end{equation}
+y análogamente para varianza, cola izquierda, costes de ejecución y turnover efectivo. El módulo opera sobre esta heterogeneidad condicional.
+
+\subsection{Rol arquitectónico}
+
+La cadena lógica de la carpeta \texttt{models/regimes} es:
+\[
+\texttt{regime\_features} \;\longrightarrow\; \texttt{hmm} \;\longrightarrow\; \texttt{regime\_gating}.
+\]
+
+En esa cadena:
+\begin{itemize}
+  \item \texttt{regime\_features.py} construye el espacio observable del estado del mercado;
+  \item \texttt{hmm.py} infiere estados latentes y probabilidades filtradas;
+  \item \texttt{regime\_gating.py} traduce esas probabilidades a consecuencias operativas concretas.
+\end{itemize}
+
+Por tanto, \texttt{regime\_gating.py} es la primera capa donde el concepto de régimen genera \textbf{impacto económico directo} sobre el sistema. Si el HMM es la capa de inferencia, el gating es la capa de \textbf{control adaptativo}.
+
+\subsection{Alcance del módulo}
+
+El módulo incluye:
+\begin{itemize}
+  \item resolución de régimen operativo a partir de probabilidades filtradas;
+  \item aplicación de model gating, weight gating, risk gating y trade gating;
+  \item mezcla suave o dura entre políticas según confianza y persistencia;
+  \item priorización formal entre restricciones potencialmente conflictivas;
+  \item fail-safe y fallback cuando la inferencia de régimen es débil o inestable;
+  \item persistencia de decisiones, escalados y diagnósticos.
+\end{itemize}
+
+No incluye:
+\begin{itemize}
+  \item inferencia del régimen;
+  \item sizing final de cartera;
+  \item optimización de ejecución;
+  \item definición base de risk limits estratégicos de la firma.
+\end{itemize}
+
+\subsection{Tipos de gating soportados}
+
+\subsubsection{Model gating}
+
+El \textbf{model gating} decide si un modelo \(m\) debe participar o no bajo el régimen operativo actual. Formalmente:
+\begin{equation}
+\text{mask}_t^{(m)} = \mathbb{I}(r_t^{\star} \in \mathcal{R}_m),
+\end{equation}
+donde \(\mathcal{R}_m\) es el conjunto de regímenes en que el modelo está habilitado.
+
+La versión estricta es binaria. La versión recomendada en producción admite atenuación suave:
+\begin{equation}
+\tilde{y}_{t,s}^{(m)} = \eta_t^{(m)} \, y_{t,s}^{(m)},
+\qquad \eta_t^{(m)} \in [0,1],
+\end{equation}
+donde \(\eta_t^{(m)}\) depende de confianza, persistencia y política específica del modelo.
+
+Esto evita que pequeños cambios de probabilidad produzcan apagados bruscos de modelos con alpha todavía útil.
+
+\subsubsection{Weight gating}
+
+El \textbf{weight gating} repondera la combinación de modelos condicionalmente al régimen:
+\begin{equation}
+\tilde{w}_t^{(m)}
+=
+\frac{w_t^{(m)} \cdot g^{(m)}(r_t^{\star}, \boldsymbol{\pi}_t)}
+{\sum_{j} w_t^{(j)} \cdot g^{(j)}(r_t^{\star}, \boldsymbol{\pi}_t)},
+\end{equation}
+con \(g^{(m)} \ge 0\) una función de escalado por régimen.
+
+La predicción agregada queda:
+\begin{equation}
+\hat{y}_{t,s}^{\text{gated}}
+=
+\sum_{m=1}^{M} \tilde{w}_t^{(m)} \, y_{t,s}^{(m)}.
+\end{equation}
+
+La política recomendada no debe depender solo del \emph{label} duro del régimen, sino de la mezcla probabilística y del nivel de certeza:
+\begin{equation}
+g^{(m)}(r_t^{\star}, \boldsymbol{\pi}_t)
+=
+\sum_{k=0}^{K-1} \phi_k(\boldsymbol{\pi}_t)\, g_k^{(m)},
+\end{equation}
+donde \(\phi_k(\boldsymbol{\pi}_t)\) son pesos de interpolación causal y \(g_k^{(m)}\) son multiplicadores aprendidos o calibrados por estado.
+
+\subsubsection{Risk gating}
+
+El \textbf{risk gating} transforma límites base de riesgo en límites efectivos dependientes del régimen:
+\begin{align}
+\text{gross\_cap}_t^{\text{eff}} &= \text{base\_gross}_t \cdot \kappa_{\text{gross}}(r_t^{\star}, \boldsymbol{\pi}_t), \\
+\text{net\_cap}_t^{\text{eff}} &= \text{base\_net}_t \cdot \kappa_{\text{net}}(r_t^{\star}, \boldsymbol{\pi}_t), \\
+\text{turnover\_cap}_t^{\text{eff}} &= \text{base\_turnover}_t \cdot \kappa_{\text{turnover}}(r_t^{\star}, \boldsymbol{\pi}_t), \\
+\text{short\_cap}_t^{\text{eff}} &= \text{base\_short}_t \cdot \kappa_{\text{short}}(r_t^{\star}, \boldsymbol{\pi}_t).
+\end{align}
+
+Las funciones \(\kappa_{\cdot}\) no deben ser tratadas como constantes arbitrarias pegadas al código. Deben definirse como parte de una política calibrable y versionada, por ejemplo:
+\begin{equation}
+\kappa_j(r_t^{\star}, \boldsymbol{\pi}_t)
+=
+\operatorname{clip}\Big(
+a_j^{(r_t^{\star})}
++
+b_j^{(r_t^{\star})}\cdot \text{conf}_t
++
+c_j^{(r_t^{\star})}\cdot \text{duration}_t
+,\,
+\kappa_{j,\min},\,
+\kappa_{j,\max}
+\Big),
+\end{equation}
+donde:
+\begin{itemize}
+  \item \(j \in \{\text{gross}, \text{net}, \text{turnover}, \text{short}\}\),
+  \item \(\text{conf}_t = \max_k \pi_{t,k}\),
+  \item \(\text{duration}_t\) es la duración del régimen operativo actual,
+  \item \(\operatorname{clip}\) garantiza límites económicos plausibles.
+\end{itemize}
+
+Esto introduce una especificación formal y evita que el módulo dependa de umbrales sueltos no gobernados.
+
+\subsubsection{Trade gating}
+
+El \textbf{trade gating} regula qué acciones de trading están permitidas. Puede incluir:
+\begin{itemize}
+  \item prohibición de nuevos cortos en estados de crisis;
+  \item veto de apertura de nuevas posiciones si la confianza de régimen es insuficiente;
+  \item reducción de tamaño por trade;
+  \item prohibición temporal de aumentar gross en entornos de stress;
+  \item cierre parcial o total bajo políticas de emergencia.
+\end{itemize}
+
+Formalmente, el conjunto de acciones permitidas en \(t\) es:
+\begin{equation}
+\tilde{\mathcal{A}}^{\text{trade}}_t
+=
+\mathcal{A}^{\text{base}}_t
+\cap
+\mathcal{A}^{\text{regime}}(r_t^{\star}, \boldsymbol{\pi}_t).
+\end{equation}
+
+\subsection{Resolución del régimen operativo}
+
+Un error frecuente es usar el \texttt{argmax} de \(\boldsymbol{\pi}_t\) como si fuera el régimen operativo final. En producción, eso es demasiado frágil. El módulo define una función causal:
+\begin{equation}
+r_t^{\star}
+=
+f\!\left(
+\boldsymbol{\pi}_t,\,
+r_{t-1}^{\star},\,
+\text{duration}_{t-1},\,
+\texttt{confidence\_min},\,
+\texttt{hysteresis\_policy}
+\right),
+\end{equation}
+que incorpora tres niveles:
+
+\paragraph{1. Dominancia probabilística}
+Se identifica el candidato principal:
+\[
+k_t^{\max} = \arg\max_k \pi_{t,k}.
+\]
+
+\paragraph{2. Confianza mínima}
+Si \(\max_k \pi_{t,k} < \texttt{confidence\_min}\), no se permite transición plena. El sistema entra en:
+\begin{itemize}
+  \item régimen previo con fuerza reducida, o
+  \item estado \texttt{uncertain}/\texttt{neutral} operativo.
+\end{itemize}
+
+\paragraph{3. Hysteresis}
+Una transición de \(r_{t-1}^{\star}\) a \(k_t^{\max}\) solo se acepta si:
+\begin{itemize}
+  \item el nuevo estado domina durante un número mínimo de observaciones, o
+  \item la diferencia \(\pi_{t,k_t^{\max}} - \pi_{t,r_{t-1}^{\star}}\) supera un umbral de ruptura, o
+  \item existe un trigger de emergencia asociado a crisis/stress.
+\end{itemize}
+
+Esta lógica reduce \emph{chattering} y evita que el pipeline downstream oscile entre políticas incompatibles por ruido de inferencia.
+
+\subsection{Fuerza de gating y transición suave}
+
+La intensidad del gating debe depender no solo del régimen, sino de cuán convencido está el sistema de él. Se define una fuerza de gating:
+\begin{equation}
+\gamma_t \in [0,1],
+\end{equation}
+por ejemplo:
+\begin{equation}
+\gamma_t
+=
+\operatorname{clip}
+\left(
+\frac{\max_k \pi_{t,k} - \texttt{confidence\_floor}}
+{\texttt{confidence\_full} - \texttt{confidence\_floor}}
+,\,0,\,1\right).
+\end{equation}
+
+Entonces cualquier política puede interpolarse entre modo base y modo régimen:
+\begin{equation}
+\Theta_t^{\text{eff}}
+=
+(1-\gamma_t)\Theta^{\text{base}}
++
+\gamma_t \Theta^{\text{regime}}(r_t^{\star}),
+\end{equation}
+donde \(\Theta\) representa pesos, caps o restricciones.
+
+Esta formulación es preferible a reglas binarias puras, porque reduce error de clasificación costoso y suaviza el impacto sobre alpha.
+
+\subsection{Precedencia entre políticas y resolución de conflictos}
+
+Una de las críticas más importantes del diseño abierto es que múltiples políticas pueden actuar a la vez y entrar en conflicto. La especificación debe fijar una jerarquía inequívoca.
+
+Se define el siguiente orden de precedencia:
+
+\[
+\texttt{hard risk constraints}
+\;\succ\;
+\texttt{trade safety constraints}
+\;\succ\;
+\texttt{risk gating}
+\;\succ\;
+\texttt{trade gating}
+\;\succ\;
+\texttt{model gating}
+\;\succ\;
+\texttt{weight gating}.
+\]
+
+Interpretación:
+\begin{itemize}
+  \item Si una restricción dura de riesgo veta una acción, ninguna señal alpha puede reactivarla.
+  \item Si \texttt{trade\_gating} prohíbe abrir nuevas posiciones, el \texttt{weight\_gating} solo puede actuar sobre las posiciones permitidas.
+  \item El \texttt{model\_gating} nunca puede incrementar exposición por encima de lo autorizado por \texttt{risk\_gating}.
+\end{itemize}
+
+Formalmente, la política efectiva es la intersección restringida:
+\begin{equation}
+\Pi_t^{\text{eff}}
+=
+\Pi_t^{\text{alpha}}
+\cap
+\Pi_t^{\text{model}}
+\cap
+\Pi_t^{\text{weight}}
+\cap
+\Pi_t^{\text{trade}}
+\cap
+\Pi_t^{\text{risk}}
+\cap
+\Pi_t^{\text{hard}},
+\end{equation}
+resuelta en el orden jerárquico anterior.
+
+\subsection{Calibración formal de las funciones \(\kappa\)}
+
+Para llevar el módulo a nivel más alto, las funciones de escalado deben calibrarse explícitamente. No basta con poner \texttt{risk\_off = 0.7} y \texttt{crisis = 0.3}. La calibración debe maximizar utilidad condicional bajo restricciones de robustez.
+
+Sea \(\theta\) el conjunto de parámetros de las funciones \(\kappa\). Se propone resolver:
+\begin{equation}
+\theta^\star
+=
+\arg\max_{\theta}
+\left[
+U_{\text{perf}}(\theta)
+-
+\lambda_1 U_{\text{turnover}}(\theta)
+-
+\lambda_2 U_{\text{instability}}(\theta)
+-
+\lambda_3 U_{\text{complexity}}(\theta)
+\right],
+\end{equation}
+bajo restricciones:
+\begin{align}
+0 \le \kappa_j(\cdot) \le 1.25, \\
+\kappa_j(\texttt{crisis}) \le \kappa_j(\texttt{risk\_off}) \le \kappa_j(\texttt{neutral}) \le \kappa_j(\texttt{risk\_on}),
+\end{align}
+y, si procede, monotonicidad con la confianza o severidad del régimen.
+
+Aquí:
+\begin{itemize}
+  \item \(U_{\text{perf}}\) puede reflejar Sharpe, Calmar o utilidad media robusta walk-forward;
+  \item \(U_{\text{turnover}}\) penaliza rotación excesiva inducida por gating;
+  \item \(U_{\text{instability}}\) penaliza switches y oscilación de políticas;
+  \item \(U_{\text{complexity}}\) penaliza reglas demasiado flexibles y propensas a sobreajuste.
+\end{itemize}
+
+\subsection{Control del daño sobre alpha}
+
+El mayor riesgo de un buen gating mal calibrado es destruir alpha útil. Por ello, el módulo debe controlar explícitamente el \textbf{alpha preservation ratio}. Sea:
+\begin{equation}
+\text{APR}
+=
+\frac{\mathbb{E}[R^{\text{gated}} \mid \text{regimes favorables}]}
+{\mathbb{E}[R^{\text{baseline}} \mid \text{regimes favorables}] + \varepsilon}.
+\end{equation}
+
+La política no debe aceptarse si mejora drawdown a costa de anular sistemáticamente la capacidad del sistema de capturar alpha en estados normales. En términos operativos, el gating debe:
+\begin{itemize}
+  \item ser fuerte donde el entorno es realmente hostil;
+  \item ser suave o casi invisible donde el sistema ya funciona bien;
+  \item evitar entrar y salir de modo prudencial por ruido de baja convicción.
 \end{itemize}
 
 \subsection{Contrato de entrada y salida}
-Entradas mínimas:
+
+\paragraph{Entradas mínimas}
 \begin{itemize}
-  \item \texttt{regime\_states\_path}: \((t, \pi_0,\dots,\pi_{K-1}, \texttt{regime\_label}, \texttt{regime\_confidence})\).
-  \item \texttt{model\_predictions\_path}: \((t, s, y_t^{(m)})\) por modelo/símbolo.
-  \item \texttt{gating\_config\_path}: políticas de \texttt{model\_gating}, \texttt{weight\_gating}, \texttt{risk\_gating}, \texttt{trade\_gating}.
+  \item \texttt{regime\_states\_path}: probabilidades filtradas, \texttt{regime\_label}, \texttt{state\_confidence}, \texttt{state\_entropy}, \texttt{model\_accepted}.
+  \item \texttt{model\_predictions\_path}: scores o predicciones raw por símbolo y modelo.
+  \item \texttt{gating\_config\_path}: políticas de model, weight, risk y trade gating.
   \item \texttt{run\_id}.
 \end{itemize}
-Opcionales:
+
+\paragraph{Entradas opcionales}
 \begin{itemize}
-  \item \texttt{risk\_limits\_path}, \texttt{liquidity\_stress\_path}, \texttt{previous\_state\_path} (histeresis).
-\end{itemize}
-Salidas:
-\begin{itemize}
-  \item \texttt{models/regimes/gating/\{run\_id\}/gated\_scores.parquet}: \((t, s, y_{t,s}^{\text{raw}}, y_{t,s}^{\text{gated}}, \texttt{regime\_label}, \texttt{regime\_confidence})\).
-  \item \texttt{gating\_decisions.parquet}: \((t, s, \texttt{gating\_action}, \texttt{risk\_scale\_factor}, \texttt{trade\_gate\_flag})\).
-  \item \texttt{gating\_summary.json} y \texttt{manifest.json} con estadísticas de switches, confianza, \texttt{risk\_scale\_factor} y \texttt{config\_hash}.
+  \item \texttt{risk\_limits\_path}
+  \item \texttt{liquidity\_stress\_path}
+  \item \texttt{portfolio\_state\_path}
+  \item \texttt{previous\_gating\_state\_path}
 \end{itemize}
 
-\subsection{Políticas de decisión y reglas de \textit{gating}}
+\paragraph{Salidas}
 \begin{itemize}
-  \item \textbf{Threshold por confianza}:
-    \begin{equation}
-    \texttt{gating\_strength}_t =
-    \begin{cases}
-    1 & \text{si } \max_k \pi_{t,k} \geq \texttt{confidence\_min}, \\
-    \lambda_t \in [0,1) & \text{en caso contrario,}
-    \end{cases}
-    \end{equation}
-    aplicando \texttt{gating} suave/fuerte según umbral.
-    \item \textbf{Histeresis y estado operativo}:
-      \begin{itemize}
-        \item \texttt{resolve\_operational\_regime} combina \(\boldsymbol{\pi}_t\), \texttt{previous\_state} y \texttt{regime\_hysteresis\_window} para evitar \emph{chattering} excesivo \cite{Hamilton2010}.
-        \item \(\texttt{regime\_duration}(\texttt{regime\_label})\) utilizado como \texttt{weighting} explícito en \texttt{weight\_gating}.
-      \end{itemize}
-  \item \textbf{Transiciones suaves entre regímenes}:
-    \begin{itemize}
-      \item \(\tilde{w}_t^{(m)} = \sum_{k} \phi_{k}(\boldsymbol{\pi}_t) \cdot w_{k}^{(m)}\), combinando políticas de \texttt{regime\_on} y \texttt{regime\_off} con función de \texttt{interpolation\_method} (linear, exp, sigmoid).
-    \end{itemize}
-  \item \textbf{Fail‑safe}:
-    \begin{itemize}
-      \item Si \(\texttt{regime\_confidence} \ll \texttt{confidence\_min}\) más de \texttt{max\_low\_confidence\_days} días, \texttt{fallback\_blender} activa un modelo robusto (low‑leverage, robust baseline) \cite{Philippas2019}.
-    \end{itemize}
+  \item \texttt{gated\_scores.parquet}: scores raw y gated con metadatos de régimen.
+  \item \texttt{gating\_decisions.parquet}: decisiones explícitas por fecha/símbolo/modelo.
+  \item \texttt{risk\_gating\_caps.parquet}: gross/net/turnover/short caps efectivos por fecha.
+  \item \texttt{gating\_summary.json}: estadísticas agregadas de switches, confianza, fracciones de activación, APR y métricas de impacto.
+  \item \texttt{manifest.json}: huella completa del run.
 \end{itemize}
 
-\subsection{Reglas PIT y anti‑leakage}
+\subsection{Reglas PIT y anti-leakage}
+
+Las reglas PIT son no negociables:
 \begin{itemize}
-  \item El gating en \(t\) usa \textbf{solo} \(\boldsymbol{\pi}_t\) obtenido de \texttt{filtered\_probs} de HMM; \(\boldsymbol{\pi}_t^{\text{smoothed}}\) solo se usa en análisis \texttt{offline}.
-  \item \texttt{current\_state\_t} se resuelve sin información futura:
-    \begin{equation}
-    \texttt{operational\_regime}_t = f(\boldsymbol{\pi}_0,\dots,\boldsymbol{\pi}_t; \texttt{hysteresis\_window}, \texttt{previous\_state}),
-    \end{equation}
-    donde \(f\) es una función causal bien definida \cite{Hamilton2010}.
-  \item \texttt{logging} explicita \texttt{mode=inference} vs \texttt{mode=offline} para documentar si el \texttt{regime\_label} proviene de \texttt{filtered} o \texttt{smoothed} distribuciones.
+  \item el gating en \(t\) usa solo probabilidades filtradas disponibles en \(t\);
+  \item las probabilidades suavizadas quedan prohibidas para decisiones live;
+  \item cualquier hysteresis debe construirse de forma estrictamente causal;
+  \item si el HMM marca \texttt{model\_accepted = false}, el gating no puede fingir certeza inexistente;
+  \item cada output debe registrar el namespace de probabilidad usado y el modo operativo.
 \end{itemize}
 
-\subsection{Flujo del proceso}
+Formalmente:
+\begin{equation}
+\mathcal{G}_t
+=
+g\left(
+\{\boldsymbol{\pi}_\tau\}_{\tau \le t},
+\{\text{portfolio\_state}_\tau\}_{\tau \le t},
+\{\text{risk\_limits}_\tau\}_{\tau \le t}
+\right),
+\end{equation}
+sin dependencia de \(\tau > t\).
+
+\subsection{Fail-safe y degraded mode}
+
+Un sistema serio no debe asumir que la capa de regímenes siempre funciona bien. Si la inferencia pierde calidad, el gating debe degradarse de forma controlada.
+
+Se consideran triggers de fail-safe:
+\begin{itemize}
+  \item \(\max_k \pi_{t,k} < \texttt{confidence\_min}\) durante demasiados días;
+  \item alta entropía persistente;
+  \item HMM marcado como no aceptado;
+  \item inestabilidad excesiva de switches;
+  \item ausencia de datos de régimen.
+\end{itemize}
+
+En esos casos, el módulo puede activar:
+\begin{itemize}
+  \item \texttt{fallback\_blender}: ensemble robusto de baja complejidad;
+  \item \texttt{risk\_degraded\_mode}: reducción prudencial de gross y turnover;
+  \item \texttt{neutral\_gating\_policy}: desactivación parcial de la adaptación por régimen;
+  \item congelación temporal del régimen operativo previo si así lo define la política.
+\end{itemize}
+
+\subsection{Flujo operativo del proceso}
+
 \begin{enumerate}
-  \item \texttt{load\_gating\_config}, \texttt{load\_regime\_states}, \texttt{load\_model\_predictions} leen inputs PIT.
-  \item \texttt{resolve\_operational\_regime} infiere \texttt{regime\_label\_t} con histeresis.
-  \item \texttt{apply\_model\_weight\_gating} y \texttt{apply\_risk\_trade\_gating} aplican:
-    \begin{itemize}
-      \item \texttt{mask} por modelo.
-      \item \texttt{weight\_scale} por estado.
-      \item \texttt{risk\_scale\_factor} y \texttt{trade\_gates}.
-    \end{itemize}
-  \item \texttt{validate\_gated\_outputs} chequea:
-    \begin{itemize}
-      \item Sin \texttt{NaN}/\texttt{inf} en \texttt{y\_pred\_gated}.
-      \item \texttt{gating\_actions} en el conjunto de \texttt{valid\_gates} definido en \texttt{gating\_config}.
-      \item Cobertura de todas las fechas del universo de backtest.
-    \end{itemize}
-  \item \texttt{evaluate\_gating\_diagnostics} computa métricas de impacto (drawdown, risk, turnover).
-  \item \texttt{persist\_gating\_outputs} serializa \texttt{gated\_scores} y \texttt{gating\_decisions} con \texttt{manifest}.
+  \item Cargar configuración, probabilidades de régimen y predicciones de modelos.
+  \item Validar integridad temporal y namespace PIT.
+  \item Resolver \(r_t^{\star}\) con confianza, persistencia e hysteresis.
+  \item Calcular fuerza de gating \(\gamma_t\).
+  \item Aplicar model gating y weight gating.
+  \item Calcular caps efectivos de riesgo con \(\kappa_{\cdot}\).
+  \item Aplicar trade gating bajo jerarquía de precedencia.
+  \item Ejecutar validaciones y comprobar conflictos.
+  \item Persistir decisiones, escalados y diagnósticos.
 \end{enumerate}
 
 \subsection{Métricas recomendadas}
+
+\paragraph{Métricas de régimen}
 \begin{itemize}
-  \item \texttt{pct\_days\_each\_regime}: fracción de tiempo en \texttt{risk\_on}/\texttt{neutral}/\texttt{risk\_off}/\texttt{crisis}.
-  \item \texttt{pct\_days\_confidence\_low}: \(\#\{t : \max_k \pi_{t,k} < \texttt{confidence\_min}\} / T\).
-  \item \texttt{avg\_risk\_scale\_factor}: \(\frac{1}{T}\sum_t \text{risk\_scale\_factor}_t\), proxy de reducción de exposición en regímenes adversos \cite{Briner2019}.
-  \item \texttt{turnover\_impact\_estimate}: \(\text{turnover}_t(\text{con gating}) - \text{turnover}_t(\text{baseline})\).
-  \item \texttt{performance\_delta\_vs\_no\_gating}: \(\text{Sharpe}^{\text{gated}} - \text{Sharpe}^{\text{no\_gating}}\) y \(\text{MDD}^{\text{gated}} < \text{MDD}^{\text{baseline}}\) \cite{Ang2012, Hamilton2010}.
+  \item \texttt{pct\_days\_each\_regime}
+  \item \texttt{pct\_days\_low\_confidence}
+  \item \texttt{avg\_state\_duration}
+  \item \texttt{n\_switches}
+  \item \texttt{switches\_per\_year}
 \end{itemize}
 
-\subsection{Gates y validaciones}
+\paragraph{Métricas de intensidad}
 \begin{itemize}
-  \item \texttt{Gate 1: no leakage} en uso de estados (solo \texttt{filtered} en \texttt{t}).
-  \item \texttt{Gate 2: estabilidad} de decisiones (no \emph{chattering} excesivo; \texttt{hysteresis} y \texttt{smoothing} controlados).
-  \item \texttt{Gate 3: mejora de drawdown} vs baseline (prototipado en análisis \texttt{offline}).
-  \item \texttt{Motricidad de switches}:
-    \begin{itemize}
-      \item \texttt{n\_switches} y \texttt{avg\_state\_duration} en \texttt{gating\_summary}.
-      \item Manejo de \texttt{switches extremos}: ampliar \texttt{hysteresis\_window} o \texttt{smoothing} si frecuencia de switches supera umbral.
-    \end{itemize}
+  \item \texttt{avg\_risk\_scale\_factor}
+  \item \texttt{avg\_gross\_cap\_effective}
+  \item \texttt{avg\_turnover\_cap\_effective}
+  \item \texttt{pct\_trades\_blocked}
 \end{itemize}
 
-\subsection{Manejo de casos especiales}
+\paragraph{Métricas de resultado}
 \begin{itemize}
-  \item \texttt{missing regime probs} en fecha:
-    \begin{itemize}
-      \item \texttt{fall back} a \texttt{previous\_state} o \texttt{neutral\_state} con \texttt{WARNING} en log.
-    \end{itemize}
-  \item \texttt{conflicto alpha vs risk}:
-    \begin{itemize}
-      \item Prioridad a \texttt{risk\_gating} y \texttt{trade\_gating} sobre \texttt{model\_gating}; si una regla de riesgo pide \texttt{close\_positions} y una de alpha sugiere \texttt{open\_new}, se aplica \texttt{close\_positions}.
-    \end{itemize}
+  \item \(\Delta\) Sharpe vs baseline
+  \item \(\Delta\) Calmar vs baseline
+  \item \(\Delta\) MDD vs baseline
+  \item \(\Delta\) turnover vs baseline
+  \item \texttt{APR} (alpha preservation ratio)
+  \item mejora condicional en estados adversos
 \end{itemize}
 
-\subsection{Riesgos y decisiones abiertas}
+\subsection{Criterios de aceptación y rechazo}
+
+El módulo no debe considerarse aceptado solo porque produzca outputs válidos. Un run se considera \texttt{accepted} si cumple simultáneamente:
+
 \begin{itemize}
-  \item \textbf{Thresholds de confianza}: sensibilidad de \texttt{confidence\_min} y \texttt{risk\_scale\_factor} al backtest OOS \cite{Bailey2014}.
-  \item \textbf{Complejidad de reglas} vs mantenibilidad: un espacio de políticas parametrizado (p. ej. \texttt{piecewise\_linear} por \(\boldsymbol{\pi}_t\)) permite exploración sistemática sin \emph{hard‑code} masivo \cite{Briner2019}.
-  \item \textbf{Sobreajuste}: las políticas de gating deben ser validadas \texttt{walk‑forward} para evitar \emph{regime overfitting} \cite{Hamilton2010}.
+  \item no leakage y causalidad estricta;
+  \item jerarquía de precedencia respetada sin conflictos irresueltos;
+  \item número de switches dentro de banda razonable;
+  \item mejora o no deterioro material de drawdown y perfil de cola;
+  \item preservación suficiente de alpha en estados normales/favorables;
+  \item complejidad de reglas compatible con robustez walk-forward;
+  \item fail-safe funcional y validado.
+\end{itemize}
+
+Si el gating reduce drawdown pero destruye de forma excesiva el retorno en estados benignos, debe rechazarse como política de producción.
+
+\subsection{Casos especiales}
+
+\paragraph{Missing regime probabilities}
+Si faltan probabilidades en una fecha:
+\begin{itemize}
+  \item se intenta usar estado previo solo si la política lo permite;
+  \item en caso contrario se pasa a \texttt{neutral\_gating\_policy} o \texttt{degraded mode};
+  \item el evento queda registrado con \texttt{WARNING}.
+\end{itemize}
+
+\paragraph{Conflicto alpha vs riesgo}
+La prioridad siempre es del riesgo. Ninguna señal alpha puede abrir riesgo prohibido.
+
+\paragraph{Cambio brusco a crisis}
+La hysteresis puede relajarse si la transición es hacia un estado severamente adverso y la política define triggers de emergencia.
+
+\paragraph{Sobre-actividad por ruido}
+Si \texttt{n\_switches} supera umbral, el módulo debe proponer automáticamente revisión de:
+\begin{itemize}
+  \item \texttt{confidence\_min}
+  \item \texttt{hysteresis\_window}
+  \item \texttt{transition\_margin}
+  \item funciones \(\kappa\)
 \end{itemize}
 
 \subsection{Casos de prueba mínimos}
+
 \begin{itemize}
-  \item Cambio de régimen activa la política correcta (p. ej. \texttt{no\_shorts} en \texttt{crisis}).
-  \item Histeresis reduce \texttt{n\_switches} comparado con gating sin \texttt{hysteresis\_window}.
-  \item \texttt{fallback} en baja confianza devuelve \texttt{y\_pred\_gated} consistentes con el \texttt{blender\_base}.
-  \item Conflicto \texttt{alpha} vs \texttt{risk} respeta prioridad a riesgo \texttt{offline} y \texttt{in‑sample}.
+  \item un cambio claro de régimen activa la política correcta;
+  \item la hysteresis reduce switches frente a una versión sin hysteresis;
+  \item la precedencia de riesgo domina cualquier regla de alpha conflictiva;
+  \item el fail-safe se activa correctamente en baja confianza persistente;
+  \item las caps efectivas respetan límites configurados;
+  \item el modo degradado produce outputs válidos y prudenciales;
+  \item la política es reproducible bajo igual configuración e inputs.
 \end{itemize}
 
-\texttt{regime\_gating.py} desempeña un papel central en la \textbf{regime‑aware risk management architecture} y debe ser \textbf{PIT‑reproducible, robusto} a \emph{regime noise} y \textbf{integrable} con \texttt{portfolio/sizing.py} y \texttt{backtest/engine.py} para investigación industrial y trading en producción.
+\subsection{Interpretación final}
+
+\texttt{regime\_gating.py} debe entenderse como la \textbf{capa de control adaptativo} que convierte una inferencia probabilística de estado de mercado en consecuencias operativas sobre modelos, exposición y ejecución. Su valor no reside en “hacer market timing” en sentido superficial, sino en ajustar la agresividad del sistema a la estructura contemporánea del entorno sin introducir leakage, inestabilidad ni exceso de prudencia destructiva.
+
+En un stack cuantitativo serio, el gating por régimen no es una colección de reglas if/else sobre etiquetas tipo \texttt{risk\_on} y \texttt{risk\_off}. Es una política causal, jerárquica, calibrada y auditable que debe mejorar la relación entre alpha capturado y riesgo realizado. Esa es la función exacta de este módulo dentro de \texttt{simons\_smallcap\_swing}.

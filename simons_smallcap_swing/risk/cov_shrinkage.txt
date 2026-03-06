@@ -1,14 +1,18 @@
 \documentclass{article}
 \usepackage[utf8]{inputenc}
-\usepackage{amsmath,amssymb,amsfonts}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,mathtools}
 \usepackage{booktabs}
-\usepackage{listings}
-\usepackage{hyperref}
+\usepackage{array}
+\usepackage{enumitem}
 \usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
 \geometry{margin=1in}
 
-\title{Explicación SOTA: risk/cov\_shrinkage.py \\ Swing Trading Ultra-Rentable (Nivel Renaissance)}
-\author{Análisis Research Industrial}
+\title{\textbf{Especificación Técnica: \texttt{risk/cov\_shrinkage.py}}}
+\author{Quant Research Infrastructure}
 \date{Marzo 2026}
 
 \begin{document}
@@ -17,102 +21,521 @@
 \tableofcontents
 \newpage
 
-\section{Objetivo y Alcance}
-Estimar matrices de covarianza estables mediante shrinkage para robustez en optimización de cartera swing trading (holding 5-20 días). Mejora conditioning number \(\kappa(\Sigma) = \frac{\lambda_{\max}(\Sigma)}{\lambda_{\min}(\Sigma)}\) de \(10^6\) a $<100$, reduciendo pesos extremos y drawdowns $[web:25]$.
+\section{Propósito del módulo}
 
-Alcance: Cov muestral, shrinkage (Ledoit-Wolf/OAS/custom), validación PSD, persistencia. Integra con factor models downstream.
+Este módulo estima matrices de covarianza robustas para su uso en optimización de cartera, construcción de riesgo ex--ante, control de exposición y análisis de estabilidad numérica en estrategias \emph{swing} sobre small caps.
 
-\section{Teoría Matemática Fundamental}
-Covarianza muestral: 
+El problema central es bien conocido: la covarianza muestral
 \[
-\hat{\Sigma} = \frac{1}{T-1} (X - \bar{X})^T (X - \bar{X}), \quad X \in \mathbb{R}^{T \times N}
+\hat{\Sigma}_{\text{sample}}
+=
+\frac{1}{T-1}(X-\bar{X})^\top (X-\bar{X}),
+\qquad
+X \in \mathbb{R}^{T \times N},
 \]
-Inestable por ruido en muestras finitas (curse of dimensionality, $N > T/5$).
+es un estimador de alta varianza cuando la dimensión transversal \(N\) no es pequeña respecto a la longitud temporal efectiva \(T\), cuando existen datos faltantes, cuando el universo rota con frecuencia o cuando la estructura de correlación cambia de régimen. En estas condiciones, la optimización basada directamente en \(\hat{\Sigma}_{\text{sample}}\) tiende a producir pesos inestables, concentraciones espurias y sensibilidad excesiva al error de estimación.
 
-Shrinkage (Ledoit-Wolf 2004):
+La función del módulo es reemplazar esa matriz frágil por una matriz regularizada
 \[
-\hat{\Sigma}_{shrink} = (1 - \delta) \hat{\Sigma} + \delta \Sigma_{target}, \quad \delta \in [0,1]
+\hat{\Sigma}_{\text{shrink}}
+=
+(1-\delta)\hat{\Sigma}_{\text{sample}}
++
+\delta \Sigma_{\text{target}},
+\qquad
+\delta \in [0,1],
 \]
-donde \(\delta\) data-driven minimiza $E[\|\Sigma_{true} - \hat{\Sigma}\|^2_F]$.
+donde \(\Sigma_{\text{target}}\) es una estructura más parsimoniosa y estable, y \(\delta\) controla la intensidad de regularización.
 
-Targets:
-- Identity: $\Sigma_{target} = I$ (diagonal uniforme).
-- Constant corr: $\rho_{ij} = 0.3$ (empírico equities), $\sigma_{target} = \sqrt{\hat{\Sigma}_{ii}}$.
-- Factor: $\Sigma_{target} = B \Sigma_F B^T$ (Grinold \& Kahn 2000).
+\section{Objetivo operativo}
 
-OAS (Chen 2010): Optimiza $\delta$ vía approximated log-likelihood para muestras pequeñas.
+El módulo debe producir una matriz de covarianza que cumpla simultáneamente cuatro propiedades:
 
-PSD validación: Eigen-decomp $\Sigma = Q \Lambda Q^T$, clip $\lambda_i < 0$ a $\epsilon = 10^{-6}$.
-
-\section{Papers Seminales y Estado del Arte}
-\begin{itemize}
-\item \href{https://arxiv.org/abs/0312116}{Ledoit \& Wolf (2004)}: ``Honey, I Shrunk the Sample Covariance Matrix'' -- $\delta$ asintóticamente óptimo $[web:36]$.
-\item Chen et al. (2010): OAS para $T \approx N$.
-\item \href{https://arxiv.org/abs/1605.03421}{Ledoit \& Wolf (2012)}: Nested Clustered para outliers en finanzas.
-\item Ledoit \& Wolf (2017): Nonlinear shrinkage via eigenvalues.
-\end{itemize}
-
-\section{Libros Industriales (Renaissance-level)}
-\begin{itemize}
-\item Chan (2020): \textit{Quantitative Trading} -- Shrinkage en mean-reversion swings.
-\item Grinold \& Kahn (2000): \textit{Active Portfolio Management} -- Factor cov targets (usado en RenTech).
-\item López de Prado (2019): \textit{Advances in Financial Machine Learning} -- Cap. 17: Cov shrinkage + ML para backtests sin overfitting.
-\item Jurczenko (2020): \textit{ML for Factor Investing} -- GARCH-integrated shrinkage.
-\end{itemize}
-
-\section{Análisis Detallado del Módulo}
-Flujo:
-\begin{enumerate}
-\item Load returns $X$ (parquet, lookback 252-1260 días, min\_obs=30).
-\item \(\hat{\Sigma}_{sample} =\) np.cov.
-\item Target: identity/constant\_corr/factor.
-\item \(\delta =\) ledoit\_wolf (sklearn) o custom (rolling volatility regime).
-\item \(\hat{\Sigma}_{shrink}\), validate simétrica/PSD (np.linalg.eigh).
-\item Persist: cov\_shrunk.parquet, diagnostics.json (cond\#, $\delta$, forecast error $\| \hat{\Sigma} - \Sigma_{target} \|_F$).
+\begin{enumerate}[label=\arabic*.]
+    \item \textbf{Simetría y semidefinición positiva}: la matriz debe ser válida para cálculo de volatilidad, riesgo marginal y optimización cuadrática.
+    \item \textbf{Estabilidad numérica}: el acondicionamiento debe ser suficientemente bueno para evitar soluciones de cartera dominadas por ruido.
+    \item \textbf{Robustez ante datos incompletos y universos cambiantes}: el módulo no debe colapsar cuando faltan observaciones o entran y salen símbolos.
+    \item \textbf{Trazabilidad}: deben persistirse tanto la matriz final como los diagnósticos necesarios para auditar por qué se eligió una determinada regularización.
 \end{enumerate}
 
-Casos especiales: Fallback identity si $T < 50$; jitter $\epsilon I$ si ill-conditioned.
+El objetivo del módulo no es maximizar por sí mismo Sharpe, Calmar o retorno. Su función es reducir error de estimación en la capa de riesgo para que los módulos aguas abajo tomen decisiones sobre una base más estable.
 
-\section{Optimizaciones SOTA para Swing Trading Rentable}
-- Target híbrido: Constant corr + factor (Rajan \& Ray 2021 Hierarchical cov).
-- \(\delta\) adaptativa: Alta en alta vol (VIX>25), baja en calm.
-- Integra con GJR-GARCH para conditional cov: $\sigma_t^2 = \omega + \alpha \epsilon_{t-1}^2 + \gamma \epsilon_{t-1}^2 I_{\epsilon<0} + \beta \sigma_{t-1}^2$.
-- ML boost: PCA eigenvalues para nonlinear shrinkage.
+\section{Entradas, salidas y contrato del módulo}
 
-Código mejora (snippet):
-\begin{lstlisting}[language=Python]
-from sklearn.covariance import LedoitWolf
-lw = LedoitWolf(assume_centered=False)
-cov_shrunk = lw.fit(returns).covariance_
-\end{lstlisting}
+\subsection{Entradas}
 
-\section{Backtest Élite: Métricas Industriales}
-Simulación universe 50 equities, rebalance semanal swings:
+El módulo recibe, como mínimo:
+
+\begin{itemize}
+    \item una matriz de retornos \(X\) de dimensión \(T \times N\), alineada temporalmente y con columnas identificadas por símbolo;
+    \item parámetros de configuración:
+    \begin{itemize}
+        \item \texttt{lookback},
+        \item \texttt{min\_obs},
+        \item \texttt{target\_type},
+        \item \texttt{shrinkage\_method},
+        \item \texttt{nan\_policy},
+        \item \texttt{psd\_policy},
+        \item \texttt{diag\_floor},
+        \item \texttt{jitter},
+        \item \texttt{universe\_policy}.
+    \end{itemize}
+\end{itemize}
+
+\subsection{Salida principal}
+
+La salida principal es una matriz
 \[
-Sharpe = \frac{\mathbb{E}[r_p - r_f]}{\sqrt{w^T \Sigma w}}, \quad MDD = \min_t \frac{P_t - \max_{s \le t} P_s}{\max_{s \le t} P_s}
+\hat{\Sigma}_{\text{final}} \in \mathbb{R}^{N \times N}
 \]
-Monte Carlo 10k paths para CVaR $\alpha=5\%$.
+indexada por símbolo y lista para ser consumida por:
 
-\begin{table}[h]
-\centering
-\begin{tabular}{lccc}
+\begin{itemize}
+    \item \texttt{portfolio/optimizer.py},
+    \item \texttt{risk/factor\_model.py},
+    \item \texttt{risk/stress\_tests.py},
+    \item \texttt{risk/exposure\_report.py}.
+\end{itemize}
+
+\subsection{Artefactos persistidos}
+
+El módulo debe persistir:
+
+\begin{itemize}
+    \item \texttt{cov\_shrunk.parquet}: matriz final;
+    \item \texttt{cov\_sample.parquet}: matriz muestral usada como punto de partida;
+    \item \texttt{cov\_target.parquet}: target de shrinkage;
+    \item \texttt{diagnostics.json}: metadatos y métricas de calidad;
+    \item \texttt{universe\_stats.json}: cobertura efectiva por activo y universo final usado.
+\end{itemize}
+
+\subsection{Campos mínimos de \texttt{diagnostics.json}}
+
+\begin{itemize}
+    \item fecha de cálculo;
+    \item número de activos \(N\);
+    \item número de observaciones efectivas \(T\);
+    \item método de shrinkage;
+    \item target utilizado;
+    \item \(\delta\) final;
+    \item condición numérica;
+    \item fracción de valores faltantes;
+    \item número de autovalores corregidos por política PSD;
+    \item si se activó \emph{fallback};
+    \item motivo del \emph{fallback}, si aplica.
+\end{itemize}
+
+\section{Formulación matemática}
+
+\subsection{Covarianza muestral}
+
+Sea \(X = (x_{t,i})\) la matriz de retornos. La covarianza muestral es
+\[
+\hat{\Sigma}_{\text{sample}}
+=
+\frac{1}{T-1}
+(X-\bar{X})^\top (X-\bar{X}).
+\]
+
+Este estimador es consistente en el límite clásico, pero en práctica es muy sensible a:
+
+\begin{itemize}
+    \item relaciones \(N/T\) elevadas;
+    \item colinealidad entre activos;
+    \item heterogeneidad de volatilidades;
+    \item observaciones faltantes;
+    \item ventanas temporales cortas;
+    \item cambios de régimen.
+\end{itemize}
+
+\subsection{Shrinkage lineal}
+
+El estimador de shrinkage lineal es
+\[
+\hat{\Sigma}_{\text{shrink}}
+=
+(1-\delta)\hat{\Sigma}_{\text{sample}}
++
+\delta \Sigma_{\text{target}},
+\qquad
+\delta \in [0,1].
+\]
+
+Interpretación:
+
+\begin{itemize}
+    \item si \(\delta=0\), se usa la covarianza muestral pura;
+    \item si \(\delta=1\), se usa el target puro;
+    \item valores intermedios equilibran fidelidad empírica y robustez estructural.
+\end{itemize}
+
+\subsection{Targets soportados}
+
+\paragraph{1. Target diagonal escalado}
+\[
+\Sigma_{\text{target}} = \operatorname{diag}(\hat{\Sigma}_{11}, \ldots, \hat{\Sigma}_{NN}).
+\]
+Preserva volatilidades individuales y anula correlaciones cruzadas. Es el target más conservador y el \emph{fallback} por defecto.
+
+\paragraph{2. Target identidad escalada}
+\[
+\Sigma_{\text{target}} = \bar{\sigma}^2 I,
+\qquad
+\bar{\sigma}^2 = \frac{1}{N}\sum_{i=1}^{N}\hat{\Sigma}_{ii}.
+\]
+Se usa solo como último recurso cuando las diagonales estimadas no son fiables o la cobertura es extremadamente baja.
+
+\paragraph{3. Target de correlación constante}
+Sea
+\[
+\bar{\rho}
+=
+\frac{2}{N(N-1)}
+\sum_{i<j}\hat{\rho}_{ij},
+\]
+donde \(\hat{\rho}_{ij}\) son correlaciones muestrales válidas. Entonces
+\[
+(\Sigma_{\text{target}})_{ij}
+=
+\begin{cases}
+\hat{\sigma}_i^2, & i=j,\\
+\bar{\rho}\,\hat{\sigma}_i \hat{\sigma}_j, & i\neq j.
+\end{cases}
+\]
+Este target es útil cuando se desea capturar una correlación media de mercado sin heredar toda la inestabilidad de la matriz completa.
+
+\paragraph{4. Target factorial}
+Si existe un modelo factorial ya estimado,
+\[
+\Sigma_{\text{target}} = B \Omega_f B^\top + D,
+\]
+donde \(B\) es la matriz de cargas, \(\Omega_f\) la covarianza factorial y \(D\) la matriz diagonal de riesgo específico. Este target solo debe activarse si el modelo factorial aguas arriba cumple validaciones mínimas de cobertura y estabilidad.
+
+\section{Selección del estimador de shrinkage}
+
+\subsection{Métodos soportados}
+
+\begin{itemize}
+    \item \textbf{Ledoit--Wolf}: opción canónica por defecto;
+    \item \textbf{OAS}: preferible cuando \(T\) es reducido respecto a \(N\);
+    \item \textbf{Shrinkage fijo}: \(\delta\) configurado manualmente para depuración o estudios controlados.
+\end{itemize}
+
+\subsection{Política por defecto}
+
+La política por defecto debe ser:
+
+\begin{center}
+\begin{tabular}{>{\raggedright\arraybackslash}p{4.3cm} >{\raggedright\arraybackslash}p{8.7cm}}
 \toprule
-Métrica & Sample Cov & Shrunk Cov & Mejora \% \\
+Condición & Método por defecto \\
 \midrule
-Cond. Number & $10^6$ & 50 & 99.995 \\
-Sharpe Ratio & 0.8 & 1.6 & +100 \\
-Turnover & 0.40 & 0.20 & -50 \\
-Max DD (\%) & 25 & 12 & -52 \\
-Calmar Ratio & 0.32 & 1.0 & +212 \\
+\(T \ge 3N\) y cobertura alta & Ledoit--Wolf con target diagonal escalado o correlación constante \\
+\(N < T < 3N\) & OAS o Ledoit--Wolf con target diagonal \\
+\(T < N\) o cobertura débil & Target diagonal con \emph{fallback} conservador \\
+Modelo factorial validado disponible & Target factorial opcional \\
 \bottomrule
 \end{tabular}
-\caption{Backtest Swing Trading (2015-2026, fuente sintética + empiria) $[web:42]$.}
-\end{table}
+\end{center}
 
-\section{Validaciones y Checklist}
-Cumple: PSD, cond<1e4, no NaN, anti-leakage (rolling <=t). Tests: Sintética ill-cond mejora 99\%.
+\subsection{Decisión sobre \(\delta\)}
 
-\section{Próximos Pasos}
-Integra con portfolio/optimizer.py para Kelly criterion swings: $f^* = \arg\max_f \mathbb{E}[U(w f r)]$.
+Cuando el método es automático, \(\delta\) debe calcularse por el estimador elegido. Cuando el método es fijo, debe imponerse:
+\[
+0 \le \delta \le 1.
+\]
+
+No se debe introducir una \(\delta\) ``adaptativa por régimen'' en la versión canónica del módulo salvo que exista un protocolo documentado, reproducible y testeado para dicha adaptación. Esa idea puede existir como extensión experimental, pero no como comportamiento implícito del módulo base.
+
+\section{Política de datos faltantes y universo}
+
+\subsection{Mínimo de observaciones}
+
+Un activo \(i\) solo puede participar en la estimación si cumple:
+\[
+\#\{t: x_{t,i}\ \text{observado}\} \ge \texttt{min\_obs}.
+\]
+
+La recomendación base para \texttt{min\_obs} es:
+\[
+\texttt{min\_obs} = \max(30, \lfloor 0.6 \cdot \texttt{lookback} \rfloor)
+\]
+en universos con alta rotación, o una fracción algo mayor en universos estables.
+
+\subsection{Política por defecto ante NaN}
+
+La política canónica debe ser:
+
+\begin{enumerate}[label=\arabic*.]
+    \item filtrar activos que no alcanzan \texttt{min\_obs};
+    \item alinear por fechas comunes del conjunto restante;
+    \item estimar covarianza sobre las observaciones válidas;
+    \item no imputar correlaciones faltantes con cero salvo que se documente expresamente como \emph{fallback} de emergencia.
+\end{enumerate}
+
+Asignar beta, correlación o covarianza cero por defecto a observaciones faltantes no debe ser una regla base del sistema.
+
+\subsection{Universo cambiante}
+
+Cuando el universo rota, el módulo debe construir la matriz sobre el subconjunto elegible en cada fecha de cálculo. El \texttt{diagnostics.json} debe registrar:
+
+\begin{itemize}
+    \item activos entrantes y salientes;
+    \item cobertura media y mínima;
+    \item dimensión final de la matriz.
+\end{itemize}
+
+\section{Garantía de simetría y semidefinición positiva}
+
+Aunque el estimador teórico sea PSD, en práctica pueden aparecer pequeños autovalores negativos por error numérico, datos incompletos o transformaciones intermedias. Por ello, la política PSD debe ser explícita.
+
+\subsection{Paso 1: simetrización}
+
+Antes de cualquier corrección espectral:
+\[
+\hat{\Sigma} \leftarrow \frac{1}{2}\left(\hat{\Sigma} + \hat{\Sigma}^\top\right).
+\]
+
+\subsection{Paso 2: corrección espectral}
+
+Sea la descomposición espectral
+\[
+\hat{\Sigma} = Q \Lambda Q^\top.
+\]
+Definimos
+\[
+\Lambda^+ = \operatorname{diag}\left(\max(\lambda_1,\varepsilon), \ldots, \max(\lambda_N,\varepsilon)\right),
+\]
+con \(\varepsilon > 0\) pequeño, y reconstruimos:
+\[
+\hat{\Sigma}_{\text{PSD}} = Q \Lambda^+ Q^\top.
+\]
+
+\subsection{Paso 3: regularización diagonal}
+
+Si el acondicionamiento sigue siendo excesivo, se añade
+\[
+\hat{\Sigma}_{\text{final}}
+=
+\hat{\Sigma}_{\text{PSD}} + \eta I,
+\]
+con \(\eta = \texttt{jitter}\), típicamente pequeño respecto a la escala diagonal.
+
+\subsection{Regla operativa}
+
+Toda corrección PSD debe quedar reflejada en el diagnóstico. No debe realizarse silenciosamente.
+
+\section{Algoritmo de referencia}
+
+\begin{enumerate}[label=\arabic*.]
+    \item Cargar retornos en ventana \texttt{lookback}.
+    \item Filtrar activos con menos de \texttt{min\_obs}.
+    \item Alinear matriz y calcular cobertura efectiva.
+    \item Construir \(\hat{\Sigma}_{\text{sample}}\).
+    \item Construir \(\Sigma_{\text{target}}\) según \texttt{target\_type}.
+    \item Estimar \(\delta\) según \texttt{shrinkage\_method}.
+    \item Formar \(\hat{\Sigma}_{\text{shrink}}\).
+    \item Simetrizar y corregir PSD si es necesario.
+    \item Calcular diagnósticos: condición, rango efectivo, autovalores mínimos, cobertura, \(\delta\), norma de la diferencia respecto al target.
+    \item Persistir matriz final, componentes y metadatos.
+\end{enumerate}
+
+\section{Criterios de \emph{fallback}}
+
+Los \emph{fallbacks} deben ser escasos, explícitos y conservadores. Se activan solo si ocurre alguno de los siguientes casos:
+
+\begin{itemize}
+    \item \(N < 2\) tras filtros de cobertura;
+    \item la matriz muestral contiene NaN o infinitos no resolubles;
+    \item falla la estimación automática de \(\delta\);
+    \item la corrección PSD requiere un recorte espectral excesivo;
+    \item el número de condición excede un umbral máximo tras la regularización.
+\end{itemize}
+
+\subsection{Jerarquía de fallback}
+
+\begin{enumerate}[label=\arabic*.]
+    \item target diagonal escalado;
+    \item identidad escalada;
+    \item abortar y emitir error controlado si ni siquiera puede construirse una diagonal fiable.
+\end{enumerate}
+
+La regla ``usar identidad si \(T<50\)'' es demasiado rígida para ser una política general. El criterio correcto debe depender de la relación entre \(T\), \(N\) y la cobertura efectiva, no solo de un umbral absoluto en \(T\).
+
+\section{Métricas diagnósticas obligatorias}
+
+\subsection{Número de condición}
+
+\[
+\kappa(\Sigma) = \frac{\lambda_{\max}(\Sigma)}{\lambda_{\min}(\Sigma)}.
+\]
+
+Este indicador no debe presentarse como una métrica de marketing, sino como una señal de estabilidad numérica. La reducción de \(\kappa\) es deseable, pero no existe un umbral universal válido para todas las escalas y universos.
+
+\subsection{Norma de ajuste al target}
+
+\[
+d_{\text{target}}
+=
+\left\|
+\hat{\Sigma}_{\text{shrink}} - \Sigma_{\text{target}}
+\right\|_F.
+\]
+
+\subsection{Magnitud del recorte espectral}
+
+\[
+d_{\lambda}
+=
+\sum_{i=1}^{N} \max(0,\varepsilon-\lambda_i).
+\]
+
+\subsection{Cobertura media}
+
+\[
+\text{coverage}
+=
+\frac{1}{N}
+\sum_{i=1}^{N}
+\frac{\#\text{obs}_i}{T}.
+\]
+
+\subsection{Rango efectivo}
+
+Puede medirse, por ejemplo, como el número de autovalores estrictamente positivos tras corrección o mediante una variante entrópica si se desea mayor riqueza diagnóstica.
+
+\section{Interacción con módulos aguas abajo}
+
+\subsection{Con \texttt{portfolio/optimizer.py}}
+
+La matriz final se utiliza para:
+
+\begin{itemize}
+    \item cálculo de volatilidad ex--ante;
+    \item contribuciones marginales y totales al riesgo;
+    \item problemas de optimización cuadrática;
+    \item penalización por concentración de riesgo.
+\end{itemize}
+
+El optimizador no debe asumir que la matriz proviene siempre del mismo target ni del mismo estimador; debe leer metadatos.
+
+\subsection{Con \texttt{risk/factor\_model.py}}
+
+Cuando exista modelo factorial, este módulo puede:
+
+\begin{itemize}
+    \item usar la covarianza shrinked como referencia de robustez;
+    \item o construir un target factorial para la siguiente iteración.
+\end{itemize}
+
+La dependencia debe ser explícita para evitar ciclos ambiguos.
+
+\subsection{Con \texttt{risk/stress\_tests.py}}
+
+Las matrices stressadas deben derivarse de una matriz base válida. Por tanto, \texttt{stress\_tests.py} debe fallar rápido si \texttt{cov\_shrinkage.py} no ha producido una matriz PSD auditada.
+
+\section{Pruebas mínimas de aceptación}
+
+El módulo no debe considerarse listo por ``sonar bien''. Debe superar al menos los siguientes tests.
+
+\subsection{Test 1: simetría}
+\[
+\|\Sigma - \Sigma^\top\|_{\infty} < \tau_{\text{sym}}.
+\]
+
+\subsection{Test 2: PSD}
+Todos los autovalores deben cumplir
+\[
+\lambda_i \ge -\tau_{\text{psd}}.
+\]
+
+\subsection{Test 3: robustez ante datos faltantes}
+Dado un conjunto sintético con NaN estructurados, el módulo debe devolver o bien una matriz válida o bien un error controlado con razón explícita.
+
+\subsection{Test 4: estabilidad del acondicionamiento}
+La matriz final no debe empeorar de forma sistemática el número de condición respecto a la matriz muestral en datasets mal condicionados.
+
+\subsection{Test 5: invariancia dimensional}
+Si dos activos idénticos se duplican artificialmente, la rutina debe seguir produciendo una matriz PSD y trazable.
+
+\subsection{Test 6: persistencia}
+Todos los artefactos esperados deben escribirse con índices consistentes y metadatos completos.
+
+\section{Implementación de referencia}
+
+\begin{lstlisting}[language=Python,basicstyle=\ttfamily\small,breaklines=true]
+from sklearn.covariance import LedoitWolf, OAS
+import numpy as np
+
+def estimate_shrunk_cov(returns, method="ledoit_wolf"):
+    x = np.asarray(returns, dtype=float)
+
+    if method == "ledoit_wolf":
+        est = LedoitWolf(assume_centered=False).fit(x)
+        cov = est.covariance_
+        delta = getattr(est, "shrinkage_", None)
+
+    elif method == "oas":
+        est = OAS(assume_centered=False).fit(x)
+        cov = est.covariance_
+        delta = getattr(est, "shrinkage_", None)
+
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
+    cov = 0.5 * (cov + cov.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    eps = 1e-8
+    eigvals = np.maximum(eigvals, eps)
+    cov = eigvecs @ np.diag(eigvals) @ eigvecs.T
+    cov = 0.5 * (cov + cov.T)
+
+    return cov, delta
+\end{lstlisting}
+
+\section{Qué no debe hacer este módulo}
+
+Para mantener una especificación limpia, el módulo base no debe:
+
+\begin{itemize}
+    \item prometer mejoras de Sharpe, Calmar o drawdown sin un protocolo experimental separado;
+    \item mezclar en la implementación canónica GARCH multivariante, nonlinear shrinkage, copulas o PCA espectral avanzada;
+    \item introducir reglas implícitas dependientes de VIX, regímenes o señales macro sin un contrato formal;
+    \item usar tablas de \emph{backtest} sintético como sustituto de tests de aceptación.
+\end{itemize}
+
+Todas esas extensiones pueden existir, pero deben ir en investigación o detrás de flags experimentales, no dentro del contrato base.
+
+\section{Extensiones futuras razonables}
+
+Una vez la versión canónica esté estable y testeada, las siguientes extensiones son razonables:
+
+\begin{itemize}
+    \item shrinkage no lineal sobre autovalores;
+    \item targets jerárquicos sector--factor;
+    \item covarianza condicional por régimen;
+    \item integración con modelo factorial dinámico;
+    \item validación ex--ante vs volatilidad realizada.
+\end{itemize}
+
+Estas extensiones solo deben incorporarse cuando exista evidencia empírica reproducible de que mejoran estabilidad o calidad predictiva sin degradar trazabilidad.
+
+\section{Resumen ejecutivo}
+
+\texttt{risk/cov\_shrinkage.py} debe ser una pieza de infraestructura cuantitativa sobria y confiable. Su valor no está en un lenguaje grandilocuente ni en promesas de rendimiento, sino en entregar una matriz de covarianza:
+
+\begin{itemize}
+    \item válida,
+    \item estable,
+    \item auditable,
+    \item robusta a universos imperfectos,
+    \item y útil para optimización, control de riesgo y stress testing.
+\end{itemize}
+
+La prioridad de diseño correcta es:
+
+\[
+\text{validez} \;\rightarrow\; \text{estabilidad} \;\rightarrow\; \text{trazabilidad} \;\rightarrow\; \text{sofisticación}.
+\]
 
 \end{document}

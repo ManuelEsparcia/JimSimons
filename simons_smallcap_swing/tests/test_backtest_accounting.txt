@@ -7,89 +7,424 @@
 \usepackage{listings}
 \usepackage{xcolor}
 \usepackage{hyperref}
+\usepackage[margin=2.5cm]{geometry}
 
 \lstset{
   language=Python,
   basicstyle=\ttfamily\small,
   keywordstyle=\color{blue},
-  commentstyle=\color{green},
+  commentstyle=\color{teal},
   stringstyle=\color{red},
   breaklines=true,
-  frame=single
+  frame=single,
+  showstringspaces=false
 }
 
-\title{Explicación Industrial: tests/test\_backtest\_accounting.py \\ Validación Contable Robusta para Backtests Swing Trading Elite}
-\author{Perplexity Research -- Nivel RenTech}
+\title{Especificación Técnica: \texttt{tests/test\_backtest\_accounting.py}\\
+Validación Contable del Motor de Backtest}
+\author{Rewrite Quant PhD Level}
 \date{Marzo 2026}
 
 \begin{document}
 \maketitle
 
-\section{Objetivo Estratégico}
-Validar consistencia contable del motor de backtest: cash, posiciones, NAV, PnL y costes para estrategias swing (holding 3-10 d\'ias). Asegura reconciliaci\'on exacta $\NAV_t = \cash_t + \sum_i \pos_i \cdot \price_{t,i}$ bajo tolerancia $10^{-6}$, previniendo leaks que inflan Sharpe $\Sharpe = \frac{\E[\PnL] - r_f}{\sigma(\PnL)}$. Cr\'itico para auditor\'ia industrial como en Medallion Fund.[web:56][web:54]
+\section{Propósito del Módulo}
 
-\section{Casos M\'inimos y Assertions Matem\'aticas}
+El objetivo de \texttt{tests/test\_backtest\_accounting.py} es verificar que el motor de backtest preserva identidades contables fundamentales bajo ejecución parcial, costes de transacción, eventos corporativos y actualización multi-período del estado de cartera.
+
+Este módulo no evalúa la calidad predictiva de una estrategia ni su rentabilidad. Su misión es más básica y más importante: asegurar que las magnitudes económicas reportadas por el backtester son internamente consistentes. Si estas identidades fallan, cualquier métrica posterior ---PNL, drawdown, turnover, exposición, Sharpe o attribution--- queda metodológicamente contaminada.
+
+En términos de ingeniería, la suite debe responder a una pregunta concreta:
+
+\begin{quote}
+\emph{Dado un conjunto de órdenes, fills, precios y reglas de coste, ¿el estado contable del portafolio evoluciona exactamente como debe?}
+\end{quote}
+
+\section{Principios de Diseño del Test}
+
+La especificación de accounting debe construirse sobre cuatro principios:
+
+\begin{enumerate}
+    \item \textbf{Reconciliación exacta}: NAV, cash, market value y PnL deben satisfacer identidades auditables en cada timestamp.
+    \item \textbf{Orden temporal explícito}: el resultado depende del orden en que se aplican fills, costes, mark-to-market y corporate actions.
+    \item \textbf{Tolerancias numéricas controladas}: toda comparación en coma flotante debe usar tolerancias explícitas.
+    \item \textbf{Cobertura de casos borde}: la suite debe cubrir estados parciales, días sin trade, corporate actions y transición multi-day.
+\end{enumerate}
+
+\section{Identidades Contables que Deben Verificarse}
+
+\subsection{Reconciliación de NAV}
+
+La identidad central del motor es:
+
+\[
+\mathrm{NAV}_t = \mathrm{Cash}_t + \sum_{i=1}^{N} q_{t,i} \, P_{t,i} + \mathrm{Accruals}_t - \mathrm{Liabilities}_t
+\]
+
+En una versión mínima sin accruals ni pasivos explícitos:
+
+\[
+\mathrm{NAV}_t = \mathrm{Cash}_t + \mathrm{MTM}_t,
+\qquad
+\mathrm{MTM}_t := \sum_{i=1}^{N} q_{t,i} P_{t,i}
+\]
+
+Todo test de accounting debe poder recomputar esta identidad desde el estado primitivo del sistema y verificar que coincide con la salida del backtester.
+
+\subsection{Waterfall Gross-to-Net PnL}
+
+La descomposición neta de resultados debe ser consistente con la desagregación de costes:
+
+\[
+\mathrm{PnL}^{\mathrm{net}}_t
+=
+\mathrm{PnL}^{\mathrm{gross}}_t
+-
+\mathrm{Commission}_t
+-
+\mathrm{Slippage}_t
+-
+\mathrm{Fees}_t
+-
+\mathrm{BorrowCost}_t
+\]
+
+o, en forma acumulada,
+
+\[
+\sum_{u \le t} \mathrm{PnL}^{\mathrm{net}}_u
+=
+\sum_{u \le t} \mathrm{PnL}^{\mathrm{gross}}_u
+-
+\sum_{u \le t} \mathrm{Costs}_u
+\]
+
+La prueba no debe asumir qué modelo de slippage usa el sistema; debe verificar la identidad dado el output del propio motor.
+
+\subsection{Actualización de Posiciones por Fills}
+
+Para cada símbolo \(i\), si una orden recibe fill parcial o total, la posición debe actualizarse como:
+
+\[
+q_{t+1,i} = q_{t,i} + s_{t,i} \cdot f_{t,i}
+\]
+
+donde:
 \begin{itemize}
-\item \texttt{test\_nav\_reconciliation\_cash\_plus\_positions}: $\NAV_t \approx \cash_t + \mtm_t$, MTM via $V_t = S_t \cdot N_t$ (Itô lemma para opciones si aplica).
-\item \texttt{test\_gross\_to\_net\_pnl\_waterfall\_consistency}: $\PnLnet = \PnLgross - \sum (\commission + \slippage + \impact)$, waterfall descompuesto.
-\item \texttt{test\_partial\_fills\_update\_positions\_correctly}: $\pos_{t+1} = \pos_t + \fillqty \cdot \sign(order)$, sin overshoot.
-\item \texttt{test\_cost\_components\_non\_negative}: $\forall c \in \{\commission, \slippage\} \geq 0$.
-\item \texttt{test\_corporate\_action\_adjustment\_consistency}: Splits/dividends: $S_{adj} = S \cdot f$, $\cash += N \cdot div$.
+    \item \(f_{t,i} \ge 0\) es la cantidad efectivamente ejecutada,
+    \item \(s_{t,i} \in \{+1,-1\}\) codifica compra o venta.
 \end{itemize}
 
-\section{Matemáticas Avanzadas: Accounting bajo Procesos Estocásticos}
-NAV evolution: $d\NAV_t = d\cash_t + d\mtm_t$, con $d\mtm_t = \sum (\delta_t dS_t + \frac{1}{2} \Gamma_t (dS_t)^2)$ (Greeks para non-linear). Costes: $\commission = \gamma \cdot \notional$, $\slippage = \lambda \sqrt{v_t}$, modelo Kyle. Gross PnL: $\PnLgross_t = \sum (exit - entry) \cdot shares$. SOTA: Incorporar transaction cost models de Almgren-Chriss $\cost = \eta \sigma \sqrt{\frac{X}{V}}$.[web:49][web:51]
-
-Para swing: Waterfall optimizado minimizando TC impact en holds cortos, target $\PnLnet / \PnLgross > 0.85$.
-
-\section{Papers SOTA y Libros Industria}
+El test debe impedir:
 \begin{itemize}
-\item \href{https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4659866}{Optimizing Swing Trading Portfolios} (backtest accounting con lazy rebalance).[web:49]
-\item \href{https://kernc.github.io/backtesting.py/}{Backtesting.py} (validaci\'on PnL exacta).[web:56]
-\item Libros: ``Quantitative Trading'' (Chan, cap. 5: Backtest pitfalls); ``Advances in Financial Machine Learning'' (L\'opez de Prado, cap. 6: Cost-aware metrics); ``Algorithmic Trading \& DMA'' (Kearns, TC models).[web:54][web:50]
+    \item doble contabilización del mismo fill,
+    \item signo incorrecto en compras/ventas,
+    \item salto de posición mayor que la cantidad ejecutada,
+    \item actualización usando la cantidad ordenada en lugar de la realmente ejecutada.
 \end{itemize}
 
-\section{Fixtures Optimizadas para Research}
+\subsection{No Negatividad y Coherencia de Costes}
+
+Salvo que el sistema modele rebates explícitos, las componentes de coste deben cumplir:
+
+\[
+\mathrm{Commission}_t \ge 0,
+\qquad
+\mathrm{Slippage}_t \ge 0,
+\qquad
+\mathrm{Fees}_t \ge 0,
+\qquad
+\mathrm{BorrowCost}_t \ge 0
+\]
+
+Más importante que esa no negatividad aislada es la coherencia con el tamaño ejecutado. Por ejemplo, si no hay fill, no debe existir comisión variable asociada al trade.
+
+\subsection{Consistencia Bajo Corporate Actions}
+
+Los eventos corporativos deben preservar riqueza económica salvo entradas o salidas explícitas de caja.
+
+\paragraph{Split \(k{:}1\)}
+Si una posición de \(q\) acciones a precio \(P\) recibe un split \(k{:}1\), la nueva posición y el nuevo precio deben satisfacer:
+
+\[
+q' = kq,
+\qquad
+P' = \frac{P}{k},
+\qquad
+q'P' = qP
+\]
+
+El market value previo y posterior al split debe coincidir salvo errores de redondeo definidos por política explícita.
+
+\paragraph{Dividendo en efectivo \(d\)}
+Si el símbolo paga un dividendo por acción \(d\), entonces:
+
+\[
+\mathrm{Cash}' = \mathrm{Cash} + q d
+\]
+
+y el ajuste de precio debe tratarse según la convención del dataset. El test no debe mezclar precios ajustados y cash dividends sin fijar esa convención.
+
+\section{Orden de Eventos dentro de un Timestamp}
+
+Muchos errores contables no provienen de fórmulas incorrectas, sino de aplicar eventos en orden erróneo. La suite debe fijar una convención operativa. Una convención razonable es:
+
+\begin{enumerate}
+    \item estado heredado del timestamp anterior,
+    \item aplicación de corporate actions,
+    \item aplicación de fills,
+    \item deducción de costes,
+    \item mark-to-market al precio de valoración,
+    \item cálculo de NAV y PnL.
+\end{enumerate}
+
+Si el motor usa otra convención, los tests deben reflejarla explícitamente. Lo importante no es cuál se elija, sino que:
+\begin{itemize}
+    \item sea única,
+    \item esté documentada,
+    \item y toda la suite la use de forma consistente.
+\end{itemize}
+
+\section{Casos Mínimos que Debe Cubrir el Módulo}
+
+\subsection{\texttt{test\_nav\_reconciliation\_cash\_plus\_positions}}
+
+Verifica que el NAV reportado coincide con la suma de cash más valor de mercado de posiciones.
+
+\paragraph{Qué protege}
+Errores en:
+\begin{itemize}
+    \item actualización de cash,
+    \item mark-to-market,
+    \item signos de posición,
+    \item doble contabilización de fills,
+    \item corporate actions mal aplicadas.
+\end{itemize}
+
+\paragraph{Assertion base}
+\begin{lstlisting}
+assert np.isclose(
+    nav_observed,
+    cash_observed + mtm_recomputed,
+    rtol=1e-10,
+    atol=1e-12,
+)
+\end{lstlisting}
+
+\subsection{\texttt{test\_gross\_to\_net\_pnl\_waterfall\_consistency}}
+
+Comprueba que la cascada gross-to-net es algebraicamente consistente.
+
+\paragraph{Assertion base}
+\begin{lstlisting}
+expected_net = gross_pnl - commission - slippage - fees - borrow_cost
+assert np.isclose(net_pnl, expected_net, rtol=1e-10, atol=1e-12)
+\end{lstlisting}
+
+\paragraph{Qué protege}
+\begin{itemize}
+    \item costes restados dos veces,
+    \item costes omitidos,
+    \item mezcla entre PnL realizado y no realizado,
+    \item inconsistencia entre reporting agregado y ledger elemental.
+\end{itemize}
+
+\subsection{\texttt{test\_partial\_fills\_update\_positions\_correctly}}
+
+Verifica que las posiciones se actualizan con la cantidad efectivamente ejecutada, no con la ordenada.
+
+\paragraph{Escenario mínimo}
+\begin{itemize}
+    \item posición inicial: 100 acciones,
+    \item orden de compra por 50,
+    \item fill efectivo de 20,
+    \item posición final esperada: 120.
+\end{itemize}
+
+\paragraph{Qué protege}
+Errores muy comunes en simuladores: usar \texttt{order\_qty} en lugar de \texttt{fill\_qty}, o actualizar posición antes de conocer el fill real.
+
+\subsection{\texttt{test\_cost\_components\_non\_negative}}
+
+Valida que las componentes de coste cumplen su contrato de signo y que son cero cuando corresponde.
+
+\paragraph{Assertions útiles}
+\begin{lstlisting}
+assert (cost_df[["commission", "slippage", "fees"]] >= 0).all().all()
+assert (cost_df.loc[no_fill_mask, "commission"] == 0).all()
+\end{lstlisting}
+
+\subsection{\texttt{test\_corporate\_action\_adjustment\_consistency}}
+
+Verifica que splits y dividendos preservan consistencia económica.
+
+\paragraph{Split}
+\begin{lstlisting}
+assert new_qty == old_qty * split_factor
+assert np.isclose(new_price, old_price / split_factor)
+assert np.isclose(new_qty * new_price, old_qty * old_price)
+\end{lstlisting}
+
+\paragraph{Dividendo}
+\begin{lstlisting}
+assert np.isclose(new_cash, old_cash + old_qty * dividend_per_share)
+\end{lstlisting}
+
+\section{Casos Borde que Deben Añadirse}
+
+Para llevar este módulo a nivel realmente fuerte, conviene cubrir además:
+
+\subsection{Días sin trades}
+
+Si no hay fills y no hay corporate actions, el cambio en NAV debe proceder exclusivamente del movimiento de precios sobre posiciones existentes:
+
+\[
+\Delta \mathrm{NAV}_t = \sum_i q_{t-1,i}(P_{t,i} - P_{t-1,i})
+\]
+
+\subsection{Cierre total de posición}
+
+Cuando una posición se cierra completamente, el inventario final debe ser exactamente cero dentro de tolerancia y no debe quedar residual por redondeo no controlado.
+
+\subsection{Cambio de signo de posición}
+
+Si una venta excede la posición larga actual, el sistema pasa de largo a corto. Este caso debe validar:
+\begin{itemize}
+    \item nueva cantidad con signo correcto,
+    \item cash consistente con la venta,
+    \item posible activación de borrow cost en timestamps posteriores.
+\end{itemize}
+
+\subsection{Multiday state persistence}
+
+El estado del día \(t\) debe ser exactamente el estado inicial del día \(t+1\), salvo eventos definidos. Este test protege contra reinitializations ocultas, recomputaciones inconsistentes o errores en snapshots intermedios.
+
+\subsection{Política de redondeo}
+
+Si el sistema redondea cash, cantidad o precios, esa política debe ser única y testeada. Un test bueno no solo usa tolerancias; también verifica que el redondeo aplicado por el motor coincide con la política declarada.
+
+\section{Fixtures Recomendadas}
+
+Las fixtures deben ser pequeñas, deterministas y orientadas a recomputar estados esperados a mano.
+
+\subsection{Ledger mínimo de fills}
+
+\begin{lstlisting}
+import pandas as pd
+import pytest
+
+@pytest.fixture
+def simple_fills():
+    return pd.DataFrame([
+        {"ts": "2024-01-02", "symbol": "AAA", "side": "buy",  "qty": 100, "fill_qty": 100, "fill_price": 10.0},
+        {"ts": "2024-01-03", "symbol": "AAA", "side": "buy",  "qty":  50, "fill_qty":  20, "fill_price": 11.0},
+        {"ts": "2024-01-04", "symbol": "AAA", "side": "sell", "qty":  40, "fill_qty":  40, "fill_price": 12.0},
+    ])
+\end{lstlisting}
+
+\subsection{Serie mínima de precios}
+
 \begin{lstlisting}
 @pytest.fixture
-def synthetic_orders_fills():
-    np.random.seed(42)
-    return pd.DataFrame({
-        'timestamp': pd.date_range('2020', periods=100),
-        'symbol': 'SPY',
-        'side': np.random.choice(['buy', 'sell'], 100),
-        'qty': np.random.poisson(100, 100),
-        'fill\_pct': np.random.uniform(0.8, 1.0, 100)  # Partial fills
-    })
+def simple_prices():
+    return pd.DataFrame([
+        {"ts": "2024-01-02", "symbol": "AAA", "price": 10.0},
+        {"ts": "2024-01-03", "symbol": "AAA", "price": 11.0},
+        {"ts": "2024-01-04", "symbol": "AAA", "price": 12.0},
+        {"ts": "2024-01-05", "symbol": "AAA", "price": 11.5},
+    ])
 \end{lstlisting}
-\texttt{synthetic\_price\_path}: GBM con jumps para swings. \texttt{synthetic\_cost\_breakdown}: Breakdown $\commission=0.001\%$, $\slippage=0.5$ bps.
 
-\section{Implementación Assertions: Tolerancias Numéricas}
-Usa $\texttt{np.allclose(obs, exp, rtol=1e-8, atol=1e-10)}$ para float precision. Test edge: Zero positions, max leverage 2x (swing conservative).
+\subsection{Cost model explícito}
 
-\section{Backtest Ejemplo: Tabla Waterfall Elite}
-Simulaci\'on 2020-2025 swing en SPY:
+\begin{lstlisting}
+@pytest.fixture
+def simple_cost_model():
+    return {
+        "commission_per_share": 0.01,
+        "slippage_bps": 5.0,
+        "borrow_daily_bps": 0.0,
+    }
+\end{lstlisting}
 
-\begin{table}[h]
-\centering
-\begin{tabular}{lrrrr}
-\toprule
-Componente & Gross & Costs & Net & \% Impact \\
-\midrule
-Trades PnL & 28.5\% & - & 25.2\% & - \\
-Commissions & - & -0.45\% & - & 1.6\% \\
-Slippage & - & -1.65\% & - & 5.8\% \\
-Impact & - & -1.2\% & - & 4.2\% \\
-\bottomrule
-\end{tabular}
-\caption{Waterfall PnL: Net Sharpe 2.9 vs. 1.1 benchmark.}
-\end{table}
+La clave no es la sofisticación del modelo, sino que permita recomputar manualmente cash y net PnL esperados.
 
-DoD: 100\% coverage, reconciliaci\'on perfecta, ready para prod en Quantopian/QuantConnect.
+\section{Ejemplo de Test Sobrio}
 
-\section{Optimizaciones SOTA para Rentabilidad Máxima}
-- TC-aware optimization: Min $\PnLnet$ via quadratic programming.
-- MonteCarlo 10k paths para VaR 95\% <10\% drawdown.
-- Integrar con VectorBT para vectorized validation +1000 l\'ineas.
+\begin{lstlisting}
+def test_nav_reconciliation_cash_plus_positions(backtest_output):
+    state = backtest_output.daily_state.copy()
+
+    mtm = state["position_qty"] * state["mark_price"]
+    expected_nav = state["cash"] + mtm
+
+    assert np.allclose(
+        state["nav"].to_numpy(),
+        expected_nav.to_numpy(),
+        rtol=1e-10,
+        atol=1e-12,
+    )
+\end{lstlisting}
+
+Este tipo de test es correcto porque:
+\begin{itemize}
+    \item recomputa una identidad fundamental,
+    \item no depende de métricas decorativas,
+    \item falla exactamente cuando el ledger contable está roto.
+\end{itemize}
+
+\section{Tolerancias Numéricas}
+
+Las tolerancias deben ser explícitas y coherentes con el tipo de dato:
+
+\begin{itemize}
+    \item \textbf{cantidades enteras} (\texttt{shares}, \texttt{fills}): comparación exacta,
+    \item \textbf{cash y precios}: \texttt{atol}/\texttt{rtol} fijos,
+    \item \textbf{agregados largos}: tolerancia algo mayor si existe acumulación de error flotante controlado.
+\end{itemize}
+
+Una política razonable para tests unitarios de accounting es:
+
+\[
+\texttt{rtol}=10^{-10}, \qquad \texttt{atol}=10^{-12}
+\]
+
+salvo que el sistema trabaje de forma explícita con redondeo monetario a céntimo.
+
+\section{Qué No Debe Hacer Este Módulo}
+
+Para mantener nivel alto, este archivo no debe mezclar accounting con afirmaciones que pertenecen a otras capas:
+
+\begin{itemize}
+    \item no debe hablar de Sharpe objetivo,
+    \item no debe justificar el test por benchmark de rentabilidad,
+    \item no debe introducir modelos de ejecución complejos si no forman parte del contrato testeado,
+    \item no debe usar lenguaje de ``ready for prod'' como sustituto de invariantes verificables.
+\end{itemize}
+
+Un test de accounting es bueno cuando especifica estados, transiciones e identidades; no cuando presume de performance de estrategia.
+
+\section{Definition of Done}
+
+El módulo \texttt{tests/test\_backtest\_accounting.py} puede considerarse sólido si cumple todo lo siguiente:
+
+\begin{enumerate}
+    \item Verifica reconciliación NAV = cash + MTM en cada timestamp.
+    \item Verifica consistencia gross-to-net PnL.
+    \item Verifica actualización correcta de posiciones bajo fills parciales.
+    \item Verifica signos y activación de costes.
+    \item Verifica tratamiento coherente de corporate actions.
+    \item Cubre al menos un caso multi-day.
+    \item Fija tolerancias numéricas explícitas.
+    \item Falla con mensajes que identifiquen la identidad contable violada.
+\end{enumerate}
+
+\section{Conclusión}
+
+\texttt{test\_backtest\_accounting.py} debe entenderse como una capa de auditoría del simulador. No prueba si la estrategia gana dinero; prueba si el motor sabe contar. Esa diferencia es esencial.
+
+En un stack cuantitativo serio, la accounting layer debe ser una fuente de verdad verificable. Si el cash, las posiciones, el MTM, el net PnL y los corporate actions no están blindados por tests de identidades exactas, el resto del pipeline hereda números que pueden parecer plausibles pero no son confiables.
+
+Por eso este módulo debe escribirse con tono sobrio y estructura de auditoría: contratos explícitos, fixtures pequeñas, recomputación independiente y casos borde contables. Ahí es donde realmente sube al nivel de una especificación fuerte.
 
 \end{document}

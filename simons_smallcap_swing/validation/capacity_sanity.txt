@@ -1,73 +1,410 @@
 % Copiar y pegar en LaTeX (guarda como .txt)
 \documentclass{article}
 \usepackage[utf8]{inputenc}
-\usepackage{amsmath}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs}
 \usepackage{hyperref}
-\usepackage{booktabs} % Para tablas
-\title{Explicaci\'on SOTA: validation/capacity\_sanity.py}
-\author{Perplexity Research Industrial}
+\usepackage{enumitem}
+
+\title{Especificaci\'on Cuantitativa: validation/capacity\_sanity.py}
+\author{JimSimons Small Cap Swing --- Validation Research Note}
 \date{Marzo 2026}
+
 \begin{document}
 \maketitle
 
-\section{Resumen Ejecutivo}
-M\'odulo para validar capacidad operativa en swing trading, escalando AUM sin degradaci\'on por liquidez. Integrado con modelos Kyle-Almeida y optimizaci\'on convexa para rentabilidad institucional (Sharpe $>$2 hasta 1.5x AUM).
+\section{Prop\'osito del m\'odulo}
 
-\section{Teor\'ia Matem\'atica}
-\subsection{Impacto de Mercado}
-El slippage $s$ se modela como
-\begin{equation}
-s = \lambda \cdot \frac{Q}{\text{ADV}}, \quad p = \frac{Q}{\text{ADV}} \leq p_{95}
-\end{equation}
-donde $\lambda \approx 0.1-0.5\%$ (Almeida et al., 2006).
+Este m\'odulo no estima ``retornos institucionales'' ni pretende demostrar ventaja estad\'istica.
+Su funci\'on es mucho m\'as austera y operativa: determinar si una estrategia que parece
+v\'alida en backtest sigue siendo ejecutable cuando el capital gestionado aumenta y los costes
+de liquidez dejan de ser despreciables.
 
-\subsection{D\'ias para Liquidar (DTL)}
-\begin{equation}
-\text{DTL}_{p95} = F^{-1}(0.95)
-\end{equation}
-$F$: CDF posiciones (Pareto tails).
+La pregunta formal es la siguiente: dado un proceso de se\~nales, construcci\'on de cartera y
+ejecuci\'on ya fijado, \emph{\`hasta qu\'e escala de AUM puede aumentarse la estrategia sin violar
+restricciones de participaci\'on, tiempo de liquidaci\'on, concentraci\'on y degradaci\'on aceptable
+del rendimiento neto?}
 
-\subsection{Retorno Neto}
-\begin{equation}
-R_{net} = R_{gross} - \left( \sum_t c_t + \frac{1}{2} \lambda \frac{Q_t^2}{V_t} \right)
-\end{equation}
+Por tanto, \texttt{capacity\_sanity.py} debe tratar la capacidad como una \textbf{restricci\'on de
+factibilidad} y no como un argumento comercial.
 
-\section{Backtest Optimizado}
-\begin{table}[h]
-\centering
-\begin{tabular}{lccccc}
-\toprule
-Escenario AUM & Part. P95 & DTL P95 & Ret. Neto & Sharpe & Gate \\
-\midrule
-x0.5 (\$5M) & 2.1\% & 1.2 & 28.4\% & 2.8 & PASS \\
-x1.0 (\$10M) & 4.2\% & 2.1 & 25.7\% & 2.5 & PASS \\
-x1.5 (\$15M) & 6.3\% & 3.4 & 21.2\% & 2.1 & WARN \\
-x2.0 (\$20M) & 8.4\% & 5.1 & 15.9\% & 1.6 & FAIL \\
-\bottomrule
-\end{tabular}
-\caption{Resultados Backtest SPY/QQQ 2020-2026}
-\end{table}
+\section{Definiciones y notaci\'on}
 
-Capacidad l\'imite: \$14M.
+Sea $i \in \{1,\dots,N_t\}$ un activo elegible en la fecha $t$ y sea $\alpha > 0$ un factor de
+escalado del AUM respecto al backtest base. Si el portafolio base opera con AUM $A_0$, entonces
+el escenario evaluado opera con
+\[
+A(\alpha) = \alpha A_0.
+\]
 
-\section{Referencias}
-\begin{itemize}
-\item Almeida et al. (2006). Liquidity and Capacity. \url{https://jfqa.org}
-\item Chan (2020). Quantitative Trading.
-\item L\'opez de Prado (2018). Advances in Financial ML.
-\item arXiv:2401.06139 Swing Trading STL.
+Denotamos:
+\begin{itemize}[leftmargin=2em]
+    \item $q_{i,t}^{(1)}$: n\'umero de acciones compradas o vendidas en el backtest base;
+    \item $h_{i,t}^{(1)}$: posici\'on mantenida al cierre en el backtest base;
+    \item $P_{i,t}$: precio de ejecuci\'on o precio de referencia;
+    \item $\mathrm{ADV}_{i,t}$: volumen diario medio monetario o en acciones, medido con ventana fija;
+    \item $\rho \in (0,1]$: haircut de liquidez para descontar volumen no realmente accesible;
+    \item $\mathrm{ADV}^{\mathrm{eff}}_{i,t} = \rho \, \mathrm{ADV}_{i,t}$: volumen efectivo utilizable;
+    \item $\sigma_{i,t}$: volatilidad diaria estimada;
+    \item $s_{i,t}$: spread bid-ask estimado;
+    \item $\eta \in (0,1)$: fracci\'on m\'axima del volumen efectivo que el sistema asume poder ejecutar por d\'ia.
 \end{itemize}
 
-\section{C\'odigo Mejorado}
-Snippet CVXPY para AUM\_max:
+Bajo un test de capacidad puro, las decisiones de se\~nal no se reoptimizan. Se reescala
+la estrategia ya existente:
+\[
+q_{i,t}(\alpha) = \alpha q_{i,t}^{(1)},
+\qquad
+h_{i,t}(\alpha) = \alpha h_{i,t}^{(1)}.
+\]
+Esto es importante: el m\'odulo debe medir \emph{robustez de ejecuci\'on bajo escala}, no
+ventaja espuria obtenida al cambiar simult\'aneamente la l\'ogica de inversi\'on.
+
+\section{M\'etricas nucleares de capacidad}
+
+\subsection{Participaci\'on en volumen}
+
+La m\'etrica elemental de presi\'on de ejecuci\'on es la participaci\'on:
+\[
+\pi_{i,t}(\alpha) =
+\frac{|q_{i,t}(\alpha)|}{\mathrm{ADV}^{\mathrm{eff}}_{i,t}}.
+\]
+
+No interesa solo el promedio. En small caps la cola derecha importa mucho m\'as que la media.
+Por ello, el m\'odulo debe reportar al menos:
+\[
+Q_{0.50}(\pi), \qquad Q_{0.95}(\pi), \qquad Q_{0.99}(\pi),
+\]
+as\'i como el m\'aximo por activo y por rebalanceo.
+
+\subsection{D\'ias para liquidar}
+
+La capacidad tambi\'en debe medirse sobre el inventario, no solo sobre los flujos de orden.
+Definimos los d\'ias para liquidar de una posici\'on como
+\[
+\mathrm{DTL}_{i,t}(\alpha)
+=
+\frac{|h_{i,t}(\alpha)|}{\eta \, \mathrm{ADV}^{\mathrm{eff}}_{i,t}}.
+\]
+
+Esta cantidad aproxima cu\'antos d\'ias de volumen accesible se necesitar\'ian para deshacer la
+posici\'on sin exceder el ritmo de participaci\'on permitido por el sistema. Igual que antes,
+deben reportarse cuantiles y colas:
+\[
+Q_{0.50}(\mathrm{DTL}), \qquad Q_{0.95}(\mathrm{DTL}), \qquad Q_{0.99}(\mathrm{DTL}).
+\]
+
+\subsection{Coste de ejecuci\'on}
+
+El coste total de trading debe descomponerse en t\'erminos con significado econ\'omico.
+Una parametrizaci\'on suficientemente general para validaci\'on es:
+\[
+c^{\mathrm{bps}}_{i,t}(\alpha)
+=
+c^{\mathrm{fees}}_{i,t}
++
+c^{\mathrm{spread}}_{i,t}
++
+c^{\mathrm{impact}}_{i,t}(\alpha),
+\]
+donde
+\[
+c^{\mathrm{spread}}_{i,t} \approx \frac{1}{2}s_{i,t},
+\qquad
+c^{\mathrm{impact}}_{i,t}(\alpha)
+=
+\lambda_{i,t}
+\left(
+\pi_{i,t}(\alpha)
+\right)^\beta,
+\qquad \beta \in [1,2].
+\]
+
+Aqu\'i $\lambda_{i,t}$ y $\beta$ no deben fijarse por narrativa sino por calibraci\'on a datos
+de ejecuci\'on o, en su defecto, por escenarios conservadores definidos a nivel de sistema.
+El coste monetario por trade queda:
+\[
+\mathrm{TC}_{i,t}(\alpha)
+=
+\frac{c^{\mathrm{bps}}_{i,t}(\alpha)}{10^4}
+\, |q_{i,t}(\alpha)| P_{i,t}.
+\]
+
+\subsection{Rendimiento neto bajo escala}
+
+Sea $\mathrm{PnL}^{\mathrm{gross}}_t(\alpha)$ el PnL bruto del backtest reescalado y
+$\mathrm{TC}_t(\alpha)$ el coste agregado de ejecuci\'on. Entonces:
+\[
+\mathrm{PnL}^{\mathrm{net}}_t(\alpha)
+=
+\mathrm{PnL}^{\mathrm{gross}}_t(\alpha)
+-
+\mathrm{TC}_t(\alpha).
+\]
+
+A partir de esta serie se recomputan, como m\'inimo:
+\begin{itemize}[leftmargin=2em]
+    \item retorno anualizado neto,
+    \item volatilidad anualizada,
+    \item Sharpe neto,
+    \item turnover neto de costes,
+    \item drawdown m\'aximo,
+    \item ratio de retenci\'on de alpha:
+    \[
+    \mathrm{Retention}(\alpha)
+    =
+    \frac{\mathbb{E}[\mathrm{PnL}^{\mathrm{net}}(\alpha)]}
+         {\mathbb{E}[\mathrm{PnL}^{\mathrm{gross}}(\alpha)]}.
+    \]
+\end{itemize}
+
+\section{Definici\'on formal de capacidad}
+
+La capacidad no debe devolverse como una cifra aislada sin contexto. El objeto correcto es
+un \textbf{escenario m\'aximo factible}:
+\[
+\alpha^\star
+=
+\sup \left\{
+\alpha > 0 :
+\begin{array}{l}
+Q_{0.95}(\pi(\alpha)) \le \pi_{\max},\\
+Q_{0.95}(\mathrm{DTL}(\alpha)) \le \mathrm{DTL}_{\max},\\
+\mathrm{Retention}(\alpha) \ge r_{\min},\\
+\mathrm{Sharpe}^{\mathrm{net}}(\alpha) \ge S_{\min},\\
+\Delta \mathrm{DD}(\alpha) \le \mathrm{DD}_{\max}^{\mathrm{extra}}
+\end{array}
+\right\}.
+\]
+
+La salida econ\'omicamente interpretable es
+\[
+A^\star = \alpha^\star A_0.
+\]
+
+Esta formulaci\'on deja claro que la capacidad depende de restricciones elegidas ex ante y no
+de una cifra ornamental puesta a posteriori.
+
+\section{Protocolo correcto de evaluaci\'on}
+
+\subsection{Principio de invariancia}
+
+Para que el test sea interpretable, deben mantenerse fijos:
+\begin{itemize}[leftmargin=2em]
+    \item universo elegible,
+    \item se\~nales y ranking,
+    \item reglas de construcci\'on de cartera,
+    \item frecuencia de rebalanceo,
+    \item l\'ogica de riesgo,
+    \item definici\'on temporal de ADV, spreads y volatilidad.
+\end{itemize}
+
+Si estos componentes cambian con $\alpha$, entonces ya no se est\'a midiendo capacidad del
+mismo proceso, sino una estrategia distinta.
+
+\subsection{Grid de escalado}
+
+El m\'odulo debe evaluar una rejilla creciente
+\[
+\alpha \in \{\alpha_1,\dots,\alpha_K\},
+\qquad
+1 = \alpha_1 < \alpha_2 < \cdots < \alpha_K,
+\]
+por ejemplo geom\'etrica o cuasi-lineal. Para cada $\alpha$ se recalculan:
+
+\begin{enumerate}[leftmargin=2em]
+    \item tama\~nos de orden y posiciones;
+    \item participaci\'on por activo y fecha;
+    \item DTL por activo y fecha;
+    \item coste de ejecuci\'on por trade;
+    \item PnL neto agregado;
+    \item m\'etricas de cola y degradaci\'on relativa frente al escenario base.
+\end{enumerate}
+
+La capacidad final no debe tomarse del primer punto que ``parece malo'' visualmente, sino del
+mayor $\alpha$ que satisface simult\'aneamente todas las restricciones.
+
+\subsection{Escenarios de calibraci\'on}
+
+Es recomendable evaluar al menos tres escenarios de coste:
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Base}: par\'ametros calibrados centrales;
+    \item \textbf{Adverso}: haircut de volumen m\'as severo, spread m\'as alto, impacto mayor;
+    \item \textbf{Estresado}: combinaci\'on conservadora para ventanas de liquidez deteriorada.
+\end{itemize}
+
+La cifra reportable de capacidad debe ser la m\'inima entre escenarios o, como m\'inimo, debe
+informarse expl\'icitamente de qu\'e escenario produce la restricci\'on vinculante.
+
+\section{Gates y gobernanza}
+
+\subsection{Filosof\'ia de gates}
+
+En validaci\'on, un gate no debe ser una decoraci\'on narrativa sino una decisi\'on operacional.
+La salida recomendada es \texttt{PASS/WARN/FAIL}, pero el criterio debe ser transparente.
+
+\subsection{Estructura recomendada}
+
+Para un escenario $\alpha$, def\'inanse:
+\[
+g_1(\alpha) = \frac{Q_{0.95}(\pi(\alpha))}{\pi_{\max}},
+\qquad
+g_2(\alpha) = \frac{Q_{0.95}(\mathrm{DTL}(\alpha))}{\mathrm{DTL}_{\max}},
+\]
+\[
+g_3(\alpha) = \frac{r_{\min}}{\max(\mathrm{Retention}(\alpha),\varepsilon)},
+\qquad
+g_4(\alpha) = \frac{S_{\min}}{\max(\mathrm{Sharpe}^{\mathrm{net}}(\alpha),\varepsilon)}.
+\]
+
+Con $\varepsilon > 0$ peque\~no para evitar divisiones inestables. Una gobernanza simple y robusta es:
+\begin{itemize}[leftmargin=2em]
+    \item \texttt{PASS} si $\max_j g_j(\alpha) \le 1$;
+    \item \texttt{WARN} si hay una \'unica restricci\'on marginalmente vulnerada pero las colas extremas siguen controladas;
+    \item \texttt{FAIL} si cualquier restricci\'on cr\'itica se viola de forma material o si
+    $Q_{0.99}(\pi)$ o $Q_{0.99}(\mathrm{DTL})$ muestran concentraci\'on no tolerable.
+\end{itemize}
+
+\subsection{Sobre los umbrales}
+
+Los umbrales no deben presentarse como universales. Deben ser calibrados por:
+\begin{itemize}[leftmargin=2em]
+    \item tama\~no medio de capitalizaci\'on del universo,
+    \item frecuencia de rebalanceo,
+    \item agresividad permitida de ejecuci\'on,
+    \item restricciones internas del mandato,
+    \item evidencia hist\'orica del propio sistema.
+\end{itemize}
+
+A falta de calibraci\'on espec\'ifica, el documento puede incluir \emph{defaults operativos}
+expl\'icitamente marcados como provisionales, por ejemplo:
+\[
+\pi_{\max} \in [3\%, 5\%], \qquad
+\mathrm{DTL}_{\max} \in [3,5]\ \text{d\'ias}, \qquad
+r_{\min} \in [0.65,0.80].
+\]
+Pero nunca deben venderse como constantes de la naturaleza.
+
+\section{Casos l\'imite y fuentes de error}
+
+El m\'odulo debe endurecerse frente a varios edge cases que en small caps son frecuentes:
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{ADV espurio o desactualizado.} Si el volumen reciente cae bruscamente respecto a la
+    ventana de c\'alculo, el test debe aplicar haircut adicional o marcar observaci\'on inv\'alida.
+    \item \textbf{Activos con trading discontinuo.} Si existen sesiones con volumen casi nulo,
+    el DTL debe crecer dr\'asticamente o declararse no fiable.
+    \item \textbf{Halts, limit moves o gaps extremos.} No pueden tratarse como d\'ias ordinarios de liquidez.
+    \item \textbf{Concentraci\'on por nombre.} Un promedio aceptable puede ocultar uno o dos activos imposibles
+    de ejecutar; por eso el m\'aximo y el cuantil 99\% son obligatorios.
+    \item \textbf{Microcaps arrastrando la capacidad.} Debe informarse qu\'e porcentaje del universo es vinculante
+    para la restricci\'on.
+    \item \textbf{Se\~nales que cambian el turnover al escalar.} Si la cartera requiere truncamiento o clipping
+    adicional, esto debe registrarse como cambio de estrategia y no como capacidad del dise\~no original.
+\end{enumerate}
+
+\section{Invariantes de implementaci\'on}
+
+El c\'odigo debe respetar al menos estos invariantes:
+
+\begin{itemize}[leftmargin=2em]
+    \item ninguna capacidad reportada puede exceder la de un escenario m\'as adverso;
+    \item el coste total debe ser no decreciente en $\alpha$;
+    \item $Q_{0.95}(\pi)$ y $Q_{0.95}(\mathrm{DTL})$ deben ser no decrecientes salvo peque\~nas irregularidades num\'ericas;
+    \item si el universo, la se\~nal o el rebalanceo cambian, debe emitirse advertencia de comparabilidad;
+    \item la salida debe identificar qu\'e restricci\'on fue vinculante en $A^\star$.
+\end{itemize}
+
+\section{Salida recomendada del m\'odulo}
+
+La funci\'on principal no deber\'ia devolver una sola cifra, sino una estructura auditable del tipo:
+
 \begin{verbatim}
-import cvxpy as cp
-# constraints = [p95 <= 0.05, dtl_p95 <= 5]
-AUM_max = cp.Variable()
-prob = cp.Problem(cp.Maximize(AUM_max), constraints)
-prob.solve()
+{
+  "aum_base": ...,
+  "alpha_star": ...,
+  "aum_star": ...,
+  "binding_constraint": "...",
+  "scenario": "base|adverse|stressed",
+  "grid_results": [...],
+  "p95_participation": ...,
+  "p95_dtl": ...,
+  "retention": ...,
+  "net_sharpe": ...,
+  "gate": "PASS|WARN|FAIL"
+}
 \end{verbatim}
 
-\bibliographystyle{plain}
-\bibliography{refs}
+Esto facilita integraci\'on con \texttt{validation\_suite.py} y evita informes ambiguos.
+
+\section{Esqueleto de implementaci\'on}
+
+La b\'usqueda de $\alpha^\star$ puede hacerse por rejilla creciente o por bisecci\'on si las
+restricciones son suficientemente mon\'otonas. Un boceto razonable es:
+
+\begin{verbatim}
+def evaluate_capacity(alpha, trades, holdings, market_data, cost_model, limits):
+    scaled_trades = scale_trades(trades, alpha)
+    scaled_holdings = scale_holdings(holdings, alpha)
+
+    participation = compute_participation(scaled_trades, market_data)
+    dtl = compute_dtl(scaled_holdings, market_data, limits.max_daily_fraction)
+
+    tc = compute_execution_costs(
+        scaled_trades,
+        market_data,
+        cost_model
+    )
+
+    pnl_net = recompute_net_pnl(scaled_trades, scaled_holdings, tc, market_data)
+    metrics = summarize_capacity_metrics(participation, dtl, pnl_net)
+
+    gate, binding_constraint = apply_capacity_gates(metrics, limits)
+    return metrics, gate, binding_constraint
+
+
+def find_capacity_limit(alpha_grid, *args, **kwargs):
+    last_pass = None
+    history = []
+
+    for alpha in alpha_grid:
+        metrics, gate, binding = evaluate_capacity(alpha, *args, **kwargs)
+        history.append((alpha, metrics, gate, binding))
+        if gate == "PASS":
+            last_pass = (alpha, binding)
+        else:
+            break
+
+    return last_pass, history
+\end{verbatim}
+
+\section{Interpretaci\'on correcta}
+
+La lectura correcta del m\'odulo es:
+\begin{quote}
+``Dada esta estrategia, este universo y este modelo de ejecuci\'on, la escala m\'axima compatible
+con nuestras restricciones internas de liquidez y degradaci\'on neta es $A^\star$. Por encima de
+ese nivel, la estrategia deja de ser operacionalmente equivalente a s\'i misma.''
+\end{quote}
+
+Eso es mucho m\'as \'util que cualquier tabla adornada con Sharpe elevados, porque define
+cu\'ando el sistema sigue siendo ejecutable y cu\'ando ya no lo es.
+
+\section{Referencias orientativas}
+
+\begin{itemize}[leftmargin=2em]
+    \item Almgren, R. y Chriss, N. (2000). Optimal execution with temporary and permanent impact.
+    \item Kyle, A. S. (1985). Continuous auctions and insider trading.
+    \item Kissell, R. (distintas ediciones). Market microstructure and trading cost models.
+    \item L\'opez de Prado, M. (2018). \emph{Advances in Financial Machine Learning}.
+\end{itemize}
+
+\section{Conclusi\'on}
+
+Un m\'odulo serio de capacidad no promete ``Sharpe institucional'' ni presenta un AUM m\'agico
+como argumento de venta. Su responsabilidad es m\'as simple y m\'as exigente: mostrar, con una
+definici\'on reproducible y restricciones expl\'icitas, cu\'ando una estrategia deja de escalar de
+forma econ\'omicamente consistente.
+
 \end{document}

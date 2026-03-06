@@ -1,6 +1,8 @@
 \documentclass[12pt,a4paper]{article}
+
 \usepackage[utf8]{inputenc}
-\usepackage[spanish]{babel}
+\usepackage[spanish,es-nodecimaldot]{babel}
+\usepackage[T1]{fontenc}
 \usepackage{lmodern}
 \usepackage[
   lmargin=2.5cm,
@@ -8,18 +10,20 @@
   tmargin=2.5cm,
   bmargin=2.5cm
 ]{geometry}
-\usepackage{amsmath,amssymb,amsthm}
-\usepackage{graphicx}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{bm}
 \usepackage{booktabs}
-\usepackage{listings}
+\usepackage{array}
 \usepackage{float}
+\usepackage{enumitem}
 \usepackage{csquotes}
-\usepackage{natbib}
-\usepackage[colorlinks=true,linkcolor=blue]{hyperref}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
 
-\title{Análisis de \texttt{train\_elasticnet.py} \\
-Estado del arte para baselines de ElasticNet en \\ data temporal financiera}
-\author{Baseline de ElasticNet (L1+L2) para regresión continua}
+\title{\textbf{Análisis de \texttt{train\_elasticnet.py}}\\
+Especificación de nivel research-industrial para una baseline ElasticNet\\
+en predicción temporal financiera}
+\author{Baseline interpretable de regresión regularizada con trazabilidad por \texttt{run\_id}}
 \date{\today}
 
 \begin{document}
@@ -27,246 +31,582 @@ Estado del arte para baselines de ElasticNet en \\ data temporal financiera}
 \maketitle
 
 \begin{abstract}
-  Este documento analiza el módulo \texttt{models/baselines/train\_elasticnet.py}, que implementa una \textbf{baseline de ElasticNet} para predicir targets continuos en contraportfolios financieros. Se discute la formulación matemática de ElasticNet, la \textbf{validación cruzada temporal purged} (PIT), la selección de hiperparámetros y la métrica de \emph{sparsity ratio} y estabilidad de coeficientes. El objetivo es maximizar la utilidad de este componente como modelo de referencia interpretable y robusto dentro de un sistema de swing trading de nivel research industrial.
+Este documento especifica el módulo \texttt{models/baselines/train\_elasticnet.py}, encargado de entrenar una baseline de \textbf{ElasticNet} para predicción de targets continuos en un sistema de \emph{small-cap swing trading}. El objetivo del módulo no es únicamente producir una referencia lineal interpretable, sino establecer un estándar metodológico de comparación para el resto del \emph{stack} predictivo: validación temporal \emph{purged}, preprocesado estrictamente \emph{train-only}, gobernanza reproducible de hiperparámetros, exportación de artefactos auditables y métricas que capturen tanto capacidad predictiva como estabilidad estructural del modelo. ElasticNet se utiliza aquí como un baseline de alta utilidad científica: suficientemente simple para ser inspeccionable, pero suficientemente rico para manejar multicolinealidad, ruido, alta dimensionalidad moderada y selección parcial de variables.
 \end{abstract}
 
-\section{Contexto del módulo}
+\tableofcontents
 
-El script \texttt{train\_elasticnet.py} pertenece al subpaquete \texttt{models/baselines} del repositorio \texttt{JimSimons}. Su objetivo principal es:
+\section{Propósito del módulo}
 
-\begin{itemize}
-  \item Entrenar un modelo de regresión lineal regularizada con \textbf{ElasticNet} (L1 + L2) para targets continuos.
-  \item Combinar \textbf{interpretabilidad} (coeficientes \( \beta_j \)) con \textbf{selección de variables} mediante sparsity inducida por L1 y \textbf{regularización robusta} mediante L2.
+El módulo \texttt{train\_elasticnet.py} implementa una baseline lineal regularizada para targets continuos. Su papel dentro del sistema es cuádruple:
+
+\begin{enumerate}[label=\arabic*)]
+    \item \textbf{Proveer una referencia interpretable} frente a modelos más complejos como gradiente boosting, ensamblados no lineales o arquitecturas neuronales.
+    \item \textbf{Estimar relaciones lineales penalizadas} entre variables predictoras y retornos/targets continuos, preservando capacidad explicativa mediante coeficientes por \emph{feature}.
+    \item \textbf{Aplicar selección y contracción simultáneas}, reduciendo sensibilidad a multicolinealidad, ruido transversal e inestabilidad paramétrica.
+    \item \textbf{Generar artefactos reproducibles} por \texttt{run\_id} que permitan auditoría, comparación justa entre modelos y reconstrucción exacta del experimento.
+\end{enumerate}
+
+Esta baseline no debe interpretarse como un modelo “simple” en sentido ingenuo, sino como una \textbf{pieza de control científico} del pipeline: si un modelo más complejo no supera de forma robusta a ElasticNet bajo el mismo esquema de validación, mismo universo, mismas etiquetas y mismos \emph{splits}, dicho modelo complejo no ha justificado su coste operacional.
+
+\section{Contexto cuantitativo y racional económico}
+
+En un entorno de \emph{small caps}, las features suelen presentar varias propiedades adversas:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item alta correlación entre transformaciones derivadas de precio, volumen, volatilidad y microestructura;
+    \item \emph{signal-to-noise ratio} bajo;
+    \item inestabilidad temporal de relaciones lineales;
+    \item distribución no gaussiana, colas pesadas y episodios de régimen;
+    \item datos incompletos o disponibilidad irregular en fundamentales y algunas señales cross-sectional.
 \end{itemize}
 
-Este módulo se concibe como un \textbf{baseline mínimo viable} contra el que comparar modelos más complejos (por ejemplo, GBDT, redes neuronales, etc.), preservando la capacidad de inspeccionar variables relevantes y la estabilidad de coeficientes entre folds.
+En este contexto, un ajuste lineal sin regularización tiende a producir:
+\begin{itemize}[leftmargin=1.5em]
+    \item varianza alta en coeficientes;
+    \item sensibilidad excesiva a cambios menores en muestra;
+    \item deterioro rápido fuera de muestra;
+    \item interpretaciones engañosas cuando varias variables compiten por explicar la misma fuente latente de señal.
+\end{itemize}
 
-\section{Formulación matemática de ElasticNet}
+ElasticNet responde a este problema mediante una combinación de:
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{penalización L1}, que fuerza parsimonia y puede anular coeficientes;
+    \item \textbf{penalización L2}, que estabiliza la solución ante colinealidad y dispersa peso entre grupos de variables relacionadas.
+\end{itemize}
 
-Sea \( X \in \mathbb{R}^{n \times p} \) la matriz de features, \( y \in \mathbb{R}^n \) el target continuo y \( \beta \in \mathbb{R}^p \) el vector de coeficientes. El problema de ElasticNet para cada fold se define como:
+Por ello, dentro del sistema, ElasticNet funciona como una baseline especialmente valiosa cuando se busca un equilibrio entre:
+\[
+\text{capacidad predictiva} \quad + \quad \text{robustez estadística} \quad + \quad \text{interpretabilidad operativa}.
+\]
+
+\section{Definición matemática}
+
+Sea:
+\begin{itemize}[leftmargin=1.5em]
+    \item \(X \in \mathbb{R}^{n \times p}\) la matriz de features del fold de entrenamiento;
+    \item \(y \in \mathbb{R}^{n}\) el target continuo;
+    \item \(\beta \in \mathbb{R}^{p}\) el vector de coeficientes;
+    \item \(\beta_0 \in \mathbb{R}\) el intercepto.
+\end{itemize}
+
+El problema de optimización de ElasticNet es:
 
 \begin{equation}
-  \min_{\beta} \frac{1}{2n} \| y - X\beta \|^2_2
-  + \alpha \left( (1 - \rho)\|\beta\|_1 + \rho \|\beta\|_2^2 \right),
+\min_{\beta_0,\beta}
+\left\{
+\frac{1}{2n}\|y - \beta_0\mathbf{1} - X\beta\|_2^2
++
+\alpha
+\left(
+\rho \|\beta\|_1
++
+\frac{1-\rho}{2}\|\beta\|_2^2
+\right)
+\right\},
+\label{eq:elasticnet}
 \end{equation}
 
 donde:
-\begin{itemize}
-  \item \( \alpha > 0 \) es el parámetro de regularización global (escala de penalización).
-  \item \( \rho \in [0,1] \) es el \textbf{l1\_ratio} (proporción de L1 respecto a L2).
-  \item \( \|\beta\|_1 = \sum_{j=1}^p |\beta_j| \) es la penalización L1 (Lasso).
-  \item \( \|\beta\|_2^2 = \sum_{j=1}^p \beta_j^2 \) es la penalización L2 (Ridge).
+\begin{itemize}[leftmargin=1.5em]
+    \item \(\alpha > 0\) controla la intensidad total de regularización;
+    \item \(\rho \in [0,1]\) corresponde a \texttt{l1\_ratio};
+    \item \(\|\beta\|_1 = \sum_{j=1}^{p} |\beta_j|\);
+    \item \(\|\beta\|_2^2 = \sum_{j=1}^{p} \beta_j^2\).
 \end{itemize}
 
-Cuando:
-\begin{itemize}
-  \item \( \rho = 0 \): se obtiene Lasso (\( \|\beta\|_2^2 = 0 \)); favorece sparsity extrema.
-  \item \( \rho = 1 \): se obtiene Ridge (\( \|\beta\|_1 = 0 \)); mantiene todas las variables pero con coeficientes pequeños.
+\subsection{Convención correcta de \texttt{l1\_ratio}}
+
+La convención operativa que debe seguir el módulo es:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item si \(\rho = 1\), la penalización es puramente L1 y se recupera \textbf{Lasso};
+    \item si \(\rho = 0\), la penalización es puramente L2 y se recupera \textbf{Ridge};
+    \item si \(0 < \rho < 1\), se obtiene una combinación mixta L1+L2.
 \end{itemize}
 
-La elastic net permite capturar:
-\begin{itemize}
-  \item \textbf{Sparsity} (L1) para interpretación y selección de features.
-  \item \textbf{Estabilidad} frente a multicolinealidad (L2), gracias al efecto de \emph{grouping} de variables correlacionadas.
-\end{itemize}
-[web:49][web:40]
+Esta convención debe estar alineada con implementaciones tipo \texttt{scikit-learn} y no debe invertirse ni en documentación ni en configuración, porque un error aquí contamina la interpretación completa de la \emph{grid} de hiperparámetros.
 
-\subsection{Ventajas frente a Lasso y Ridge}
+\subsection{Interpretación cuantitativa}
 
-\begin{itemize}
-  \item Frente a Lasso, ElasticNet:
-    \[
-      \text{Var}(\hat{\beta}_{\text{elastic}}) < \text{Var}(\hat{\beta}_{\text{lasso}})
-    \]
-    en presencia de correlación entre features, reduciendo varianza a cambio de algo de sesgo. [web:49]
-  \item Frente a Ridge, ElasticNet induce \textbf{sparsity inherentemente} gracias al término L1, permitiendo descartar variables no relevantes.
-  \item En escenarios de alta dimensionalidad y correlación (típicos en trading), ElasticNet suele dominar a Lasso y Ridge según experimentos de simulación y benchmarks de la literatura. [web:49]
+La ecuación \eqref{eq:elasticnet} implica:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item mayor \(\alpha\) $\Rightarrow$ mayor contracción, menor varianza, más sesgo;
+    \item mayor \(\rho\) $\Rightarrow$ mayor tendencia a sparsidad;
+    \item menor \(\rho\) $\Rightarrow$ mayor efecto estabilizador tipo Ridge;
+    \item en presencia de grupos de features correlacionadas, ElasticNet tiende a comportarse mejor que Lasso puro, evitando selecciones arbitrarias demasiado agresivas.
 \end{itemize}
 
-\section{Objetivo y alcance del módulo}
+\section{Objetivo exacto del entrenamiento}
 
-\subsection{Objetivo principal}
+El módulo no persigue maximizar una única métrica de forma miope. Su objetivo formal es producir una baseline que sea simultáneamente:
 
-El objetivo del módulo es entrenar un modelo de ElasticNet con:
-\begin{itemize}
-  \item Validación cruzada temporal \textbf{purged} para evitar \emph{data leakage}.
-  \item Búsqueda de hiperparámetros sobre una \textbf{grid} de \( (\alpha, \rho) \).
-  \item Exportación de:
-    \begin{itemize}
-      \item Coeficientes \textbf{sparsity-aware} (analizar variables activas/inactivas).
-      \item Predicciones OOF (out-of-fold) y posiblemente OOS (out-of-sample).
-      \item Métricas de rendimiento y estabilidad entre folds.
-    \end{itemize}
-\end{itemize}
-
-\subsection{Alcance funcional}
-
-El módulo incluye:
-\begin{itemize}
-  \item Entrenamiento con \textbf{CV temporal purged} (PIT) para evitar que el modelo “vea” el futuro al calcular el target.
-  \item Grid search sobre \( \texttt{alpha\_grid} \) y \( \texttt{l1\_ratio\_grid} \) para encontrar el par \( (\alpha^\ast, \rho^\ast) \) óptimo global por fold.
-  \item Export de:
-    \begin{itemize}
-      \item Modelo por fold (\texttt{model.pkl}).
-      \item Predicciones OOF (\texttt{oof.parquet}).
-      \item Coeficientes por fold (\texttt{coef\_paths.parquet}).
-      \item Métricas resumidas (\texttt{metrics\_summary.json}).
-      \item Manifesto de run (\texttt{manifest.json}).
-    \end{itemize}
-  \item Comparativa frente a otros baselines (Ridge, GBDT, etc.).
-\end{itemize}
-
-\section{Entradas y salidas}
-
-\subsection{Entradas}
-
-El módulo recibe:
-\begin{itemize}
-  \item \texttt{features\_path}: ruta a los features preprocesados (por ejemplo, \texttt{features/store}).
-  \item \texttt{labels\_path}: ruta a los targets continuos (\texttt{labels/store}).
-  \item \texttt{splits\_path}: ruta a splits \textbf{purged} (\texttt{labels/splits/purged\_splits\_latest.parquet}).
-  \item \texttt{config\_path}: configuración YAML (\texttt{configs/models/elasticnet.yaml}).
-  \item \texttt{run\_id}: identificador de corrida (p. ej. \texttt{train\_elasticnet\_20260305\_001}).
-\end{itemize}
-
-\subsection{Salidas}
-
-Por cada \texttt{run\_id}, se generan:
-\begin{itemize}
-  \item Modelos por fold:
-    \texttt{models/artifacts/baselines/elasticnet/{run\_id}/fold\_{k}/model.pkl}
-  \item Predicciones OOF:
-    \texttt{models/predictions/baselines/elasticnet/{run\_id}/oof.parquet}
-  \item Coeficientes:
-    \texttt{models/reports/baselines/elasticnet/{run\_id}/coef\_paths.parquet}
-  \item Métricas:
-    \texttt{models/reports/baselines/elasticnet/{run\_id}/metrics\_summary.json}
-  \item Manifesto:
-    \texttt{models/reports/baselines/elasticnet/{run\_id}/manifest.json}
-\end{itemize}
-
-\section{Parámetros clave y configuración}
-
-\begin{itemize}
-  \item \texttt{alpha\_grid}: conjunto de valores \( \alpha \) explorados (por ejemplo, \( [10^{-6}, 10^{-4}, 10^{-2}, 1] \)).
-  \item \texttt{l1\_ratio\_grid}: conjunto de valores \( \rho \) explorados (por ejemplo, \( [0.1, 0.5, 0.9] \)).
-  \item \texttt{fit\_intercept}: indicador booleano de si se ajusta el intercepto.
-  \item \texttt{max\_iter}: número máximo de iteraciones del solver.
-  \item \texttt{tol}: tolerancia de convergencia del solver.
-  \item \texttt{standardize\_features}: si se escala/centra las features antes de entrenar.
-\end{itemize}
-
-Estos parámetros permiten controlar:
-\begin{itemize}
-  \item Compromiso \emph{bias–variance}.
-  \item Grado de sparsity y robustez frente a ruido.
-  \item Estabilidad computacional y tiempo de entrenamiento.
-\end{itemize}
-
-\section{Validación cruzada temporal purged (PIT)}
-
-\subsection{Motivación}
-
-En datos temporales, la suposición de \emph{i.i.d.} no se mantiene. Usar \texttt{KFold} estándar induciría \emph{look‑ahead leakage} si las etiquetas se construyen usando ventanas futuras. [web:50]
-
-La \textbf{Purged Cross-Validation} evita:
-\begin{itemize}
-  \item Entrenar con observaciones que podrían “ver” el futuro del test.
-  \item Compartir datos de entrenamiento y test que se superpongan en el tiempo de construcción del label.
-\end{itemize}
-
-\subsection{Implementación sugerida}
-
-Sea \( \mathcal{T} \) el rango temporal de las etiquetas y \( \mathcal{W} \) la ventana de \emph{feature window} y \emph{label window}. Para cada fold:
-\begin{enumerate}
-  \item Definir el rango de test \( \mathcal{T}_{\text{test}} \).
-  \item Remover de entrenamiento cualquier observación cuya etiqueta se solape con \( \mathcal{T}_{\text{test}} \) (fase de \textbf{purging}).
-  \item Opcionalmente, añadir un pequeño \textbf{embargo} tras el test para desinflar el impacto de la ultima ventana de feature.
+\begin{enumerate}[label=\alph*)]
+    \item \textbf{predictiva}, mediante buen desempeño OOF;
+    \item \textbf{estable}, mediante coeficientes razonablemente consistentes entre folds;
+    \item \textbf{parsimoniosa}, evitando complejidad efectiva innecesaria;
+    \item \textbf{reproducible}, mediante artefactos y manifiestos completos;
+    \item \textbf{comparable}, usando exactamente el mismo régimen de validación que el resto de modelos.
 \end{enumerate}
 
-Esto garantiza que el modelo solo “ve” el pasado estricto al momento de predicción, preservando la integridad del backtest. [web:50][web:41]
+Por ello, el módulo debe considerarse una \textbf{baseline de investigación}, no un simple \emph{script} de entrenamiento lineal.
+
+\section{Entradas del módulo}
+
+El contrato de entrada debe estar completamente definido. El módulo espera:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{features\_path}: dataset de features ya construido y versionado.
+    \item \texttt{labels\_path}: dataset de etiquetas continuas alineadas temporalmente con las features.
+    \item \texttt{splits\_path}: archivo con \emph{splits} temporales \emph{purged} y, si aplica, embargo.
+    \item \texttt{config\_path}: configuración YAML del experimento.
+    \item \texttt{run\_id}: identificador único y trazable de la ejecución.
+    \item \texttt{feature\_list} o selector equivalente: subconjunto explícito de variables a utilizar, si no se entrenan todas.
+\end{itemize}
+
+\subsection{Requisitos de integridad previos al entrenamiento}
+
+Antes de ajustar el modelo, el módulo debe verificar:
+
+\begin{enumerate}[label=\arabic*)]
+    \item alineación uno a uno entre \texttt{features} y \texttt{labels};
+    \item unicidad del índice lógico \((date, asset)\) o equivalente;
+    \item ausencia de fuga temporal obvia en columnas derivadas;
+    \item consistencia del universo de activos a lo largo del fold;
+    \item ausencia de columnas completamente constantes o completamente nulas en el entrenamiento del fold;
+    \item esquema de tipos correcto: columnas numéricas finitas tras preprocesado.
+\end{enumerate}
+
+Si alguna de estas condiciones falla, el entrenamiento debe abortar con error explícito y registrado en \texttt{manifest.json}.
+
+\section{Preprocesado: reglas no negociables}
+
+Uno de los puntos más importantes para elevar la calidad de la especificación es cerrar el preprocesado \emph{por fold}. Todo transformador estadístico debe aprenderse \textbf{solo con el conjunto de entrenamiento del fold} y aplicarse después al tramo de validación/test correspondiente.
+
+\subsection{Pipeline recomendado}
+
+Para cada fold, el pipeline base recomendado es:
+
+\begin{enumerate}[label=\arabic*)]
+    \item seleccionar columnas válidas en entrenamiento;
+    \item imputar \emph{missing values} usando parámetros aprendidos en entrenamiento;
+    \item opcionalmente aplicar \emph{winsorization}/clipping robusto aprendido en entrenamiento;
+    \item estandarizar features usando media y desviación del entrenamiento, o transformador robusto equivalente si así se define en configuración;
+    \item ajustar ElasticNet sobre la matriz transformada del entrenamiento;
+    \item transformar validación/test con los mismos parámetros ya fijados.
+\end{enumerate}
+
+\subsection{Tratamiento de \emph{missing values}}
+
+La política de \emph{missingness} debe estar especificada. Como baseline institucional, el módulo debe admitir al menos una de estas opciones configurables:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{impute = median}: imputación por mediana de entrenamiento por feature;
+    \item \texttt{impute = zero}: imputación por cero solo si la semántica económica de la variable lo justifica;
+    \item \texttt{drop\_feature\_if\_missing\_gt\_threshold}: exclusión de variables cuyo porcentaje de \emph{missing} en entrenamiento exceda un umbral;
+    \item \texttt{add\_missing\_indicator}: crear indicador binario si se considera relevante para ciertos bloques de features.
+\end{itemize}
+
+La baseline no debe permitir que el tratamiento de \emph{missing} dependa accidentalmente de información del test fold.
+
+\subsection{Estandarización}
+
+Dado que la penalización de ElasticNet es sensible a escala, la estandarización no es opcional en sentido metodológico salvo justificación explícita. La regla por defecto debe ser:
+
+\[
+X^{\text{std}}_{j} = \frac{X_j - \mu^{\text{train}}_j}{\sigma^{\text{train}}_j + \varepsilon},
+\]
+
+donde \(\mu^{\text{train}}_j\) y \(\sigma^{\text{train}}_j\) se calculan exclusivamente en el entrenamiento del fold.
+
+Sin esta etapa, el valor de \(\alpha\) deja de ser comparable entre features y la interpretación de sparsidad queda distorsionada.
+
+\section{Validación temporal \emph{purged}}
+
+\subsection{Principio metodológico}
+
+En series temporales financieras no es válido emplear \texttt{KFold} aleatorio ni CV estándar. Las etiquetas suelen depender de ventanas futuras, y muchas features utilizan información agregada de ventanas móviles. Por ello, la validación debe respetar tres principios:
+
+\begin{enumerate}[label=\arabic*)]
+    \item \textbf{orden temporal};
+    \item \textbf{purging} de observaciones con solapamiento informacional;
+    \item \textbf{embargo} opcional tras el bloque de test.
+\end{enumerate}
+
+\subsection{Definición operativa}
+
+Para cada fold \(k\):
+\begin{itemize}[leftmargin=1.5em]
+    \item se define un bloque temporal de validación/test \( \mathcal{I}^{(k)}_{\text{test}} \);
+    \item el conjunto de entrenamiento \( \mathcal{I}^{(k)}_{\text{train}} \) excluye observaciones cuya ventana de construcción del label o de features se solape con \( \mathcal{I}^{(k)}_{\text{test}} \);
+    \item opcionalmente se aplica un embargo temporal adicional posterior al test.
+\end{itemize}
+
+Formalmente:
+\[
+\mathcal{I}^{(k)}_{\text{train}} \cap \text{InfoSet}\left(\mathcal{I}^{(k)}_{\text{test}}\right) = \varnothing.
+\]
+
+La función del purging no es estética: es impedir que el modelo aprenda indirectamente información sobre el futuro de las observaciones que pretende validar.
+
+\subsection{Requisito de comparabilidad}
+
+Los mismos \texttt{splits\_path} deben reutilizarse para:
+\begin{itemize}[leftmargin=1.5em]
+    \item Ridge,
+    \item ElasticNet,
+    \item Logistic si comparte esquema comparable,
+    \item GBDT,
+    \item cualquier modelo posterior usado en benchmark.
+\end{itemize}
+
+Cambiar \emph{splits} entre modelos invalida la comparación científica.
+
+\section{Búsqueda de hiperparámetros}
+
+\subsection{Espacio de búsqueda}
+
+La configuración debe definir explícitamente una \emph{grid} o espacio de búsqueda para:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \(\alpha \in \texttt{alpha\_grid}\), idealmente en escala logarítmica;
+    \item \(\rho \in \texttt{l1\_ratio\_grid}\), por ejemplo:
+    \[
+    \rho \in \{0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 1.00\}.
+    \]
+\end{itemize}
+
+La elección de \(\alpha\) debe cubrir varios órdenes de magnitud para capturar desde soluciones cercanas a OLS regularizado débil hasta soluciones fuertemente contraídas.
+
+\subsection{Regla de selección}
+
+Aquí conviene cerrar un punto que en muchas \emph{specs} queda ambiguo. El módulo debe especificar si:
+
+\begin{enumerate}[label=\arabic*)]
+    \item selecciona hiperparámetros \textbf{por fold} usando únicamente el tramo de entrenamiento de ese fold con una validación interna temporal; o
+    \item utiliza un esquema de selección \textbf{global} previo y luego reentrena por fold con esos hiperparámetros fijos.
+\end{enumerate}
+
+Como baseline robusta, la recomendación prioritaria es:
+
+\begin{quote}
+\textbf{usar una validación interna temporal dentro del entrenamiento de cada fold externo}, de forma que la selección de \((\alpha,\rho)\) no vea nunca el tramo externo de validación/test.
+\end{quote}
+
+Si por simplicidad computacional se adopta una política global única, eso debe declararse explícitamente en el manifiesto como una decisión metodológica, no como una ambigüedad implícita.
+
+\subsection{Métrica principal y desempates}
+
+La \emph{spec} debe fijar una métrica principal de selección, por ejemplo:
+\[
+\texttt{selection\_metric} \in \{\texttt{rmse}, \texttt{mae}, \texttt{spearman\_ic}\}.
+\]
+
+Recomendación institucional:
+\begin{itemize}[leftmargin=1.5em]
+    \item si el target es retorno continuo con interés en ranking transversal, usar \texttt{spearman\_ic} como métrica primaria de investigación y RMSE/MAE como secundarias;
+    \item si el objetivo es ajuste numérico puro del target, usar RMSE o MAE como primaria.
+\end{itemize}
+
+En caso de empate material entre combinaciones de hiperparámetros, el módulo debe aplicar una regla de desempate explícita:
+\begin{enumerate}[label=\arabic*)]
+    \item preferir menor complejidad efectiva;
+    \item preferir mayor estabilidad de coeficientes;
+    \item preferir menor \(\alpha\) solo si no se sacrifica robustez;
+    \item opcionalmente aplicar una regla tipo \emph{one-standard-error} para escoger una solución más parsimoniosa.
+\end{enumerate}
 
 \section{Métricas de evaluación}
 
-El módulo registra:
-
-\subsection{Métricas de error de regresión}
-
-\begin{itemize}
-  \item RMSE:
-    \[
-      \text{RMSE} = \sqrt{\frac{1}{n} \sum_{i=1}^n (y_i - \hat{y}_i)^2}
-    \]
-  \item MAE:
-    \[
-      \text{MAE} = \frac{1}{n} \sum_{i=1}^n |y_i - \hat{y}_i|
-    \]
+El módulo debe registrar métricas a dos niveles:
+\begin{itemize}[leftmargin=1.5em]
+    \item por fold;
+    \item agregadas a nivel \texttt{run\_id}.
 \end{itemize}
 
-Estas métricas permiten comparar ElasticNet con otros baselines (Ridge, GBDT, etc.) en términos de precisión de predicción.
+\subsection{Métricas predictivas}
 
-\subsection{Información de coeficientes}
+\paragraph{RMSE}
+\[
+\text{RMSE} =
+\sqrt{
+\frac{1}{n}
+\sum_{i=1}^{n}(y_i - \hat{y}_i)^2
+}.
+\]
 
-\begin{itemize}
-  \item \textbf{Sparsity ratio}:
-    \[
-      \text{Sparsity Ratio} = 1 - \frac{|\{j: \hat{\beta}_j \neq 0\}|}{p}
-    \]
-    mide la proporción de features efectivamente descartadas.
-  \item \textbf{Estabilidad de coeficientes}:
-    \[
-      \text{Stability}(\beta_j) = 1 - \frac{\text{Var}(\hat{\beta}_{j}^{(k)})}{\text{Var}(\hat{\beta}_{j}^{(k)}) + \text{Var}(\bar{\beta}_j)},
-    \]
-    donde \( \hat{\beta}_{j}^{(k)} \) es el coeficiente de la variable \( j \) en el fold \( k \). [web:34]
+\paragraph{MAE}
+\[
+\text{MAE} =
+\frac{1}{n}
+\sum_{i=1}^{n}|y_i - \hat{y}_i|.
+\]
+
+\paragraph{IC de Spearman}
+Si el problema tiene una dimensión cross-sectional relevante, debe calcularse la correlación de rangos entre predicción y target:
+\[
+\text{IC}_{\text{Spearman}} = \rho_s(\hat{y}, y).
+\]
+
+También es recomendable registrar:
+\begin{itemize}[leftmargin=1.5em]
+    \item media temporal del IC por fecha;
+    \item desviación estándar del IC;
+    \item \emph{hit-rate} por signo, si es pertinente para el target.
 \end{itemize}
 
-\section{Estado del arte académico e industrial}
+\subsection{Métricas estructurales del modelo}
 
-\subsection{ElasticNet y selección de variables}
+\paragraph{Sparsity ratio}
 
-\begin{itemize}
-  \item El artículo original de Zou \& Hastie (2005) \emph{Regularization and variable selection via the elastic net} justifica ElasticNet como método que combina las ventajas de Lasso (sparsity) y Ridge (estabilidad frente a colinealidad). [web:49]
-  \item En finanzas, modelos lineales regularizados se usan como baselines interpretables para pricing de derivados, factor models y estrategias de arbitraje estadístico. [web:37]
+Sea \(p\) el número de features efectivas tras filtrado y sea
+\[
+A = \{j \in \{1,\dots,p\}: |\hat{\beta}_j| > \tau\},
+\]
+donde \(\tau\) es un umbral numérico pequeño para distinguir ceros efectivos de ruido de precisión.
+
+Entonces:
+\[
+\text{Sparsity Ratio} = 1 - \frac{|A|}{p}.
+\]
+
+Es importante definir \(\tau\) de forma reproducible, por ejemplo \(\tau = 10^{-8}\) o un umbral configurable.
+
+\paragraph{Estabilidad de coeficientes}
+
+La estabilidad no debe quedar como noción vaga. Una definición operativa recomendable es:
+
+\[
+\text{Stability}_j
+=
+\frac{
+|\{k : |\hat{\beta}^{(k)}_j| > \tau\}|
+}{
+K
+},
+\]
+
+que mide la frecuencia con la que la variable \(j\) aparece activa a través de \(K\) folds.
+
+Complementariamente, para variables activas recurrentes:
+\[
+\text{SignConsistency}_j
+=
+\frac{
+\left|
+\sum_{k=1}^{K}
+\operatorname{sign}(\hat{\beta}^{(k)}_j)\mathbf{1}\{|\hat{\beta}^{(k)}_j|>\tau\}
+\right|
+}{
+|\{k : |\hat{\beta}^{(k)}_j| > \tau\}| + \varepsilon
+}.
+\]
+
+Y para magnitud:
+\[
+\text{CoefCV}_j
+=
+\frac{
+\operatorname{std}\left(\hat{\beta}^{(1)}_j,\dots,\hat{\beta}^{(K)}_j\right)
+}{
+|\operatorname{mean}\left(\hat{\beta}^{(1)}_j,\dots,\hat{\beta}^{(K)}_j\right)|+\varepsilon
+}.
+\]
+
+De este modo, la estabilidad queda descompuesta en:
+\begin{itemize}[leftmargin=1.5em]
+    \item frecuencia de activación;
+    \item consistencia de signo;
+    \item dispersión relativa de magnitud.
 \end{itemize}
 
-\subsection{Validación cruzada temporal purged}
+Esto es mucho más accionable que una fórmula abstracta difícil de reproducir.
 
-\begin{itemize}
-  \item Versión de k‑fold adaptada a series temporales, desarrollada para evitar \emph{look‑ahead bias} en contextos de trading y ML financiero. [web:50]
-  \item Se recomienda usar \texttt{PurgedKFold} + \texttt{embargo} mientras se reserva un conjunto de test completamente independiente para evaluación final. [web:41]
+\section{Interpretación de coeficientes}
+
+Dado que el modelo opera sobre features estandarizadas por fold, la comparación relativa de coeficientes es más significativa. No obstante, la interpretación debe seguir estas reglas:
+
+\begin{enumerate}[label=\arabic*)]
+    \item un coeficiente no debe interpretarse causalmente;
+    \item la magnitud depende del régimen de entrenamiento y del conjunto de features activo;
+    \item si varias variables están altamente correlacionadas, el reparto de peso puede cambiar entre folds sin que cambie la señal económica subyacente;
+    \item las conclusiones deben apoyarse en estabilidad transversal, no en un único fold.
+\end{enumerate}
+
+Por ello, el módulo debe exportar no solo coeficientes puntuales, sino también resúmenes de persistencia y estabilidad.
+
+\section{Artefactos de salida}
+
+Por cada \texttt{run\_id}, el módulo debe escribir una estructura de artefactos completa y estable:
+
+\subsection{Modelos por fold}
+\[
+\texttt{models/artifacts/baselines/elasticnet/\{run\_id\}/fold\_\{k\}/model.pkl}
+\]
+
+Cada \texttt{model.pkl} debe contener:
+\begin{itemize}[leftmargin=1.5em]
+    \item el estimador ajustado;
+    \item el pipeline de preprocesado del fold;
+    \item la lista exacta de features utilizadas;
+    \item hiperparámetros finales;
+    \item versión de librerías si se serializa de forma enriquecida.
 \end{itemize}
 
-\subsection{Libros de referencia}
+\subsection{Predicciones OOF}
+\[
+\texttt{models/predictions/baselines/elasticnet/\{run\_id\}/oof.parquet}
+\]
 
-\begin{itemize}
-  \item \emph{Advances in Financial Machine Learning} de Marcos López de Prado: discute muestreo temporal, validación cruzada estructurada y diseño de features para estrategias cuantitativas. [web:34]
-  \item \emph{Quantitative Trading} de Ernest Chan: introduce modelos lineales y regresión regularizada como bloques de construcción de estrategias de momentum y mean‑reversion. [web:39]
-  \item \emph{Elements of Statistical Learning} de Hastie, Tibshirani \& Friedman: presenta Lasso, Ridge y ElasticNet desde un marco teórico unificado. [web:49]
+Debe incluir, al menos:
+\begin{itemize}[leftmargin=1.5em]
+    \item índice temporal y activo;
+    \item target real;
+    \item predicción OOF;
+    \item fold de procedencia;
+    \item timestamp lógico del experimento;
+    \item hiperparámetros usados en ese fold, si se desea máxima trazabilidad.
 \end{itemize}
 
-\section{Reglas de PIT y buenas prácticas}
+\subsection{Coeficientes}
+\[
+\texttt{models/reports/baselines/elasticnet/\{run\_id\}/coef\_paths.parquet}
+\]
 
-\begin{itemize}
-  \item Usar los \textbf{mismos splits purged} para todos los baselines comparativos (ElasticNet, Ridge, GBDT, etc.).
-  \item No realizar \textbf{tuning con test}: solo se usa el test para evaluación final, no para selección de hiperparámetros.
-  \item Registrar los hiperparámetros elegidos por fold y globalmente (\texttt{alpha^\ast}, \texttt{l1\_ratio^\ast}).
+Debe contener:
+\begin{itemize}[leftmargin=1.5em]
+    \item nombre de feature;
+    \item fold;
+    \item coeficiente;
+    \item indicador de actividad (\(|\beta_j|>\tau\));
+    \item ranking por magnitud absoluta;
+    \item estadísticas agregadas entre folds si se genera una tabla consolidada.
 \end{itemize}
 
-Esto asegura que las comparaciones entre modelos sean justas y reproducibles.
+\subsection{Resumen de métricas}
+\[
+\texttt{models/reports/baselines/elasticnet/\{run\_id\}/metrics\_summary.json}
+\]
 
-\section{Flujo de ejecución}
+Debe contener:
+\begin{itemize}[leftmargin=1.5em]
+    \item métricas por fold;
+    \item medias, medianas y dispersión;
+    \item hiperparámetros seleccionados;
+    \item sparsity ratio;
+    \item estadísticas de estabilidad;
+    \item número efectivo de features activas.
+\end{itemize}
 
-El módulo sigue un flujo de alto nivel:
+\subsection{Manifiesto}
+\[
+\texttt{models/reports/baselines/elasticnet/\{run\_id\}/manifest.json}
+\]
 
-\begin{enumerate}
-  \item Cargar y alinear \texttt{features} y \texttt{labels} por índice temporal y activo.
-  \item Escalar datos si \texttt{standardize\_features=True}.
-  \item Para cada fold:
-    \begin{itemize}
-      \item Definir train/test con \texttt{purged\_splits}.
-      \item Entrenar ElasticNet con \texttt{GridSearchCV} o \texttt{ElasticNetCV} sobre \( (\alpha, \rho) \).
-      \item Guardar modelo (\texttt{model.pkl}).
-      \item Generar predicciones OOF/OOS.
-    \end{itemize}
-  \item Consolidar coeficientes por fold y guardar en \texttt{coef\_paths.parquet}.
-  \item Calcular métricas (RMSE, MAE, IC Spearman, sparsity ratio, estabilidad) y guardar en \
+Este fichero debe ser el contrato de auditoría del experimento e incluir:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{run\_id};
+    \item rutas de entrada usadas;
+    \item hash/versionado de datasets si existe;
+    \item configuración completa;
+    \item timestamp;
+    \item número de folds;
+    \item esquema de purging/embargo;
+    \item política de imputación;
+    \item política de estandarización;
+    \item semilla(s) si procede;
+    \item versión de dependencias críticas;
+    \item criterio de selección de hiperparámetros;
+    \item estado final de la ejecución.
+\end{itemize}
+
+\section{Flujo de ejecución de alto nivel}
+
+El flujo del módulo debe ser:
+
+\begin{enumerate}[label=\arabic*)]
+    \item cargar datasets y configuración;
+    \item validar integridad y alineación;
+    \item cargar \emph{splits} temporales \emph{purged};
+    \item para cada fold externo:
+    \begin{enumerate}[label=\roman*)]
+        \item separar entrenamiento y validación/test;
+        \item ajustar el pipeline de preprocesado solo en entrenamiento;
+        \item ejecutar selección de hiperparámetros usando validación interna temporal si está habilitada;
+        \item reentrenar el modelo final del fold con los hiperparámetros elegidos;
+        \item generar predicciones OOF del tramo externo;
+        \item guardar artefactos y métricas del fold.
+    \end{enumerate}
+    \item consolidar predicciones OOF;
+    \item consolidar coeficientes y métricas estructurales;
+    \item escribir \texttt{metrics\_summary.json} y \texttt{manifest.json};
+    \item devolver código de salida exitoso solo si todos los artefactos críticos fueron persistidos.
+\end{enumerate}
+
+\section{Buenas prácticas obligatorias}
+
+\subsection{No fuga de información}
+
+Está prohibido:
+\begin{itemize}[leftmargin=1.5em]
+    \item imputar con estadísticas globales de todo el dataset;
+    \item estandarizar usando información del fold de test;
+    \item seleccionar hiperparámetros mirando resultados OOF externos;
+    \item usar test final para ninguna decisión de modelado.
+\end{itemize}
+
+\subsection{Gobernanza de tuning}
+
+La \emph{spec} debe dejar claro:
+\begin{itemize}[leftmargin=1.5em]
+    \item cuál es la métrica primaria;
+    \item cómo se resuelven empates;
+    \item si el tuning es por fold o global;
+    \item qué combinaciones de hiperparámetros fueron probadas y rechazadas.
+\end{itemize}
+
+\subsection{Reproducibilidad}
+
+Toda ejecución debe ser reproducible a nivel de:
+\begin{itemize}[leftmargin=1.5em]
+    \item datos de entrada;
+    \item configuración;
+    \item \emph{splits};
+    \item versión de software;
+    \item artefactos serializados;
+    \item métricas finales.
+\end{itemize}
+
+\section{Qué hace valiosa esta baseline frente a otras}
+
+ElasticNet ocupa una posición especialmente útil entre Ridge y modelos no lineales:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item frente a \textbf{Ridge}, puede eliminar variables irrelevantes y producir una representación más parsimoniosa;
+    \item frente a \textbf{Lasso}, suele comportarse mejor cuando existen grupos de predictors correlacionados;
+    \item frente a \textbf{GBDT} o modelos más complejos, ofrece una referencia interpretable, estable y rápida de entrenar;
+    \item como baseline de investigación, permite identificar si la ganancia aparente de modelos complejos proviene de señal real o de sobreajuste encubierto.
+\end{itemize}
+
+\section{Criterios de aceptación del módulo}
+
+El módulo debe considerarse correcto solo si cumple simultáneamente:
+
+\begin{enumerate}[label=\arabic*)]
+    \item no existe fuga temporal en preprocesado ni tuning;
+    \item todos los folds generan predicciones OOF válidas;
+    \item los artefactos quedan persistidos bajo \texttt{run\_id};
+    \item el manifiesto permite reconstruir la corrida;
+    \item la selección de hiperparámetros está completamente documentada;
+    \item las métricas estructurales del modelo son calculables y auditables;
+    \item la comparación con otros baselines puede hacerse con igualdad metodológica.
+\end{enumerate}
+
+\section{Conclusión}
+
+\texttt{train\_elasticnet.py} no debe entenderse como un simple entrenamiento de regresión lineal regularizada, sino como una \textbf{baseline institucional de referencia} para el sistema de \emph{small-cap swing trading}. Su función es establecer un punto de comparación científicamente limpio, operativamente reproducible y económicamente interpretable. Para cumplir ese papel con nivel \emph{research-industrial}, la especificación debe cerrar con precisión los detalles que más suelen degradar la calidad real de un experimento: preprocesado por fold, política de \emph{missingness}, selección de hiperparámetros, definición operativa de estabilidad, trazabilidad de artefactos y disciplina estricta frente a fuga de información.
+
+Cuando esta baseline está bien implementada, el sistema gana algo más importante que una métrica adicional: gana una referencia robusta contra la que juzgar si la complejidad posterior está comprando señal auténtica o simplemente sofisticación cosmética. En un \emph{stack} cuantitativo serio, esa distinción es fundamental.
+\end{document}

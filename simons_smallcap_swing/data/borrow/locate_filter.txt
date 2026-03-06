@@ -6,274 +6,573 @@
 \usepackage{graphicx}
 \usepackage{hyperref}
 \usepackage[margin=2.5cm]{geometry}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
 
-\title{Módulo de Localización de Cortos: \texttt{data/borrow/locate\_filter.py}}
+\title{Especificación Research--Production del Filtro de Locate para \texttt{data/borrow/locate\_filter.py}}
 \author{}
 \date{}
 
 \begin{document}
 \maketitle
 
-
 \section{Objetivo del módulo}
-El módulo \texttt{data/borrow/locate\_filter.py} determina la \emph{elegibilidad de short} por símbolo $ i $ y fecha $ t $ en función de la disponibilidad estimada de \emph{locate} y \emph{borrow}, evitando supuestos irrealistas de ejecución en corto dentro de un sistema de trading cuantitativo.  
 
-El objetivo es:
-\begin{itemize}
-  \item Filtrar activos en los que el coste de préstamo o la falta de disponibilidad hacen el shorting inviable o no robusto.
-  \item Mapear el espacio de eligibilidad en \texttt{tiers} (por ejemplo, \emph{easy} / \emph{medium} / \emph{hard} / \emph{blocked}) para integrarlo en estrategias de \emph{swing trading} y \emph{portfolio construction}.
-  \item Proporcionar una capa de realidad de securities lending/ecosistema de préstamo de acciones al backtest, alineado con la literatura de \emph{hard‑to‑borrow} y \emph{locate requirements} en el mercado de short selling \cite{regsho2005, isla2024short, stocks2024hardtoborrow, iongroup2026lending}.
+El módulo \texttt{data/borrow/locate\_filter.py} determina, para cada símbolo $i$ y fecha $t$, si una posición corta debe considerarse \textbf{operable}, \textbf{penalizable} o \textbf{bloqueada} bajo una representación causal y conservadora de la disponibilidad de inventario, del coste de préstamo y de las restricciones efectivas de \emph{locate}.
+
+La finalidad del módulo no es simplemente ``filtrar nombres difíciles'', sino convertir fricciones de \emph{securities lending} en una \textbf{decisión operacional explícita} que pueda ser consumida sin ambigüedad por el backtester, el portfolio constructor y la capa de control de riesgo. En otras palabras, este módulo traduce una realidad microestructural incierta y parcialmente observable en un contrato de elegibilidad reproducible.
+
+Sus objetivos concretos son:
+
+\begin{itemize}[leftmargin=2em]
+    \item determinar un flag binario de elegibilidad de corto \texttt{short\_eligible\_flag};
+    \item clasificar cada símbolo en un \texttt{locate\_tier} operativo (\texttt{easy}, \texttt{medium}, \texttt{hard}, \texttt{blocked});
+    \item documentar, con precedencia formal, la razón dominante de rechazo o degradación;
+    \item impedir que el backtest asuma ejecuciones cortas ficticiamente accesibles;
+    \item preservar estabilidad temporal suficiente para que pequeños movimientos de inputs no generen oscilación espuria de estados.
 \end{itemize}
 
+La filosofía del módulo es asimétrica: en caso de ambigüedad, el error tolerable es \textbf{bloquear o penalizar en exceso antes que permitir cortos inviables}. Esto es consistente con el hecho de que el principal riesgo de modelización en el lado corto no es ser demasiado prudente, sino inflar artificialmente la capacidad de ejecución.
 
-\section{Alcance del filtro de locate}
-El módulo implementa reglas de filtro \emph{hard} y \emph{soft} sobre:
-\begin{itemize}
-  \item \textbf{Borrow availability} ($ \alpha_{i,t} $).
-  \item \textbf{Borrow fee proxy} ($ \widehat{B}_{i,t} $, $ \widehat{b}_{i,t} $).
-  \item \textbf{Liquidez} y capitalización.
-  \item \textbf{Flags HTB} (\emph{hard‑to‑borrow} severo) según política de riesgo.
+\section{Papel dentro de la arquitectura}
+
+\texttt{locate\_filter.py} se sitúa aguas abajo de \texttt{borrow\_cost\_proxy.py} y aguas arriba del portfolio constructor y del motor de backtest. Su función no es estimar el coste de préstamo, sino \textbf{decidir la usabilidad del corto} a partir de ese coste estimado, de la disponibilidad proxy y de reglas explícitas de política de riesgo.
+
+La secuencia lógica es:
+
+\begin{enumerate}[leftmargin=2em]
+    \item \texttt{borrow\_cost\_proxy.py} estima fricción, disponibilidad y severidad de préstamo;
+    \item \texttt{locate\_filter.py} transforma esas señales en elegibilidad y tiers operativos;
+    \item \texttt{borrow\_qc.py} audita que esa transformación sea coherente, estable y suficientemente cubierta.
+\end{enumerate}
+
+Esta separación es deliberada. Un error habitual en sistemas inmaduros es mezclar inferencia de borrow con decisión de operabilidad. Aquí ambas capas quedan desacopladas: el proxy estima, el locate decide.
+
+\section{Principios de diseño no negociables}
+
+El módulo se rige por los siguientes principios:
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Causalidad estricta.} Todas las decisiones en $t$ deben basarse únicamente en información disponible al cierre operativo de $t$ o antes.
+    \item \textbf{Conservadurismo operacional.} Si una combinación de señales admite múltiples interpretaciones plausibles, se elige la más restrictiva.
+    \item \textbf{Precedencia formal.} Si varias reglas disparan simultáneamente, la razón final y el tier final se resuelven mediante un orden jerárquico explícito y no por arbitraje informal del programador.
+    \item \textbf{Estabilidad temporal.} La transición entre tiers no debe oscilar por ruido diario; debe existir hysteresis y control de persistencia.
+    \item \textbf{Explicabilidad.} Todo símbolo bloqueado o degradado debe poder auditarse mediante \texttt{reject\_reason}, \texttt{dominant\_rule} y metadatos de configuración.
+    \item \textbf{Integrabilidad.} La salida debe poder consumirse directamente por backtest, portfolio construction y reporting sin reinterpretación semántica.
+\end{enumerate}
+
+\section{Entradas y dependencias}
+
+Entradas obligatorias:
+
+\begin{itemize}[leftmargin=2em]
+    \item \texttt{borrow\_proxy\_path}: salida de \texttt{borrow\_cost\_proxy.py};
+    \item \texttt{universe\_path}: universo efectivo de activos elegibles por fecha;
+    \item \texttt{locate\_rules\_config\_path}: configuración versionada con thresholds, overrides y políticas de hysteresis;
+    \item \texttt{run\_id}: identificador único del job.
 \end{itemize}
 
-Las reglas:
-\begin{itemize}
-  \item \textbf{hard‑block}: activos que se marcan como no elegibles para short de forma estricta.
-  \item \textbf{soft‑penalización}: activos permitidos pero con \emph{locate\_tier} medio/difícil, que se pueden usar con penalización de tamaño, frecuencia de rebalanceo o coste de prestamo en el backtest \cite{regsho2005, isla2024short}.
-\end{itemize}
+El módulo asume que el \texttt{borrow\_proxy} contiene al menos:
 
-La salida de este módulo permite:
-\begin{itemize}
-  \item Construir un universo de \emph{short‑eligible} controlado.
-  \item Aplicar tamaños de posición diferenciados según el tier de locate.
-  \item Monitorear el impacto de \emph{HTB} y alta disponibilidad en el retorno y el riesgo de portafolios de corto \cite{stocks2024hardtoborrow, iongroup2026lending}.
-\end{itemize}
+\begin{center}
+\begin{tabular}{>{\ttfamily}p{4.2cm} p{8.4cm}}
+\toprule
+\textnormal{\textbf{Campo}} & \textbf{Descripción} \\
+\midrule
+symbol & ticker normalizado \\
+date & fecha efectiva \\
+borrow\_fee\_annual & fee anualizado estimado \\
+borrow\_fee\_daily & fee diario estimado \\
+borrow\_availability\_score & score de disponibilidad en $[0,1]$ \\
+htb\_flag & flag hard-to-borrow \\
+borrow\_tier & tier del proxy de borrow \\
+proxy\_quality & calidad del proxy \\
+proxy\_source & fuente dominante \\
+stress\_score & score latente de fricción \\
+fallback\_flag & indica uso de fallback upstream \\
+stale\_input\_flag & input potencialmente obsoleto \\
+config\_version & versión del proxy upstream \\
+\bottomrule
+\end{tabular}
+\end{center}
 
+Si faltan columnas obligatorias, el módulo debe abortar con error estructural. No está permitido ``adivinar'' defaults silenciosos dentro de \texttt{locate\_filter.py}.
 
-\section{Entradas y estructura de datos}
-Entradas utilizadas:
-\begin{itemize}
-  \item \texttt{borrow\_proxy\_path}: datos de \texttt{borrow\_cost\_proxy.py} (por día, símbolo), con:
-  \[
-    (\widehat{B}_{i,t}, \widehat{b}_{i,t}, \alpha_{i,t}, H_{i,t}).
-  \]
-  \item \texttt{universe\_path}: universo de activos elegibles $ \mathcal{U}_t $ en fecha $ t $.
-  \item \texttt{locate\_rules\_config\_path}: JSON/YAML con umbrales y reglas de filtro:
-  \begin{itemize}
-    \item $ \theta_{\alpha}^{\min} $: mínimo \texttt{availability\_score} permitido para elegibilidad.
-    \item $ \theta_{B}^{\max} $: máximo \texttt{borrow\_fee\_proxy\_daily} aceptable.
-    \item $ \theta_{\text{HTB}} $: umbral/definición de “hard‑to‑borrow severo”.
-    \item Conceptos de \emph{tier} y penalización.
-  \end{itemize}
-  \item \texttt{run\_id}: identificador del job de \texttt{locate\_filter}.
-\end{itemize}
+\section{Representación formal}
 
-La estructura interna:
+Sea $\mathcal{U}_t$ el universo efectivo en fecha $t$. Para cada $i\in\mathcal{U}_t$, el módulo opera sobre:
+
 \[
-  \mathcal{D}_t = \{ (i, t, \widehat{B}_{i,t}, \widehat{b}_{i,t}, \alpha_{i,t}, H_{i,t}) \}_{i \in \mathcal{U}_t},
-\]
-sobre la que se aplican las reglas de \emph{short\_eligibility} y \emph{locate\_tier}.
-
-
-\section{Campos de salida y significado}
-Campos mínimos en la salida:
-
-\begin{itemize}
-  \item \texttt{date}, \texttt{symbol}, \texttt{run\_id}.
-  \item \texttt{short\_eligible\_flag} $ \in \{0,1\} $:
-  \[
-    \eta_{i,t} = \mathbb{1}(\text{actividad de short permitida en $ (i,t) $}).
-  \]
-  \item \texttt{locate\_tier} $ \in \{\text{easy}, \text{medium}, \text{hard}, \text{blocked}\} $, mapeado como:
-  \[
-    \tau_{i,t} \in \{0, 1, 2, 3\}
-  \]
-  para uso numérico en modelos de decisión de cartera.
-  \item \texttt{reject\_reason} (opcional): cadena explicativa de la razón de rechazo (por ejemplo, \texttt{fee\_too\_high}, \texttt{availability\_too\_low}, \texttt{htb\_severe}).
-  \item \texttt{borrow\_fee\_proxy\_daily} y \texttt{availability\_score}, propagados para trazabilidad.
-\end{itemize}
-
-Este esquema sigue la práctica de las plataformas de securities lending y de brokers de short selling, que clasifican activos por niveles de dificultad de préstamo y disponibilidad de locate \cite{ibkr2024shortavailability, centerpoint2020locates, stocks2024hardtoborrow}.
-
-
-\section{Reglas de elegibilidad de short}
-El módulo implementa reglas basadas en umbrales y políticas de riesgo de préstamo de acciones.
-
-\subsection{Bloqueo por disponibilidad mínima}
-Sea $ \alpha_{i,t} \in [0,1] $ el \emph{borrow availability score} (estimado por el módulo de \texttt{borrow\_cost\_proxy}).  
-La regla de disponibilidad mínima:
-\[
-  \eta_{i,t}^{(\alpha)} = \mathbb{1}\left( \alpha_{i,t} \geq \theta_{\alpha}^{\min} \right).
-\]
-
-Si $ \alpha_{i,t} < \theta_{\alpha}^{\min} $, el sistema:
-\begin{itemize}
-  \item Marca $ \eta_{i,t} = 0 $ (no elegible).
-  \item Asigna \texttt{locate\_tier} = \texttt{blocked}.
-  \item Codifica \texttt{reject\_reason} = \texttt{availability\_too\_low}.
-\end{itemize}
-
-\subsection{Bloqueo por coste de préstamo}
-Sea $ \widehat{b}_{i,t} $ el \emph{borrow fee proxy} diario (anualizado $ \widehat{B}_{i,t} = 365 \cdot \widehat{b}_{i,t} $).  
-La regla de \emph{fee cap}:
-\[
-  \eta_{i,t}^{(B)} = \mathbb{1}\left( \widehat{b}_{i,t} \leq \theta_{B}^{\max} \right).
+\mathcal{D}_t
+=
+\left\{
+(i,t,\widehat{B}_{i,t},\widehat{b}_{i,t},\alpha_{i,t},H_{i,t},Q_{i,t},F_{i,t})
+\right\}_{i\in\mathcal{U}_t^\ast},
 \]
 
-Si $ \widehat{b}_{i,t} > \theta_{B}^{\max} $:
-\begin{itemize}
-  \item $ \eta_{i,t} = 0 $.
-  \item \texttt{locate\_tier} = \texttt{blocked}.
-  \item \texttt{reject\_reason} = \texttt{fee\_too\_high}.
+donde:
+\begin{itemize}[leftmargin=2em]
+    \item $\widehat{B}_{i,t}$ es el fee anualizado estimado;
+    \item $\widehat{b}_{i,t}$ es el fee diario;
+    \item $\alpha_{i,t}\in[0,1]$ es el score de disponibilidad;
+    \item $H_{i,t}\in\{0,1\}$ es el flag HTB;
+    \item $Q_{i,t}\in\{\texttt{high},\texttt{medium},\texttt{low}\}$ es la calidad del proxy;
+    \item $F_{i,t}\in\{0,1\}$ denota si el proxy upstream ha usado fallback severo.
 \end{itemize}
 
-Estos umbrales se pueden calibrar a partir de:
-\begin{itemize}
-  \item Distribución empírica de \emph{borrow fees} observadas en feeds de securities lending.
-  \item Literatura de \emph{HTB} donde activos con fees superiores a ciertos percentiles se consideran casi no shorteables \cite{hankins2018termstructure, neudata2025shortinterest}.
+La salida principal del módulo será:
+
+\[
+\mathcal{L}_t
+=
+\left\{
+(i,t,\eta_{i,t},\tau_{i,t},r_{i,t},d_{i,t})
+\right\}_{i\in\mathcal{U}_t},
+\]
+
+donde:
+\begin{itemize}[leftmargin=2em]
+    \item $\eta_{i,t}\in\{0,1\}$ es el flag de elegibilidad de corto;
+    \item $\tau_{i,t}\in\{\texttt{easy},\texttt{medium},\texttt{hard},\texttt{blocked}\}$ es el tier final;
+    \item $r_{i,t}$ es la razón dominante de rechazo o degradación;
+    \item $d_{i,t}$ es el detalle completo de reglas activadas.
 \end{itemize}
+
+\section{Semántica exacta de los tiers}
+
+La versión anterior describía bien la intuición de los tiers, pero no fijaba una semántica suficientemente cerrada. Aquí se definen de manera operativa:
+
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{\texttt{easy}}: corto permitido sin restricciones extraordinarias; coste y disponibilidad en zona benigna; sizing estándar permitido.
+    \item \textbf{\texttt{medium}}: corto permitido, pero sujeto a penalización moderada de tamaño, rebalanceo o confianza operativa.
+    \item \textbf{\texttt{hard}}: corto permitido sólo bajo reglas restrictivas; sizing severamente recortado; elegibilidad condicionada a política explícita del portfolio constructor.
+    \item \textbf{\texttt{blocked}}: corto no operable bajo la política del sistema; el nombre queda excluido del universo corto.
+\end{itemize}
+
+Importante: \texttt{hard} no equivale a \texttt{blocked}. Un sistema serio debe poder distinguir entre nombres penalizables y nombres directamente no operables.
+
+\section{Jerarquía de reglas y precedencia formal}
+
+Éste es el punto central que más eleva el documento a nivel institucional. Cuando múltiples reglas disparan simultáneamente, el módulo resolverá el estado final con la siguiente precedencia estricta:
+
+\[
+\texttt{structural\_missing}
+\succ
+\texttt{explicit\_block\_override}
+\succ
+\texttt{availability\_critical}
+\succ
+\texttt{fee\_critical}
+\succ
+\texttt{htb\_severe}
+\succ
+\texttt{proxy\_quality\_too\_low}
+\succ
+\texttt{fallback\_severe}
+\succ
+\texttt{tier\_mapping\_soft}.
+\]
+
+Regla de interpretación:
+\begin{itemize}[leftmargin=2em]
+    \item La regla de mayor precedencia activa determina \texttt{reject\_reason}.
+    \item Las reglas de menor precedencia se conservan en \texttt{all\_triggered\_rules}, pero no sustituyen la dominante.
+    \item Ninguna regla de nivel inferior puede suavizar o revertir una de nivel superior.
+\end{itemize}
+
+Esto elimina el mayor riesgo del texto anterior: dejar a criterio del implementador qué razón debe prevalecer cuando fee, availability y HTB disparan a la vez.
+
+\section{Reglas duras de bloqueo}
+
+\subsection{Bloqueo por ausencia crítica de datos}
+
+Si un símbolo del universo no dispone de campos mínimos críticos del proxy:
+\[
+\mathcal{K}=\{\widehat{b}_{i,t},\alpha_{i,t},H_{i,t},Q_{i,t}\},
+\]
+entonces:
+
+\[
+\eta_{i,t}=0,\qquad \tau_{i,t}=\texttt{blocked},
+\]
+y:
+\[
+r_{i,t}=\texttt{structural\_missing}.
+\]
+
+La política es deliberadamente dura: el sistema no debe permitir cortos sobre símbolos cuyo estado de préstamo sea desconocido de forma material.
+
+\subsection{Bloqueo por disponibilidad crítica}
+
+Sea $\theta_\alpha^{\text{block}}$ el umbral duro de disponibilidad mínima. Entonces:
+
+\[
+\eta_{i,t}^{(\alpha)}
+=
+\mathbb{1}\left(\alpha_{i,t}\ge \theta_\alpha^{\text{block}}\right).
+\]
+
+Si $\alpha_{i,t}<\theta_\alpha^{\text{block}}$:
+\[
+\eta_{i,t}=0,\qquad \tau_{i,t}=\texttt{blocked},\qquad r_{i,t}=\texttt{availability\_critical}.
+\]
+
+\subsection{Bloqueo por fee crítico}
+
+Sea $\theta_b^{\text{block}}$ el fee diario máximo tolerable para operabilidad. Entonces:
+
+\[
+\eta_{i,t}^{(b)}
+=
+\mathbb{1}\left(\widehat{b}_{i,t}\le \theta_b^{\text{block}}\right).
+\]
+
+Si $\widehat{b}_{i,t}>\theta_b^{\text{block}}$:
+\[
+\eta_{i,t}=0,\qquad \tau_{i,t}=\texttt{blocked},\qquad r_{i,t}=\texttt{fee\_critical}.
+\]
 
 \subsection{Bloqueo por HTB severo}
-Además de reglas de \emph{fee} y \emph{availability}, se pueden usar flags de \emph{hard‑to‑borrow}:
+
+El HTB no debe tratarse como mera etiqueta decorativa. Si la política de configuración marca que un nombre con $H_{i,t}=1$ debe bloquearse, entonces:
+
 \[
-  H_{i,t} = \mathbb{1}\left( \widehat{B}_{i,t} > \theta_{B}^{\text{HTB}} \text{ ó } \alpha_{i,t} < \theta_{\alpha}^{\text{HTB}} \right).
+\eta_{i,t}=0,\qquad \tau_{i,t}=\texttt{blocked},\qquad r_{i,t}=\texttt{htb\_severe}.
 \]
 
-La regla de HTB severo:
+\subsection{Bloqueo por baja confianza operativa}
+
+Si:
 \[
-  \eta_{i,t}^{(\text{HTB})} =
-  \begin{cases}
-    0 & \text{si } H_{i,t} = 1 \text{ y política marca HTB como bloqueado}, \\
-    1 & \text{en otro caso}.
-  \end{cases}
+Q_{i,t}=\texttt{low}
+\]
+y la configuración indica \texttt{block\_on\_low\_quality=True}, entonces el símbolo puede bloquearse aunque fee y availability no sean formalmente extremos. Esto refleja un principio prudencial: una señal benigna pero poco fiable no debe equipararse a una señal benigna sólida.
+
+\section{Reglas blandas de tiering}
+
+Si un símbolo no ha sido bloqueado por reglas duras, se clasifica por una función de tiering determinista. Se definen umbrales ordenados:
+
+\[
+\theta_\alpha^{(e)} > \theta_\alpha^{(m)} > \theta_\alpha^{(h)} > \theta_\alpha^{\text{block}},
+\]
+\[
+\theta_b^{(e)} < \theta_b^{(m)} < \theta_b^{(h)} < \theta_b^{\text{block}}.
 \]
 
-En ese caso:
-\begin{itemize}
-  \item \texttt{reject\_reason} = \texttt{htb\_severe}.
-  \item \texttt{locate\_tier} = \texttt{blocked} o \texttt{hard}, según grano de \texttt{locate\_rules\_config}.
+La asignación base es:
+
+\subsection*{\texttt{easy}}
+\[
+\tau_{i,t}=\texttt{easy}
+\quad \text{si} \quad
+\alpha_{i,t}\ge \theta_\alpha^{(e)}
+\;\wedge\;
+\widehat{b}_{i,t}\le \theta_b^{(e)}
+\;\wedge\;
+H_{i,t}=0.
+\]
+
+\subsection*{\texttt{medium}}
+\[
+\tau_{i,t}=\texttt{medium}
+\]
+si no es \texttt{easy} ni \texttt{hard}, y el símbolo permanece en una zona intermedia de fee/disponibilidad.
+
+\subsection*{\texttt{hard}}
+\[
+\tau_{i,t}=\texttt{hard}
+\]
+si:
+\[
+\alpha_{i,t}< \theta_\alpha^{(h)}
+\quad \vee \quad
+\widehat{b}_{i,t}> \theta_b^{(h)}
+\quad \vee \quad
+H_{i,t}=1 \text{ bajo política de penalización y no bloqueo}.
+\]
+
+Si $\tau_{i,t}\in\{\texttt{easy},\texttt{medium},\texttt{hard}\}$, entonces:
+\[
+\eta_{i,t}=1.
+\]
+
+\section{Función de decisión oficial}
+
+La elegibilidad final no queda ya abierta como ``AND/OVERRIDE según config'' de forma genérica. Se fija una lógica oficial:
+
+\[
+\eta_{i,t}
+=
+\mathbb{1}\Big(
+\neg R^{\text{hard}}_{i,t}
+\Big),
+\]
+donde:
+\[
+R^{\text{hard}}_{i,t}
+=
+R^{\text{missing}}_{i,t}
+\vee
+R^{\alpha}_{i,t}
+\vee
+R^{b}_{i,t}
+\vee
+R^{H}_{i,t}
+\vee
+R^{Q}_{i,t}
+\vee
+R^{\text{override}}_{i,t}.
+\]
+
+Es decir: la decisión oficial es una unión de reglas duras de bloqueo. Las reglas blandas sólo determinan el tier entre los símbolos permitidos.
+
+\section{Overrides controlados}
+
+Se admiten overrides, pero de forma muy restringida.
+
+\subsection{Override explícito de bloqueo}
+Un símbolo puede bloquearse por lista explícita (\texttt{manual\_blocklist}, restricciones regulatorias, símbolos suspendidos, eventos corporativos graves). Este override tiene precedencia máxima tras fallos estructurales.
+
+\subsection{Override explícito de permiso}
+Sólo se admite un permiso excepcional si:
+\begin{itemize}[leftmargin=2em]
+    \item existe justificación documentada en config;
+    \item no se violan reglas estructurales ni availability crítica;
+    \item el override queda reflejado en \texttt{override\_flag=1}.
 \end{itemize}
 
-\subsection{Permitir con penalización en tiers intermedios}
-Para activos que no se bloquean, se define un \emph{locate\_tier} graduado:
-\begin{itemize}
-  \item \textbf{easy}:
-  \[
-    \text{if } \alpha_{i,t} \geq \theta_{\alpha}^{(e)} \text{ y } \widehat{b}_{i,t} \leq \theta_{B}^{(e)}.
-  \]
-  \item \textbf{medium}:
-  \[
-    \text{if } \alpha_{i,t} \in [\theta_{\alpha}^{(m)}, \theta_{\alpha}^{(e)}) \text{ o } \widehat{b}_{i,t} \in (\theta_{B}^{(e)}, \theta_{B}^{(h)}].
-  \]
-  \item \textbf{hard}:
-  \[
-    \text{if } \alpha_{i,t} < \theta_{\alpha}^{(h)} \text{ o } \widehat{b}_{i,t} \in (\theta_{B}^{(h)}, \theta_{B}^{\max}].
-  \]
+Importante: no se permite override manual para convertir un caso \texttt{structural\_missing} o \texttt{availability\_critical} en elegible. Esto evita que el sistema se degrade por intervenciones oportunistas.
+
+\section{Hysteresis y persistencia temporal}
+
+Para evitar cambios espurios \texttt{medium} $\leftrightarrow$ \texttt{hard} o \texttt{hard} $\leftrightarrow$ \texttt{blocked}, el módulo implementa hysteresis obligatoria.
+
+Sea $\tau_{i,t}^{\star}$ el tier instantáneo inducido por reglas del día. El tier final $\tau_{i,t}$ se define a partir de $\tau_{i,t}^{\star}$ y del estado anterior $\tau_{i,t-1}$ con las siguientes reglas:
+
+\begin{itemize}[leftmargin=2em]
+    \item transiciones hacia estados más severos: inmediatas;
+    \item transiciones hacia estados menos severos: requieren persistencia mínima de $k_{\downarrow}$ días;
+    \item toda transición a \texttt{blocked} por regla dura crítica es inmediata y no suavizable;
+    \item un símbolo nuevo o reincorporado tras ausencia larga no hereda automáticamente el tier histórico.
 \end{itemize}
 
-Los umbrales $ \theta_{\alpha}^{(e)}, \theta_{\alpha}^{(m)}, \theta_{\alpha}^{(h)}, \theta_{B}^{(e)}, \theta_{B}^{(h)} $ se fijan según la política de riesgo y el universo de trading, siguiendo la práctica de clasificación de \emph{locate} por niveles de liquidez y disponibilidad de inventario en brokers y agencias de securities lending \cite{centerpoint2020locates, stocks2024hardtoborrow}.
+Ejemplo formal:
+\[
+\tau_{i,t}=
+\begin{cases}
+\tau_{i,t}^{\star} & \text{si } \tau_{i,t}^{\star}\text{ es más severo que }\tau_{i,t-1},\\
+\tau_{i,t-1} & \text{si la mejora no ha persistido lo suficiente},\\
+\tau_{i,t}^{\star} & \text{si la mejora cumple persistencia}.
+\end{cases}
+\]
 
+Esto ataca uno de los vacíos principales del documento previo: que un nombre pudiera entrar y salir de \texttt{blocked} por ruido diario del proxy.
 
-\section{Flujo de ejecución}
-El flujo del módulo es:
+\section{Tratamiento de missing data, símbolos nuevos y cambios de universo}
 
-1. \textbf{Carga de datos y config}.
-   \begin{itemize}
-     \item Cargar \texttt{borrow\_proxy} diarios por símbolo.
-     \item Cargar el universo elegible $ \mathcal{U}_t $.
-     \item Parsear \texttt{locate\_rules\_config} (umbrales de $ \alpha_{i,t} $, $ \widehat{B}_{i,t} $, HTB, tiers).
-   \end{itemize}
+\subsection{Missing data}
+Si falta el join con el proxy de borrow para un símbolo presente en el universo:
+\begin{itemize}[leftmargin=2em]
+    \item el símbolo se marca \texttt{blocked};
+    \item \texttt{reject\_reason = structural\_missing};
+    \item \texttt{data\_quality\_flag = missing\_borrow\_join}.
+\end{itemize}
 
-2. \textbf{Aplicación de reglas por símbolo/fecha}.
-   \begin{itemize}
-     \item Para cada $ i \in \mathcal{U}_t $:
-     \begin{itemize}
-       \item Calcular flags $ \eta_{i,t}^{(\alpha)}, \eta_{i,t}^{(B)}, \eta_{i,t}^{(\text{HTB})} $.
-       \item Combinar en $ \eta_{i,t} $ según lógica de config (AND/OVERRIDE según reglas de negocio).
-       \item Mapear $ \tau_{i,t} $ en \texttt{easy/medium/hard/blocked}.
-       \item Rellenar \texttt{reject\_reason} cuando aplica.
-     \end{itemize}
-   \end{itemize}
+\subsection{Símbolos nuevos}
+Un símbolo recién incorporado al universo puede no tener histórico suficiente de proxy. En ese caso:
+\begin{itemize}[leftmargin=2em]
+    \item si el proxy actual está completo y de calidad suficiente, se aplica decisión normal;
+    \item si no lo está, se bloquea por prudencia;
+    \item no se usa tier previo inexistente.
+\end{itemize}
 
-3. \textbf{Clasificación final y persistencia}.
-   \begin{itemize}
-     \item Consolidar tabla:
-     \[
-       \mathcal{L}_t = \{ (i, t, \eta_{i,t}, \tau_{i,t}, r_{i,t}, \widehat{b}_{i,t}, \alpha_{i,t}, \text{run\_id}) \}_{i \in \mathcal{U}_t}.
-     \]
-     \item Escribir:
-     \begin{itemize}
-       \item \texttt{data/borrow/locate/date=\{yyyy-mm-dd\}/part-*.parquet} (por día).
-       \item \texttt{locate\_summary_\{run\_id\}.json} (métricas de elegibilidad: \% blocked, por tier, etc.).
-       \item \texttt{manifest_\{run\_id\}.json} (metadatos de umbrales y reglas usadas).
-     \end{itemize}
-   \end{itemize}
+\subsection{Cambios de universo}
+Toda métrica de cobertura y elegibilidad se calcula respecto de $\mathcal{U}_t$ y no respecto de un universo retrospectivo fijo. Esto evita confundir cambios legítimos del universo con fallos del filtro.
 
+\section{Contrato exacto de outputs}
+
+La salida diaria debe contener, como mínimo:
+
+\begin{center}
+\begin{tabular}{>{\ttfamily}p{4.5cm} p{8.0cm}}
+\toprule
+\textnormal{\textbf{Campo}} & \textbf{Descripción} \\
+\midrule
+date & fecha efectiva \\
+symbol & ticker normalizado \\
+run\_id & identificador del job \\
+short\_eligible\_flag & 1 si corto permitido, 0 si bloqueado \\
+locate\_tier & easy / medium / hard / blocked \\
+locate\_tier\_code & 0/1/2/3 o codificación equivalente fija \\
+reject\_reason & razón dominante del rechazo, si aplica \\
+dominant\_rule & regla de precedencia que decidió el estado \\
+all\_triggered\_rules & lista serializada de reglas disparadas \\
+borrow\_fee\_daily & fee diario propagado \\
+borrow\_fee\_annual & fee anual propagado \\
+availability\_score & score de disponibilidad propagado \\
+htb\_flag & flag HTB propagado \\
+proxy\_quality & calidad del proxy \\
+fallback\_flag & si el proxy upstream usó fallback \\
+override\_flag & indica override explícito \\
+data\_quality\_flag & incidencias de join o completitud \\
+locate\_config\_version & versión de thresholds y reglas \\
+upstream\_proxy\_version & versión del proxy de borrow \\
+asof\_timestamp & timestamp de construcción \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Este contrato no es opcional. Sin estos campos, el módulo no ofrece trazabilidad suficiente para un entorno de research-production serio.
+
+\section{Resumen diario y métricas obligatorias}
+
+Además de la tabla por símbolo, el módulo debe generar un resumen diario con al menos:
+
+\begin{itemize}[leftmargin=2em]
+    \item tamaño del universo efectivo;
+    \item porcentaje de \texttt{short\_eligible};
+    \item distribución por \texttt{locate\_tier};
+    \item porcentaje bloqueado por cada \texttt{reject\_reason};
+    \item porcentaje de overrides;
+    \item porcentaje con \texttt{proxy\_quality=low};
+    \item porcentaje con \texttt{fallback\_flag=1};
+    \item concentración de bloqueos en small/micro caps si ese metadato existe;
+    \item cambios netos de distribución de tiers respecto del día anterior.
+\end{itemize}
+
+Estas métricas son críticas para distinguir si el filtro está operando de forma razonable o si, por ejemplo, una degradación del upstream está colapsando la capacidad del lado corto.
 
 \section{Validaciones de consistencia}
-Para evitar inconsistencies entre universo y filtros, el módulo implementa:
 
-\begin{itemize}
-  \item \textbf{Consistencia de flags y motivos}:
-  \[
-    \eta_{i,t} = 0 \Rightarrow \neg r_{i,t} \text{ está vacío},
-  \]
-  es decir, todo activo no elegible debe tener un \texttt{reject\_reason} no nulo.  
-  \item \textbf{short\_eligible solo en universo}:
-  \[
-    \eta_{i,t} = 1 \Rightarrow i \in \mathcal{U}_t.
-  \]
-  Evita \emph{data leakage} de símbolos fuera del universo elegible.
-  \item \textbf{Cobertura diaria reportada}:
-  \[
-    \psi_t^{\text{elig}} = \frac{1}{|\mathcal{U}_t|} \sum_{i \in \mathcal{U}_t} \eta_{i,t},
-  \]
-  monitorizada en el \texttt{locate\_summary} para garantizar que el universo \emph{short‑eligible} tiene suficiente diversificación y tamaño para backtest \cite{spg2023securitiesfinance, quantrocket2024borrowfees}.
+La implementación debe incluir, como mínimo, las siguientes validaciones:
+
+\subsection{Consistencia de rechazo}
+\[
+\eta_{i,t}=0 \;\Rightarrow\; r_{i,t}\neq \varnothing.
+\]
+
+Todo símbolo bloqueado debe tener razón dominante no vacía.
+
+\subsection{Consistencia de permiso}
+\[
+\eta_{i,t}=1 \;\Rightarrow\; \tau_{i,t}\in\{\texttt{easy},\texttt{medium},\texttt{hard}\}.
+\]
+
+\subsection{Consistencia de bloqueo}
+\[
+\tau_{i,t}=\texttt{blocked} \;\Rightarrow\; \eta_{i,t}=0.
+\]
+
+\subsection{Consistencia con el universo}
+\[
+\eta_{i,t}=1 \;\Rightarrow\; i\in\mathcal{U}_t.
+\]
+
+\subsection{Consistencia con availability crítica}
+\[
+\alpha_{i,t}<\theta_\alpha^{\text{block}}
+\;\Rightarrow\;
+\eta_{i,t}=0.
+\]
+
+No se admite ninguna excepción silenciosa a esta regla.
+
+\section{Integración con portfolio construction y backtest}
+
+La salida del módulo debe consumirse con una semántica precisa:
+
+\subsection{Filtrado del universo corto}
+El conjunto operable de cortos en fecha $t$ es:
+\[
+\mathcal{S}_t^{\text{short}}
+=
+\{i\in\mathcal{U}_t : \eta_{i,t}=1\}.
+\]
+
+\subsection{Sizing por tier}
+El tamaño máximo permitido en cortos debe decrecer con la severidad del tier:
+\[
+w_{i,t}^{\max,\text{short}}
+=
+w_0 \cdot \omega(\tau_{i,t}),
+\]
+donde:
+\[
+\omega(\texttt{easy}) > \omega(\texttt{medium}) > \omega(\texttt{hard}) > \omega(\texttt{blocked})=0.
+\]
+
+\subsection{Coste neto}
+El coste de préstamo debe reflejarse en el retorno neto:
+\[
+r_{i,t}^{\text{net}}
+=
+r_{i,t}^{\text{raw}}
+-
+\widehat{b}_{i,t}\cdot \mathbb{1}(\text{short position}_{i,t}).
+\]
+
+No es correcto multiplicar el coste por \(\eta_{i,t}\) una vez la posición ya existe; la elegibilidad determina si la posición puede abrirse o mantenerse bajo política, pero el coste pertenece a la existencia efectiva de la posición corta. Esta precisión corrige una pequeña ambigüedad conceptual del texto previo.
+
+\subsection{Límite agregado de inventario difícil}
+Puede imponerse:
+\[
+\sum_{i:\tau_{i,t}=\texttt{hard}}
+|w_{i,t}^{\text{short}}|
+\le
+\Theta_{\text{hard}},
+\]
+para contener exposición a nombres operables pero estructuralmente frágiles.
+
+\section{Uso analítico y de governance}
+
+Los outputs de \texttt{locate\_filter.py} deben servir también para:
+
+\begin{itemize}[leftmargin=2em]
+    \item analizar si el alpha del lado corto depende desproporcionadamente de nombres difícilmente prestables;
+    \item evaluar si un cambio en thresholds destruye cobertura útil del universo corto;
+    \item detectar degradaciones del proxy upstream cuando aumenta abruptamente el porcentaje bloqueado;
+    \item comparar regímenes de política de locate mediante \texttt{locate\_config\_version}.
 \end{itemize}
 
+Un sistema maduro no usa el locate sólo para ``dejar pasar o no'', sino como instrumento para medir cuánto de su supuesto alpha corto depende de fricción no capturada.
 
-\section{Integración con portfolio y backtest}
-La salida de \texttt{locate\_filter.py} se consume en:
+\section{Tests e invariantes obligatorios}
 
-\begin{itemize}
-  \item \textbf{Módulos de backtest}:
-  \begin{itemize}
-    \item Filtrar el universo de cortos a $ \{i \in \mathcal{U}_t : \eta_{i,t} = 1\} $, garantizando que solo se permitan posiciones cortas en activos con \texttt{short\_eligible\_flag = 1}.
-    \item Ajustar pesos de portafolio por \texttt{locate\_tier}:
-    \[
-      w_{i,t}^{\text{short}} \propto \omega(\tau_{i,t}),
-    \]
-    con $ \omega(\text{easy}) > \omega(\text{medium}) > \omega(\text{hard}) > 0 $, de modo que se asigne mayor riesgo a los activos de más fácil acceso (bajo coste de préstamo y alta disponibilidad).
-  \end{itemize}
+La implementación debe incluir tests automáticos sobre los siguientes invariantes:
 
-  \item \textbf{Gestión de riesgo de inventario}:
-  \begin{itemize}
-    \item Limitar el tamaño total de cortos en \texttt{hard} o \texttt{blocked}, por ejemplo:
-    \[
-      \sum_{i \in \mathcal{H}_t} |w_{i,t}^{\text{short}}| \leq \Theta_{\text{hard}},
-    \]
-    donde $ \mathcal{H}_t = \{i : \tau_{i,t} = \text{hard}\} $ y $ \Theta_{\text{hard}} $ es un límite de riesgo de inventario.
-    \item Aplicar \emph{cost adjustment} en el retorno:
-    \[
-      r_{i,t}^{\text{net}} = r_{i,t}^{\text{raw}} - \widehat{b}_{i,t} \cdot \eta_{i,t} \cdot \mathbb{1}(\text{short position}_{i,t}),
-    \]
-    donde:
-    \begin{itemize}
-      \item $ r_{i,t}^{\text{raw}} $: retorno bruto del activo $ i $ en $ t $,
-      \item $ \widehat{b}_{i,t} $: borrow fee proxy diario,
-      \item $ \eta_{i,t} $: flag de elegibilidad.
-    \end{itemize}
-    Esto asegura que el impacto de costes de préstamo se refleje de forma diferente según el \texttt{locate\_tier}, y se penalice más fuertemente a los \emph{hard‑to‑borrow} o \emph{blocked} no permitidos en la política de risk.
-  \end{itemize}
+\begin{enumerate}[leftmargin=2em]
+    \item ningún símbolo con \texttt{locate\_tier=blocked} puede tener \texttt{short\_eligible\_flag=1};
+    \item todo símbolo con \texttt{short\_eligible\_flag=0} debe tener \texttt{reject\_reason} no nulo;
+    \item una caída exógena de \(\alpha_{i,t}\) manteniendo lo demás constante no puede mejorar el tier;
+    \item un aumento exógeno de \(\widehat{b}_{i,t}\) manteniendo lo demás constante no puede mejorar el tier;
+    \item si una regla de bloqueo de mayor precedencia dispara, ninguna regla inferior puede producir \texttt{easy}/\texttt{medium}/\texttt{hard};
+    \item símbolos fuera del universo no pueden aparecer como elegibles;
+    \item un cambio de configuración debe reflejarse en \texttt{locate\_config\_version};
+    \item la hysteresis no puede impedir un bloqueo inmediato por disponibilidad crítica o fallo estructural.
+\end{enumerate}
+
+\section{Definition of Done}
+
+El módulo \texttt{locate\_filter.py} se considera terminado únicamente si:
+
+\begin{itemize}[leftmargin=2em]
+    \item convierte el proxy de borrow en una decisión de operabilidad causal y trazable;
+    \item implementa reglas duras y blandas con precedencia formal cerrada;
+    \item documenta razón dominante, reglas activadas y versión de configuración;
+    \item gestiona missing data, símbolos nuevos y cambios de universo sin ambigüedad;
+    \item incorpora hysteresis para evitar oscilación espuria de tiers;
+    \item puede ser consumido directamente por portfolio construction, backtest y QC;
+    \item impide que el lado corto del sistema descanse sobre inventario ficticio o artificialmente benigno.
 \end{itemize}
 
-Además, el \texttt{reject\_reason} y el \texttt{locate\_tier} pueden usarse en:
-\begin{itemize}
-  \item \textbf{Diagnosis de performance}: identificar si el \emph{alpha} de corto proviene de activos de fácil acceso o, en su defecto, si el modelo de \texttt{borrow\_cost\_proxy} está introduciendo \emph{data leakage} al sobreestimar la disponibilidad.
-  \item \textbf{Calibración de políticas de locate}: ajustar umbrales $ \theta_{\alpha}^{\min}, \theta_{B}^{\max} $ y \texttt{HTB} para balancear cobertura y coste de inventario, en línea con la práctica de brokers y plataformas de securities lending \cite{ibkr2024shortavailability, centerpoint2020locates, stocks2024hardtoborrow}.
-\end{itemize}
+En otras palabras, el módulo no está terminado cuando ``clasifica símbolos'', sino cuando impone una frontera operativa creíble entre cortos ejecutables, cortos penalizables y cortos que sólo existen en backtests ingenuos.
 
-El \textbf{Definition of Done} (DoD) es:
-\begin{itemize}
-  \item El \emph{filtro de short eligibles} está listo para ser consumido por módulos de portfolio construction y backtest.
-  \item Los \texttt{locate\_tiers} pueden ser usados en decisiones de tamaño de posición, penalización de costes y gestión de riesgo de inventario, asegurando que el backtest refleje de forma realista la capacidad de ejecutar cortos en el universo objetivo.
-\end{itemize}
+\section{Referencias conceptuales}
+
+La lógica económica de esta especificación se alinea con la práctica de \emph{locates}, \emph{hard-to-borrow lists}, gestión de inventario de préstamo, restricciones de Reg SHO y modelización conservadora de short selling en contextos cuantitativos. El papel de estas referencias no es ornamentar el documento, sino justificar que la elegibilidad del corto debe tratarse como una restricción de primer orden y no como un detalle cosmético del backtest.
+
+\bibliographystyle{plain}
+\bibliography{locate_filter_refs}
+
+\end{document}

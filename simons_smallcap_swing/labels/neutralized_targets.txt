@@ -2,257 +2,513 @@
 
 \subsection{Objetivo del módulo}
 
-El objetivo de \texttt{labels/neutralized\_targets.py} es neutralizar \emph{targets forward} frente a exposiciones sistemáticas (mercado, sector, factores de riesgo) con el fin de:
+El objetivo de \texttt{labels/neutralized\_targets.py} es transformar \emph{targets forward} brutos o netos en \emph{targets neutralizados} frente a exposiciones sistemáticas observables en fecha \(t\), con el fin de aislar el componente idiosincrático del retorno esperado y reducir el aprendizaje espurio de primas de riesgo ampliamente conocidas o no deseadas. En un pipeline serio de \emph{cross-sectional small caps swing trading}, este módulo no debe entenderse como una simple ``regresión residual'', sino como una capa formal de \emph{target engineering} que decide qué parte del retorno futuro se considera \emph{alpha modelable} y qué parte se considera \emph{beta/exposición sistemática} que debe ser retirada del objetivo de aprendizaje.
+
+Desde un punto de vista económico, la neutralización persigue tres metas simultáneas:
 
 \begin{itemize}
-  \item Aislar un \emph{alpha idiosincrático} más robusto para el modelo.
-  \item Reducir el \emph{aprendizaje espurio} de exposiciones de factores conocidas por el mercado.
-  \item Producir \emph{labels neutrales} adecuados para entrenamiento y evaluación de modelos de \emph{cross‑sectional} swing trading.
+  \item \textbf{Aislar alpha idiosincrático.} Evitar que el modelo obtenga aparente capacidad predictiva simplemente por reproducir exposición a mercado, tamaño, sector o liquidez.
+  \item \textbf{Mejorar robustez fuera de muestra.} Forzar al modelo a aprender estructura residual más estable y menos dependiente de regímenes de factores ampliamente arbitrados.
+  \item \textbf{Desacoplar predicción y posicionamiento.} Permitir que la señal aprendida represente una preferencia relativa residual, mientras la decisión final de cartera y riesgo puede reintroducir o restringir exposiciones sistemáticas en otra capa del sistema.
 \end{itemize}
 
-Este módulo se alinea directamente con la literatura de \emph{factor‑neutral} y \emph{alpha‑neutral} asset pricing, donde el retorno residual se interpreta como \emph{pricing error} o \emph{alpha} \cite{GrinoldKahn2000,FactorNeutral2019,FactorNeutralInvesting2025}.
+Por tanto, el módulo debe producir \emph{targets neutralizados PIT, reproducibles, metodológicamente auditables y compatibles con validación temporal robusta}. En particular, debe responder de forma cerrada a cinco cuestiones que no pueden quedar abiertas en una especificación institucional:
 
-\subsection{Marco matemático de la neutralización}
+\begin{enumerate}
+  \item Qué target base se neutraliza.
+  \item Frente a qué conjunto exacto de exposiciones se neutraliza por defecto.
+  \item Qué estimador se utiliza cuando la cross-section es ruidosa, pequeña o mal condicionada.
+  \item Qué ocurre cuando faltan exposiciones o el ajuste es numéricamente inestable.
+  \item Cómo se valida que la neutralización reduce sesgo sistemático sin destruir de manera inútil el contenido predictivo del target.
+\end{enumerate}
+
+En consecuencia, \texttt{neutralized\_targets.py} es un módulo de frontera entre \emph{label construction}, \emph{risk modeling} y \emph{cross-sectional statistics}. No debe diseñarse como una utilidad opcional de postprocesado, sino como una especificación de primer nivel dentro de la arquitectura del sistema \cite{GrinoldKahn2000}.
+
+\subsection{Principios de diseño}
+
+La neutralización debe obedecer a los siguientes principios no negociables:
+
+\begin{enumerate}
+  \item \textbf{Primacía PIT.} Toda exposición utilizada en fecha \(t\) debe estar disponible en \(t\) o antes, conforme a la convención oficial de \emph{information lag}. Está prohibido usar betas, factores o clasificaciones construidas con información futura.
+  
+  \item \textbf{Neutralización cross-sectional por fecha.} La operación se realiza independientemente para cada fecha y horizonte. Nunca deben mezclarse fechas en una misma regresión, ya que ello introduciría contaminación temporal y alteraría la semántica residual.
+  
+  \item \textbf{Separación entre target económico base y target derivado neutralizado.} El sistema debe preservar siempre el target original (\texttt{y\_raw} o \texttt{y\_net}) y producir el neutralizado como capa derivada, no destructiva.
+  
+  \item \textbf{Estimación robusta antes que pureza algebraica.} En small caps, OLS puro puede ser frágil ante multicolinealidad, dummies poco pobladas, colas pesadas y observaciones de alto apalancamiento. El estimador por defecto debe reflejar esta realidad operativa.
+  
+  \item \textbf{Fallo explícito en condiciones patológicas.} Si la matriz de diseño está mal condicionada, faltan exposiciones esenciales o la cross-section es demasiado pequeña, el sistema debe invalidar la fecha/horizonte correspondiente de forma determinista.
+  
+  \item \textbf{Validación de utilidad, no solo de ortogonalidad.} No basta con reducir correlación con factores. También debe comprobarse que la neutralización no colapsa la varianza residual ni elimina de forma indiscriminada la señal económicamente relevante.
+\end{enumerate}
+
+\subsection{Notación y marco matemático}
 
 Denotamos:
 
 \begin{itemize}
-  \item \( y_{i,h}(t) \): \emph{target} forward bruto del activo \( i \) para horizonte \( h \) en fecha \( t \).
-  \item \( \mathbf{y}_t \in \mathbb{R}^{n_t} \): vector de targets \emph{raw} de la cross‑section en \( t \).
-  \item \( \mathbf{X}_t \in \mathbb{R}^{n_t \times k} \): matriz de exposiciones factoriales (market, sector, factores de estilo, etc.).
+  \item \( y_{i,t,h}^{\mathrm{base}} \): target base del activo \(i\) en fecha \(t\) y horizonte \(h\). Por defecto será el retorno forward neto de costes, no el bruto.
+  \item \( \mathbf{y}_{t,h} \in \mathbb{R}^{n_{t,h}} \): vector de targets base válidos en la cross-section de fecha \(t\) para horizonte \(h\).
+  \item \( \mathbf{X}_{t} \in \mathbb{R}^{n_{t,h}\times k} \): matriz de exposiciones sistemáticas PIT para los mismos activos.
+  \item \( \boldsymbol{\beta}_{t,h} \in \mathbb{R}^k \): vector de coeficientes estimados en fecha \(t\), horizonte \(h\).
+  \item \( \boldsymbol{\varepsilon}_{t,h} \in \mathbb{R}^{n_{t,h}} \): residual cross-sectional.
 \end{itemize}
 
-\subsubsection{Neutralización cross‑sectional por fecha}
-
-La metodología recomendada consiste en una regresión cross‑sectional por fecha \( t \):
-
+La neutralización se define por:
 \begin{equation}
-\mathbf{y}_t = \mathbf{X}_t \boldsymbol{\beta}_t + \boldsymbol{\varepsilon}_t,
+\mathbf{y}_{t,h}^{\mathrm{base}}
+=
+\mathbf{X}_{t}\boldsymbol{\beta}_{t,h}
++
+\boldsymbol{\varepsilon}_{t,h},
+\end{equation}
+y el target neutralizado por:
+\begin{equation}
+y_{i,t,h}^{\mathrm{neut}} = \varepsilon_{i,t,h}.
+\end{equation}
+
+El residual se interpreta como el componente del target base no explicado linealmente por las exposiciones sistemáticas observadas. En este contexto, no debe confundirse con ``alpha verdadero'', pero sí con una aproximación operacional a un \emph{target más idiosincrático} para aprendizaje supervisado.
+
+\subsection{Qué target se neutraliza}
+
+La especificación no debe dejar abierta la cuestión de cuál es el input del módulo. El target base oficial recomendado será:
+\begin{center}
+\texttt{neutralization\_input = y\_fwd\_ret\_net}
+\end{center}
+es decir, el retorno forward neto de costes procedente de \texttt{build\_labels.py}.
+
+Solo en investigación explícitamente marcada como no canónica se permitirá neutralizar:
+\begin{itemize}
+  \item retorno bruto,
+  \item rank cross-sectional,
+  \item label continuo abnormal-return ya ajustado por benchmark,
+  \item u otros targets derivados.
+\end{itemize}
+
+\paragraph{Razón económica.}
+Neutralizar sobre retornos brutos mientras el sistema pretende modelar rentabilidad realizable puede reintroducir incoherencia semántica entre capa de labels y capa de ejecución. El input del módulo debe reflejar, por defecto, la magnitud económicamente relevante.
+
+\subsection{Conjunto canónico de exposiciones}
+
+Uno de los puntos más importantes para elevar el módulo a nivel institucional es fijar de forma explícita \emph{qué se neutraliza}. La configuración canónica por defecto debe incluir:
+
+\begin{itemize}
+  \item \textbf{Intercepto} para absorber desplazamiento medio cross-sectional.
+  \item \textbf{Dummies sectoriales o industriales} PIT.
+  \item \textbf{Beta de mercado} estimada PIT.
+  \item \textbf{Tamaño} medido como \(\log(\mathrm{mktcap})\).
+  \item \textbf{Liquidez} mediante una o varias métricas PIT (\%ADV, turnover, Amihud, etc.).
+  \item \textbf{Volatilidad reciente} si forma parte del risk schema oficial.
+\end{itemize}
+
+La configuración institucional recomendada será:
+\begin{center}
+\texttt{neutralization\_mode = sector\_beta\_size\_liquidity}
+\end{center}
+
+Toda exposición adicional debe cumplir dos requisitos:
+\begin{itemize}
+  \item disponibilidad PIT verificable,
+  \item justificación económica explícita.
+\end{itemize}
+
+La especificación debe prohibir, en configuración canónica, el uso ad hoc de factores oportunistas definidos ex post o con información no consolidada temporalmente.
+
+\subsection{Estimador de neutralización}
+
+\subsubsection{Por qué OLS puro no debe ser el default}
+
+Aunque la formulación clásica es:
+\begin{equation}
+\hat{\boldsymbol{\beta}}_{t,h}^{\mathrm{OLS}}
+=
+(\mathbf{X}_t^\top \mathbf{X}_t)^{-1}\mathbf{X}_t^\top \mathbf{y}_{t,h}^{\mathrm{base}},
+\end{equation}
+en small caps esta solución puede ser numéricamente frágil por:
+
+\begin{itemize}
+  \item multicolinealidad entre tamaño, liquidez y volatilidad,
+  \item alta dispersión de leverage points,
+  \item dummies de sectores con baja ocupación,
+  \item cross-sections reducidas en ciertos días o segmentos,
+  \item colas pesadas y outliers genuinos.
+\end{itemize}
+
+Por ello, OLS puede mantenerse como benchmark metodológico, pero no debe ser el \emph{default} institucional.
+
+\subsubsection{Estimador canónico recomendado}
+
+La política por defecto debe ser:
+\begin{center}
+\texttt{neutralization\_estimator = weighted\_ridge}
+\end{center}
+con pesos opcionales por calidad de observación y una regularización moderada.
+
+La estimación se escribe como:
+\begin{equation}
+\hat{\boldsymbol{\beta}}_{t,h}
+=
+\arg\min_{\boldsymbol{\beta}}
+\left(
+(\mathbf{y}_{t,h}^{\mathrm{base}}-\mathbf{X}_t\boldsymbol{\beta})^\top
+\mathbf{W}_t
+(\mathbf{y}_{t,h}^{\mathrm{base}}-\mathbf{X}_t\boldsymbol{\beta})
++
+\lambda \|\boldsymbol{\beta}\|_2^2
+\right),
 \end{equation}
 donde:
 \begin{itemize}
-  \item \( \boldsymbol{\beta}_t \): \emph{factor loadings} (betas) por fecha \( t \).
-  \item \( \boldsymbol{\varepsilon}_t \): residuo de regresión, que se usa como \emph{target neutralizado}:
-  \begin{equation}
-  y^{\text{neut}}_{i,h}(t) = \varepsilon_{i,t}.
-  \end{equation}
+  \item \( \mathbf{W}_t \) es una matriz diagonal de pesos,
+  \item \( \lambda > 0 \) controla estabilidad numérica.
 \end{itemize}
 
-Este enfoque está alineado con la literatura de \emph{factor‑neutral returns} y \emph{pure factor exposure} \cite{GrinoldKahn2000,FactorNeutral2019,FactorNeutralInvesting2025}.
+\paragraph{Ventajas.}
+Esta elección:
+\begin{itemize}
+  \item reduce sensibilidad a matrices mal condicionadas,
+  \item estabiliza coeficientes en cross-sections pequeñas,
+  \item mitiga la explosión de betas sobre factores casi colineales,
+  \item mantiene interpretabilidad suficiente para diagnóstico.
+\end{itemize}
 
-\subsubsection{Formulación OLS estándar}
+\subsubsection{Variantes experimentales}
 
-Bajo \emph{OLS cross‑sectional}:
+El módulo debe permitir, bajo bandera explícita:
+\begin{itemize}
+  \item \texttt{ols},
+  \item \texttt{ridge},
+  \item \texttt{weighted\_ridge},
+  \item \texttt{huber},
+  \item \texttt{quantile},
+  \item \texttt{sector\_demean\_plus\_factor\_residual}.
+\end{itemize}
 
+Pero toda variante distinta del default canónico debe quedar marcada como \texttt{non-canonical} en el manifest.
+
+\subsection{Tratamiento de multicolinealidad y diseño patológico}
+
+La especificación debe cerrar explícitamente cómo actuar cuando \( \mathbf{X}_t \) está mal condicionada.
+
+\subsubsection{Checks obligatorios del diseño}
+
+Para cada fecha \(t\), horizonte \(h\), el módulo debe calcular al menos:
+\begin{itemize}
+  \item rango efectivo de \(\mathbf{X}_t\),
+  \item condición numérica de \(\mathbf{X}_t^\top \mathbf{X}_t\),
+  \item ocupación mínima por dummy sectorial,
+  \item porcentaje de columnas casi constantes,
+  \item número de observaciones válidas \(n_{t,h}\).
+\end{itemize}
+
+\subsubsection{Política canónica}
+
+La política oficial recomendada será:
+\begin{itemize}
+  \item si \(n_{t,h} < n_{\min}^{\mathrm{neut}}\): invalidar fecha/horizonte;
+  \item si una dummy sectorial carece de soporte suficiente: agrupar en bucket \texttt{OTHER} o eliminar dicha columna según regla fija;
+  \item si la condición numérica supera umbral crítico: usar regularización reforzada o invalidar si persiste la inestabilidad;
+  \item si el diseño queda singular tras filtrado: invalidar.
+\end{itemize}
+
+Esto debe registrarse con códigos formales y no como warnings informales.
+
+\subsection{Faltantes en exposiciones y cobertura}
+
+Éste era uno de los puntos que quedaban abiertos en la versión anterior. La especificación institucional debe fijar qué hacer cuando faltan factores para un subconjunto de símbolos.
+
+\subsubsection{Política por defecto}
+
+La política canónica será:
+\begin{center}
+\texttt{missing\_exposure\_policy = row\_drop\_if\_inessential, invalidate\_if\_material}
+\end{center}
+
+Interpretación:
+\begin{itemize}
+  \item Si faltan exposiciones en una fracción pequeña y no sistemática de la cross-section, esas filas pueden excluirse del ajuste de esa fecha.
+  \item Si faltan exposiciones en una parte material de la cross-section o en factores esenciales del modo canónico, la neutralización de esa fecha/horizonte debe invalidarse.
+\end{itemize}
+
+\subsubsection{Umbrales recomendados}
+
+El módulo debe parametrizar:
+\begin{itemize}
+  \item fracción máxima permitida de filas descartadas por faltantes,
+  \item fracción máxima permitida de cobertura sectorial perdida,
+  \item conjunto de factores marcados como \texttt{essential}.
+\end{itemize}
+
+Sin estos umbrales, el módulo queda abierto a arbitrariedad experimental.
+
+\subsection{Definición formal del output neutralizado}
+
+Una vez estimado el modelo, el residual se define por:
 \begin{equation}
-\boldsymbol{\beta}_t = (\mathbf{X}_t^\top \mathbf{X}_t)^{-1} \mathbf{X}_t^\top \mathbf{y}_t,
+\boldsymbol{\varepsilon}_{t,h}
+=
+\mathbf{y}_{t,h}^{\mathrm{base}}
+-
+\mathbf{X}_t\hat{\boldsymbol{\beta}}_{t,h}.
+\end{equation}
+
+Además de \(\boldsymbol{\varepsilon}_{t,h}\), deben calcularse:
+\begin{equation}
+\sigma_{\varepsilon,t,h}^{2}
+=
+\mathrm{Var}(\boldsymbol{\varepsilon}_{t,h}),
 \end{equation}
 \begin{equation}
-\boldsymbol{\varepsilon}_t = \mathbf{y}_t - \mathbf{X}_t \boldsymbol{\beta}_t.
+R_{t,h}^{2}
+=
+1-\frac{\sum_i \varepsilon_{i,t,h}^{2}}{\sum_i (y_{i,t,h}^{\mathrm{base}}-\bar{y}_{t,h})^2}.
 \end{equation}
 
-\subsubsection{Alternativas robustas}
+La varianza residual mide cuánta dispersión útil sobrevive al proceso; el \(R^2\) mide qué fracción del target base estaba explicada por las exposiciones sistemáticas seleccionadas. Ambos son diagnósticos centrales del módulo.
 
-Se pueden usar variantes más robustas:
+\subsection{Qué hacer cuando falla la neutralización}
+
+Este punto es decisivo para cerrar la especificación.
+
+\subsubsection{Causas de fallo}
+
+La neutralización debe considerarse fallida si ocurre cualquiera de las siguientes:
 
 \begin{itemize}
-  \item \emph{Robust regression} (por ejemplo, \emph{Huber loss}, \emph{quantile regression}).
-  \item \emph{Sector‑demean} + \emph{factor residual}:
-  \begin{equation}
-  y^{\text{neut}}_{i,h}(t) = \varepsilon_{i,t}^{(factor)} - \overline{\varepsilon}^{(sector)}(i,t),
-  \end{equation}
-  donde \( \overline{\varepsilon}^{(sector)}(i,t) \) es el promedio de residuales dentro del sector de \( i \) en \( t \).
+  \item \(n_{t,h} < n_{\min}^{\mathrm{neut}}\),
+  \item faltantes materiales en exposiciones esenciales,
+  \item diseño singular o casi singular,
+  \item no convergencia del estimador,
+  \item varianza residual degenerada,
+  \item residual compuesto mayoritariamente por NaN/Inf,
+  \item cobertura insuficiente tras el filtrado.
 \end{itemize}
 
-Estas variantes reducen el impacto de \emph{outliers} y \emph{factor clustering} \cite{GrinoldKahn2000,FactorNeutralInvesting2025}.
+\subsubsection{Política canónica de fallo}
 
-\subsubsection{Varianza y desviación estándar del residual}
+La regla oficial debe ser:
+\begin{center}
+\texttt{neutralization\_failure\_policy = invalidate\_derived\_target}
+\end{center}
 
-La \emph{varianza residual} por fecha:
+Es decir:
+\begin{itemize}
+  \item el target base permanece intacto si fue correctamente calculado;
+  \item el target neutralizado para esa fecha/horizonte se marca inválido;
+  \item el manifest y el summary reportan la razón formal del fallo;
+  \item no se permite \emph{fallback silencioso} a OLS u otro estimador distinto del solicitado.
+\end{itemize}
 
+Esta última decisión es especialmente importante: los cambios silenciosos de estimador hacen que los resultados de investigación dejen de ser comparables.
+
+\subsection{Reglas PIT y consistencia temporal}
+
+La neutralización solo es metodológicamente válida si respeta timing informativo estricto.
+
+\begin{itemize}
+  \item Las exposiciones deben estar disponibles en \(t\) o \(t-1\), según la convención formal del sistema.
+  \item Está prohibido usar betas o factores reestimados con información posterior a la fecha de decisión.
+  \item La neutralización se ejecuta independientemente por fecha y horizonte:
+  \[
+  \forall (t,h), \quad
+  \mathbf{y}_{t,h}^{\mathrm{base}} \rightarrow \boldsymbol{\varepsilon}_{t,h}.
+  \]
+  \item El calendario y el universo deben ser los mismos que en \texttt{build\_labels.py}; no puede producirse una reindexación oportunista.
+\end{itemize}
+
+Estas reglas alinean el módulo con prácticas industriales de \emph{risk modeling} y evitan \emph{temporal mixing} o \emph{factor leakage}.
+
+\subsection{Validaciones: ortogonalidad, estabilidad y utilidad}
+
+La validación no debe limitarse a comprobar que la correlación con factores cae. Se requieren tres capas.
+
+\subsubsection{Reducción de exposición sistemática}
+
+Para cada factor \(k\) relevante:
 \begin{equation}
-\sigma^2_{\varepsilon,t} = \text{Var}(\boldsymbol{\varepsilon}_t),
+\left|\mathrm{Corr}(y_{t,h}^{\mathrm{base}}, X_t^{(k)})\right|
+\gg
+\left|\mathrm{Corr}(y_{t,h}^{\mathrm{neut}}, X_t^{(k)})\right|,
+\end{equation}
+o, de forma más general, una reducción material en exposición lineal.
+
+No es necesario exigir ortogonalidad exacta en presencia de regularización, pero sí una caída sustantiva y consistente.
+
+\subsubsection{No degeneración residual}
+
+Debe cumplirse:
+\begin{equation}
+\sigma_{\varepsilon,t,h}^{2} \ge \epsilon_{\min}.
 \end{equation}
 
-y la \emph{desviación estándar del residual}:
+Si la varianza residual colapsa repetidamente, el target neutralizado deja de ser útil para aprendizaje. Esto puede deberse a:
+\begin{itemize}
+  \item sobreespecificación del modelo de factores,
+  \item factores excesivamente cercanos al propio target,
+  \item cross-section demasiado pequeña,
+  \item problema de datos.
+\end{itemize}
 
-\begin{equation}
-\sigma_{\varepsilon,t} = \sqrt{\text{Var}(\boldsymbol{\varepsilon}_t)},
-\end{equation}
+\subsubsection{Preservación de señal útil}
 
-se almacena en \texttt{residual\_std} como métrica de \emph{noise/signal} del alpha residual \cite{GrinoldKahn2000}.
+La neutralización no debe evaluarse solo por pureza factorial. También debe comprobarse que no destruye innecesariamente el contenido predictivo. El módulo debe soportar métricas comparativas \texttt{before/after} como:
 
-\subsection{Entradas y salidas del módulo}
+\begin{itemize}
+  \item correlación de \texttt{y\_raw} y \texttt{y\_neutralized} con forward realized rank,
+  \item dispersión cross-sectional útil,
+  \item estabilidad temporal del residual,
+  \item capacidad de ordenar colas extremas.
+\end{itemize}
+
+\paragraph{Principio clave.}
+Una neutralización que reduce exposición a factores pero elimina casi toda la estructura explotable del target no debe celebrarse como éxito metodológico. Debe tratarse como señal de posible sobre-neutralización.
+
+\subsection{Flujo operativo del módulo}
+
+El flujo de alto nivel recomendado es:
+
+\begin{enumerate}
+  \item \texttt{load\_labels(...)}
+  \item \texttt{load\_factor\_exposures(...)}
+  \item \texttt{canonicalize\_exposure\_set(...)}
+  \item \texttt{align\_labels\_and\_exposures\_by\_date\_symbol(...)}
+  \item \texttt{validate\_design\_matrix\_quality(...)}
+  \item \texttt{fit\_neutralization\_model\_by\_date\_and\_horizon(...)}
+  \item \texttt{compute\_residuals\_and\_diagnostics(...)}
+  \item \texttt{apply\_neutralization\_failure\_policy(...)}
+  \item \texttt{compute\_before\_after\_stats(...)}
+  \item \texttt{persist\_outputs\_and\_manifest(...)}
+\end{enumerate}
+
+La etapa \texttt{canonicalize\_exposure\_set(...)} es crucial: el módulo no debe operar directamente sobre cualquier tabla de factores sin controlar consistencia, tipos y disponibilidad PIT.
+
+\subsection{Entradas y salidas}
 
 \subsubsection{Entradas}
 
 \begin{itemize}
-  \item \texttt{labels\_path}: store de labels \texttt{labels/store} con \texttt{y\_raw}.
-  \item \texttt{factor\_exposures\_path}: matriz de exposiciones factoriales \texttt{risk/factors/latest.parquet}.
-  \item \texttt{neutralization\_config\_path}: configuración de modelo (OLS, robust, sector‑demean, etc.).
+  \item \texttt{labels\_path}: store de labels base.
+  \item \texttt{factor\_exposures\_path}: store de exposiciones PIT.
+  \item \texttt{neutralization\_config\_path}: configuración del estimador, thresholds y políticas.
   \item \texttt{run\_id}: identificador de ejecución.
 \end{itemize}
 
-\subsubsection{Salidas}
+\subsubsection{Salidas principales}
 
 \begin{itemize}
-  \item \texttt{labels/neutralized/date={yyyy-mm-dd}/part-*.parquet}:
-  \begin{itemize}
-    \item \texttt{y\_raw}, \texttt{y\_neutralized}, \texttt{residual\_std}, \texttt{neutralization\_model}, \texttt{horizon}.
-  \end{itemize}
-  \item \texttt{labels/neutralized/neutralization\_summary_{run_id}.json}:
-  \begin{itemize}
-    \item \emph{R²} por fecha/factor.
-    \item \emph{number of observations} por fecha.
-    \item \emph{coverage} y \emph{number of failed dates}.
-  \end{itemize}
-  \item \texttt{labels/neutralized/before\_after\_stats_{run_id}.parquet}:
-  \begin{itemize}
-    \item \emph{mean, std, skew, kurtosis} de \texttt{y\_raw} vs \texttt{y\_neutralized}.
-    \item \emph{correlation with factors} antes y después de neutralizar.
-  \end{itemize}
-  \item \texttt{labels/neutralized/manifest_{run_id}.json}:
-  \begin{itemize}
-    \item \texttt{config\_hash}, \texttt{run\_id}, \texttt{start\_date}, \texttt{end\_date}.
-    \item \texttt{factor\_model\_version}.
-  \end{itemize}
+  \item \texttt{labels/neutralized/date={yyyy-mm-dd}/part-*.parquet}
+  \item \texttt{labels/neutralized/neutralization\_summary\_\{run\_id\}.json}
+  \item \texttt{labels/neutralized/before\_after\_stats\_\{run\_id\}.parquet}
+  \item \texttt{labels/neutralized/failed\_dates\_\{run\_id\}.parquet}
+  \item \texttt{labels/neutralized/manifest\_\{run\_id\}.json}
 \end{itemize}
 
-\subsection{Campos mínimos en el output}
+\subsubsection{Campos mínimos del output}
 
 \begin{itemize}
-  \item \texttt{date}.
-  \item \texttt{symbol}.
-  \item \texttt{y\_raw}: target forward bruto.
-  \item \texttt{y\_neutralized}: residuo neutralizado.
-  \item \texttt{horizon}: horizonte forward (5d, 10d, 20d, etc.).
-  \item \texttt{neutralization\_model}: tipo de modelo usado (OLS, robust, sector‑demean, etc.).
-  \item \texttt{residual\_std}: desviación estándar de \texttt{y\_neutralized} por fecha.
-  \item \texttt{run\_id}.
+  \item \texttt{date}
+  \item \texttt{symbol}
+  \item \texttt{horizon}
+  \item \texttt{y\_base}
+  \item \texttt{y\_neutralized}
+  \item \texttt{neutralization\_model}
+  \item \texttt{residual\_std}
+  \item \texttt{r2\_cross\_sectional}
+  \item \texttt{n\_obs\_date}
+  \item \texttt{neutralization\_valid\_flag}
+  \item \texttt{neutralization\_failure\_reason}
+  \item \texttt{run\_id}
 \end{itemize}
 
-\subsection{Reglas Pit y de diseño temporal}
+\subsection{Defaults canónicos}
+
+Para sonar a spec institucional y no a framework abierto, el módulo debe fijar defaults oficiales:
 
 \begin{itemize}
-  \item Las \emph{exposiciones factoriales} \texttt{factor\_exposures} deben estar disponibles en la fecha \emph{PIT} \( t \) o \( t-1 \) según la convención de \emph{information lag}:
-  \begin{equation}
-  \mathbf{X}_t \text{ disponible en } t \text{ o } t-1.
-  \end{equation}
-  \item No se usan \emph{betas futuras} en la construcción de \texttt{y\_neutralized}.
-  \item La neutralización se realiza \emph{por fecha} (no mezclando múltiples fechas) para evitar \emph{temporal mixing}:
-  \begin{equation}
-  \forall t, \text{ operación independiente } \mathbf{y}_t \longrightarrow \boldsymbol{\varepsilon}_t.
-  \end{equation}
+  \item \texttt{neutralization\_input = y\_fwd\_ret\_net}
+  \item \texttt{neutralization\_mode = sector\_beta\_size\_liquidity}
+  \item \texttt{neutralization\_estimator = weighted\_ridge}
+  \item \texttt{missing\_exposure\_policy = material\_missing\_fails\_date}
+  \item \texttt{neutralization\_failure\_policy = invalidate\_derived\_target}
+  \item \texttt{min\_obs\_per\_date = 50} o el mínimo institucional que corresponda
+  \item \texttt{conditioning\_policy = regularize\_then\_fail}
 \end{itemize}
 
-Estas reglas preservan \emph{no‑leakage} y alinean con prácticas de \emph{factor modeling} en risk management industrial \cite{GrinoldKahn2000,FactorNeutralInvesting2025}.
+Todo experimento que se aparte de estos defaults debe quedar marcado como \texttt{non-canonical} en el manifest.
 
-\subsection{Flujo de proceso}
+\subsection{CLI}
 
-\begin{enumerate}
-  \item \texttt{load\_labels} desde \texttt{labels\_path}.
-  \item \texttt{load\_factor\_exposures} y alinear por \((date, symbol)\).
-  \item \texttt{execute\_neutralization\_by\_date\_and\_horizon}:
-  \begin{itemize}
-    \item Por cada \( t \) y \( h \): regresión \texttt{y\_raw} vs \texttt{exposures}.
-    \item Guardar \texttt{y\_neutralized} y \texttt{residual\_std}.
-  \end{itemize}
-  \item \texttt{validate\_residuals\_and\_coverage}:
-  \begin{itemize}
-    \item \emph{No degeneración} de varianza residual.
-    \item \emph{Cobertura mínima} por fecha.
-    \item \emph{Sin NaN críticos} en \texttt{y\_neutralized}.
-  \end{itemize}
-  \item \texttt{persist\_outputs} en formato Parquet/JSON.
-\end{enumerate}
-
-\subsection{Validaciones y métricas}
-
-\begin{itemize}
-  \item \textbf{Varianza residual no degenerada}:
-  \begin{equation}
-  \sigma^2_{\varepsilon,t} \geq \epsilon_{\min} \quad \text{(por ejemplo, } \epsilon_{\min} = 10^{-8} \text{)}.
-  \end{equation}
-  \item \textbf{Cobertura mínima por fecha}:
-  \begin{equation}
-  \#\{i : i \in \mathcal{U}_t\} \geq N_{\min},
-  \end{equation}
-  donde \( N_{\min} \) es configurable.
-  \item \textbf{Sin NaN críticos} en \texttt{y\_neutralized}:
-  \begin{equation}
-  \exists i \text{ tal que } \varepsilon_{i,t} = \text{NaN} \Rightarrow \text{error o warning}.
-  \end{equation}
-  \item \textbf{Reducción de correlación con factores objetivo}:
-  \begin{equation}
-  \lvert \text{Corr}(\mathbf{y}_t, \mathbf{X}_t^{(k)}) \rvert \gg \lvert \text{Corr}(\boldsymbol{\varepsilon}_t, \mathbf{X}_t^{(k)}) \rvert,
-  \end{equation}
-  para cada factor \( k \) de interés \cite{GrinoldKahn2000,Nechvatalova2021}.
-\end{itemize}
-
-Estas validaciones aseguran que la neutralización no \emph{saturate} el alpha o introduzca \emph{noise} excesivo \cite{FactorNeutral2019,FactorNeutralInvesting2025}.
-
-\subsection{Interfaz de ejecución CLI}
+Ejemplo:
 
 \begin{verbatim}
-python -m labels.neutralized_targets ^
-  --labels-path labels/store ^
-  --factor-exposures-path risk/factors/latest.parquet ^
-  --config-path configs/labels/neutralized_targets.yaml ^
+python -m labels.neutralized_targets \
+  --labels-path labels/store \
+  --factor-exposures-path risk/factors/latest.parquet \
+  --config-path configs/labels/neutralized_targets.yaml \
   --run-id neutralized_targets_20260305_001
 \end{verbatim}
 
-Este comando ejecuta la neutralización completa por fecha y horizonte y genera:
-
+La CLI debe abortar si:
 \begin{itemize}
-  \item Store de labels neutralizados.
-  \item Reportes de \emph{before‑after} statistics.
-  \item Metadatos de ajuste por fecha.
+  \item no existen labels base válidos,
+  \item el exposure schema no puede canonicalizarse,
+  \item se solicitan factores sin disponibilidad PIT verificada,
+  \item o la configuración del estimador es inconsistente con los datos de entrada.
 \end{itemize}
 
 \subsection{Criterios de aceptación (DoD)}
 
+La \emph{Definition of Done} del módulo exige:
+
 \begin{itemize}
-  \item \textbf{Targets neutralizados robustos}:
-  \begin{itemize}
-    \item Alta reducción de exposición a factores sistemańticos.
-    \item Residuos con \emph{varianza razonable} y \emph{no degenerados}.
-  \end{itemize}
-  \item \textbf{Sin leakage temporal}:
-  \begin{itemize}
-    \item Exposiciones PIT y no uso de \emph{betas futuras}.
-  \end{itemize}
-  \item \textbf{Cobertura y validación suficientes}:
-  \begin{itemize}
-    \item \emph{Cobertura mínima} por fecha cumplida.
-    \item Sin \emph{NaN/inf críticos} en \texttt{y\_neutralized}.
-  \end{itemize}
-  \item \textbf{Reportes de calidad}:
-  \begin{itemize}
-    \item \texttt{neutralization\_summary}, \texttt{before\_after\_stats} y \texttt{manifest} están disponibles.
-  \end{itemize}
+  \item targets neutralizados PIT y reproducibles,
+  \item conjunto de exposiciones canónico y explícito,
+  \item manejo robusto de multicolinealidad y cross-sections pequeñas,
+  \item política formal para faltantes y fallos de ajuste,
+  \item reducción material de exposición sistemática,
+  \item residual con varianza utilizable y sin degeneración,
+  \item reportes \texttt{before/after} suficientes para juzgar pureza y utilidad.
 \end{itemize}
 
-Estos criterios sitúan \texttt{neutralized\_targets.py} como un \emph{core module} dentro de un pipeline de \emph{factor‑neutral} swing trading industrial \cite{GrinoldKahn2000,FactorNeutral2019,FactorNeutralInvesting2025}.
+No basta con producir un residual. El módulo debe producir un residual cuya semántica económica, validez temporal y estabilidad estadística estén suficientemente cerradas como para soportar investigación seria y uso interno reproducible.
+
+\subsection{Casos de prueba mínimos}
+
+La batería mínima de tests debe cubrir:
+
+\begin{itemize}
+  \item neutralización exacta en datos sintéticos con factores conocidos,
+  \item reducción de exposición en presencia de correlación controlada,
+  \item comportamiento con multicolinealidad severa,
+  \item cross-section demasiado pequeña,
+  \item faltantes materiales en exposiciones,
+  \item fallo de convergencia del estimador robusto,
+  \item preservación del target base cuando falla la capa neutralizada,
+  \item persistencia correcta de summary, failed dates y manifest.
+\end{itemize}
 
 \subsection{Bibliografía y referencias de estado del arte}
 
 \begin{thebibliography}{9}
+
 \bibitem{GrinoldKahn2000}
-Grinold, R. C., \& Kahn, R. N. (2000). \emph{Active Portfolio Management: A Quantitative Approach for Producing Superior Returns and Controlling Risk}. McGraw‑Hill.
+Grinold, R. C., \& Kahn, R. N. (2000).
+\emph{Active Portfolio Management: A Quantitative Approach for Producing Superior Returns and Controlling Risk}.
+McGraw-Hill.
 
 \bibitem{FactorNeutral2019}
-Papoutsis, G., \& Falkenstein, E. (2019). \emph{The Quest for Pure Equity Factor Exposure: How to Eliminate Unwanted Biases in Equity Factors}. SSRN.
-
-\bibitem{FactorNeutralInvesting2025}
-Wang, R. (2025). \emph{Factor Investing and Factor‑Neutral Investing}. PDF draft.
-
-\bibitem{Nechvatalova2021}
-Nechvátalová, H. et al. (2021). \emph{Real‑time identification of abnormal returns via cross‑sectional event‑based study}. Czech Journal of Economics and Finance.
+Papoutsis, G., \& Falkenstein, E. (2019).
+\emph{The Quest for Pure Equity Factor Exposure: How to Eliminate Unwanted Biases in Equity Factors}.
+SSRN.
 
 \bibitem{SectorNeutralFactor2023}
-Kumar, S. et al. (2023). \emph{Sector exposures in factor portfolios: why neutralise when you can optimise?} Journal of Asset Management.
+Kumar, S. et al. (2023).
+\emph{Sector exposures in factor portfolios: why neutralise when you can optimise?}
+Journal of Asset Management.
 
 \bibitem{FactorZoo2021}
-Roussanov, R. (2021). \emph{Navigating the factor zoo around the world}. Finance Research Letters.
+Roussanov, R. (2021).
+\emph{Navigating the factor zoo around the world}.
+Finance Research Letters.
 
 \end{thebibliography}

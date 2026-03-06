@@ -2,171 +2,380 @@
 
 \subsection{Objetivo del módulo}
 
-El objetivo de \texttt{labels/build\_labels.py} es construir un banco de \emph{labels forward, point‑in‑time (PIT)} para entrenamiento y evaluación de modelos \emph{cross‑sectional} en universos de small caps, garantizando que:
-\begin{itemize}
-  \item Los \emph{labels} son netos de costes conforme a la configuración (slippage, fees, borrow).
-  \item No existe \emph{temporal leakage} ni contaminación con información futura.
-  \item Se generan \emph{targets multi‑horizonte} consistentes con la estrategia de swing trading (e.g., 5d, 10d, 20d).
-\end{itemize}
-Este módulo ocupa la posición central en la \emph{label pipeline} de un sistema de \emph{quant research industrial}, donde la calidad del \emph{target} determina directamente el máximo rendimiento teórico alcanzable del modelo (Capítulo 8 de \cite{LopezdePrado2018}).
+El objetivo de \texttt{labels/build\_labels.py} es construir la \emph{capa canónica de targets} del sistema, es decir, un banco de \emph{labels forward, point-in-time (PIT), multi-horizonte y reproducibles} para entrenamiento, validación y evaluación de modelos \emph{cross-sectional} en universos de \emph{small caps}. En un pipeline de \emph{quant research} de nivel institucional, este módulo no se limita a ``calcular retornos futuros'', sino que fija de manera explícita \emph{qué} aprende el modelo, \emph{bajo qué convención de ejecución}, \emph{con qué fricciones económicas}, y \emph{con qué reglas de validez temporal}.
 
-\subsection{Marco matemático de los labels forward PIT}
+El módulo debe garantizar simultáneamente que:
+\begin{itemize}
+  \item Todo \emph{label} es estrictamente \emph{point-in-time}: ninguna observación utiliza información no disponible en la fecha de decisión.
+  \item La semántica del target es consistente con la convención de ejecución definida en \texttt{execution/*} y con la convención de construcción de \texttt{features/build\_features.py}.
+  \item Los retornos forward pueden construirse tanto en forma \emph{bruta} como \emph{neta de costes}, incorporando explícitamente \emph{slippage}, comisiones, \emph{borrow}, costes de financiación y, en su caso, penalizaciones por iliquidez.
+  \item El sistema soporta targets de regresión, ranking y clasificación sobre una base multi-horizonte coherente con una estrategia \emph{swing} en small caps.
+  \item Toda observación queda acompañada de un estado formal de validez, una razón de exclusión estandarizada y metadatos suficientes para trazabilidad total por \texttt{run\_id}, \texttt{config\_hash}, versión de inputs y calendario.
+\end{itemize}
+
+En términos prácticos, \texttt{build\_labels.py} define el máximo contenido económico que el modelo puede aspirar a capturar. Un modelo excelente entrenado sobre labels mal alineados, contaminados, mal neutralizados o inconsistentes con la ejecución es estructuralmente inferior a un modelo más simple entrenado sobre un target correctamente especificado. Por ello, este módulo debe tratarse como una \emph{pieza de infraestructura crítica}, no como una utilidad auxiliar de preprocesado \cite{LopezdePrado2018}.
+
+\subsection{Principios de diseño}
+
+La especificación del módulo se rige por seis principios no negociables:
+
+\begin{enumerate}
+  \item \textbf{Primacía PIT.} Toda magnitud empleada en la construcción del label debe estar disponible en la fecha efectiva de decisión. Si existe duda sobre disponibilidad temporal, la observación se invalida por defecto.
+  
+  \item \textbf{Consistencia económica.} El label debe reflejar la ganancia o pérdida económicamente realizable bajo la convención de entrada/salida del sistema, no una abstracción académica desconectada del \emph{execution layer}.
+  
+  \item \textbf{Determinismo operacional.} Dado el mismo conjunto de inputs, configuración, calendario y versión de dependencias, el módulo debe producir exactamente el mismo output, sin ambigüedad en exclusiones ni en tratamiento de casos frontera.
+  
+  \item \textbf{Jerarquía explícita de exclusiones.} Cuando una observación presenta múltiples problemas simultáneos, la razón de invalidez reportada debe seguir una prioridad formal y estable, de modo que los resultados sean auditables y comparables entre ejecuciones.
+  
+  \item \textbf{Separación entre target económico y transformaciones auxiliares.} El retorno neto forward es la magnitud económica primaria; ranking, clasificación y neutralización son transformaciones derivadas y deben poder reconstruirse a partir del target base y sus metadatos.
+  
+  \item \textbf{Compatibilidad con validación temporal robusta.} La estructura del label debe ser compatible con \texttt{labels/purged\_splits.py}, de manera que horizontes forward, ventanas efectivas de evento y reglas de embargo puedan derivarse de forma inequívoca.
+\end{enumerate}
+
+\subsection{Notación y marco matemático}
 
 Denotamos:
 \begin{itemize}
-  \item \( t \): fecha de decisión o de construcción de features.
-  \item \( \mathcal{U}_t \): universo de small caps elegibles en \( t \), i.e., \( \mathcal{U}_t = \{ i \in \mathcal{I} : \texttt{is\_eligible}(i,t) = 1 \} \).
-  \item \( h \in \mathcal{H} = \{h_1, h_2, \dots \} \): conjunto de horizontes forward (5d, 10d, 20d,…).
-  \item \( \text{lag} \in \{0,1\} \): \emph{decision lag} en días.
-  \item \( r_{i,t+\tau} \): retorno bruto del activo \( i \) entre \( t+\text{lag} \) y \( t+\text{lag}+\tau \).
+  \item \( t \): fecha de decisión asociada a la fila de features.
+  \item \( i \): símbolo o activo individual.
+  \item \( \mathcal{U}_t \subseteq \mathcal{I} \): universo elegible en \( t \), determinado exclusivamente por \texttt{universe\_history} y nunca por una fotografía actual del universo.
+  \item \( \mathcal{H} = \{h_1,\dots,h_m\} \): conjunto finito de horizontes forward expresados en sesiones de mercado.
+  \item \( \ell \in \{0,1,\dots\} \): \emph{decision lag} en sesiones, definido como el número de barras entre la observación de features y la primera barra económicamente operable.
+  \item \( P^{(x)}_{i,t} \): precio ajustado bajo la convención \( x \in \{\texttt{close}, \texttt{open}, \texttt{vwap}, \dots\} \), siempre tras aplicar el esquema PIT de ajustes corporativos aprobado por el sistema.
+  \item \( C^{\text{entry}}_{i,t,h} \), \( C^{\text{exit}}_{i,t,h} \), \( C^{\text{carry}}_{i,t:h} \): costes de entrada, salida y mantenimiento asociados al horizonte \( h \).
 \end{itemize}
+
+La fecha económica de entrada se denota por
+\[
+t^{\text{in}} = t + \ell,
+\]
+y la fecha económica de salida para horizonte \( h \) por
+\[
+t^{\text{out}}(h) = t + \ell + h.
+\]
+
+Estas fechas no son meros índices aritméticos: deben resolverse sobre el calendario real de negociación del activo o del calendario maestro adoptado por el sistema. Si una fecha no es negociable, la función de calendarización debe mapearla de forma determinista a la siguiente sesión válida según la política oficial de mercado.
+
+\subsection{Definición del target económico base}
 
 \subsubsection{Retorno forward bruto}
 
-El retorno forward bruto para horizonte \( h \) en \( t \) se define como:
+El target económico bruto para el activo \( i \), fecha de decisión \( t \) y horizonte \( h \) es:
 \begin{equation}
-y^{\text{ret}}_{i,h}(t) = \frac{P_{i,t+\text{lag}+h}}{P_{i,t+\text{lag}}} - 1,
+y^{\mathrm{gross}}_{i,t,h}
+=
+\frac{P^{(\mathrm{exit})}_{i,t^{\mathrm{out}}(h)}}{P^{(\mathrm{entry})}_{i,t^{\mathrm{in}}}} - 1.
 \end{equation}
-donde \( P_{i,\cdot} \) es el precio ajustado (close o close/open ajustado según la configuración \texttt{return\_mode}). La elección de \texttt{return\_mode} (close‑to‑close, open‑to‑close, close‑to‑open) implica una mapeada directa a la convención de \emph{execution timing} y a la definición de \emph{signal horizon} en el backtest \cite{CampbellLoMackinlay1997,LoMacKinlay2001}.
+
+Las convenciones \( \mathrm{entry} \) y \( \mathrm{exit} \) quedan determinadas por \texttt{return\_mode}. El módulo debe soportar al menos las siguientes convenciones canónicas:
+\begin{itemize}
+  \item \texttt{close\_to\_close}: señal construida al cierre de \( t \), ejecución económica modelada al cierre de \( t+\ell \), salida al cierre de \( t+\ell+h \).
+  \item \texttt{close\_to\_open}: señal construida al cierre de \( t \), ejecución al \emph{open} de \( t+\ell \), salida al \emph{open} de \( t+\ell+h \) o al \emph{close} si así lo especifica la configuración.
+  \item \texttt{open\_to\_close}: caso reservado para pipelines intradiarios o de señal pre-open, solo válido si la capa de features acredita disponibilidad temporal consistente.
+\end{itemize}
+
+La convención \texttt{return\_mode} no puede quedar ``semiabierta'': toda ejecución debe registrar explícitamente qué campo de precio se usa en entrada y salida. Una configuración incompleta o ambigua invalida el \texttt{run} completo.
 
 \subsubsection{Retorno forward neto de costes}
 
-Si se activa \texttt{net\_of\_costs = true}, el label neto se construye como:
+Cuando \texttt{net\_of\_costs = true}, el target principal recomendado del sistema será el retorno realizable neto:
 \begin{equation}
-y^{\text{ret, net}}_{i,h}(t) = y^{\text{ret}}_{i,h}(t) - c^{\text{entry}}_{i,t} - c^{\text{exit}}_{i,t+h} - c^{\text{borrow}}_{i,t:t+h},
+y^{\mathrm{net}}_{i,t,h}
+=
+y^{\mathrm{gross}}_{i,t,h}
+-
+C^{\mathrm{entry}}_{i,t,h}
+-
+C^{\mathrm{exit}}_{i,t,h}
+-
+C^{\mathrm{carry}}_{i,t:h}.
 \end{equation}
-donde \( c^{\bullet}_{i,\cdot} \) proviene de salida de \texttt{execution/cost\_model}. Este modelo de costes puede ser un modelo paramétrico (slippage proporcional al volumen, comisiones fijas, coste de financiación) o un modelo de impacto no lineal basado en \emph{transaction cost analysis} (TCA) \cite{Almgren2000,AlmgrenChun2001,Gatheral2010}.
 
-\subsubsection{Rank cross‑sectional}
+Aquí:
+\begin{itemize}
+  \item \( C^{\mathrm{entry}}_{i,t,h} \) incorpora \emph{fees}, \emph{half-spread}, slippage, impacto parametrizado y cualquier recargo dependiente de liquidez aplicable al acto de entrada.
+  \item \( C^{\mathrm{exit}}_{i,t,h} \) incorpora el coste simétrico o asimétrico de salida.
+  \item \( C^{\mathrm{carry}}_{i,t:h} \) incorpora \emph{borrow}, financiación, \emph{rebate} negativo, y cualesquiera costes proporcionales al tiempo de mantenimiento.
+\end{itemize}
 
-El label de ranking se define como:
+\paragraph{Principio operativo.}
+El sistema debe considerar \( y^{\mathrm{net}} \) como \emph{target económico primario por defecto} para investigación principal en small caps, salvo que un experimento se marque explícitamente como \emph{gross-only research}. Esta decisión no es cosmética: en small caps, una fracción significativa del supuesto alpha bruto desaparece al incorporar fricciones reales de ejecución \cite{Almgren2000,AlmgrenChun2001,Gatheral2010}.
+
+\paragraph{Política obligatoria ante costes faltantes.}
+Cuando \texttt{net\_of\_costs = true}, la política por defecto será:
+\begin{center}
+\texttt{missing\_cost\_policy = strict\_invalidate}
+\end{center}
+es decir, si falta cualquier componente material del coste requerido para construir el target neto, la observación se marca como inválida. Solo podrán admitirse políticas relajadas como \texttt{fallback\_proxy} o \texttt{zero\_imputation} en experimentos explícitamente etiquetados como no canónicos, y dichas decisiones deberán quedar registradas en metadata.
+
+\subsection{Transformaciones derivadas del target base}
+
+\subsubsection{Ranking cross-sectional}
+
+Para cada fecha \( t \) y horizonte \( h \), el módulo puede construir un ranking cross-sectional:
 \begin{equation}
-y^{\text{rank}}_{i,h}(t) = F_{t,h}\left( y^{\text{ret}}_{i,h}(t) \right),
+y^{\mathrm{rank}}_{i,t,h}
+=
+F_{t,h}\!\left(y^{\star}_{i,t,h}\right),
 \end{equation}
-donde \( F_{t,h}(\cdot) \) es la función de distribución empírica cross‑sectional de retornos forward en \( t \) para el horizonte \( h \). Esto conecta directamente con la metodología de \emph{portfolio sorting} en \emph{cross‑sectional asset pricing} \cite{FamaFrench1993,HouMoPeng2013}.
+donde \( y^{\star}_{i,t,h} \) denota el target base seleccionado (por defecto \( y^{\mathrm{net}}_{i,t,h} \) si está disponible; en su defecto, \( y^{\mathrm{gross}}_{i,t,h} \)) y \( F_{t,h} \) es la CDF empírica cross-sectional.
 
-\subsubsection{Labels de clasificación}
+La política por defecto debe producir:
+\begin{itemize}
+  \item un \emph{percentile rank} en \([0,1]\),
+  \item estable frente a empates mediante regla determinista,
+  \item calculado exclusivamente sobre observaciones válidas en \((t,h)\).
+\end{itemize}
 
-Para clasificación binaria:
+\subsubsection{Clasificación binaria y por colas}
+
+Para clasificación binaria, el módulo construye:
 \begin{equation}
-y^{\text{cls, up}}_{i,h}(t) = \mathbb{I}\left\{ y^{\text{ret}}_{i,h}(t) > \theta_h \right\},
+y^{\mathrm{cls,up}}_{i,t,h}
+=
+\mathbb{I}\{y^{\star}_{i,t,h} > \theta_{t,h}\},
 \end{equation}
-donde \( \theta_h \) es un umbral por horizonte (puede ser fijo, o calibrado dinámicamente vía percentiles históricos). Para colas top/bottom:
+donde \( \theta_{t,h} \) puede ser:
+\begin{itemize}
+  \item fijo por horizonte,
+  \item dependiente del coste esperado,
+  \item o cuantílico por fecha.
+\end{itemize}
+
+Para clasificación por colas:
 \begin{equation}
-y^{\text{cls, tail}}_{i,h}(t) = 
+y^{\mathrm{cls,tail}}_{i,t,h}
+=
 \begin{cases}
-+1 & \text{si } y^{\text{ret}}_{i,h}(t) > \text{quant}_\alpha, \\
--1 & \text{si } y^{\text{ret}}_{i,h}(t) < \text{quant}_{1-\alpha}, \\
-0 & \text{en otro caso},
++1, & y^{\star}_{i,t,h} \ge q^{\mathrm{top}}_{t,h},\\
+-1, & y^{\star}_{i,t,h} \le q^{\mathrm{bot}}_{t,h},\\
+0, & \text{en otro caso}.
 \end{cases}
 \end{equation}
-análogo a la literatura de \emph{quantile‑based labeling} y \emph{trend‑following} en horizontes múltiples \cite{LoMacKinlay2001,HarveyLiu2015}.
 
-\subsubsection{Neutralización de target}
+\paragraph{Default canónico.}
+Para evitar inestabilidad experimental, el módulo debe fijar un \emph{default oficial}:
+\begin{center}
+\texttt{classification\_default = tail\_20\_20\_on\_net\_10d}
+\end{center}
+es decir, top 20\%, bottom 20\%, target base neto a 10 días, salvo anulación explícita por configuración. El objetivo de este default es reducir proliferación de variantes no comparables entre experimentos.
 
-Si se activa \texttt{neutralization\_mode} (\texttt{sector}, \texttt{beta} o \texttt{factor\_model}), el label se transforma vía regresión cross‑sectional:
+\subsection{Neutralización del target}
+
+Si \texttt{neutralization\_mode} está activado, el target base se neutraliza cross-sectionalmente frente a exposiciones disponibles en \( t \):
 \begin{equation}
-\mathbf{y}_t = \mathbf{X}_t \boldsymbol{\beta}_t + \boldsymbol{\varepsilon}_t,
+\mathbf{y}_{t,h} = \mathbf{X}_{t}\boldsymbol{\beta}_{t,h} + \boldsymbol{\varepsilon}_{t,h}.
 \end{equation}
-donde \( \mathbf{y}_t \) es el vector de retornos forward en \( t \), \( \mathbf{X}_t \) contiene exposiciones factoriales (sector, beta de mercado, factores de estilo), y el residual \( \boldsymbol{\varepsilon}_t \) se usa como \emph{label neutralizado}:
+El target neutralizado se define como:
 \begin{equation}
-y^{\text{neut}}_{i,h}(t) = \varepsilon_{i,t}.
+y^{\mathrm{neut}}_{i,t,h} = \varepsilon_{i,t,h}.
 \end{equation}
-Esta aproximación está alineada con la \emph{factor‑neutral target construction} de la literatura de risk‑factor investing y alphas estandarizados \cite{GrinoldKahn2000,Brar2019}.
 
-\subsection{Familias de labels y elección de target principal}
+\subsubsection{Conjunto canónico de exposiciones}
 
-El módulo soporta tres familias de labels:
+El módulo no debe dejar abierta indefinidamente la pregunta de ``qué neutralizar''. La configuración oficial por defecto debe incluir:
 \begin{itemize}
-  \item \emph{Regresión}: \( y^{\text{ret}}_{h}(t) \), \( y^{\text{ret, net}}_{h}(t) \).
-  \item \emph{Ranking}: \( y^{\text{rank}}_{h}(t) \).
-  \item \emph{Clasificación}: \( y^{\text{cls, up}}_{h}(t) \), \( y^{\text{cls, tail}}_{h}(t) \).
+  \item intercepto,
+  \item dummies sectoriales o industriales,
+  \item beta de mercado estimada PIT,
+  \item \(\log(\mathrm{mktcap})\),
+  \item factor de liquidez,
+  \item opcionalmente volatilidad idiosincrática reciente.
 \end{itemize}
 
-La recomendación inicial de configuración sugiere:
+\subsubsection{Método por defecto}
+
+El método oficial recomendado será:
+\begin{center}
+\texttt{neutralization\_estimator = weighted\_ridge}
+\end{center}
+con pesos por calidad/liquidez y regularización moderada. La razón es que la neutralización en small caps puede sufrir:
 \begin{itemize}
-  \item Horizontes \( \mathcal{H} = \{5,10,20\} \) días.
-  \item Target principal de investigación: \( y^{\text{ret, net}}_{10d} \).
+  \item multicolinealidad severa,
+  \item \emph{cross-sections} pequeñas,
+  \item dummies escasamente pobladas,
+  \item y observaciones extremas con apalancamiento desproporcionado.
 \end{itemize}
-Esto refleja un compromiso entre el \emph{information horizon} y la penalización por costes de transacción, típico en swing trading de small caps donde el \emph{cross‑sectional dispersion} es amplio \cite{MSCI2023_smallcap_dispersion}.
 
-\subsection{Flujo del proceso (alto nivel)}
+OLS puro podrá mantenerse como referencia, pero no debe ser el default institucional. Huber o \emph{quantile regression} podrán habilitarse como variantes experimentales.
 
-El flujo interno del módulo sigue:
+\subsubsection{Condiciones de invalidez de la neutralización}
+
+La observación neutralizada debe invalidarse si ocurre cualquiera de las siguientes condiciones:
+\begin{itemize}
+  \item \( n_{\mathrm{valid}}(t,h) < n_{\min}^{\mathrm{neut}} \),
+  \item matriz de diseño mal condicionada por encima del umbral permitido,
+  \item porcentaje de exposiciones faltantes superior al máximo tolerado,
+  \item fallo de convergencia del estimador,
+  \item varianza residual cross-sectional degenerada.
+\end{itemize}
+
+En tales casos, la política canónica será:
+\begin{center}
+\texttt{neutralization\_failure\_policy = invalidate\_derived\_target}
+\end{center}
+mientras el target económico base no neutralizado podrá seguir existiendo si fue correctamente calculado.
+
+\subsection{Jerarquía formal de validez y exclusión}
+
+Uno de los puntos más importantes del módulo es que la invalidez no puede resolverse de forma ad hoc. Cuando una fila presenta múltiples problemas, el campo \texttt{label\_exclusion\_reason} debe reportar la causa de mayor prioridad según la siguiente jerarquía formal:
+
 \begin{enumerate}
-  \item \texttt{load\_label\_config(...)}.  
-  \item \texttt{load\_prices\_adjusted(...)}.  
-  \item \texttt{load\_universe\_history(...)}.  
-  \item \texttt{compute\_forward\_returns(...)}.  
-  \item \texttt{apply\_cost\_adjustment(...)}.  
-  \item \texttt{apply\_target\_neutralization(...)}.  
-  \item \texttt{build\_rank\_and\_class\_labels(...)}.  
-  \item \texttt{apply\_label\_validity\_filters(...)}.  
-  \item \texttt{validate\_label\_store(...)}.  
-  \item \texttt{persist\_label\_outputs(...)}.  
+  \item \texttt{OUT\_OF\_SAMPLE\_DATE} --- fecha fuera del rango operativo permitido.
+  \item \texttt{NOT\_IN\_UNIVERSE} --- símbolo no elegible en \((i,t)\) según \texttt{universe\_history}.
+  \item \texttt{MISSING\_ENTRY\_PRICE} --- no existe precio PIT válido de entrada.
+  \item \texttt{MISSING\_EXIT\_PRICE} --- no existe precio PIT válido de salida.
+  \item \texttt{INCOMPLETE\_FORWARD\_WINDOW} --- la ventana forward no puede completarse íntegramente.
+  \item \texttt{CORPORATE\_ACTION\_UNSAFE} --- evento corporativo extremo o ajuste no confiable dentro de la ventana.
+  \item \texttt{TRADING\_HALT\_OR\_SUSPENSION} --- suspensión o interrupción material de negociación.
+  \item \texttt{DELIST\_AMBIGUOUS} --- delisting sin convención suficiente para monetizar la salida.
+  \item \texttt{MISSING\_COST\_INPUT} --- faltan costes bajo política estricta.
+  \item \texttt{MISSING\_EXPOSURES} --- faltan exposiciones requeridas para neutralización.
+  \item \texttt{NEUTRALIZATION\_FAILED} --- fracaso del ajuste neutralizante.
+  \item \texttt{QC\_REJECTED} --- rechazo por controles posteriores de calidad.
 \end{enumerate}
 
-Este diseño modular permite:
+El campo \texttt{label\_valid\_flag} será \texttt{true} únicamente si ninguna regla de exclusión de prioridad superior ha sido activada. Esta jerarquía debe ser estable entre versiones salvo cambio mayor explícito.
+
+\subsection{Tratamiento de edge cases críticos}
+
+\subsubsection{Delistings}
+
+El tratamiento de \emph{delistings} es obligatorio y no puede quedar implícito. La política canónica será:
 \begin{itemize}
-  \item Combinar variantes de \emph{labeling} (multi‑horizonte, neto/bruto, rank/cls) en un único pipeline.
-  \item Reutilizar componentes en otros módulos de \texttt{labels} y \texttt{validation}.
+  \item si existe \emph{delisting return} PIT confiable, incorporarlo al retorno económico;
+  \item si no existe pero la salida es monetizable con convención documentada, usar esa convención;
+  \item si no puede resolverse de manera fiable, marcar \texttt{DELIST\_AMBIGUOUS}.
 \end{itemize}
 
-\subsection{Reglas PIT y anti‑leakage}
+En particular, usar simplemente el último precio observado como salida por defecto está prohibido en configuración canónica, ya que introduce sesgo optimista.
 
-Las reglas de \emph{point‑in‑time} y \emph{anti‑leakage} son:
+\subsubsection{Eventos corporativos y gaps extremos}
+
+Splits, reverse splits, mergers, spin-offs, tender offers y gaps extremos asociados a eventos corporativos deben tratarse bajo una política PIT explícita. Si el esquema de precios ajustados no garantiza representatividad económica del retorno realizable, la observación se invalida. La prioridad aquí es preservar integridad semántica, no maximizar cobertura.
+
+\subsubsection{Múltiples problemas simultáneos}
+
+Cuando una observación presenta, por ejemplo, ventana incompleta, falta de costes y suspensión, solo debe persistirse una razón primaria siguiendo la jerarquía anterior. Opcionalmente podrán persistirse razones secundarias en un campo adicional \texttt{label\_exclusion\_details}, pero el \emph{reason code} principal debe ser único.
+
+\subsection{Relación con el universo y con el pipeline de features}
+
+La construcción del label debe ser plenamente coherente con:
 \begin{itemize}
-  \item El label en \( t \) usa precios de \( t+1 \dots t+h \) según la convención de timing, nunca información anterior mal alineada.
-  \item El \texttt{decision\_lag} debe ser coherente con \texttt{build\_features} (misma convención de mantenimiento de posiciones).
-  \item Se excluyen observaciones sin ventana forward completa.
-  \item No se usa \texttt{universe\_current} para filtrar historia (solo \texttt{universe\_history}).
-  \item En neutralización, se usan solo exposiciones \emph{available in t} (o \( t-1 \) si corresponde).
+  \item \texttt{data/*} para precios PIT y eventos corporativos,
+  \item \texttt{universe/universe\_history.py} para elegibilidad histórica,
+  \item \texttt{features/build\_features.py} para fecha efectiva de decisión y lag operacional,
+  \item \texttt{execution/cost\_model.py} para componentes de coste,
+  \item \texttt{risk/*} para exposiciones de neutralización.
 \end{itemize}
 
-Estas reglas responden directamente a la literatura de \emph{look‑ahead bias} y \emph{PIT data} en research quantamental \cite{SPGlobal_quantamental_PIT,Nechvatalova2021}.
+\paragraph{Regla fundamental.}
+El módulo no debe recalcular por su cuenta decisiones de elegibilidad que pertenecen a \texttt{universe\_history}; solo debe consumirlas. Del mismo modo, no debe redefinir convenciones de ejecución: debe importarlas y hacerlas cumplir.
 
-\subsection{Política de exclusiones y flags de validez}
+\subsection{Flujo operativo del pipeline}
 
-El módulo produce:
+El flujo de alto nivel recomendado es:
+
+\begin{enumerate}
+  \item \texttt{load\_label\_config(...)}
+  \item \texttt{load\_adjusted\_prices\_pit(...)}
+  \item \texttt{load\_universe\_history(...)}
+  \item \texttt{resolve\_calendar\_and\_decision\_lag(...)}
+  \item \texttt{compute\_base\_forward\_returns(...)}
+  \item \texttt{attach\_execution\_costs(...)}
+  \item \texttt{compute\_net\_targets(...)}
+  \item \texttt{apply\_target\_neutralization(...)}
+  \item \texttt{derive\_rank\_and\_classification\_targets(...)}
+  \item \texttt{apply\_validity\_hierarchy(...)}
+  \item \texttt{run\_label\_qc(...)}
+  \item \texttt{persist\_labels\_and\_metadata(...)}
+\end{enumerate}
+
+La separación entre \texttt{compute\_base\_forward\_returns(...)} y \texttt{compute\_net\_targets(...)} es deliberada: el sistema debe conservar capacidad de auditar qué parte del target proviene del movimiento del precio y qué parte proviene del modelo de costes.
+
+\subsection{Defaults canónicos del sistema}
+
+Para reducir dispersión experimental y asegurar comparabilidad entre investigaciones, el módulo debe fijar los siguientes defaults oficiales:
+
 \begin{itemize}
-  \item \texttt{label\_valid\_flag}: booleano que indica si la etiqueta es válida.
-  \item \texttt{label\_exclusion\_reason}: código estandarizado de razón de exclusión.
+  \item \texttt{horizons = [5, 10, 20]}
+  \item \texttt{primary\_target = y\_fwd\_ret\_net\_10d}
+  \item \texttt{return\_mode = close\_to\_close} o el estándar oficial del backtest
+  \item \texttt{decision\_lag = 1} si la señal se genera al cierre y se ejecuta al día siguiente
+  \item \texttt{net\_of\_costs = true}
+  \item \texttt{missing\_cost\_policy = strict\_invalidate}
+  \item \texttt{neutralization\_mode = sector\_beta\_size\_liquidity}
+  \item \texttt{classification\_default = tail\_20\_20\_on\_net\_10d}
 \end{itemize}
-Se excluyen/flagan cuando:
+
+Todo experimento que se aparte de estos defaults debe quedar marcado como \emph{non-canonical} en el manifest.
+
+\subsection{Validación mínima obligatoria}
+
+Además del QC descriptivo, el módulo debe imponer controles duros de aceptación. Entre ellos:
+
 \begin{itemize}
-  \item No existe ventana forward completa.
-  \item El símbolo está fuera de universo elegible en \( t \).
-  \item El precio es no positivo o no válido en los puntos de cálculo.
-  \item Existe un evento corporativo extremo o suspensión (según \texttt{events\_blacklist\_path}).
-  \item No hay costes disponibles cuando \texttt{net\_of\_costs = true} y se usa política estricta.
+  \item No puede haber duplicados en la clave \((date, symbol)\).
+  \item La cobertura válida por horizonte no puede caer por debajo de un umbral global configurado durante periodos extensos.
+  \item Debe existir varianza cross-sectional positiva por fecha en el target primario, salvo sesiones excepcionales explícitamente documentadas.
+  \item En targets de clasificación, la proporción de clases no puede colapsar de forma estructural por mala parametrización del umbral.
+  \item Debe verificarse que los últimos \( h \) días del rango quedan invalidados de forma coherente por falta de ventana forward.
+  \item Debe verificarse que el número de observaciones etiquetadas no excede nunca la cobertura del universo histórico elegible.
 \end{itemize}
 
-\subsection{Validaciones mínimas y reportes de cobertura}
-
-Las validaciones de integridad incluyen:
+\paragraph{Governance de severidad.}
+Cada check debe clasificarse en uno de tres niveles:
 \begin{itemize}
-  \item Sin duplicados en \( (date, symbol) \).
-  \item Labels dentro de \texttt{start\_date}–\texttt{end\_date}.
-  \item Tipos numéricos correctos.
+  \item \texttt{FAIL}: aborta el \texttt{run},
+  \item \texttt{WARN}: permite persistir pero etiqueta el \texttt{run} como degradado,
+  \item \texttt{INFO}: solo reporta diagnóstico.
 \end{itemize}
-Las validaciones de sanidad estadística:
+
+Sin esta gobernanza, el QC queda reducido a un reporte cosmético.
+
+\subsection{Persistencia, trazabilidad y reproducibilidad}
+
+El output principal debe persistirse en formato particionado, por ejemplo:
+\begin{verbatim}
+labels/store/date={yyyy-mm-dd}/part-*.parquet
+\end{verbatim}
+
+Cada fila debe incluir, como mínimo:
 \begin{itemize}
-  \item Sin \( \pm \infty \).
-  \item Varianza positiva por fecha (salvo días excepcionales).
-  \item Proporción de clases razonable en labels binarios.
+  \item identificadores: \texttt{date}, \texttt{symbol},
+  \item targets base: \texttt{y\_fwd\_ret\_5d}, \texttt{y\_fwd\_ret\_10d}, \texttt{y\_fwd\_ret\_20d},
+  \item versión neta cuando aplique,
+  \item targets derivados: rank, clase, target neutralizado,
+  \item \texttt{label\_valid\_flag},
+  \item \texttt{label\_exclusion\_reason},
+  \item metadatos mínimos de auditoría.
 \end{itemize}
 
-Los reportes de cobertura:
+Además, toda ejecución debe producir:
 \begin{itemize}
-  \item Tasa de cobertura por horizonte \( \geq \) umbral configurable.
-  \item Reporte de \( n_{\text{valid}} \) vs \( n_{\text{total}} \) por fecha.
+  \item \texttt{label\_dictionary\_\{run\_id\}.json},
+  \item \texttt{label\_manifest\_\{run\_id\}.json},
+  \item \texttt{label\_coverage\_\{run\_id\}.parquet},
+  \item \texttt{label\_qc\_\{run\_id\}.json},
+  \item \texttt{split\_compatibility\_\{run\_id\}.json} con la ventana efectiva máxima del evento por horizonte.
 \end{itemize}
 
-Estos reportes conexos con el \emph{label coverage} y la calidad de datos en universos pequeños son críticos en un setting industrial \cite{Nechvatalova2021,HarveyLiu2015}.
+El manifest debe incluir obligatoriamente:
+\begin{itemize}
+  \item \texttt{run\_id},
+  \item \texttt{config\_hash},
+  \item versión de calendario,
+  \item versión de \texttt{universe\_history},
+  \item versión de precios ajustados,
+  \item versión del modelo de costes,
+  \item versión de exposiciones de neutralización,
+  \item lista de defaults canónicos usados o anulados.
+\end{itemize}
 
-\subsection{Interfaz de ejecución CLI y persistencia}
+\subsection{Interfaz CLI}
 
-Ejemplo de interfaz CLI:
+Ejemplo de interfaz:
 \begin{verbatim}
 python -m labels.build_labels \
   --prices-adjusted-path data/price/adjusted/mode=dual_output \
@@ -179,59 +388,66 @@ python -m labels.build_labels \
   --run-id build_labels_20260305_001
 \end{verbatim}
 
-El output principal se guarda en:
-\begin{verbatim}
-labels/store/date={yyyy-mm-dd}/part-*.parquet
-\end{verbatim}
-con columnas como:
+La CLI debe rechazar la ejecución si:
 \begin{itemize}
-  \item \texttt{y\_fwd\_ret\_5d}, \texttt{y\_fwd\_ret\_10d}, \texttt{y\_fwd\_ret\_20d}.
-  \item \texttt{y\_fwd\_ret\_net\_10d} (si \texttt{net\_of\_costs = true}).
-  \item \texttt{y\_rank\_10d}, \texttt{y\_cls\_up\_10d}.
-  \item \texttt{label\_valid\_flag}, \texttt{label\_exclusion\_reason}.
+  \item faltan inputs esenciales para el target configurado,
+  \item la convención de \texttt{return\_mode} es inconsistente,
+  \item la configuración solicita neutralización sin exposiciones válidas,
+  \item o se detecta un conflicto entre horizonte, lag y calendario.
 \end{itemize}
 
-Además, se generan:
+\subsection{Criterios de aceptación}
+
+La \emph{Definition of Done} del módulo exige:
+
 \begin{itemize}
-  \item \texttt{labels/metadata/label\_dictionary\_{run\_id}.json}.
-  \item \texttt{labels/metadata/label\_manifest\_{run\_id}.json}.
-  \item \texttt{labels/metadata/label\_coverage\_{run\_id}.parquet}.
+  \item targets PIT sin leakage y consistentes con ejecución,
+  \item soporte multi-horizonte completamente funcional,
+  \item distinción clara entre target económico base y derivados,
+  \item jerarquía formal de exclusiones implementada,
+  \item tratamiento explícito de delistings, eventos corporativos y costes faltantes,
+  \item metadata completa y reproducible por \texttt{run\_id},
+  \item compatibilidad verificable con purged splits y embargo temporal.
 \end{itemize}
 
-\subsection{Criterios de aceptación y casos de prueba}
+No basta con ``producir columnas de labels'': el módulo debe producirlas con semántica económica, trazabilidad y validez metodológica suficientes para investigación y producción interna.
 
-Los criterios de aceptación (Definition of Done) incluyen:
+\subsection{Casos de prueba mínimos}
+
+La batería mínima de tests debe cubrir:
+
 \begin{itemize}
-  \item Labels PIT sin leakage temporal.
-  \item Soporte multi‑horizonte y variantes (regresión, ranking, clasificación).
-  \item Funcionalidad de neutralización y \texttt{net\_of\_costs} según configuración.
-  \item Cobertura y calidad suficientes para entrenar modelos.
-  \item Metadata / manifest trazables por \texttt{run\_id} y \texttt{config\_hash}.
+  \item cálculo exacto de retornos forward en series sintéticas con varios \texttt{return\_mode},
+  \item coherencia entre \texttt{decision\_lag} y timing de features,
+  \item invalidez automática de los últimos \( h \) días por ventana incompleta,
+  \item ajuste correcto de costes en targets netos,
+  \item invalidación bajo \texttt{strict\_invalidate} cuando faltan costes,
+  \item neutralización correcta sobre datos sintéticos con factores conocidos,
+  \item comportamiento robusto con matrices mal condicionadas,
+  \item jerarquía determinista de exclusión cuando coexisten varias causas,
+  \item tratamiento correcto de delisting con y sin \emph{delisting return},
+  \item persistencia reproducible de manifest, diccionario y cobertura.
 \end{itemize}
 
-Casos de prueba mínimos:
+\subsection{Riesgos residuales y decisiones de investigación}
+
+Persisten algunos riesgos estructurales que el módulo no elimina por sí solo:
 \begin{itemize}
-  \item Cálculo correcto de retornos forward 5d/10d en serie sintética.
-  \item Alineación coherente entre \texttt{decision\_lag} y features.
-  \item Últimos \( h \) días del rango quedan inválidos por falta de ventana forward.
-  \item Ajuste correcto de costes en \texttt{net\_of\_costs}.
-  \item Neutralización por factores devuelve residuales esperados.
-  \item Clasificación por umbral/quantil produce etiquetas correctas.
-  \item No hay duplicados en \( (date, symbol) \) y el reporte de cobertura es coherente.
+  \item error de especificación en el modelo de costes,
+  \item destrucción excesiva de señal por sobre-neutralización,
+  \item fragilidad del target en universos extremadamente ilíquidos,
+  \item sensibilidad del horizonte óptimo al régimen de mercado,
+  \item degradación de cobertura en periodos de estrés o actividad corporativa intensa.
 \end{itemize}
 
-\subsection{Riesgos y decisiones abiertas}
+Estos riesgos no invalidan el diseño; obligan a medirlos explícitamente y a distinguir entre \emph{research signal} y \emph{implementation drag}.
+
+\subsection{Bibliografía y referencias}
 
 \begin{itemize}
-  \item Elección del target principal a promover (horizonte y neto/bruto) condiciona el \emph{risk‑reward} de la estrategia.
-  \item Sensibilidad del label a costes estimados introduce ruido de modelado \cite{Almgren2000,AlmgrenChun2001}.
-  \item Desbalance de clases en regímenes de mercado extremos puede afectar al entrenamiento de modelos clasificadores.
-  \item Inestabilidad potencial de la neutralización con cross‑section pequeño o factores mal definidos.
+  \item \cite{LopezdePrado2018}: \emph{Advances in Financial Machine Learning}.
+  \item \cite{CampbellLoMackinlay1997,LoMacKinlay2001}: retornos, predictibilidad y estructura temporal.
+  \item \cite{Almgren2000,AlmgrenChun2001,Gatheral2010}: modelización de costes e impacto.
+  \item \cite{FamaFrench1993,HouMoPeng2013}: estructura cross-sectional y \emph{portfolio sorting}.
+  \item \cite{GrinoldKahn2000,Brar2019}: construcción y neutralización de alpha.
 \end{itemize}
-
-\subsection{Bibliografía y referencias de estado del arte}
-
-\begin{itemize}
-  \item \cite{LopezdePrado2018}: \emph{Advances in Financial Machine Learning} (capítulo en construcción de labels y evitación de leakage).
-  \item \cite{FamaFrench1993,HouMoPeng2013}: \emph{Cross‑sectional asset pricing} y uso de \emph{portfolio sorting}.
-  \item

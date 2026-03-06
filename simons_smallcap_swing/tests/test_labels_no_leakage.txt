@@ -7,88 +7,487 @@
 \usepackage{listings}
 \usepackage{xcolor}
 \usepackage{hyperref}
+\usepackage[margin=2.5cm]{geometry}
 
 \lstset{
   language=Python,
   basicstyle=\ttfamily\small,
   keywordstyle=\color{blue},
-  commentstyle=\color{green},
+  commentstyle=\color{teal},
   stringstyle=\color{red},
   breaklines=true,
-  frame=single
+  frame=single,
+  showstringspaces=false
 }
 
-\title{Explicación Industrial: tests/test\_labels\_no\_leakage.py \\ Labels Forward Leakage-Free para Swing Trading ML}
-\author{Perplexity Research -- Nivel RenTech}
+\title{Especificación Técnica: \texttt{tests/test\_labels\_no\_leakage.py}\\
+Validación de Labels Forward sin Fuga Temporal}
+\author{Rewrite Quant PhD Level}
 \date{Marzo 2026}
 
 \begin{document}
 \maketitle
 
-\section{Objetivo Estratégico}
-Asegurar labels forward/neutralizados sin fuga temporal ni misalignment con features/splits. Vital para swing: labels $y_t = r_{t:t+h}$ ($h=5$días) deben ser estrictamente futuro, maximizando IC OOS $\corr(\pred_t, y_t) > 0.20$ sin lookahead. Pipeline protegido como en Two Sigma/RenTech.[web:54][web:56]
+\section{Propósito del Módulo}
 
-\section{Casos Mínimos y Assertions Temporales}
+El objetivo de \texttt{tests/test\_labels\_no\_leakage.py} es verificar que la construcción de labels forward respeta estrictamente la causalidad temporal del problema, mantiene alineación exacta con la tabla de features y con el instante real de decisión, y no introduce solapes indebidos entre entrenamiento y validación cuando se emplean horizontes futuros.
+
+Este módulo no pretende demostrar que una etiqueta sea predictiva ni que produzca mejor rendimiento out-of-sample. Su función es anterior y más básica: asegurar que el objetivo supervisado usado por el sistema es metodológicamente válido. Si la label incorpora información futura de manera incorrecta, o si queda mal alineada con el instante de decisión, entonces cualquier métrica posterior ---accuracy, IC, precision, Sharpe, drawdown o attribution--- deja de tener interpretación causal.
+
+La pregunta correcta que debe responder esta suite es:
+
+\begin{quote}
+\emph{¿Cada label asignada a la observación \(t\) depende únicamente de información futura respecto a \(t\), está alineada con la decisión tomada en \(t\), y no contamina splits temporales por solape de horizonte?}
+\end{quote}
+
+\section{Principios de Diseño}
+
+La especificación de este módulo debe construirse sobre cinco principios:
+
+\begin{enumerate}
+    \item \textbf{Causalidad estricta}: la label de \(t\) no puede usar información de \(t-1\), de \(t\) mal interpretada, ni de ninguna observación fuera del horizonte definido.
+    \item \textbf{Alineación exacta}: features, decisión y label deben compartir una semántica temporal explícita.
+    \item \textbf{Invalidación de cola}: las últimas observaciones sin horizonte completo deben quedar marcadas como inválidas según contrato.
+    \item \textbf{Neutralización controlada}: si se neutralizan labels frente a factores, la operación debe preservar causalidad y manejar correctamente datos faltantes.
+    \item \textbf{Splits sin solape}: el esquema de validación temporal debe purgar las observaciones cuyo horizonte futuro invade el bloque de evaluación.
+\end{enumerate}
+
+\section{Contrato Temporal de una Label Forward}
+
+Sea una serie de precios \(P_t\) y un horizonte \(h \ge 1\). Una construcción canónica de label forward es:
+
+\[
+y_t^{(h)} = \frac{P_{t+h} - P_t}{P_t}
+\]
+
+o equivalentemente, en forma logarítmica,
+
+\[
+y_t^{(h)} = \log\left(\frac{P_{t+h}}{P_t}\right)
+\]
+
+La condición esencial no es la forma exacta del retorno, sino que el valor asignado a \(t\) dependa exclusivamente de información en el intervalo futuro \((t, t+h]\) o \([t, t+h]\), según convención explícita del sistema.
+
+En particular, la suite debe impedir las siguientes clases de error:
+
 \begin{itemize}
-\item \texttt{test\_forward\_label\_uses\_only\_future\_window\_configured}: $y_t \in [t+1, t+h]$.
-\item \texttt{test\_last\_horizon\_rows\_marked\_invalid}: Filas $t > T-h$ tagged NaN.
-\item \texttt{test\_decision\_lag\_alignment\_features\_labels}: $\features_t$ alinea $\decision\_ts = t$.
-\item \texttt{test\_neutralized\_targets\_reduce\_factor\_corr}: $\corr(y^{neu}, f) < \epsilon$.
-\item \texttt{test\_purged\_splits\_remove\_overlap}: No overlap train/test post-purge.
+    \item usar precios futuros y luego reindexar de forma incorrecta,
+    \item construir la label con una ventana diferente a la configurada,
+    \item desplazar la serie en dirección equivocada,
+    \item alinear la label con el timestamp de salida en lugar del timestamp de decisión.
 \end{itemize}
 
-\section{Matemáticas Avanzadas: Labels Forward y Neutralización}
-Forward return: $y_t^{(h)} = \frac{P_{t+h} - P_t}{P_t}$, o log $r = \log(P_{t+h}/P_t)$. Last rows: $\I(t \leq T-h)$. Neutralizaci\'on: $y^{neu} = y - \beta \cdot F$, $\beta = \argmin \E[(y - \beta F)^2]$, reduce $\corr(y,F) \approx 0$. Purged split: Train $[t_0, t_1 - T_{emb}]$, $T_{emb}=h+m$. Meta-labeling: $\bar{y}_t = \sign(\pred_t - \threshold)$.[web:54][web:45]
+\section{Modelo Temporal Canónico}
 
-\section{Papers SOTA y Libros Industria}
+Para que el test sea auditable, conviene fijar una nomenclatura simple:
+
 \begin{itemize}
-\item ``Advances in Financial Machine Learning'' (López de Prado, cap. 13: Meta-labeling, purged CV).[web:54]
-\item \href{https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4659866}{Swing Portfolio w/ Neutral Targets}.[web:49]
-\item ``Machine Learning for Algorithmic Trading'' (Jansen): Label engineering leakage-free.
-\item MLFinLab library: Labels con embargo automático.[web:56]
+    \item \(\mathrm{feature\_ts}\): instante al que pertenecen las features.
+    \item \(\mathrm{decision\_ts}\): instante en que se toma la decisión.
+    \item \(\mathrm{label\_anchor\_ts}\): timestamp al que se asigna la label.
+    \item \(\mathrm{label\_end\_ts}\): fin del horizonte futuro usado para construirla.
 \end{itemize}
 
-\section{Fixtures Optimizadas para Leakage Testing}
+El contrato correcto exige:
+
+\[
+\mathrm{feature\_ts} = \mathrm{decision\_ts} = \mathrm{label\_anchor\_ts}
+\]
+
+y además:
+
+\[
+\mathrm{label\_end\_ts} > \mathrm{decision\_ts}
+\]
+
+En otras palabras, la observación indexada por \(t\) debe usar features observables en \(t\) y una label que resume lo que ocurre \emph{después} de \(t\).
+
+\section{Invalidación de las Últimas Filas}
+
+Para una muestra de longitud \(T\) y horizonte \(h\), las últimas \(h\) filas no disponen de ventana futura completa. Por tanto, deben marcarse como inválidas según una política explícita, normalmente:
+
+\[
+y_t^{(h)} = \mathrm{NaN}
+\qquad \text{para todo } t > T-h
+\]
+
+o equivalentemente:
+
+\[
+y_t^{(h)} \text{ es válida} \iff t \le T-h
+\]
+
+La suite debe impedir dos errores frecuentes:
+
+\begin{itemize}
+    \item conservar valores en cola que en realidad usan datos inexistentes,
+    \item truncar silenciosamente la muestra sin dejar constancia en la label.
+\end{itemize}
+
+\section{Alineación entre Features, Decisión y Label}
+
+Si una estrategia decide en \(t\) usando un vector de features \(x_t\), la label asignada a esa observación debe corresponder a la evolución posterior a dicha decisión. Formalmente:
+
+\[
+(x_t, y_t^{(h)})
+\]
+
+es válido solo si \(x_t\) no contiene información posterior a \(t\), y \(y_t^{(h)}\) resume únicamente el futuro relativo a \(t\).
+
+Esto implica que un buen test no debe limitarse a comprobar que los índices coinciden. Debe verificar además que la semántica temporal de esos índices es coherente.
+
+Por ejemplo, si las features usan el cierre de \(t\) pero la decisión real ocurre en apertura de \(t\), hay un problema metodológico aunque el índice etiquete ambas filas con la misma fecha. La suite debe dejar clara la convención operativa del repositorio.
+
+\section{Neutralización de Labels}
+
+Si el sistema neutraliza labels frente a exposiciones de factor \(F_t\), una formulación habitual es:
+
+\[
+y_t^{\mathrm{neu}} = y_t - \hat{\beta}_t^\top F_t
+\]
+
+donde \(\hat{\beta}_t\) se estima según el diseño elegido. Lo importante para esta suite no es la sofisticación de la neutralización, sino que se cumplan tres propiedades:
+
+\begin{enumerate}
+    \item las exposiciones \(F_t\) sean contemporáneas o anteriores a \(t\),
+    \item la neutralización no reintroduzca información futura,
+    \item el tratamiento de faltantes y universos parciales esté definido.
+\end{enumerate}
+
+Este módulo no necesita demostrar una cota numérica universal de correlación residual; sí debe comprobar que el procedimiento reduce o elimina exposición factoral bajo un escenario sintético controlado cuando ese es el contrato del sistema.
+
+\section{Purged Splits y Solape Temporal}
+
+Si una observación en \(t\) usa un horizonte futuro de longitud \(h\), entonces su label depende de información que se extiende hasta \(t+h\). Por tanto, en validación temporal no basta con separar train y test por fecha de ancla; también hay que purgar las observaciones cuyo horizonte invade el siguiente bloque.
+
+Sea un bloque de entrenamiento \([a,b]\) y uno de test \([c,d]\) con \(b < c\). Para evitar solape informacional, debe cumplirse:
+
+\[
+t + h < c
+\qquad \text{para toda observación de entrenamiento admitida}
+\]
+
+o, con embargo adicional \(m\):
+
+\[
+t + h + m < c
+\]
+
+La suite debe verificar que el particionado elimina exactamente esas observaciones fronterizas y no solo que los anchors de train y test sean disjuntos.
+
+\section{Casos Mínimos que Debe Cubrir el Módulo}
+
+\subsection{\texttt{test\_forward\_label\_uses\_only\_future\_window\_configured}}
+
+Verifica que la label se construye con el horizonte configurado y solo con observaciones futuras.
+
+\paragraph{Contrato}
+Si el horizonte es \(h\), entonces:
+
+\[
+y_t = g(P_t, P_{t+h})
+\]
+
+y no cualquier otra variante como \(g(P_{t-1}, P_{t+h})\), \(g(P_t, P_{t+h+1})\) o desplazamientos implícitos erróneos.
+
+\paragraph{Qué protege}
+\begin{itemize}
+    \item \texttt{shift} en dirección equivocada,
+    \item horizontes distintos al configurado,
+    \item reindexaciones que desplacen el anchor temporal.
+\end{itemize}
+
+\subsection{\texttt{test\_last\_horizon\_rows\_marked\_invalid}}
+
+Verifica que las últimas \(h\) filas de cada serie quedan marcadas como inválidas.
+
+\paragraph{Qué protege}
+\begin{itemize}
+    \item labels espurias en la cola,
+    \item recorte silencioso del dataset,
+    \item mezcla de símbolos con longitudes distintas sin invalidación correcta.
+\end{itemize}
+
+\subsection{\texttt{test\_decision\_lag\_alignment\_features\_labels}}
+
+Verifica que features y labels están alineadas con el mismo instante de decisión.
+
+\paragraph{Qué protege}
+\begin{itemize}
+    \item uso de features en \(t\) con label anclada en \(t+1\),
+    \item desfases por merge,
+    \item alineación aparentemente correcta pero semánticamente errónea.
+\end{itemize}
+
+\subsection{\texttt{test\_neutralized\_targets\_reduce\_factor\_corr}}
+
+Comprueba, sobre un caso sintético controlado, que la neutralización reduce dependencia con factores y no rompe el índice temporal.
+
+\paragraph{Qué protege}
+\begin{itemize}
+    \item neutralización mal implementada,
+    \item regresión sobre factores futuros,
+    \item pérdida de alineación o de cobertura por símbolos.
+\end{itemize}
+
+\subsection{\texttt{test\_purged\_splits\_remove\_overlap}}
+
+Verifica que el purgado temporal elimina observaciones cuyo horizonte invade el bloque siguiente.
+
+\paragraph{Qué protege}
+\begin{itemize}
+    \item solape oculto entre train y test,
+    \item validación optimista,
+    \item embargo definido pero no aplicado.
+\end{itemize}
+
+\section{Fixtures Recomendadas}
+
+Las fixtures deben ser pequeñas, deterministas y suficientes para recomputar las labels a mano.
+
+\subsection{Panel mínimo de precios}
+
+\begin{lstlisting}
+import numpy as np
+import pandas as pd
+import pytest
+
+@pytest.fixture
+def synthetic_price_panel():
+    dates = pd.bdate_range("2024-01-01", periods=10)
+    close = pd.Series(
+        [100.0, 101.0, 103.0, 102.0, 104.0, 107.0, 106.0, 108.0, 109.0, 111.0],
+        index=dates,
+        name="close",
+    )
+    return pd.DataFrame({"close": close})
+\end{lstlisting}
+
+\subsection{Construcción canónica de labels}
+
 \begin{lstlisting}
 @pytest.fixture
 def synthetic_label_panel(synthetic_price_panel):
-    h = 5
-    prices = synthetic_price_panel['Close']
-    labels = prices.pct_change(h).shift(-h)  # Forward pure
-    labels.iloc[-h:] = np.nan  # Invalid tail
-    return pd.DataFrame({'label': labels})
+    h = 3
+    close = synthetic_price_panel["close"]
+    fwd_ret = close.shift(-h) / close - 1.0
+    labels = pd.DataFrame({"label_fwd_3d": fwd_ret})
+    labels.iloc[-h:] = np.nan
+    return labels
+\end{lstlisting}
 
+\subsection{Features alineadas}
+
+\begin{lstlisting}
+@pytest.fixture
+def synthetic_feature_panel(synthetic_price_panel):
+    close = synthetic_price_panel["close"]
+    feat = pd.DataFrame({
+        "ret_1d": close.pct_change(),
+        "ma_3": close.rolling(3).mean(),
+    })
+    return feat
+\end{lstlisting}
+
+\subsection{Exposiciones de factor sintéticas}
+
+\begin{lstlisting}
 @pytest.fixture
 def synthetic_factor_exposures():
-    return pd.DataFrame({'factor1': np.random.normal(0,1,1000)})
+    dates = pd.bdate_range("2024-01-01", periods=10)
+    return pd.DataFrame(
+        {"factor_beta": np.linspace(-1.0, 1.0, len(dates))},
+        index=dates,
+    )
 \end{lstlisting}
-Induce leakage: Unshift(-h), assert falla corr.
 
-\section{Implementación: Alignment Checks}
-$\texttt{corr}(y^{neu}, F) < 0.05$, $\texttt{(labels.index == features.index).all()}$.
+\subsection{Splits temporales mínimos}
 
-\section{Backtest Ejemplo: Impacto Leakage en Labels Swing}
-Train simple classifier:
+\begin{lstlisting}
+@pytest.fixture
+def synthetic_temporal_split():
+    return {
+        "train_end": pd.Timestamp("2024-01-08"),
+        "test_start": pd.Timestamp("2024-01-09"),
+        "horizon": 3,
+        "embargo": 0,
+    }
+\end{lstlisting}
 
-\begin{table}[h]
-\centering
-\begin{tabular}{lcccc}
-\toprule
-Config & OOS IC & Sharpe & Precision & Recall \\
-\midrule
-Leaky Labels & 0.32 & 1.8 & 62\% & 59\% \\
-Clean PIT & 0.22 & 2.9 & 58\% & 61\% \\
-Neutralized & 0.21 & 3.1 & 60\% & 63\% \\
-\bottomrule
-\end{tabular}
-\caption{Leakage infla IC 45\%, neutral boost Sharpe.}
-\end{table}
+\section{Implementaciones de Referencia}
 
-DoD: Pipeline leakage-free, tests detectan misalignment 100\%.
+\subsection{Construcción explícita de la label}
 
-\section{Optimizaciones SOTA para Rentabilidade Máxima}
-- Multi-horizon labels $y^{(h_1)}, y^{(h_2)}$.
-- Orthogonalization via Gram-Schmidt en factors.
-- Dynamic purge basado en vol $T_{emb} \propto 1/\sigma_t$.
+\begin{lstlisting}
+def make_forward_label(close: pd.Series, horizon: int) -> pd.Series:
+    y = close.shift(-horizon) / close - 1.0
+    y.iloc[-horizon:] = np.nan
+    return y
+\end{lstlisting}
+
+\subsection{Neutralización básica}
+
+\begin{lstlisting}
+def neutralize_against_factor(y: pd.Series, f: pd.Series) -> pd.Series:
+    df = pd.concat([y, f], axis=1).dropna()
+    yv = df.iloc[:, 0].to_numpy()
+    fv = df.iloc[:, 1].to_numpy()
+
+    beta = np.dot(fv, yv) / np.dot(fv, fv)
+    y_neu = y.copy()
+    y_neu.loc[df.index] = yv - beta * fv
+    return y_neu
+\end{lstlisting}
+
+\subsection{Chequeo de solape en splits}
+
+\begin{lstlisting}
+def has_label_overlap(train_index, test_start, horizon, embargo=0):
+    cutoff = test_start - pd.tseries.offsets.BDay(horizon + embargo)
+    return (train_index > cutoff).any()
+\end{lstlisting}
+
+\section{Ejemplos de Tests Sobrios}
+
+\subsection{Label forward correcta}
+
+\begin{lstlisting}
+def test_forward_label_uses_only_future_window_configured(synthetic_price_panel):
+    close = synthetic_price_panel["close"]
+    observed = make_forward_label(close, horizon=3)
+
+    expected = close.shift(-3) / close - 1.0
+    expected.iloc[-3:] = np.nan
+
+    pd.testing.assert_series_equal(observed, expected)
+\end{lstlisting}
+
+\subsection{Invalidación de cola}
+
+\begin{lstlisting}
+def test_last_horizon_rows_marked_invalid(synthetic_label_panel):
+    tail = synthetic_label_panel["label_fwd_3d"].tail(3)
+    assert tail.isna().all()
+\end{lstlisting}
+
+\subsection{Alineación con features}
+
+\begin{lstlisting}
+def test_decision_lag_alignment_features_labels(
+    synthetic_feature_panel,
+    synthetic_label_panel,
+):
+    assert synthetic_feature_panel.index.equals(synthetic_label_panel.index)
+\end{lstlisting}
+
+\subsection{Neutralización}
+
+\begin{lstlisting}
+def test_neutralized_targets_reduce_factor_corr(
+    synthetic_label_panel,
+    synthetic_factor_exposures,
+):
+    y = synthetic_label_panel["label_fwd_3d"]
+    f = synthetic_factor_exposures["factor_beta"]
+
+    y_neu = neutralize_against_factor(y, f)
+
+    df_before = pd.concat([y, f], axis=1).dropna()
+    df_after = pd.concat([y_neu, f], axis=1).dropna()
+
+    corr_before = df_before.corr().iloc[0, 1]
+    corr_after = df_after.corr().iloc[0, 1]
+
+    assert abs(corr_after) <= abs(corr_before)
+\end{lstlisting}
+
+\subsection{Purged split}
+
+\begin{lstlisting}
+def test_purged_splits_remove_overlap():
+    train_index = pd.bdate_range("2024-01-01", "2024-01-08")
+    test_start = pd.Timestamp("2024-01-09")
+
+    assert has_label_overlap(train_index, test_start, horizon=3, embargo=0)
+\end{lstlisting}
+
+En una implementación real, este último test debe aplicarse al split ya purgado y exigir que el solape sea falso.
+
+\section{Casos Borde que Deben Añadirse}
+
+Para que el módulo suba realmente de nivel, conviene cubrir además:
+
+\subsection{Huecos de calendario y festivos}
+
+La construcción de horizons sobre días hábiles debe ser consistente. La suite debe distinguir entre horizonte en número de filas y horizonte en tiempo calendario si ambas nociones aparecen en el sistema.
+
+\subsection{Universos fragmentados por símbolo}
+
+Si distintos símbolos tienen longitudes distintas o gaps propios, la invalidación de las últimas \(h\) filas debe aplicarse por símbolo, no sobre la tabla global completa.
+
+\subsection{Precios faltantes dentro del horizonte}
+
+Si falta un precio intermedio o el precio final \(P_{t+h}\), la política debe ser explícita:
+\begin{itemize}
+    \item invalidar la label,
+    \item imputar según regla contractual,
+    \item o excluir la observación.
+\end{itemize}
+
+\subsection{Neutralización con exposures faltantes}
+
+Si una exposición de factor no existe para una observación concreta, la suite debe verificar que el procedimiento no rellena con información futura ni rompe la alineación del índice.
+
+\subsection{Desfase por ejecución real}
+
+Si la decisión se toma al cierre de \(t\) para ejecutar en apertura de \(t+1\), la convención de anclaje debe reflejarlo explícitamente. Ese caso merece test propio, porque muchos pipelines etiquetan todo con la misma fecha aunque la semántica económica sea distinta.
+
+\section{Reglas de Fallo}
+
+Un módulo realmente fuerte debe fallar de forma binaria y explicativa:
+
+\begin{itemize}
+    \item si una label usa un horizonte diferente al configurado,
+    \item si alguna observación de cola queda marcada como válida sin horizonte completo,
+    \item si features y labels no comparten el mismo anchor temporal,
+    \item si la neutralización usa factores futuros o rompe el índice,
+    \item si existe solape entre observaciones de entrenamiento y el bloque siguiente dada la definición de horizonte y embargo.
+\end{itemize}
+
+No basta con decir que ``la correlación parece extraña'' o que ``el performance es sospechosamente alto''. El test debe fallar sobre una violación estructural concreta.
+
+\section{Qué No Debe Hacer Este Módulo}
+
+Para mantener nivel alto, \texttt{test\_labels\_no\_leakage.py} no debe:
+
+\begin{itemize}
+    \item justificar las labels por IC objetivo, accuracy o Sharpe,
+    \item mezclar meta-labeling si no forma parte del contrato base del sistema,
+    \item usar neutralización avanzada como sustituto de una definición temporal clara,
+    \item introducir referencias a fondos o bibliotecas externas en lugar de fijar invariantes,
+    \item confundir una mejora estadística con una validación causal.
+\end{itemize}
+
+El lenguaje correcto aquí es el de causalidad temporal, alineación y validez experimental.
+
+\section{Definition of Done}
+
+El módulo puede considerarse sólido si cumple simultáneamente lo siguiente:
+
+\begin{enumerate}
+    \item Verifica que la label forward usa exactamente el horizonte configurado.
+    \item Verifica que las últimas \(h\) filas válidas por símbolo quedan invalidadas correctamente.
+    \item Verifica alineación entre features, decisión y label.
+    \item Verifica que la neutralización no introduce fuga temporal y reduce la dependencia bajo un caso sintético controlado.
+    \item Verifica que los splits temporales están purgados respecto al horizonte y embargo.
+    \item Cubre al menos un caso con huecos de calendario o longitudes desiguales por símbolo.
+    \item Falla con mensajes precisos sobre la violación temporal detectada.
+\end{enumerate}
+
+\section{Conclusión}
+
+\texttt{tests/test\_labels\_no\_leakage.py} debe entenderse como una barrera metodológica entre la construcción del objetivo supervisado y cualquier evaluación posterior del sistema. Su misión no es embellecer la pipeline con lenguaje de robustez, sino imponer una disciplina exacta sobre qué significa ``futuro'' para cada observación, cómo se invalida la cola, cómo se alinea la decisión y cómo se evita el solape entre bloques temporales.
+
+En un stack cuantitativo serio, una label aparentemente correcta pero temporalmente mal anclada puede contaminar toda la investigación. Por eso este módulo debe redactarse como una especificación de causalidad y alineación, no como una narrativa de performance.
 
 \end{document}

@@ -1,67 +1,388 @@
 \documentclass{article}
 \usepackage[utf8]{inputenc}
-\usepackage{amsmath,amssymb}
+\usepackage[T1]{fontenc}
+\usepackage[spanish]{babel}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
 \usepackage{listings}
+\usepackage{xcolor}
 \usepackage{hyperref}
-\usepackage{booktabs} % Para tablas pro
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage[a4paper,margin=2.2cm]{geometry}
 
 \lstset{
   language=Python,
   basicstyle=\ttfamily\small,
   frame=single,
-  breaklines=true
+  breaklines=true,
+  showstringspaces=false
 }
 
-\title{Sistemas de Caché en Swing Trading Industrial: simons_core/io/cache.py}
-\author{Análisis Research-Level}
+\title{Especificación de Caché Determinista para Investigación y Producción\\
+\large \texttt{simons\_core/io/cache.py}}
+\author{Research Engineering Specification}
 \date{Marzo 2026}
 
 \begin{document}
 \maketitle
 
-\section{Objetivo y Matemáticas}
-Implementa caché local para acelerar cálculos repetitivos, clave en optimización:
-\begin{equation}
-T_{\text{total}} = \sum_{i=1}^N C_i \cdot (1 - h_i) + L \cdot h_i
-\end{equation}
-donde $C_i$ costo cómputo, $h_i$ hit rate, $L$ lookup latency. TTL: $t_{\exp} = t_0 + \text{TTL}$.
+\section{Propósito}
 
-\section{Estado del Arte}
-\begin{itemize}
-\item \href{https://www.amazon.com/Advances-Financial-Machine-Learning-Marcos/dp/1119482089}{López de Prado (2018)}: Caching en feature stores.
-\item Jansen (2020): Memoization en momentum swings.
-\item Simons-era: Hash-based invalidation en signals.
+Este módulo define una caché local determinista para acelerar cálculos repetitivos y reducir coste computacional en flujos de investigación, validación y producción dentro de un sistema de \emph{small-cap swing trading}. Su función no es alterar la lógica estadística de las estrategias ni mejorar por sí misma métricas de rentabilidad; su función es estrictamente infraestructural: evitar recomputaciones, estabilizar tiempos de ejecución, facilitar reproducibilidad operativa y hacer explícita la semántica de reutilización de artefactos computacionales.
+
+La caché debe tratarse como una capa de aceleración y no como una fuente primaria de verdad. En consecuencia, toda lectura desde caché debe ser semánticamente equivalente a recomputar el objeto desde sus entradas canónicas, salvo en los casos en que la política de invalidación exija refresco explícito.
+
+\section{Ámbito}
+
+El módulo cubre los siguientes casos de uso:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item memoización de resultados de funciones puras o cuasi-puras;
+    \item persistencia temporal de artefactos intermedios de investigación;
+    \item reutilización de universos, features, snapshots y metadatos derivados;
+    \item almacenamiento local de objetos costosos de reconstruir;
+    \item inspección operativa del estado de la caché.
 \end{itemize}
 
-\section{API Implementación Sugerida}
-\begin{lstlisting}
-def cache_key(namespace: str, params_hash: str) -> str:
-    return f"{namespace}:{params_hash}"
+Quedan fuera de alcance:
 
-def set(key: str, value: Any, ttl: Optional[int] = None,
-        metadata: Dict = None):
-    # pickle + metadata JSON
-    pass
+\begin{itemize}[leftmargin=1.5em]
+    \item consistencia distribuida entre nodos;
+    \item replicación remota;
+    \item garantías transaccionales multiobjeto;
+    \item uso de la caché como sustituto de bases de datos, lagos de datos o stores versionados de largo plazo.
+\end{itemize}
+
+\section{Modelo formal}
+
+Sea
+\[
+f : \Theta \to \mathcal{Y}
+\]
+una transformación determinista sobre un espacio de parámetros $\Theta$. Definimos una clave canónica
+\[
+k = \mathcal{K}(n, v, \iota_f, \theta, c),
+\]
+donde:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item $n$ es el \emph{namespace};
+    \item $v$ es la versión lógica del contrato de caché;
+    \item $\iota_f$ identifica la función o pipeline productor;
+    \item $\theta$ representa los argumentos normalizados;
+    \item $c$ representa contexto operativo relevante (por ejemplo, versión de datos, calendario, universo, dependencias críticas).
+\end{itemize}
+
+La caché implementa una aplicación parcial
+\[
+\mathcal{C} : k \mapsto (y, m),
+\]
+donde $y \in \mathcal{Y}$ es el valor serializado y $m$ son sus metadatos.
+
+La semántica correcta es:
+\[
+\texttt{get}(k)=
+\begin{cases}
+y, & \text{si } k \text{ existe, no está expirado y supera validaciones;}\\
+\varnothing, & \text{en caso contrario.}
+\end{cases}
+\]
+
+Si $p_{\mathrm{hit}}$ denota la probabilidad de acierto, $L_{\mathrm{hit}}$ la latencia de lectura, $L_{\mathrm{miss}}$ la penalización de fallo y $C_f$ el coste medio de recomputación, el coste esperado por petición es:
+\[
+\mathbb{E}[T]
+=
+p_{\mathrm{hit}}\,L_{\mathrm{hit}}
++
+(1-p_{\mathrm{hit}})\,(L_{\mathrm{miss}} + C_f).
+\]
+
+El objetivo operativo del módulo es minimizar $\mathbb{E}[T]$ sujeto a restricciones de coherencia, almacenamiento y validez temporal, no modificar la distribución estadística de los resultados de trading.
+
+\section{Principios de diseño}
+
+\begin{enumerate}[leftmargin=1.7em]
+    \item \textbf{Determinismo de clave.} La misma entrada lógica debe producir la misma clave.
+    \item \textbf{Equivalencia semántica.} Un \emph{cache hit} válido debe ser equivalente a recomputar.
+    \item \textbf{Invalidación explícita.} Toda reutilización debe descansar en reglas auditables.
+    \item \textbf{Aislamiento ante corrupción.} Una entrada corrupta no debe comprometer el resto del store.
+    \item \textbf{Atomicidad de escritura a nivel de entrada.} Nunca debe exponerse una entrada parcialmente escrita como válida.
+    \item \textbf{Observabilidad.} Toda decisión relevante debe dejar trazabilidad operativa suficiente.
+    \item \textbf{Sobriedad estadística.} La caché acelera cómputo; no se atribuyen al módulo mejoras de Sharpe, CAGR o drawdown.
+\end{enumerate}
+
+\section{Invariantes}
+
+El módulo debe respetar, como mínimo, los siguientes invariantes:
+
+\begin{enumerate}[label=\textbf{I\arabic*.},leftmargin=1.7em]
+    \item Una clave identifica de forma unívoca una entrada lógica dentro de un \emph{namespace} y versión dados.
+    \item Ninguna entrada se considera válida sin metadatos íntegros y checksum verificable, si dicha validación está habilitada.
+    \item Ninguna lectura devuelve una entrada expirada.
+    \item Ninguna escritura debe reemplazar una entrada existente salvo política explícita.
+    \item Un fallo durante escritura no debe dejar un artefacto visible como entrada válida.
+    \item La política de expiración y la política de expulsión deben ser distinguibles conceptualmente: expirar no es lo mismo que evacuar por presión de almacenamiento.
+\end{enumerate}
+
+\section{Semántica de clave}
+
+La construcción mínima de clave debe evitar colisiones semánticas entre ejecuciones que comparten nombre pero no contexto. Una forma recomendada es:
+
+\begin{lstlisting}
+def cache_key(
+    namespace: str,
+    fn_id: str,
+    params_digest: str,
+    version: str = "v1",
+    context_digest: str | None = None,
+) -> str:
+    parts = [namespace, version, fn_id, params_digest]
+    if context_digest:
+        parts.append(context_digest)
+    return ":".join(parts)
 \end{lstlisting}
 
-\section{Backtest Impacto}
-\begin{table}[h]
-\centering
-\begin{tabular}{lccc}
+\noindent
+Requisitos:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{namespace} separa dominios lógicos (\texttt{features}, \texttt{universe}, \texttt{signals}, \texttt{backtests}, etc.).
+    \item \texttt{fn\_id} distingue productores distintos con igual espacio de parámetros.
+    \item \texttt{params\_digest} debe derivarse de una serialización canónica de argumentos.
+    \item \texttt{version} permite invalidación masiva por cambio de contrato.
+    \item \texttt{context\_digest} incorpora dependencias externas relevantes cuando el resultado no depende solo de argumentos directos.
+\end{itemize}
+
+\section{Metadatos mínimos}
+
+Cada entrada debe persistirse junto con metadatos estructurados. Como mínimo:
+
+\begin{center}
+\begin{tabular}{ll}
 \toprule
-Métrica & Sin Caché & Con Caché & Mejora \\
+Campo & Descripción \\
 \midrule
-Tiempo (10k runs) & 45 min & 4 min & 11x \\
-Sharpe (OOS) & 2.1 & 2.4 & +14\% \\
-Max DD & 12\% & 9\% & -25\% \\
+\texttt{key} & clave lógica completa \\
+\texttt{namespace} & dominio funcional \\
+\texttt{version} & versión del contrato \\
+\texttt{created\_at} & instante de creación \\
+\texttt{expires\_at} & instante de expiración o \texttt{null} \\
+\texttt{serializer} & codec utilizado \\
+\texttt{payload\_bytes} & tamaño del payload \\
+\texttt{checksum} & hash del contenido serializado \\
+\texttt{producer} & identificador del productor \\
+\texttt{context} & contexto relevante resumido \\
+\texttt{tags} & etiquetas opcionales para invalidación selectiva \\
 \bottomrule
 \end{tabular}
-\caption{Performance con Caché en Swing Trading}
-\end{table}
+\end{center}
 
-\section{Observabilidad CLI}
-python -m simons_core.io.cache --stats
-Hit Rate: 87\%, Bytes: 2.3 GB.
+\section{Serialización}
 
-\bibliography{simons_refs}
+La serialización debe ser explícita y tipada. No debe asumirse un único formato universal para todos los objetos. La política recomendada es:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item tipos escalares, diccionarios pequeños y estructuras simples: \texttt{json} o \texttt{msgpack};
+    \item arrays numéricos: formato binario estable;
+    \item tablas: preferencia por formatos columnares cuando la escala lo justifique;
+    \item objetos arbitrarios de Python: permitirlos solo bajo política explícita, pues reducen portabilidad y aumentan superficie de riesgo.
+\end{itemize}
+
+La caché debe registrar siempre qué serializador produjo cada entrada. Leer una entrada con serializador desconocido debe fallar de forma controlada.
+
+\section{Escritura atómica}
+
+La escritura de una entrada debe seguir un protocolo del tipo:
+
+\begin{enumerate}[leftmargin=1.7em]
+    \item construir payload serializado y metadatos en memoria;
+    \item escribir a fichero temporal privado;
+    \item verificar tamaño y checksum;
+    \item hacer \emph{flush} y, si procede, \emph{fsync};
+    \item renombrar de forma atómica al path final;
+    \item publicar índice o manifest local si el diseño lo requiere.
+\end{enumerate}
+
+Con ello, el sistema evita que un lector observe una entrada parcialmente escrita. Si el proceso falla antes del renombrado final, el fichero temporal puede limpiarse posteriormente sin afectar a la validez lógica del store.
+
+\section{Expiración e invalidación}
+
+El módulo debe distinguir entre cuatro mecanismos:
+
+\subsection{TTL}
+
+Una entrada con TTL es válida mientras
+\[
+t_{\mathrm{now}} < t_{\mathrm{expires}}.
+\]
+El TTL es apropiado para artefactos cuyo valor decrece con el tiempo o cuyo contexto operativo cambia de forma previsible.
+
+\subsection{Versionado lógico}
+
+Cambios en el contrato del productor, esquema de features, universo o reglas de negocio deben reflejarse en la versión de clave. Esta es la forma más limpia de invalidación estructural.
+
+\subsection{Invalidación por etiquetas}
+
+Debe ser posible invalidar por \texttt{namespace}, \texttt{tag}, prefijo o productor. Esto permite purgar subconjuntos sin destruir el store completo.
+
+\subsection{Invalidación manual}
+
+Debe existir operación explícita para invalidar entradas individuales o grupos de entradas, con trazabilidad del motivo.
+
+\section{Política de expulsión}
+
+La expulsión responde a presión de almacenamiento, no a validez lógica. La política recomendada para una primera implementación robusta es \textbf{LRU por presupuesto de bytes}, con métricas separadas de expiración.
+
+Sea $B_{\max}$ el presupuesto máximo de bytes y $B(t)$ el tamaño actual. Cuando
+\[
+B(t) > B_{\max},
+\]
+el sistema debe expulsar entradas en orden creciente de recencia hasta recuperar un nivel operativo seguro.
+
+Extensiones futuras razonables:
+\begin{itemize}[leftmargin=1.5em]
+    \item LRU ponderado por coste de recomputación;
+    \item políticas híbridas con frecuencia de acceso;
+    \item separación por tiers según criticidad del artefacto.
+\end{itemize}
+
+\section{Concurrencia}
+
+La versión base del módulo puede declararse \emph{single-writer / multi-reader} sobre filesystem local, siempre que esta restricción quede documentada con claridad. Si se habilita concurrencia entre escritores, deben introducirse mecanismos explícitos de exclusión o leasing.
+
+El contrato mínimo debe especificar:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item si dos procesos pueden intentar poblar la misma clave simultáneamente;
+    \item qué proceso gana la carrera;
+    \item si el segundo proceso reutiliza la entrada ya escrita o recomputa;
+    \item cómo se evita exponer entradas corruptas en carreras de escritura.
+\end{itemize}
+
+Una política razonable es: \emph{first successful atomic writer wins}; el resto revalida y lee.
+
+\section{Tratamiento de corrupción}
+
+La corrupción debe tratarse como evento recuperable. El comportamiento correcto es:
+
+\begin{enumerate}[leftmargin=1.7em]
+    \item detectar la corrupción por lectura fallida, checksum inválido o metadatos inconsistentes;
+    \item marcar la entrada como inválida;
+    \item impedir que vuelva a servirse;
+    \item registrar el evento;
+    \item opcionalmente eliminar el artefacto y forzar recomputación.
+\end{enumerate}
+
+La corrupción de una entrada no debe escalar a fallo del namespace completo salvo política explícita de seguridad.
+
+\section{API sugerida}
+
+\begin{lstlisting}
+from __future__ import annotations
+from typing import Any, Optional, Mapping, Iterable
+
+def cache_key(
+    namespace: str,
+    fn_id: str,
+    params_digest: str,
+    version: str = "v1",
+    context_digest: Optional[str] = None,
+) -> str:
+    ...
+
+def get(key: str, default: Any = None) -> Any:
+    """
+    Devuelve el valor si existe, no está expirado y supera validaciones.
+    """
+
+def set(
+    key: str,
+    value: Any,
+    ttl_seconds: Optional[int] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+    serializer: str = "auto",
+    overwrite: bool = False,
+) -> None:
+    """
+    Persiste una entrada de forma atómica.
+    """
+
+def exists(key: str, validate_expiry: bool = True) -> bool:
+    ...
+
+def delete(key: str) -> bool:
+    ...
+
+def invalidate_namespace(namespace: str) -> int:
+    ...
+
+def invalidate_by_tags(tags: Iterable[str]) -> int:
+    ...
+
+def clear(expired_only: bool = False) -> int:
+    ...
+
+def stats() -> dict[str, Any]:
+    """
+    Métricas agregadas del store.
+    """
+\end{lstlisting}
+
+\section{Observabilidad}
+
+La caché debe exponer métricas suficientes para auditoría operativa. Como mínimo:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{hits}, \texttt{misses}, \texttt{hit\_rate};
+    \item latencia de lectura y escritura;
+    \item bytes totales, número de entradas y distribución por namespace;
+    \item expiraciones, invalidaciones, corrupciones detectadas;
+    \item ahorro estimado de tiempo de recomputación;
+    \item ratio de reutilización por productor.
+\end{itemize}
+
+\noindent
+Ejemplo CLI:
+
+\begin{lstlisting}
+python -m simons_core.io.cache stats
+python -m simons_core.io.cache ls --namespace features
+python -m simons_core.io.cache invalidate --namespace universe
+python -m simons_core.io.cache clear --expired-only
+\end{lstlisting}
+
+\section{Criterios de aceptación}
+
+El módulo no debe considerarse listo para producción sin pasar, como mínimo, las siguientes pruebas:
+
+\begin{enumerate}[leftmargin=1.7em]
+    \item misma entrada lógica $\Rightarrow$ misma clave;
+    \item entrada expirada $\Rightarrow$ no se sirve;
+    \item escritura interrumpida $\Rightarrow$ no aparece como válida;
+    \item checksum incorrecto $\Rightarrow$ entrada inválida;
+    \item invalidación por namespace y por tag funciona de forma exacta;
+    \item política de expulsión respeta el presupuesto de bytes;
+    \item estadísticas reflejan correctamente hits, misses y expiraciones;
+    \item dos lecturas consecutivas de una misma entrada válida devuelven objetos equivalentes.
+\end{enumerate}
+
+\section{Notas de arquitectura}
+
+En un stack cuantitativo serio, el caché bien diseñado aporta principalmente:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item reducción del tiempo de ciclo de investigación;
+    \item mejor utilización de recursos de cómputo;
+    \item mayor estabilidad operativa entre iteraciones;
+    \item reproducibilidad más fuerte de artefactos intermedios;
+    \item menor fricción entre investigación y producción.
+\end{itemize}
+
+Eso es suficiente justificación de negocio. No hace falta atribuir a la caché mejoras directas de calidad predictiva o de performance financiera, porque esas mejoras pertenecen al dominio del modelo, los datos y la ejecución, no al del subsistema de persistencia temporal.
+
+\section{Resumen}
+
+\texttt{simons\_core/io/cache.py} debe implementarse como una caché local determinista, auditable y operativamente sobria, con semántica de clave bien definida, invalidación explícita, escritura atómica, manejo de corrupción, política de expulsión clara y métricas útiles. La calidad del módulo no vendrá de su retórica, sino de la precisión de sus contratos y de la facilidad con la que permita acelerar investigación sin comprometer consistencia.
+
 \end{document}

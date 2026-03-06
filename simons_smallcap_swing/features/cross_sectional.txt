@@ -1,146 +1,429 @@
 \section{Módulo: \texttt{features/cross\_sectional.py}}
 
 \paragraph{Objetivo general}
-Este módulo implementa \textbf{transformaciones cross‑sectionales por fecha} sobre el conjunto de features base, para que las señales sean comparables entre activos y robustas frente a outliers, colas pesadas y diferencias de escala. El objetivo es producir una representación estandarizada \( Z_{t}^{(f)} \) para cada feature \( f \) en cada fecha \( t \), utilizable directamente en modelos de factor múltiple y sistemas de swing trading multi‑activo.
+Este módulo implementa la \textbf{capa de transformación cross-sectional por fecha} del sistema de features. Su propósito no es meramente reescalar columnas, sino convertir señales heterogéneas ---procedentes de precios, fundamentales, liquidez, microestructura y variables derivadas--- en una representación \textbf{comparable, robusta y metodológicamente estable} entre activos dentro de cada fecha de decisión.
 
-\subsection{Marco teórico y notación}
-
-Sea \( \mathcal{S}_t \) el universo de small caps elegibles en \( t \), y \( X_{t}^{(f)} \in \mathbb{R}^{|\mathcal{S}_t|} \) el vector de feature \( f \) antes de transformación.
-
-\paragraph{Transformaciones básicas}
+En un sistema multifactor de \textit{small caps}, esta capa cumple una función central: separar variación económica relevante de artefactos de escala, cobertura irregular, colas pesadas, dispersión extrema y sesgos inducidos por unos pocos nombres ilíquidos. El resultado buscado es una familia de variables transformadas
+\[
+Z_t^{(f)}(s),
+\]
+aptas para:
 \begin{itemize}
-    \item \texttt{cs\_rank(feature)}:
-        \[
-        \text{rank}_t^{(f)}(s) = \text{rank} \big( X_{t}^{(f)}(s) \big) \big/ |\mathcal{S}_t|,
-        \]
-        que induce una distribución uniforme en \([0,1]\) sobre el universo de esa fecha. \cite{politis2015}
-    \item \texttt{cs\_zscore\_robust(feature)}:
-        \[
-        z_{t}^{(f)}(s) = \frac{X_{t}^{(f)}(s) - \text{med} \big( X_{t}^{(f)} \big)} {\text{MAD} \big( X_{t}^{(f)} \big)},
-        \]
-        donde MAD es la mediana del valor absoluto de las desviaciones respecto a la mediana; es robusto a colas pesadas y valores atípicos. \cite{huber2011}
-    \item \texttt{cs\_winsor(feature, p\_low, p\_high)}:
-        \[
-        X_{t}^{(f,\text{win})}(s) =
-        \begin{cases}
-            q_{t,p_{\min}}^{(f)}      & \text{si } X_{t}^{(f)}(s) \leq q_{t,p_{\min}}^{(f)}, \\
-            X_{t}^{(f)}(s)            & \text{si } q_{t,p_{\min}}^{(f)} < X_{t}^{(f)}(s) < q_{t,p_{\max}}^{(f)}, \\
-            q_{t,p_{\max}}^{(f)}      & \text{si } X_{t}^{(f)}(s) \geq q_{t,p_{\max}}^{(f)},
-        \end{cases}
-        \]
-        donde \( q_{t,p}^{(f)} \) es el percentil \( p \) de \( X_{t}^{(f)} \).
-    \item \texttt{cs\_quantile\_bucket(feature, q)}:
-        \[
-        \text{bucket}_t^{(f,q)}(s) = \text{floor} \big( q \cdot \text{rank}_t^{(f)}(s) \big),
-        \]
-        que asigna cada activo a un grupo de cuantil (por ejemplo, quintiles o deciles) para bucketing o análisis de agrupamiento.
+    \item modelos \textit{cross-sectional} de predicción o ranking,
+    \item construcción de señales long-only o long-short,
+    \item formación de deciles/quintiles para análisis de monotonicidad,
+    \item neutralización por grupos,
+    \item y backtesting \textit{walk-forward} sin depender de reescalados ad hoc en pasos posteriores.
 \end{itemize}
 
-\paragraph{Neutralización simple}
-Transformaciones adicionales pueden incluir:
+La filosofía del módulo es simple pero estricta: una feature solo es útil si su representación final conserva contenido económico y, al mismo tiempo, elimina grados de libertad arbitrarios que puedan distorsionar inferencia, selección o sizing. En consecuencia, \texttt{cross\_sectional.py} debe entenderse como una \textbf{capa de normalización estadística y gobernanza operacional}, no como una utilidad secundaria de preprocesado.
+
+\subsection{Rol dentro de la arquitectura}
+
+Este módulo se sitúa aguas abajo de la construcción PIT de features base y aguas arriba de modelado, etiquetado y validación. Sus responsabilidades son:
+
+\begin{enumerate}
+    \item recibir una matriz base de features ya alineada temporalmente y filtrada por universo PIT;
+    \item aplicar transformaciones cross-sectional independientes para cada fecha;
+    \item imponer políticas explícitas y deterministas de winsorización, ranking, z-score robusto, bucketing y neutralización;
+    \item emitir artefactos transformados con trazabilidad completa;
+    \item y generar métricas de observabilidad que permitan distinguir entre fechas sanas, fechas degeneradas y transformaciones estadísticamente frágiles.
+\end{enumerate}
+
+Su contrato es doble:
 \begin{itemize}
-    \item Neutralización por industria o sector:
-        \[
-        X_{t}^{(f,\text{neut})}(s) = X_{t}^{(f)}(s) - \text{med} \big( X_{t}^{(f)}|g(s) \big),
-        \]
-        siendo \( g(s) \) el grupo de agrupación (industry/sector).
+    \item \textbf{contrato estadístico}: la transformación debe mejorar comparabilidad sin destruir estructura útil;
+    \item \textbf{contrato operacional}: la misma entrada y la misma configuración deben producir exactamente la misma salida.
 \end{itemize}
 
-\subsection{Principios de diseño y reglas PIT}
+\subsection{Marco teórico y contexto cuantitativo}
 
-\paragraph{PIT estricto cross‑sectional}
-- Cada fecha \( t \) se transforma usando \textbf{únicamente} el cross‑section de esa fecha: \( X_{t}^{(f)} \).
-- No se mezclan estadísticas (mediana, MAD, percentiles) entre días; esto previene \textit{data‑snooping} y \textit{leakage} temporal. \cite{lo1990}
+La necesidad de transformar señales por sección cruzada responde a varias regularidades empíricas y operativas:
 
-\paragraph{Robustez y reproducibilidad}
-- Uso de estadísticos robustos (mediana, rank, zscore robusto) para atenuar la influencia de outliers y colas pesadas en distribuciones de small caps.
-- El mismo conjunto de parámetros (percentiles, número de cuantiles, lag de decisión, run\_id) garantiza que la salida sea \textbf{reproducible} y que se pueda volver a computar el estado de features de cualquier fecha histórica.
+\begin{itemize}
+    \item Las features financieras raramente son gaussianas; en universos de pequeña capitalización presentan asimetrías, colas pesadas, acumulación de valores extremos y tramos degenerados.
+    \item Muchas variables económicas son interpretables solo en términos relativos dentro del universo de decisión de la fecha, no en escala absoluta.
+    \item La robustez de un modelo multifactor depende tanto de la idea económica subyacente como de la disciplina con la que se construye su representación empírica.
+    \item En \textit{small caps}, unos pocos activos ilíquidos o contablemente anómalos pueden dominar medias y varianzas si se usan transformaciones ingenuas.
+\end{itemize}
+
+Por ello, el módulo prioriza transformaciones:
+\begin{itemize}
+    \item ordinales o cuasi-ordinales cuando la distribución es inestable,
+    \item robustas a outliers,
+    \item independientes por fecha,
+    \item y compatibles con cobertura incompleta.
+\end{itemize}
+
+\subsection{Notación formal}
+
+Sea \( \mathcal{T} \) el conjunto de fechas de trading y \( \mathcal{S}_t \) el universo PIT elegible en fecha \( t \). Para una feature base \( f \), definimos:
+\[
+X_t^{(f)} = \left\{ X_t^{(f)}(s) : s \in \mathcal{S}_t^{(f)} \subseteq \mathcal{S}_t \right\},
+\]
+donde \( \mathcal{S}_t^{(f)} \) es el subconjunto de activos con valor válido para esa feature tras aplicar reglas de integridad, observabilidad y missingness.
+
+La transformación cross-sectional implementa una aplicación:
+\[
+\Psi_f: X_t^{(f)} \mapsto Z_t^{(f)},
+\]
+independiente para cada fecha \( t \). Es crucial que:
+\[
+Z_t^{(f)} \text{ depende solo de } X_t^{(f)},
+\]
+sin mezclar estadísticas entre fechas, ventanas temporales o universos posteriores.
+
+\paragraph{Unidad de trabajo}
+La unidad operativa mínima del módulo es el par:
+\[
+(t,f),
+\]
+es decir, una feature concreta dentro de una fecha concreta. Cada transformación debe ejecutarse como un problema aislado sobre el cross-section válido de ese instante.
+
+\subsection{Principios de diseño}
+
+\paragraph{1. Independencia temporal estricta}
+Cada fecha se transforma exclusivamente con la sección cruzada observable en esa fecha. No se permite reutilizar percentiles, medianas, MAD o parámetros estadísticos estimados con información de otros días.
+
+\paragraph{2. Determinismo}
+La resolución de empates, el tratamiento de nulos, el orden de operaciones y la política ante degeneraciones deben estar fijados por configuración o contrato. No se permiten resultados dependientes del orden físico de lectura ni de detalles accidentales del motor de ejecución.
+
+\paragraph{3. Robustez por defecto}
+Siempre que una familia lo permita, el módulo debe preferir transformaciones robustas (mediana, MAD, ranks, percentiles) frente a medias y desviaciones estándar sensibles a outliers.
+
+\paragraph{4. Separación entre valor económico y representación estadística}
+La feature base preserva el contenido económico; la transformación cross-sectional construye una escala comparable. Mezclar ambos niveles conceptuales produce ambigüedad metodológica y dificulta auditoría.
+
+\paragraph{5. Gobernanza explícita de casos frontera}
+Fechas con muy pocos nombres, dispersión colapsada, ties masivos, buckets vacíos o cobertura insuficiente no deben tratarse como casos normales. Deben detectarse, registrarse y resolverse con políticas estables.
+
+\subsection{Transformaciones disponibles}
+
+\subsubsection{\texttt{cs\_rank(feature)}}
+
+\paragraph{Definición}
+Sea \( N_t^{(f)} = |\mathcal{S}_t^{(f)}| \). Para cada \( s \in \mathcal{S}_t^{(f)} \),
+\[
+q_t^{(f)}(s) = \frac{\mathrm{rank}_t^{(f)}(s) - 0.5}{N_t^{(f)}},
+\]
+donde \( \mathrm{rank}_t^{(f)}(s) \in \{1,\dots,N_t^{(f)}\} \).
+
+Esta transformación induce una representación ordinal aproximadamente uniforme en \((0,1)\) y es particularmente apropiada cuando:
+\begin{itemize}
+    \item la distribución original es muy asimétrica,
+    \item existen outliers severos,
+    \item el orden relativo importa más que la magnitud absoluta,
+    \item o la comparabilidad inter-activo domina sobre la interpretación en unidades originales.
+\end{itemize}
+
+\paragraph{Política de empates}
+La resolución de \textit{ties} es un punto crítico y debe ser \textbf{determinista}. La política recomendada es:
+\begin{itemize}
+    \item \texttt{method = average} para empates genuinos;
+    \item o, alternativamente, \texttt{dense} si el \textit{downstream} exige preservación ordinal estricta sin huecos.
+\end{itemize}
+No se permite una política que dependa del orden interno del dataframe o del particionado en disco.
+
+\paragraph{Cobertura mínima}
+Si \( N_t^{(f)} < \texttt{min\_cross\_section\_size} \), el ranking debe marcarse como fecha de baja confianza. La política puede ser:
+\begin{itemize}
+    \item no transformar,
+    \item devolver \texttt{NaN},
+    \item o transformar pero etiquetar la fecha como degenerada.
+\end{itemize}
+La decisión debe ser única y definida por configuración.
+
+\subsubsection{\texttt{cs\_rank\_gauss(feature)}}
+
+\paragraph{Definición}
+A partir del percentil rankeado:
+\[
+z_t^{(f)}(s) = \Phi^{-1}\!\left(\min\!\left(\max(q_t^{(f)}(s), \varepsilon), 1-\varepsilon\right)\right),
+\]
+donde \( \Phi^{-1} \) es la inversa de la CDF normal estándar y \( \varepsilon > 0 \) evita colapsos en los extremos.
+
+\paragraph{Interpretación}
+Esta transformación conserva el orden relativo pero distribuye la masa de forma aproximadamente gaussiana, evitando saturación en los extremos y facilitando modelos que responden mejor a variables centradas y aproximadamente estandarizadas.
+
+\paragraph{Regla de clipping extremo}
+El valor de \( \varepsilon \) debe estar fijado globalmente o por familia. No puede quedar implícito. Valores típicos de referencia son pequeños, pero la elección final pertenece al contrato del sistema.
+
+\subsubsection{\texttt{cs\_zscore\_robust(feature)}}
+
+\paragraph{Definición}
+Sea
+\[
+m_t^{(f)} = \mathrm{med}\big(X_t^{(f)}\big),
+\qquad
+\mathrm{MAD}_t^{(f)} = \mathrm{med}\left(\left|X_t^{(f)} - m_t^{(f)}\right|\right).
+\]
+Entonces:
+\[
+z_t^{(f)}(s) = \frac{X_t^{(f)}(s) - m_t^{(f)}}{1.4826 \cdot \mathrm{MAD}_t^{(f)} + \epsilon}.
+\]
+
+\paragraph{Motivación}
+El uso de mediana y MAD reduce la sensibilidad a colas pesadas y observaciones extremas, algo especialmente importante en volatilidad, microestructura, iliquidez y algunos fundamentales transformados.
+
+\paragraph{Caso degenerado: MAD casi nula}
+Si
+\[
+\mathrm{MAD}_t^{(f)} < \tau_{\mathrm{mad}},
+\]
+la fecha debe tratarse como degenerada para esa feature. Las únicas políticas admisibles son:
+\begin{itemize}
+    \item \texttt{return\_zero}: devolver un vector nulo;
+    \item \texttt{fallback\_to\_rank}: degradar a transformación ordinal;
+    \item \texttt{return\_null}: marcar la fecha como inválida.
+\end{itemize}
+No se permite dividir por cantidades arbitrariamente pequeñas sin control explícito.
+
+\paragraph{Estabilidad numérica}
+El término \( \epsilon \) solo actúa como protección numérica; no debe usarse como mecanismo silencioso para esconder colapsos de dispersión. Si la dispersión está verdaderamente degenerada, debe registrarse.
+
+\subsubsection{\texttt{cs\_winsor(feature, p\_low, p\_high)}}
+
+\paragraph{Definición}
+Sea \( Q_{t,p}^{(f)} \) el percentil \( p \) de \( X_t^{(f)} \). La winsorización por fecha se define como:
+\[
+X_{t,\mathrm{win}}^{(f)}(s) =
+\min\!\left(
+\max\!\left(X_t^{(f)}(s), Q_{t,p_{\min}}^{(f)}\right),
+Q_{t,p_{\max}}^{(f)}
+\right).
+\]
+
+\paragraph{Objetivo}
+La winsorización no pretende alterar el orden económico central de la variable, sino limitar la influencia desproporcionada de colas extremas sobre transformaciones posteriores.
+
+\paragraph{Orden canónico}
+Salvo excepción explícita, el orden operativo del módulo debe ser:
+\[
+\text{validación} \rightarrow \text{winsor} \rightarrow \text{transformación principal}.
+\]
+Es decir, si una familia requiere winsorización y luego z-score robusto o z-score clásico, la winsorización debe ocurrir antes. Este orden debe quedar fijado en el contrato y no resolverse implícitamente por tipo de feature.
+
+\paragraph{Excepción para rankings}
+En transformaciones puramente ordinales, winsorizar antes del ranking suele ser irrelevante salvo que existan infinitos, errores de fuente o valores patológicos. En esos casos, la limpieza numérica sí debe preceder al ranking.
+
+\subsubsection{\texttt{cs\_quantile\_bucket(feature, q)}}
+
+\paragraph{Definición}
+Sea \( q \in \mathbb{N} \) el número de buckets:
+\[
+\mathrm{bucket}_t^{(f,q)}(s) = \min\left(\left\lfloor q \cdot q_t^{(f)}(s)\right\rfloor, q-1\right).
+\]
+
+\paragraph{Uso}
+Esta transformación permite:
+\begin{itemize}
+    \item análisis de monotonicidad por deciles/quintiles,
+    \item construcción de portfolios por grupos,
+    \item y visualización de estructura ordinal sin asumir linealidad.
+\end{itemize}
+
+\paragraph{Regla de buckets vacíos}
+Si el tamaño del cross-section es demasiado pequeño respecto a \( q \), el módulo debe:
+\begin{itemize}
+    \item reducir el número efectivo de buckets,
+    \item o marcar la fecha como no apta para bucketing fino.
+\end{itemize}
+No debe producir buckets nominales vacíos sin registrarlo.
+
+\subsubsection{Neutralización por grupo}
+
+\paragraph{Definición}
+Sea \( g(s) \in \mathcal{G}_t \) el grupo del activo \( s \) (sector, industria, cluster o cualquier taxonomía permitida). Entonces:
+\[
+X_{t,\mathrm{neut}}^{(f)}(s)
+=
+X_t^{(f)}(s)
+-
+\mathrm{med}\big(X_t^{(f)} \mid g(s)\big).
+\]
+
+\paragraph{Interpretación}
+La neutralización elimina componente común por grupo y aísla el componente relativo intra-grupo. Esto es útil cuando el objetivo del modelo no es explotar sesgos sectoriales sistemáticos, sino diferencias entre títulos comparables.
+
+\paragraph{Condición mínima por grupo}
+No debe neutralizarse un grupo con tamaño inferior a \texttt{min\_group\_size}. En esos casos, la política debe ser una de las siguientes:
+\begin{itemize}
+    \item dejar sin neutralizar,
+    \item fusionar al nivel jerárquico superior,
+    \item o marcar como missing.
+\end{itemize}
+
+\paragraph{Orden recomendado}
+Si se activa neutralización, el orden recomendado es:
+\[
+\text{validación} \rightarrow \text{winsor opcional} \rightarrow \text{neutralización} \rightarrow \text{transformación final}.
+\]
+Este orden evita que outliers de grupo distorsionen el centro neutralizado.
+
+\subsection{Reglas PIT y consistencia temporal}
+
+\paragraph{Independencia por fecha}
+Toda estadística usada por el módulo debe derivarse exclusivamente de la sección cruzada válida en la fecha \( t \). Formalmente:
+\[
+Z_t^{(f)} = \Psi_f\big(X_t^{(f)}\big),
+\]
+sin dependencia de \( X_{t-1}^{(f)} \), \( X_{t+1}^{(f)} \) ni agregados multi-fecha.
+
+\paragraph{Compatibilidad con universo PIT}
+El conjunto de símbolos transformados en fecha \( t \) debe estar acotado por:
+\[
+\mathcal{S}_t^{(f)} \subseteq \mathcal{S}_t^{\mathrm{eligible}}.
+\]
+No se permite construir estadísticas sobre nombres fuera del universo elegible y luego proyectarlas sobre el universo filtrado, ya que eso introduce inconsistencia entre señal y base de decisión.
+
+\subsection{Manejo de nulos y casos frontera}
+
+\paragraph{Clasificación de nulos}
+Los missing deben diferenciarse entre:
+\begin{itemize}
+    \item \textbf{estructurales}: la feature no existe para ese activo;
+    \item \textbf{económicos}: el valor no es interpretable;
+    \item \textbf{operativos}: fallo de carga, corrupción o inconsistencia;
+    \item \textbf{degenerativos}: la transformación no es estable en esa fecha.
+\end{itemize}
+
+\paragraph{Precedencia de tratamiento}
+El módulo debe seguir esta jerarquía:
+\begin{enumerate}
+    \item eliminar observaciones no finitas o inválidas;
+    \item excluir missing operativos;
+    \item aplicar reglas de cobertura mínima;
+    \item solo después transformar el cross-section restante.
+\end{enumerate}
+
+\paragraph{Imputación}
+Por defecto, este módulo no debe imputar. Su responsabilidad es transformar el cross-section válido, no inventar información ausente. Cualquier imputación permitida debe ser explícita, limitada y trazable.
+
+\paragraph{Secciones cruzadas pequeñas}
+Cuando \( N_t^{(f)} \) es pequeño:
+\begin{itemize}
+    \item los percentiles son inestables,
+    \item los ranks pierden granularidad,
+    \item y la MAD puede colapsar.
+\end{itemize}
+Estas fechas deben registrarse como de baja calidad estadística aunque la transformación siga siendo computable.
 
 \subsection{Entradas, salidas y contrato de interfaz}
 
 \paragraph{Entradas}
 \begin{itemize}
-    \item \texttt{base\_features\_path}: path a \texttt{features/store/date=...} con la feature matrix base.
-    \item \texttt{universe\_history\_path}: path a \texttt{data/universe/history} para filtrar por \texttt{is\_eligible} en \( t \).
-    \item \texttt{cross\_sectional\_config\_path}: archivo de configuración que define:
-        \begin{itemize}
-            \item Lista de features a transformar por familia.
-            \item Tipo de transformación (\texttt{cs\_rank}, \texttt{cs\_zscore\_robust}, \texttt{cs\_winsor}, \texttt{cs\_quantile\_bucket}).
-            \item Parámetros (percentiles, \texttt{p\_low}, \texttt{p\_high}, número de cuantiles \( q \)).
-            \item Reglas de neutralización si procede.
-        \end{itemize}
-    \item \texttt{run\_id}: identificador único del run, usado para persistir logs y metadatos.
+    \item \texttt{base\_features\_path}: ruta al snapshot base de features PIT.
+    \item \texttt{universe\_history\_path}: universo histórico PIT con elegibilidad por fecha.
+    \item \texttt{cross\_sectional\_config\_path}: configuración de transformaciones, parámetros, neutralizaciones, coberturas mínimas y políticas de fallback.
+    \item \texttt{run\_id}: identificador único de ejecución.
 \end{itemize}
 
-\paragraph{Salidas principales}
+\paragraph{Contrato mínimo de la configuración}
+La configuración debe fijar explícitamente:
 \begin{itemize}
-    \item \texttt{features/cross\_sectional/date=\{yyyy-mm-dd\}/part-*.parquet}:
-        \begin{itemize}
-            \item Columnas base: \texttt{date}, \texttt{symbol}, \texttt{is\_eligible}, \texttt{run\_id}.
-            \item Nuevas columnas de features:
-                \begin{itemize}
-                    \item \texttt{cs\_rank\_mom\_20d}, \texttt{cs\_zscore\_liquid\_20d}, \texttt{cs\_quantile\_bucket\_vol\_20d\_5}, etc.
-                \end{itemize}
-        \end{itemize}
-    \item \texttt{features/cross\_sectional/summary\_\{run\_id\}.json}:
-        \begin{itemize}
-            \item Métricas de cobertura y distribución (número de activos, % de nulos, percentiles, mediana por fecha).
-        \end{itemize}
-    \item \texttt{features/cross\_sectional/manifest\_\{run\_id\}.json}:
-        \begin{itemize}
-            \item Trazabilidad de qué transformaciones se aplicaron, qué percentiles, y qué features se procesaron.
-        \end{itemize}
+    \item lista de features por familia;
+    \item transformación principal por feature;
+    \item percentiles de winsor;
+    \item número de buckets;
+    \item política de empates;
+    \item \texttt{min\_cross\_section\_size};
+    \item umbral \(\tau_{\mathrm{mad}}\);
+    \item política de fallback ante dispersión degenerada;
+    \item reglas de neutralización y tamaño mínimo de grupo.
+\end{itemize}
+
+\paragraph{Salidas}
+\begin{itemize}
+    \item dataset transformado en:
+    \texttt{features/cross\_sectional/date=\{yyyy-mm-dd\}/part-*.parquet};
+    \item resumen de métricas por ejecución:
+    \texttt{summary\_\{run\_id\}.json};
+    \item manifest de configuración efectiva:
+    \texttt{manifest\_\{run\_id\}.json}.
+\end{itemize}
+
+\paragraph{Columnas esperadas}
+Como mínimo:
+\begin{itemize}
+    \item \texttt{date}, \texttt{symbol}, \texttt{run\_id};
+    \item indicadores de elegibilidad y calidad;
+    \item columnas transformadas con convención de nombres estable;
+    \item flags de degeneración si procede.
 \end{itemize}
 
 \subsection{Flujo de procesamiento}
 
-\paragraph{Alto nivel}
-1. \texttt{load\_base\_features(base\_features\_path, universe\_path, config)}:
-    - Carga la matriz base de features y el universo PIT filtrando por \texttt{is\_eligible}.
-2. Para cada fecha \( t \in \mathcal{T} \):
+\paragraph{Secuencia de alto nivel}
+\begin{enumerate}
+    \item Cargar snapshot base de features y universo PIT.
+    \item Restringir cada fecha al conjunto elegible.
+    \item Para cada par \( (t,f) \):
     \begin{itemize}
-        \item Filtrar \( \mathcal{S}_t \) por elegibilidad.
-        \item Aplicar transformaciones configuradas:
-            \begin{itemize}
-                \item \texttt{cs\_rank} para features de momentum, calidad, liquidez.
-                \item \texttt{cs\_zscore\_robust} para features de volatilidad y microestructura.
-                \item \texttt{cs\_winsor} en percentiles \texttt{[p\_low, p\_high]} para controlar colas.
-                \item \texttt{cs\_quantile\_bucket} para bucketing de volatilidad, tamaño, etc.
-            \end{itemize}
+        \item construir el subconjunto válido;
+        \item validar integridad numérica;
+        \item comprobar cobertura mínima;
+        \item aplicar winsorización si procede;
+        \item aplicar neutralización si procede;
+        \item aplicar transformación principal;
+        \item registrar métricas y flags de calidad.
     \end{itemize}
-3. Validación de cobertura y rangos:
-    \begin{itemize}
-        \item Comprobar que no hay duplicados en \texttt{(date, symbol)}.
-        \item Garantizar que la cobertura por fecha cumple con un umbral mínimo configurable.
-        \item Asegurar que no hay \texttt{inf} o \texttt{-inf} después de las transformaciones.
-    \end{itemize}
-4. Persistencia:
-    \begin{itemize}
-        \item Guardar la feature matrix transformada en Parquet.
-        \item Emitir \texttt{summary\_run\_id.json} y \texttt{manifest\_run\_id.json}.
-
-    \end{itemize}
-\end{itemize}
+    \item Concatenar resultados.
+    \item Validar esquema, duplicados y consistencia global.
+    \item Persistir dataset, manifest y summary.
+\end{enumerate}
 
 \subsection{Validaciones y observabilidad}
 
-\paragraph{Validaciones mínimas}
+\paragraph{Validaciones estructurales obligatorias}
 \begin{itemize}
-    \item \textbf{Integridad}: no hay duplicados en \texttt{(date, symbol)}.
-    \item \textbf{Cobertura}: por cada feature y fecha, la tasa de cobertura \( \text{pct\_non\_null} \geq \texttt{min\_coverage\_pct} \) (configurable).
-    \item \textbf{Rango numérico}: verificar que no hay \texttt{inf} o \texttt{-inf} tras las transformaciones, y que las distribuciones tienen forma razonable (por ejemplo, rank‑Gauss centradas en 0 con varianza 1 aproximadamente).
+    \item unicidad de \texttt{(date, symbol)};
+    \item ausencia de \texttt{inf}, \texttt{-inf} y \texttt{NaN} inesperados tras transformación;
+    \item consistencia entre número de filas y universo elegible por fecha;
+    \item esquema estable entre particiones;
+    \item convención de nombres reproducible.
+\end{itemize}
+
+\paragraph{Validaciones estadísticas obligatorias}
+\begin{itemize}
+    \item cobertura por feature y fecha;
+    \item distribución de tamaños cross-sectional válidos;
+    \item número de fechas con MAD degenerada;
+    \item número de fechas con grupos demasiado pequeños para neutralización;
+    \item detección de columnas constantes o casi constantes tras transformación;
+    \item verificación de que los ranks pertenecen a \((0,1)\) y los buckets a \(\{0,\dots,q-1\}\).
 \end{itemize}
 
 \paragraph{Métricas de observabilidad recomendadas}
 \begin{itemize}
-    \item \( n_{\text{features}} \), \( n_{\text{rows}} \).
-    \item \( \text{pct\_null\_global} \), \( \text{pct\_null\_per\_feature} \).
-    \item \( \text{pct\_features\_covered\_p50}, \text{p10} \) (porcentaje de fechas donde cobertura > 50\% ó 10\%).
+    \item \( n_{\mathrm{rows}}, n_{\mathrm{features}}, n_{\mathrm{dates}} \);
+    \item \( \mathrm{pct\_null\_global} \), \( \mathrm{pct\_null\_per\_feature} \);
+    \item percentiles del tamaño de sección cruzada efectiva;
+    \item número de fechas degeneradas por feature;
+    \item número de fechas con fallback activado;
+    \item cobertura post-transformación por familia.
 \end{itemize}
 
-\subsection{Ejemplo de CLI y uso en el sistema global}
+\subsection{Persistencia y reproducibilidad}
 
-\paragraph{CLI recomendada}
+\paragraph{Inmutabilidad}
+Cada \texttt{run\_id} debe corresponder a una salida inmutable. Una reejecución materialmente distinta debe producir un nuevo identificador de run.
+
+\paragraph{Trazabilidad}
+El \texttt{manifest} debe registrar:
+\begin{itemize}
+    \item configuración efectiva,
+    \item features procesadas,
+    \item transformaciones aplicadas,
+    \item parámetros concretos,
+    \item políticas de fallback activadas,
+    \item y métricas resumidas de calidad.
+\end{itemize}
+
+\paragraph{Atomicidad}
+La escritura debe evitar estados parcialmente válidos. Una ejecución fallida no debe dejar artefactos que puedan interpretarse como snapshot completo.
+
+\subsection{CLI recomendada}
+
 \begin{verbatim}
 python -m features.cross_sectional ^
   --base-features-path features/store ^
@@ -149,26 +432,41 @@ python -m features.cross_sectional ^
   --run-id cross_sectional_20260305_001
 \end{verbatim}
 
-\paragraph{Uso downstream}
-Las salidas de este módulo alimentan:
+\subsection{Uso downstream}
+
+Las salidas de este módulo alimentan directamente:
 \begin{itemize}
-    \item \texttt{labels/build\_labels.py}: aplicación de estrategia de swing trading sobre features cross‑sectionales normalizadas (por ejemplo, long‑short en top/bottom de rank de momentum o calidad).
-    \item \texttt{models/*/train\_*.py}: entrenamiento de modelos de scoring de factores o de portfolios multi‑factor.
-    \item \texttt{backtest/run\_walkforward.py}: backtest history replay donde las señales son robustas e interpretadas consistentemente en cada fecha.
+    \item construcción de labels y análisis por cuantiles;
+    \item entrenamiento de modelos de scoring multifactor;
+    \item validaciones de monotonicidad y estabilidad;
+    \item y backtests \textit{walk-forward} donde las señales deben conservar una semántica consistente entre fechas.
 \end{itemize}
 
-\subsection{Definición de término (Definition of Done)}
+La regla de diseño es que ningún consumidor downstream tenga que rehacer transformaciones cross-sectional básicas fuera de este módulo. Si eso ocurre, el contrato aquí está incompleto.
+
+\subsection{Definition of Done}
+
+\paragraph{El módulo se considera terminado únicamente si:}
+\begin{enumerate}
+    \item toda transformación es estrictamente cross-sectional y dependiente solo de la fecha actual;
+    \item la política de empates, winsorización, neutralización y fallback está totalmente cerrada;
+    \item las secciones cruzadas pequeñas y dispersiones degeneradas se detectan y registran;
+    \item las salidas son reproducibles y trazables por \texttt{run\_id};
+    \item el dataset resultante puede consumirse directamente por modelos y backtests sin reprocesado manual;
+    \item y las métricas de observabilidad distinguen claramente fechas normales de fechas frágiles.
+\end{enumerate}
+
+\subsection{Casos de prueba mínimos}
 
 \begin{itemize}
-    \item Transformaciones cross‑sectionales robustas y reproducibles: mismas entradas + misma configuración \(\Rightarrow\) misma salida.
-    \item Eliminación de escalas arbitrarias entre activos y between‑dates, garantizando que el modelo de scoring/PnL sea interpretado sobre señales comparables.
-    \item Integración limpia con el sistema de \texttt{feature\_qc.py} y \texttt{labels/build\_labels.py} sin necesidad de transformaciones adicionales en ese paso.
+    \item Verificación exacta del ranking con empates controlados.
+    \item Validación de \texttt{cs\_rank\_gauss} en una sección cruzada sintética conocida.
+    \item Prueba de \texttt{cs\_zscore\_robust} con outliers severos.
+    \item Confirmación del comportamiento cuando \(\mathrm{MAD} \approx 0\).
+    \item Validación de buckets con \(N_t < q\).
+    \item Prueba de neutralización con grupos pequeños y grupos completos.
+    \item Verificación de que dos ejecuciones idénticas producen exactamente el mismo output.
 \end{itemize}
 
-\subsection{Referencias clave}
-
-\begin{itemize}
-    \item Politis, Romano y Wolf (2015). \textit{Subsampling}. \cite{politis2015}
-    \item Huber y Ronchetti (2011). \textit{Robust Statistics}. \cite{huber2011}
-    \item Lo (1990). \textit{Maximum Likelihood Estimation for Long‑Memory Processes}. \cite{lo1990}
-\end{itemize}
+\paragraph{Síntesis final}
+\texttt{features/cross\_sectional.py} es la pieza que convierte una colección heterogénea de señales económicas en una base estadísticamente comparable para decisión multifactor. En un sistema de \textit{small caps}, esta capa no es un refinamiento cosmético: es el punto en el que se decide si la señal será robusta frente a outliers, iliquidez, escalas arbitrarias y secciones cruzadas irregulares. Si está mal especificada, el modelo aprende ruido de representación; si está bien blindada, el sistema gana consistencia, interpretabilidad y estabilidad fuera de muestra.

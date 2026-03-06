@@ -1,10 +1,13 @@
 \documentclass[12pt,a4paper]{article}
 \usepackage[utf8]{inputenc}
 \usepackage[spanish]{babel}
-\usepackage{amsmath, amssymb, bm, mathtools}
+\usepackage{amsmath, amssymb, bm, amsthm, mathtools}
 \usepackage{hyperref}
+\usepackage{graphicx}
 \usepackage{booktabs}
 \usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{siunitx}
 
 \DeclareMathOperator{\E}{\mathbb{E}}
 \DeclareMathOperator{\Var}{Var}
@@ -16,8 +19,11 @@
 \DeclareMathOperator{\NDCG}{NDCG}
 \DeclareMathOperator{\RMSE}{RMSE}
 \DeclareMathOperator{\MAE}{MAE}
+\DeclareMathOperator{\MSE}{MSE}
 \DeclareMathOperator{\LL}{LL}
-\DeclareMathOperator{\Hit}{Hit}
+\DeclareMathOperator{\argmin}{arg\,min}
+\DeclareMathOperator{\argmax}{arg\,max}
+\DeclareMathOperator{\rank}{rank}
 
 \title{Entrenamiento de modelos XGBoost con validación temporal purged \\ \texttt{models/gbdt/train\_xgb.py}}
 \author{}
@@ -27,166 +33,440 @@
 
 \maketitle
 
-\section{Objetivo y contexto de uso industrial}
+\section{Objetivo estratégico del módulo}
 
-El módulo \texttt{models/gbdt/train\_xgb.py} entrena modelos \textbf{XGBoost} para tareas de \textbf{regresión}, \textbf{clasificación} y \textbf{ranking} en un entorno de inversión, usando \textbf{validación temporal purged} y generando \textbf{artefactos reproducibles} para inferencia y ensemble. [web:89][web:100]  
+El módulo \texttt{models/gbdt/train\_xgb.py} implementa el entrenamiento de modelos \textbf{XGBoost} dentro de una arquitectura cuantitativa orientada a \textbf{small-cap swing trading}. Su propósito no es únicamente ajustar un ensemble de árboles sobre datos tabulares, sino producir un predictor no lineal temporalmente válido, reproducible y económicamente utilizable dentro de un stack de selección de activos, ranking cross-sectional, calibración probabilística y ensemble.
 
-Dado un conjunto de datos con features \(\bm{x}_i \in \mathbb{R}^d\), etiquetas \(y_i\) y una partición \texttt{purged\_splits} por fecha, el objetivo es aprender una función \(\hat{f}(\cdot; \bm{\theta})\) tal que las predicciones \(\hat{y}_i = \hat{f}(\bm{x}_i; \bm{\theta})\) sean óptimas en métricas OOS mientras se preserva la cronología temporal y se minimiza el riesgo de fuga de información. [web:89][web:101]
-
-\section{Objetivos soportados en XGBoost}
-
-El módulo soporta varios objetivos XGBoost, que se configuran vía \texttt{objective}:
-
-\subsection{Regresión: reg:squarederror}
-
-Para variables continuas (por ejemplo, retornos \textit{forward} netos):
-
-\begin{equation}
-\LL_{\text{reg}} = \sum_{i=1}^n \left(y_i - \hat{y}_i\right)^2,
-\end{equation}
-\noindent donde \(\hat{y}_i = \sum_{k=1}^K f_k(\bm{x}_i)\) y \(f_k\) son árboles de decisión. [web:89][web:92]
-
-XGBoost añade una penalización de complejidad sobre los árboles:
-
-\begin{equation}
-\Omega(f_k) = \gamma T_k + \frac{1}{2} \lambda \| \bm{w}_k \|_2^2,
-\end{equation}
-\noindent donde \(T_k\) es el número de hojas, \(\bm{w}_k\) sus pesos y \(\lambda\) el parámetro \texttt{reg\_lambda}. [web:92][web:96]
-
-\subsection{Clasificación: binary:logistic}
-
-Para etiquetas binarias \(y_i \in \{0,1\}\):
-
-\begin{equation}
-\LL_{\text{bin}} = \sum_{i=1}^n \left[
-y_i \log \hat{p}_i + (1-y_i) \log(1 - \hat{p}_i)
-\right],
-\end{equation}
-\noindent donde \(\hat{p}_i = \sigma(\hat{y}_i)\) es la probabilidad calibrada. [web:93][web:96]
-
-Métricas típicas OOS:
-
-\begin{align}
-\AUC\text{ROC} &= \text{Área bajo la curva ROC}, \\
-\AUC\text{PR}  &= \text{Área bajo la curva precision‑recall}, \\
-\text{Logloss} &= \LL_{\text{bin}} / n.
-\end{align}
-[web:99][web:96]
-
-\subsection{Ranking: rank:ndcg}
-
-Para tareas de tipo \texttt{ranking} (por ejemplo, ordenar acciones por retorno esperado):
-
-\begin{equation}
-\text{Objective} = \texttt{rank:ndcg},
-\end{equation}
-\noindent que corresponde a un algortimo inspirado en \textbf{LambdaMART}, donde los gradientes se ajustan según la sensibilidad de \(\NDCG@k\) respecto a cambios en el score de cada elemento:
-
-\begin{equation}
-\lambda_{ij} = \Delta\NDCG@k \cdot \frac{\partial \NDCG}{\partial \hat{y}_i}.
-\end{equation}
-
-La función \(\NDCG@k\) se define como:
-
-\begin{equation}
-\NDCG@k(\bm{p}) = \frac{1}{Z_k} \sum_{i=1}^k \frac{2^{r_i} - 1}{\log_2(i+1)},
-\end{equation}
-\noindent donde \(r_i\) es la relevancia del ítem en posición \(i\) y \(Z_k\) normaliza al ranking óptimo. [web:97][web:101]
-
-\section{Splits temporales purged y embargo}
-
-El modelo se entrena con \texttt{features/store}, \texttt{labels/store} y \texttt{labels/splits/purged\_splits\_latest.parquet}, donde los folds han sido construidos con \textbf{purged cross‑validation} y \textbf{embargo}. [web:78][web:83]  
-
-Cada observación \(i\) está etiquetada con \texttt{fold\_id} y \texttt{split\_role} (\texttt{train}, \texttt{valid}, \texttt{test}). La regla general es:
-
-\begin{equation}
-t_i^{\text{train}} < t_j^{\text{valid/test}} \quad \text{siempre que } i \in \text{train}, j \in \text{valid/test para el mismo fold}.
-\end{equation}
-
-Además, \textbf{features} y \textbf{labels} comparten la misma convención \texttt{decision\_lag}, de modo que ninguna variable incorpora informació de futuro respecto al tiempo de decisión. [web:78][web:100]
-
-\section{DMatrix, early stopping y regularización}
-
-XGBoost recibe los datos como \texttt{DMatrix} y permite configurar:
-
-\begin{itemize}
-    \item \texttt{eta} (\(\eta\)): learning rate.
-    \item \texttt{max\_depth}.
-    \item \texttt{min\_child\_weight} (mínimo \(\sum w_i\) por hoja).
-    \item \texttt{subsample} y \texttt{colsample\_bytree} (bagging y feature sampling).
-    \item \texttt{reg\_alpha}, \texttt{reg\_lambda}: L1 y L2 en los pesos de hoja.
-    \item \texttt{n\_estimators} y \texttt{early\_stopping\_rounds}.
+La unidad económica fundamental del sistema no es la fila aislada, sino la sección cruzada por fecha. Para cada instante \(t\), existe un universo elegible \(\mathcal{U}_t\) de activos y el modelo asigna a cada activo \(i \in \mathcal{U}_t\) un score:
+\[
+\hat{y}_{i,t} = \hat{f}(\bm{x}_{i,t};\bm{\theta}),
+\]
+donde \(\bm{x}_{i,t} \in \mathbb{R}^d\) es el vector de features del activo \(i\) en la fecha \(t\). Dependiendo del objetivo seleccionado, este score puede aproximar:
+\begin{itemize}[leftmargin=2em]
+    \item un retorno futuro esperado,
+    \item una probabilidad de evento binario,
+    \item o una relevancia ordinal para ranking cross-sectional.
 \end{itemize}
-[web:93][web:96]
 
-La función objetivo total es:
+En todos los casos, la exigencia principal es la misma: la predicción debe ser \textbf{útil fuera de muestra}, respetar la cronología y poder integrarse sin ambigüedad en las capas posteriores del sistema. Por ello, este módulo debe entenderse como una pieza de \textbf{research con disciplina de producción}, no como un experimento aislado con XGBoost.
 
-\begin{equation}
-\mathcal{L}(\bm{\theta}) = \sum_{i=1}^n \ell(y_i, \hat{y}_i) + \Omega(f),
-\end{equation}
-\noindent donde \(\ell\) es la función de pérdida asociada al \texttt{objective} y \(\Omega\) la penalización de árboles. [web:92][web:96]
+\section{Principios de diseño}
 
-El \texttt{early stopping} se realiza sobre la métrica \texttt{eval\_metric} en el conjunto \texttt{valid}, deteniendo el entrenamiento tras \texttt{early\_stopping\_rounds} iteraciones sin mejora. [web:89][web:94]
+El módulo se rige por cinco principios explícitos:
 
-\section{Flujo de trabajo por fold}
-
-A nivel de alto nivel, el módulo ejecuta:
-
-\begin{enumerate}
-    \item Cargar \texttt{features\_path}, \texttt{labels\_path}, \texttt{splits\_path}, \texttt{config\_path} y \texttt{run\_id}.
-    \item Unir por \texttt{(date, symbol)} y aplicar \texttt{label\_valid\_flag}.
-    \item Construir \texttt{DMatrix} por \texttt{fold} para \texttt{train} y \texttt{valid}.
-    \item Entrenar XGBoost con \texttt{early\_stopping} y \texttt{eval\_metric}.
-    \item Generar:
-        \begin{itemize}
-            \item \texttt{models/predictions/xgb/\{run\_id\}/oof.parquet}.
-            \item \texttt{fold\_k\_test\_pred.parquet} si \texttt{test} está disponible.
-        \end{itemize}
-    \item Calcular \texttt{metrics\_by\_fold.parquet} y \texttt{metrics\_summary.json} agregadas OOS.
-    \item Guardar \texttt{models/artifacts/xgb/\{run\_id\}/fold\_k/model.json} y \texttt{training\_manifest.json}.
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{La cronología manda.} Ninguna observación futura puede influir directa o indirectamente en el entrenamiento de un bloque anterior.
+    
+    \item \textbf{La métrica relevante es la utilidad económica OOS.} Un excelente ajuste in-sample o una pérdida baja en entrenamiento no compensan una señal débil o inestable fuera de muestra.
+    
+    \item \textbf{La complejidad debe merecerse.} XGBoost puede modelar interacciones, no linealidades y umbrales con gran flexibilidad, pero esa capacidad solo es valiosa si genera robustez y no mera captura de ruido histórico.
+    
+    \item \textbf{La reproducibilidad es obligatoria.} Toda ejecución debe dejar artefactos, configuración, métricas y metadatos suficientes para reconstruir el experimento.
+    
+    \item \textbf{La promoción del modelo requiere gates explícitos.} Un modelo no pasa a ensemble o producción por intuición ni por un único fold brillante, sino por cumplimiento de reglas formales.
 \end{enumerate}
 
-Cada predicción incluye \texttt{date, symbol, fold\_id, y\_true, y\_pred, split\_role, run\_id} para reproducibilidad en backtest y sistemas de inferencia. [web:89][web:101]
+\section{Contexto cross-sectional y uso downstream}
 
-\section{Validaciones y estabilidad de modelos}
-
-Durante el entrenamiento se realizan validaciones:
-
-\begin{itemize}
-    \item No falta ninguna columna crítica de \texttt{features} o \texttt{target}.
-    \item Cada fold tiene número mínimo de muestras para evitar alta varianza en las métricas.
-    \item Las predicciones \texttt{oof.parquet} cubren \textit{exactamente} los índices esperados por fold.
-    \item La desviación estándar de las métricas entre folds está por debajo de un umbral de \textit{estabilidad}.
+En una estrategia de small caps, el problema raramente consiste en estimar con precisión milimétrica el retorno absoluto de un activo aislado. Lo económicamente relevante es producir una ordenación útil del universo contemporáneo. Sea
+\[
+\mathcal{U}_t = \{1,\dots,N_t\},
+\]
+el conjunto de activos elegibles en fecha \(t\). El modelo genera
+\[
+\{\hat{y}_{i,t}\}_{i \in \mathcal{U}_t},
+\]
+y esos scores se usan downstream para:
+\begin{itemize}[leftmargin=2em]
+    \item seleccionar candidatos a cartera,
+    \item ordenar nombres dentro de la sección cruzada,
+    \item aplicar umbrales de entrada o exclusión,
+    \item alimentar una capa de calibración probabilística,
+    \item integrarse en un ensemble con otras familias de modelos.
 \end{itemize}
 
-Estas comprobaciones siguen estándares de \textit{model risk management} y \textit{purged CV} en finanzas cuantitativas, donde la varianza entre folds y la consistencia de ranking son tan importantes como el valor medio de la métrica. [web:78][web:89]
+Esta perspectiva obliga a que la validación, las métricas y la interpretación del score estén alineadas con el problema económico real. No basta con ``entrenar XGBoost''; hay que entrenarlo en el formato correcto para el uso final.
 
-\section{Interfaz de línea de comandos}
+\section{Contrato de entradas}
 
-Ejemplo de \texttt{CLI}:
+El módulo asume como inputs contractuales:
+
+\begin{itemize}[leftmargin=2em]
+    \item \texttt{features\_path}: tabla de features con clave lógica mínima \texttt{(date, symbol)};
+    \item \texttt{labels\_path}: tabla de etiquetas forward compatibles con la misma clave lógica;
+    \item \texttt{splits\_path}: particiones temporales purged con roles \texttt{train}, \texttt{valid}, \texttt{test};
+    \item \texttt{config\_path}: configuración cerrada del experimento;
+    \item \texttt{run\_id}: identificador único de ejecución.
+\end{itemize}
+
+La unión entre tablas se realiza únicamente sobre claves canónicas. Cualquier duplicado, ambigüedad o desalineación debe generar error de integridad. El módulo no debe ``arreglar'' silenciosamente inconsistencias aguas arriba.
+
+\section{Validación temporal purged y embargo}
+
+En presencia de labels forward, solapamientos temporales y dependencia serial, la validación aleatoria estándar es inválida. Por ello, el módulo trabaja con \textbf{purged cross-validation} y \textbf{embargo temporal}.
+
+La lógica es la siguiente:
+\begin{itemize}[leftmargin=2em]
+    \item el \textbf{purging} elimina del entrenamiento observaciones cuyo horizonte de label intersecta con la ventana de validación o test;
+    \item el \textbf{embargo} retira adicionalmente una banda temporal alrededor del bloque evaluado para reducir dependencia por proximidad.
+\end{itemize}
+
+Sea \(\mathcal{D}\) el dataset tras unir features, labels y splits. Para el fold \(k\), el conjunto de entrenamiento efectivo viene dado por
+\begin{equation}
+\mathcal{D}^{(k)}_{\mathrm{train}}
+=
+\left\{
+i \in \mathcal{D}
+\;\middle|\;
+\texttt{fold\_id}_i = k,\;
+\texttt{split\_role}_i = \texttt{train},\;
+\texttt{inclusion\_flag}_i = 1
+\right\},
+\end{equation}
+mientras que los bloques de validación y test deben satisfacer separación cronológica y ausencia de solapamiento causal con el entrenamiento:
+\begin{equation}
+\mathcal{D}^{(k)}_{\mathrm{eval}}
+=
+\left\{
+i \in \mathcal{D}
+\;\middle|\;
+\texttt{split\_role}_i \in \{\texttt{valid},\texttt{test}\},
+\;
+t_i > t_{\max}^{\mathrm{train},k},
+\;
+i \notin \texttt{purged/embargo}
+\right\}.
+\end{equation}
+
+La propiedad buscada no es una separación temporal cosmética, sino una aproximación realista a un proceso de despliegue donde la información futura todavía no existe.
+
+\section{Formulación matemática de XGBoost}
+
+XGBoost construye un predictor aditivo de árboles:
+\begin{equation}
+\hat{y}_i = \sum_{m=1}^{M} f_m(\bm{x}_i), \qquad f_m \in \mathcal{F},
+\end{equation}
+donde cada \(f_m\) es un árbol de decisión con pesos en hojas.
+
+La función objetivo general del entrenamiento es:
+\begin{equation}
+\mathcal{L} = \sum_{i=1}^{n}\ell(y_i,\hat{y}_i) + \sum_{m=1}^{M}\Omega(f_m),
+\end{equation}
+con penalización de complejidad
+\begin{equation}
+\Omega(f_m) = \gamma T_m + \frac{\lambda}{2}\sum_{j=1}^{T_m} w_{m,j}^2 + \alpha \sum_{j=1}^{T_m}|w_{m,j}|,
+\end{equation}
+donde:
+\begin{itemize}[leftmargin=2em]
+    \item \(T_m\) es el número de hojas del árbol \(m\),
+    \item \(w_{m,j}\) son los pesos de hoja,
+    \item \(\gamma\) penaliza complejidad estructural,
+    \item \(\lambda\) y \(\alpha\) corresponden a regularización L2 y L1.
+\end{itemize}
+
+Desde una perspectiva cuantitativa, estos términos controlan la capacidad efectiva del modelo para capturar no linealidades, interacciones entre señales y efectos umbral sin convertir el ajuste en una absorción oportunista del ruido histórico.
+
+\section{Objetivos soportados}
+
+\subsection{Regresión: \texttt{reg:squarederror}}
+
+Cuando el target es continuo, por ejemplo un retorno forward neto, el módulo entrena un modelo de regresión. La pérdida puntual es:
+\begin{equation}
+\mathcal{L}_{\mathrm{reg}}
+=
+\frac{1}{n}\sum_{i=1}^{n}(y_i-\hat{y}_i)^2.
+\end{equation}
+
+Sin embargo, en un problema de stock selection cross-sectional, la pérdida cuadrática no es el criterio económico definitivo. La métrica principal suele ser ordinal, por ejemplo el Information Coefficient por fecha:
+\begin{equation}
+\IC_t =
+\Corr\!\left(
+\rank(\hat{y}_{i,t}),
+\rank(y_{i,t})
+\right)_{i\in\mathcal{U}_t}.
+\end{equation}
+
+También se reportan métricas auxiliares como:
+\begin{align}
+\RMSE &= \sqrt{\frac{1}{n}\sum_{i=1}^n (y_i-\hat{y}_i)^2},\\
+\MAE  &= \frac{1}{n}\sum_{i=1}^n |y_i-\hat{y}_i|.
+\end{align}
+
+Estas últimas contextualizan, pero no sustituyen la utilidad ordinal del modelo cuando el uso downstream es ranking o construcción de cartera.
+
+\subsection{Clasificación binaria: \texttt{binary:logistic}}
+
+Cuando el label es binario, el modelo produce logits internos y probabilidades:
+\[
+\hat{p}_i = \sigma(\hat{y}_i) = \frac{1}{1+\exp(-\hat{y}_i)}.
+\]
+La pérdida es la entropía cruzada:
+\begin{equation}
+\mathcal{L}_{\mathrm{bin}}
+=
+-\frac{1}{n}
+\sum_{i=1}^{n}
+\left[
+y_i \log \hat{p}_i + (1-y_i)\log(1-\hat{p}_i)
+\right].
+\end{equation}
+
+Las métricas principales incluyen:
+\begin{itemize}[leftmargin=2em]
+    \item \(\AUC\)-ROC;
+    \item \(\AUC\)-PR en caso de desbalance severo;
+    \item logloss;
+    \item y, si las probabilidades se usan downstream, métricas de calibración en un módulo posterior.
+\end{itemize}
+
+Si las observaciones tienen distinta relevancia económica o presentan desbalance estructural, se admiten pesos:
+\begin{equation}
+\mathcal{L}_{\mathrm{weighted}}
+=
+-\frac{1}{n}
+\sum_{i=1}^{n}
+w_i
+\left[
+y_i \log \hat{p}_i + (1-y_i)\log(1-\hat{p}_i)
+\right].
+\end{equation}
+
+\subsection{Ranking: \texttt{rank:ndcg}}
+
+Cuando el objetivo económico es ordenar activos dentro de cada fecha, el módulo soporta \texttt{rank:ndcg}. En este caso, la unidad natural es el grupo por fecha, no la observación individual aislada.
+
+La métrica relevante es:
+\begin{equation}
+\NDCG@k = \frac{\DCG@k}{\IDCG@k},
+\end{equation}
+donde
+\begin{equation}
+\DCG@k = \sum_{i=1}^{k}\frac{2^{r_i}-1}{\log_2(i+1)},
+\end{equation}
+y \(r_i\) representa la relevancia del activo ubicado en la posición \(i\).
+
+Este objetivo es especialmente adecuado cuando:
+\begin{itemize}[leftmargin=2em]
+    \item la cartera consume solo top-\(k\) o percentiles extremos;
+    \item la calidad del ordenamiento importa más que el valor absoluto del retorno;
+    \item el sistema toma decisiones directamente sobre la jerarquía de nombres.
+\end{itemize}
+
+\section{Jerarquía oficial de métricas}
+
+Una carpeta de este nivel necesita una doctrina explícita sobre qué métrica manda. El módulo fija la siguiente jerarquía:
+
+\begin{itemize}[leftmargin=2em]
+    \item Si el uso downstream es \textbf{ranking cross-sectional}, la métrica principal es una métrica ordinal OOS por fecha, típicamente \(\mathrm{median}(\IC_t)\) o \(\NDCG@k\).
+    
+    \item Si el uso downstream es \textbf{clasificación probabilística}, la métrica principal es logloss o AUC, según la tarea exacta.
+    
+    \item Si el uso downstream es \textbf{predicción continua} pero el sistema consume el score de forma ordinal, las métricas de error puntual son secundarias frente a las métricas de ranking.
+\end{itemize}
+
+Por tanto, early stopping, comparación entre folds y promoción final deben estar alineados con la métrica primaria fijada ex ante en configuración. No se admite seleccionar la métrica a posteriori según el resultado que más favorezca al experimento.
+
+\section{Hiperparámetros y control de capacidad}
+
+Los hiperparámetros de XGBoost no son detalles de librería, sino controles directos sobre la flexibilidad del modelo:
+
+\begin{itemize}[leftmargin=2em]
+    \item \texttt{eta}: velocidad de aprendizaje y suavidad del ajuste;
+    \item \texttt{max\_depth}: profundidad máxima y orden potencial de interacciones;
+    \item \texttt{min\_child\_weight}: masa mínima requerida para una partición;
+    \item \texttt{subsample}: bagging sobre filas;
+    \item \texttt{colsample\_bytree} y variantes: bagging sobre features;
+    \item \texttt{reg\_alpha}, \texttt{reg\_lambda}: regularización de pesos de hoja;
+    \item \texttt{gamma}: umbral mínimo de ganancia para crear nuevas particiones;
+    \item \texttt{n\_estimators} o número de boosting rounds;
+    \item \texttt{early\_stopping\_rounds}: criterio de parada sobre validación.
+\end{itemize}
+
+En términos económicos, estos parámetros gobiernan el compromiso entre \textbf{plasticidad} y \textbf{robustez}. Un modelo demasiado rígido pierde señal; uno demasiado flexible captura accidentes históricos sin valor predictivo futuro.
+
+\section{DMatrix y estructura de grupos}
+
+XGBoost consume los datos vía \texttt{DMatrix}. En problemas de ranking, además, debe preservarse la estructura de grupos por fecha o consulta. Esto no es un detalle menor: si el modelo ignora la agrupación, deja de resolver el problema económico correcto.
+
+Por ello:
+\begin{itemize}[leftmargin=2em]
+    \item en regresión y clasificación, la matriz se construye con features, target y pesos opcionales;
+    \item en ranking, la matriz debe incluir información de grupos coherente con la sección cruzada diaria o la unidad temporal elegida.
+\end{itemize}
+
+\section{Preprocesado y contrato de features}
+
+Aunque el feature engineering se realiza aguas arriba, este módulo impone un contrato mínimo:
+
+\begin{enumerate}[leftmargin=2em]
+    \item la lista final de features debe ser idéntica entre folds;
+    \item no se admiten columnas críticas ausentes;
+    \item columnas con varianza nula, cobertura insuficiente o corrupción evidente deben excluirse según reglas configuradas;
+    \item la política de missing values debe ser estable y documentada.
+\end{enumerate}
+
+XGBoost puede manejar missingness de forma nativa, pero eso no elimina la necesidad de distinguir entre:
+\begin{itemize}[leftmargin=2em]
+    \item missing estructural con información económica,
+    \item missing accidental por problemas de datos,
+    \item y columnas demasiado incompletas para ser fiables.
+\end{itemize}
+
+\section{Early stopping y política de validación}
+
+El entrenamiento se detiene mediante \texttt{early stopping} sobre el bloque de validación del fold. Esta política exige dos condiciones:
+
+\begin{enumerate}[leftmargin=2em]
+    \item la métrica monitorizada debe ser la métrica económicamente relevante, no una proxy cómoda;
+    \item el bloque de test nunca participa en la parada ni en la selección del mejor número de iteraciones.
+\end{enumerate}
+
+Formalmente, si \(\mathcal{M}_{\mathrm{valid}}^{(m)}\) es la métrica primaria en la iteración \(m\), el entrenamiento se detiene cuando no existe mejora suficiente durante \texttt{early\_stopping\_rounds}. El modelo retenido para el fold es el correspondiente al mejor punto de validación, no el último por número de rondas.
+
+\section{Controles anti-leakage}
+
+El módulo prohíbe explícitamente:
+
+\begin{itemize}[leftmargin=2em]
+    \item entrenar con observaciones marcadas como no elegibles;
+    \item usar test para early stopping;
+    \item usar performance de test para seleccionar hiperparámetros dentro de la misma ejecución;
+    \item mezclar etiquetas o features con distinta convención temporal;
+    \item introducir información futura mediante joins, shifts incorrectos o errores de \texttt{decision\_lag}.
+\end{itemize}
+
+Estas prohibiciones forman parte de la definición del experimento. Un resultado alto obtenido violando estas reglas no se considera válido.
+
+\section{Flujo operativo por fold}
+
+El flujo oficial del módulo es el siguiente:
+
+\begin{enumerate}[leftmargin=2em]
+    \item Cargar configuración, datos y \texttt{run\_id}.
+    \item Unir features, labels y splits sobre \texttt{(date, symbol)}.
+    \item Filtrar observaciones no elegibles y validar integridad.
+    \item Construir \texttt{DMatrix} de entrenamiento y validación para cada fold.
+    \item Entrenar XGBoost con el objetivo, hiperparámetros y métrica primaria definidos.
+    \item Aplicar early stopping estrictamente sobre validación.
+    \item Generar predicciones OOF, valid y test según disponibilidad.
+    \item Calcular métricas por fold y métricas agregadas OOS.
+    \item Persistir modelo, predicciones, métricas y manifest de entrenamiento.
+    \item Emitir veredicto \texttt{pass}, \texttt{warn} o \texttt{fail}.
+\end{enumerate}
+
+\section{Artefactos de salida}
+
+Toda ejecución debe persistir, como mínimo:
+
+\begin{itemize}[leftmargin=2em]
+    \item modelo por fold, por ejemplo \texttt{model.json};
+    \item predicciones OOF;
+    \item predicciones de test por fold si existen;
+    \item métricas por fold;
+    \item resumen agregado de métricas;
+    \item manifest con configuración, hashes, timestamps, coverage y metadatos del experimento.
+\end{itemize}
+
+Una estructura típica es:
 
 \begin{verbatim}
-python -m models.gbdt.train_xgb ^
-  --features-path features/store ^
-  --labels-path labels/store ^
-  --splits-path labels/splits/purged_splits_latest.parquet ^
-  --config-path configs/models/xgb_base.yaml ^
-  --run-id train_xgb_20260305_001
+models/artifacts/xgb/{run_id}/fold_k/model.json
+models/predictions/xgb/{run_id}/oof.parquet
+models/predictions/xgb/{run_id}/fold_k_test_pred.parquet
+models/reports/xgb/{run_id}/metrics_by_fold.parquet
+models/reports/xgb/{run_id}/metrics_summary.json
+models/reports/xgb/{run_id}/training_manifest.json
 \end{verbatim}
 
-Este comando genera un experimento versionado donde los modelos y predicciones se pueden integrar directamente en \texttt{models/inference/predict.py} y \texttt{models/ensemble/blender.py} para sistemas de trading industrial. [web:89][web:101]
+Cada predicción persistida debe incluir, como mínimo:
+\[
+\texttt{date, symbol, fold\_id, split\_role, y\_true, y\_pred, run\_id}.
+\]
+Esto garantiza trazabilidad para backtesting, calibración y capas posteriores de inferencia.
 
-\section{Criterio de aceptación (DoD)}
+\section{Validaciones obligatorias}
 
-El módulo considera completado el entrenamiento cuando:
+Antes de dar el módulo por correcto, deben superarse al menos las siguientes comprobaciones:
 
-\begin{itemize}
-    \item Todos los folds se entrenan sin errores o con errores de formato controlados.
-    \item El modelo XGBoost y sus métricas OOS son \textbf{reproducibles} (mismos seeds y orden de datos).
-    \item Los artefactos \texttt{model.json}, \texttt{oof.parquet}, \texttt{metrics\_summary.json} y \texttt{training\_manifest.json} están disponibles y consistentes.
-    \item El modelo es listo para ser usado en \texttt{inference} y \texttt{ensemble} sin reentrenarlo, respetando el protocolo de split temporal purged.
+\subsection{Integridad}
+\begin{itemize}[leftmargin=2em]
+    \item unicidad de \texttt{(date, symbol)};
+    \item alineación exacta entre features, labels y splits;
+    \item fechas ordenadas y compatibles con el rol temporal asignado.
 \end{itemize}
 
-Esta especificación encaja con prácticas de \textit{MLOps cuantitativo} en donde la trazabilidad de datos,_splits y parámetros es obligatoria para la validación regulatoria y operativa. [web:89][web:90]
+\subsection{Sanidad de features}
+\begin{itemize}[leftmargin=2em]
+    \item ausencia de columnas completamente nulas;
+    \item ausencia de columnas constantes no justificadas;
+    \item consistencia de la lista de features entre folds.
+\end{itemize}
+
+\subsection{Sanidad del entrenamiento}
+\begin{itemize}[leftmargin=2em]
+    \item cada fold dispone de masa mínima de muestra;
+    \item early stopping converge de forma razonable;
+    \item no aparecen NaNs ni infinitos en predicciones.
+\end{itemize}
+
+\subsection{Sanidad de outputs}
+\begin{itemize}[leftmargin=2em]
+    \item las predicciones OOF cubren exactamente las observaciones esperadas;
+    \item los artefactos persistidos son legibles y consistentes;
+    \item el manifest permite reconstruir el experimento.
+\end{itemize}
+
+\section{Gates de aceptación del modelo}
+
+Para avanzar desde research hacia ensemble o producción, el modelo debe superar gates explícitos:
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Gate de performance primaria}: la métrica OOS principal debe superar un umbral mínimo definido ex ante.
+    
+    \item \textbf{Gate de overfitting}: la divergencia entre entrenamiento y validación no puede exceder una tolerancia:
+    \begin{equation}
+    \Delta_{\mathrm{overfit}}
+    =
+    \mathcal{M}_{\mathrm{train}}-\mathcal{M}_{\mathrm{valid}}
+    \le \varepsilon
+    \quad
+    \text{o equivalente según la orientación de la métrica.}
+    \end{equation}
+    
+    \item \textbf{Gate de estabilidad}: la dispersión entre folds debe permanecer bajo control; no se aceptan modelos cuyo resultado dependa enteramente de un subperiodo excepcional.
+    
+    \item \textbf{Gate de coverage}: la cobertura de observaciones válidas con score generado debe superar el mínimo contractual.
+    
+    \item \textbf{Gate de integridad}: errores críticos de fuga, duplicados, desalineación o corrupción de labels deben ser cero.
+\end{enumerate}
+
+Un score medio elevado no compensa una señal frágil o una validación experimental dudosa.
+
+\section{Interacción con calibración y ensemble}
+
+El output de \texttt{train\_xgb.py} no termina en sí mismo. Según el objetivo y el uso del sistema, sus predicciones pueden:
+\begin{itemize}[leftmargin=2em]
+    \item pasar a un módulo de calibración probabilística si se usan como probabilidades;
+    \item combinarse en \texttt{models/ensemble/blender.py};
+    \item alimentar directamente un ranking cross-sectional de activos;
+    \item utilizarse como una de varias capas de convicción dentro de la construcción de cartera.
+\end{itemize}
+
+Por eso, además de buena performance aislada, el modelo debe exhibir compatibilidad operativa con las capas que consumen su score.
+
+\section{Definición de Done}
+
+El módulo \texttt{train\_xgb.py} solo se considera terminado si:
+
+\begin{enumerate}[leftmargin=2em]
+    \item entrena XGBoost de forma temporalmente válida;
+    \item produce predicciones OOF y OOS trazables;
+    \item usa una jerarquía de métricas consistente con el problema económico;
+    \item persiste artefactos suficientes para auditoría y reproducción;
+    \item aplica controles anti-leakage y validaciones obligatorias;
+    \item y define gates explícitos para decidir si el modelo merece promoción a ensemble o producción.
+\end{enumerate}
+
+En consecuencia, \texttt{train\_xgb.py} no debe verse como un simple wrapper de XGBoost. Es el módulo que transforma una hipótesis de señal tabular en un predictor no lineal, validado bajo disciplina temporal, gobernanza experimental y criterios explícitos de robustez dentro de un stack cuantitativo serio.
 
 \end{document}

@@ -8,116 +8,454 @@
 \usepackage{listings}
 \usepackage{booktabs}
 \usepackage{float}
+\usepackage[a4paper,margin=2.5cm]{geometry}
 
-\title{Explicación Avanzada: ops/daily\_pipeline.py \\ Orquestación Diaria End-to-End para Swing Trading Cuantitativo Industrial}
-\author{Perplexity AI - Nivel Research Quant Finance}
-\date{5 de marzo de 2026}
+\title{Especificación Técnica: ops/daily\_pipeline.py\\
+Orquestación Diaria Determinista para un Sistema de Swing Trading Cuantitativo}
+\author{Documento de especificación operativa}
+\date{6 de marzo de 2026}
 
 \begin{document}
 \maketitle
 
-\section{Introducción y Contexto Estratégico}
-Este módulo orquesta el pipeline diario completo de un sistema de \textbf{swing trading cuantitativo}, desde ingesta de datos hasta backtest y controles de riesgo. En swing trading, capturamos movimientos de 2-10 días con Sharpe ratios >2, inspirado en Renaissance Technologies (Jim Simons), donde pipelines robustos generan alpha consistente vía reproducibilidad y fault-tolerance [web:44][web:49].
+\section{Propósito del módulo}
 
-El objetivo es maximizar rentabilidad: $\alpha = E[R_p - R_b] - \lambda \sigma_p$, con $\lambda$ penalizador de riesgo, optimizado bajo constraints de liquidez y drawdown <15\% [web:47]. No incluye lógica de features/ML (modular), pero integra con ellas para daily rebalance.
+\texttt{ops/daily\_pipeline.py} es el orquestador diario del sistema. Su responsabilidad es ejecutar, supervisar y cerrar de forma \textbf{determinista, auditable e idempotente} el flujo end-to-end de producción para una fecha de ejecución dada. El módulo no implementa la lógica económica de señales, modelos o construcción de cartera; su función es garantizar que dichas piezas se ejecuten en el orden correcto, con contratos consistentes, tolerancia a fallos transitorios y semántica de reanudación bien definida.
 
-\section{Matemáticas Fundamentales del Pipeline}
-El DAG lógico modela dependencias como grafo acíclico dirigido (DAG): $G=(V,E)$, $V$=etapas (data$\to$portfolio), $E$=precedencias. Topological sort vía Kahn's algorithm asegura orden: $\text{indegree}(v)=0 \implies \text{queue}$.
+En términos de arquitectura, el pipeline se modela como un \textbf{grafo acíclico dirigido}:
+\[
+G=(V,E),
+\]
+donde \(V\) es el conjunto de etapas operativas y \(E\) el conjunto de dependencias de precedencia. Una ejecución diaria válida consiste en producir un \textbf{run} completo para una fecha \(\tau\), de forma que cada etapa sólo se lance cuando todas sus dependencias hayan finalizado satisfactoriamente o hayan sido marcadas explícitamente como \texttt{skipped} por política.
 
-Tiempos/SLA: modelados como $T_{total} = \sum T_i + \sum W_{ij}$, con $W_{ij}$ esperas por dependencias. Retry policy: backoff exponencial $B_k = B_0 \cdot \gamma^k$, $\gamma=2$, $k \leq \max_retries$ para fallos transitorios (e.g., API rates) [web:51].
+\section{Objetivos operativos}
 
-Gates críticos: umbrales probabilísticos, e.g., data quality $Q = 1 - \frac{\sum |m_i - \hat{m}_i|}{\sum |m_i|}$, $Q > 0.95$ o fail-fast.
+El módulo debe satisfacer simultáneamente los siguientes objetivos:
 
-Idempotencia vía hashing: $\text{config\_hash} = \text{SHA256}(\text{yaml} + \text{execution\_date})$, evita re-runs corruptos.
+\begin{enumerate}
+    \item \textbf{Determinismo}: a igualdad de configuración, fecha de ejecución, universo de datos y versión de código, el pipeline debe producir el mismo plan de ejecución y los mismos artefactos lógicos.
+    \item \textbf{Idempotencia}: relanzar un \textit{run} o una etapa no debe duplicar artefactos ni corromper estado persistido.
+    \item \textbf{Auditabilidad}: toda transición de estado, decisión de reintento, artefacto emitido y fallo debe quedar registrado con marca temporal y \texttt{run\_id}.
+    \item \textbf{Reanudación segura}: tras una caída parcial, el sistema debe poder reanudar desde el último punto consistente sin repetir etapas ya confirmadas.
+    \item \textbf{Aislamiento de responsabilidades}: el runner orquesta; los módulos de negocio computan; la observabilidad y el estado persisten mediante interfaces explícitas.
+\end{enumerate}
 
-\section{Papers y Estado del Arte}
+\section{Contrato funcional}
+
+\subsection{Entradas obligatorias}
+
+El módulo recibe como mínimo:
+
 \begin{itemize}
-\item \href{https://arxiv.org/abs/2401.06139}{StockFormer (2024)} [web:44][web:50]: STL decomposition + Self-Attention para swing signals, +30.8\% anualizado. Integra en inference step.
-\item \href{https://papers.ssrn.com/sol3/papers?id=4659866}{Optimizing Swing Portfolios (2023)} [web:47]: Asset allocation con lazy portfolios, Sharpe 2.1 en backtests 2010-2023.
-\item LSTM Swing DSS (2022) [web:54]: ML en pipelines diarios, reduce overfitting vía walk-forward.
-\item Backtesting.py [web:51]: Framework Python SOTA para simulación realista con slippage/impacto.
+    \item \texttt{config\_path}: ruta al fichero de configuración.
+    \item \texttt{execution\_date}: fecha lógica del run.
+    \item \texttt{run\_mode}: modo de operación (\texttt{daily}, \texttt{replay}, \texttt{backfill}, \texttt{retrain}).
 \end{itemize}
 
-\section{Libros Industriales Recomendados}
-- \textit{Advances in Financial Machine Learning} (López de Prado, 2018) [web:49]: Purging/embargo en labels, backtests meta-labeling para swing.
-- \textit{Algorithmic Trading} (Chan, 2013) [web:49]: DAGs operativos, risk parity en portfolio step.
-- \textit{The Master Swing Trader} (Farley) [web:45]: Timing/volatilidad para ventanas operativas.
-- \textit{Quantitative Trading} (Chan): SLAs y monitoring en prod.
+Parámetros opcionales de control:
 
-\section{Análisis Detallado del Espec (Contrato y DAG)}
-El spec define un runner idempotente con CLI. DAG recomendado: 9 etapas serial/paralelo híbrido.
+\begin{itemize}
+    \item \texttt{run\_id}: identificador explícito; si no se aporta, se genera.
+    \item \texttt{fail\_fast}: aborta el pipeline en el primer fallo no recuperable.
+    \item \texttt{max\_retries}: número máximo de reintentos por etapa para errores transitorios.
+    \item \texttt{resume}: reanuda una ejecución previa compatible.
+    \item \texttt{selected\_steps}: subconjunto explícito de etapas para ejecución parcial controlada.
+\end{itemize}
 
-\textbf{Contrato Entrada}: JSON/YAML parsed a dataclass:
+\subsection{Salidas obligatorias}
+
+Toda ejecución debe producir:
+
+\begin{itemize}
+    \item un \textbf{registro persistido del run},
+    \item el \textbf{estado persistido de cada etapa},
+    \item un \textbf{resumen final de ejecución},
+    \item y los \textbf{eventos operativos} necesarios para monitorización y alertado.
+\end{itemize}
+
+Si el pipeline finaliza con error, debe existir igualmente un resumen final con causa, etapa de fallo, número de intentos consumidos y artefactos válidos preservados.
+
+\section{Modelo de estado}
+
+\subsection{Estados del run}
+
+Cada run pertenece exactamente a uno de los siguientes estados:
+
+\begin{itemize}
+    \item \texttt{created}
+    \item \texttt{running}
+    \item \texttt{success}
+    \item \texttt{failed}
+    \item \texttt{aborted}
+    \item \texttt{partial}
+\end{itemize}
+
+\noindent
+Semántica:
+
+\begin{itemize}
+    \item \texttt{success}: todas las etapas requeridas finalizaron correctamente.
+    \item \texttt{failed}: al menos una etapa crítica falló sin recuperación válida.
+    \item \texttt{aborted}: la ejecución se detuvo por decisión explícita de política o preflight.
+    \item \texttt{partial}: ejecución cerrada deliberadamente con un subconjunto permitido de etapas.
+\end{itemize}
+
+\subsection{Estados de etapa}
+
+Cada etapa \(s \in V\) debe pertenecer exactamente a uno de:
+
+\begin{itemize}
+    \item \texttt{pending}
+    \item \texttt{ready}
+    \item \texttt{running}
+    \item \texttt{success}
+    \item \texttt{failed}
+    \item \texttt{skipped}
+    \item \texttt{blocked}
+\end{itemize}
+
+\noindent
+Invariantes mínimos:
+
+\begin{enumerate}
+    \item una etapa no puede pasar a \texttt{running} si alguna dependencia sigue en \texttt{pending}, \texttt{ready}, \texttt{running}, \texttt{failed} o \texttt{blocked};
+    \item \texttt{success} es terminal;
+    \item \texttt{failed} es terminal salvo relanzamiento explícito de la etapa;
+    \item \texttt{skipped} sólo es válido si la política del pipeline lo permite y la razón queda persistida;
+    \item \texttt{blocked} indica imposibilidad de ejecución por fallo ascendente.
+\end{enumerate}
+
+\section{Idempotencia y claves de ejecución}
+
+La identidad lógica de un run debe quedar determinada por una clave del tipo:
+
+\[
+\texttt{run\_key} = H(\texttt{execution\_date},\ \texttt{run\_mode},\ \texttt{config\_version},\ \texttt{code\_version})
+\]
+
+donde \(H\) es una función hash estable. Esta clave no sustituye al \texttt{run\_id}, pero sí define la compatibilidad lógica entre reejecuciones.
+
+Además, cada etapa debe tener su propia clave idempotente:
+
+\[
+\texttt{step\_key}(s) = H(\texttt{run\_key},\ s,\ \texttt{upstream\_fingerprint})
+\]
+
+Esto impone dos propiedades esenciales:
+
+\begin{itemize}
+    \item relanzar el pipeline completo no debe reescribir artefactos de una etapa ya confirmada si su \texttt{step\_key} no ha cambiado;
+    \item relanzar una etapa concreta invalida únicamente su subárbol descendente si los contratos de dependencia así lo exigen.
+\end{itemize}
+
+\section{Plan de ejecución y dependencias}
+
+El pipeline debe construir un DAG explícito y validarlo antes de iniciar la ejecución. Las comprobaciones mínimas del plan son:
+
+\begin{enumerate}
+    \item ausencia de ciclos;
+    \item unicidad de nombres de etapa;
+    \item existencia de implementación para cada etapa declarada;
+    \item validez de dependencias;
+    \item coherencia entre etapas seleccionadas y cierre transitivo de dependencias.
+\end{enumerate}
+
+Un orden topológico válido puede definirse como una permutación \((v_1,\dots,v_n)\) tal que:
+\[
+(v_i,v_j)\in E \Rightarrow i<j.
+\]
+
+Este orden no obliga a serializar toda la ejecución: las etapas sin dependencia mutua pueden ejecutarse en paralelo si comparten un presupuesto de recursos compatible.
+
+\section{Política de ejecución}
+
+\subsection{Clasificación de errores}
+
+La política de errores debe distinguir al menos entre:
+
+\begin{itemize}
+    \item \textbf{errores transitorios}: timeouts, rate limits, indisponibilidad temporal de red, bloqueo efímero de recurso;
+    \item \textbf{errores permanentes}: contrato inválido, input corrupto, inconsistencia semántica, credenciales inexistentes, bug determinista reproducible;
+    \item \textbf{errores de gate}: datos insuficientes, salud deficiente, preflight fallido, restricción de mercado o calendario.
+\end{itemize}
+
+Sólo los errores transitorios son candidatos naturales a reintento automático.
+
+\subsection{Reintentos}
+
+Si una etapa falla con error transitorio, la espera entre intentos debe seguir una política de \textit{exponential backoff} acotado:
+
+\[
+B_k = \min(B_{\max}, B_0 \gamma^k), \qquad k = 0,\dots,R-1
+\]
+
+donde \(R\) es el máximo de reintentos, \(B_0\) la espera base y \(\gamma > 1\) el factor de crecimiento.
+
+Toda política de retry debe registrar:
+
+\begin{itemize}
+    \item tipo de excepción,
+    \item intento actual,
+    \item tiempo de espera aplicado,
+    \item y causa final de éxito o agotamiento.
+\end{itemize}
+
+\subsection{Timeouts}
+
+Cada etapa debe declarar un \texttt{timeout\_seconds}. Si el tiempo efectivo excede dicho umbral, la etapa debe marcarse como \texttt{failed} por timeout y ejecutar su lógica de limpieza segura.
+
+\section{Persistencia de estado}
+
+El pipeline debe persistir estado a dos niveles:
+
+\subsection{Nivel run}
+
+Campos mínimos recomendados:
+
+\begin{lstlisting}[language=Python]
+@dataclass
+class RunRecord:
+    run_id: str
+    run_key: str
+    execution_date: str
+    run_mode: str
+    status: str
+    created_at: str
+    started_at: str | None
+    ended_at: str | None
+    config_version: str
+    code_version: str
+    fail_fast: bool
+\end{lstlisting}
+
+\subsection{Nivel etapa}
+
+Campos mínimos recomendados:
+
+\begin{lstlisting}[language=Python]
+@dataclass
+class StepRecord:
+    run_id: str
+    step_name: str
+    step_key: str
+    status: str
+    attempt: int
+    started_at: str | None
+    ended_at: str | None
+    input_fingerprint: str
+    output_fingerprint: str | None
+    error_type: str | None
+    error_message: str | None
+\end{lstlisting}
+
+La persistencia debe ser \textbf{atómica}: una transición de estado no puede dejar registros intermedios ambiguos. Si una etapa produce artefactos, la confirmación del estado \texttt{success} sólo puede ocurrir tras verificar que esos artefactos están completos y accesibles.
+
+\section{Semántica de reanudación}
+
+La reanudación debe apoyarse en los estados persistidos y obedecer estas reglas:
+
+\begin{enumerate}
+    \item una etapa en \texttt{success} con \texttt{step\_key} compatible no se reejecuta;
+    \item una etapa en \texttt{running} procedente de un proceso interrumpido se trata como \texttt{failed} recuperable hasta reconciliación;
+    \item una etapa en \texttt{failed} puede reintentarse manualmente o por política;
+    \item cualquier cambio en configuración efectiva, versión de código o huella upstream invalida la compatibilidad.
+\end{enumerate}
+
+En particular, \textbf{reanudación} no significa continuar ciegamente desde el último nombre de etapa, sino reconstruir el plan y reconciliarlo con el estado persistido.
+
+\section{Preflight y postflight}
+
+\subsection{Preflight}
+
+Antes de lanzar la primera etapa, el pipeline debe verificar, como mínimo:
+
+\begin{itemize}
+    \item disponibilidad del almacén de estado;
+    \item accesibilidad de fuentes críticas;
+    \item existencia de credenciales requeridas;
+    \item validez sintáctica y semántica de la configuración;
+    \item calendario y ventana operativa válidos para \texttt{execution\_date};
+    \item espacio, permisos y rutas de artefactos.
+\end{itemize}
+
+Si un chequeo de preflight crítico falla, el run debe marcarse \texttt{aborted} y no pasar a \texttt{running}.
+
+\subsection{Postflight}
+
+Al finalizar, el pipeline debe ejecutar conciliaciones mínimas:
+
+\begin{itemize}
+    \item consistencia entre estados de etapas y estado global del run;
+    \item presencia de artefactos obligatorios;
+    \item métricas agregadas de duración, intentos y fallos;
+    \item emisión del resumen final;
+    \item publicación de eventos a la capa de monitorización.
+\end{itemize}
+
+\section{Paralelización y control de recursos}
+
+La paralelización sólo es admisible si:
+
+\begin{enumerate}
+    \item las etapas no comparten dependencia directa;
+    \item el acceso a recursos compartidos está serializado o protegido;
+    \item la concurrencia máxima queda fijada por configuración;
+    \item el orden de publicación de estados sigue siendo consistente.
+\end{enumerate}
+
+Formalmente, dos etapas \(u,v\) son ejecutables en paralelo si no existe camino dirigido \(u \leadsto v\) ni \(v \leadsto u\), y si su vector de recursos no viola el presupuesto global.
+
+\section{Integración con monitorización}
+
+El pipeline debe emitir eventos normalizados hacia \texttt{ops/monitoring.py}. Cada evento debe contener al menos:
+
+\begin{itemize}
+    \item \texttt{event\_type},
+    \item \texttt{run\_id},
+    \item \texttt{step\_name} si aplica,
+    \item \texttt{severity},
+    \item \texttt{timestamp},
+    \item \texttt{payload}.
+\end{itemize}
+
+Eventos mínimos:
+
+\begin{itemize}
+    \item \texttt{run\_started}
+    \item \texttt{run\_finished}
+    \item \texttt{step\_started}
+    \item \texttt{step\_succeeded}
+    \item \texttt{step\_failed}
+    \item \texttt{retry\_scheduled}
+    \item \texttt{preflight\_failed}
+    \item \texttt{postflight\_warning}
+\end{itemize}
+
+El módulo de pipeline no decide el canal final de alerta; su obligación es producir eventos completos, estructurados y suficientemente informativos.
+
+\section{Interfaz recomendada}
+
 \begin{lstlisting}[language=Python]
 @dataclass
 class PipelineConfig:
-    run_mode: Literal['daily', 'retrain']
+    run_mode: str
     fail_fast: bool = True
     max_retries: int = 3
+    max_parallel_steps: int = 1
+    retry_base_seconds: int = 5
+    retry_backoff_factor: float = 2.0
+    timeout_seconds_default: int = 1800
+    resume: bool = True
+
+@dataclass
+class PipelineContext:
+    run_id: str
+    run_key: str
+    execution_date: str
+    config: PipelineConfig
+    code_version: str
 \end{lstlisting}
 
-\textbf{Flujo Interno} (pseudocódigo optimizado):
+\section{Pseudocódigo de referencia}
+
 \begin{lstlisting}[language=Python]
-def main(config_path, exec_date, run_id):
-    cfg = load_config(config_path)
-    plan = build_dag(plan_yaml)  # NetworkX DiGraph
-    context = PipelineContext(run_id, exec_date)
-    
-    preflight_ok = run_preflight(context)  # Disk, creds, market open
-    if not preflight_ok: raise PipelineAbort
-    
-    for step in topological_sort(plan):
-        for attempt in range(cfg.max_retries):
+def main(config_path: str, execution_date: str, run_id: str | None = None):
+    cfg = load_and_validate_config(config_path)
+    ctx = build_context(cfg, execution_date, run_id)
+
+    plan = build_execution_plan(cfg, ctx)
+    validate_plan(plan)
+
+    create_run_record(ctx, status="created")
+
+    if not run_preflight(ctx, plan):
+        close_run(ctx, status="aborted")
+        emit_event("preflight_failed", ctx)
+        return
+
+    mark_run_running(ctx)
+    emit_event("run_started", ctx)
+
+    for step in scheduler(plan, ctx):
+        deps = get_dependencies(step, plan)
+        if not dependencies_satisfied(step, deps, ctx):
+            mark_step_blocked(step, ctx)
+            continue
+
+        if is_step_reusable(step, ctx):
+            mark_step_success_reused(step, ctx)
+            continue
+
+        mark_step_running(step, ctx)
+        emit_event("step_started", ctx, step)
+
+        for attempt in range(cfg.max_retries + 1):
             try:
-                output = execute_step(step, context)
-                persist_state(step, 'success', output)
+                output = execute_step(step, ctx)
+                validate_step_output(step, output, ctx)
+                persist_step_artifacts(step, output, ctx)
+                mark_step_success(step, ctx, output)
+                emit_event("step_succeeded", ctx, step)
                 break
-            except TransientError:
-                backoff_sleep(2**attempt)
-        else:
-            persist_state(step, 'fail')
-            if cfg.fail_fast: propagate_fail(step)
-    
-    postflight = run_postflight(context)  # Coherencia global
-    emit_summary(run_id, postflight.metrics)
+
+            except TransientError as exc:
+                if attempt == cfg.max_retries:
+                    mark_step_failed(step, ctx, exc)
+                    emit_event("step_failed", ctx, step, exc)
+                    if cfg.fail_fast and is_critical(step):
+                        close_run(ctx, status="failed")
+                        emit_event("run_finished", ctx)
+                        return
+                else:
+                    schedule_retry(step, ctx, attempt, exc)
+                    emit_event("retry_scheduled", ctx, step, exc)
+
+            except Exception as exc:
+                mark_step_failed(step, ctx, exc)
+                emit_event("step_failed", ctx, step, exc)
+                if cfg.fail_fast and is_critical(step):
+                    close_run(ctx, status="failed")
+                    emit_event("run_finished", ctx)
+                    return
+                break
+
+    final_status = reconcile_run_status(ctx, plan)
+    run_postflight(ctx, plan, final_status)
+    close_run(ctx, status=final_status)
+    emit_event("run_finished", ctx)
 \end{lstlisting}
 
-\textbf{Downstream Integración}: Llama ops/monitoring.py para Prometheus metrics: pipeline\_success\_flag, total\_duration.
+\section{Casos límite que el módulo debe resolver}
 
-\section{Backtest Ultra-Optimizado (Extensión SOTA)}
-Integra Backtesting.py [web:51] en final step para validación quick:
-\begin{lstlisting}[language=Python]
-from backtesting import Backtest, Strategy
-class SwingQuantStrat(Strategy):
-    def init(self):
-        self.ma = self.I(SMA, self.data.Close, 10)
-    def next(self):
-        if self.data.Close[-1] > self.ma[-1]: self.buy()
+\begin{enumerate}
+    \item \textbf{Caída del proceso tras persistir artefactos pero antes de marcar \texttt{success}}: el sistema debe reconciliar artefactos y estado al reanudar.
+    \item \textbf{Cambio de configuración entre un fallo y una reanudación}: la compatibilidad debe invalidarse.
+    \item \textbf{Fuente de datos disponible pero incompleta}: la etapa debe fallar por contrato, no por excepción genérica.
+    \item \textbf{Dependencia opcional no crítica}: puede derivar en \texttt{skipped}, nunca en éxito implícito.
+    \item \textbf{Reejecución manual de una etapa con descendientes ya confirmados}: deben invalidarse los descendientes afectados.
+    \item \textbf{Dos procesos intentando ejecutar el mismo \texttt{run\_key}}: debe existir mecanismo de exclusión o bloqueo lógico.
+\end{enumerate}
 
-bt = Backtest(data, SwingQuantStrat, cash=1e6)
-stats = bt.run()  # Sharpe, Win Rate, etc.
-assert stats['Sharpe Ratio'] > 2.0  # Gate
-\end{lstlisting}
+\section{Criterios mínimos de aceptación}
 
-Añade slippage: $P_{exec} = P_{mid} \pm 0.5 \cdot \sigma \sqrt{V}$, costs modelados. Walk-forward para evitar lookahead bias [web:49].
+El módulo no debe considerarse correcto sin pruebas que verifiquen:
 
-| Métrica | Umbral Industrial | Fórmula |
-|---------|-------------------|---------|
-| Sharpe | >2.0 | $\frac{E[R_p - R_f]}{\sigma_p}$ |
-| Max DD | <15\% | $\min \frac{P_t - P_{peak}}{P_{peak}}$ |
-| Win Rate | >55\% | $\frac{\#wins}{\#trades}$ [web:46]
+\begin{enumerate}
+    \item construcción y validación de DAG sin ciclos;
+    \item orden topológico correcto;
+    \item idempotencia por run y por etapa;
+    \item persistencia atómica de estados;
+    \item reintentos sólo sobre errores transitorios;
+    \item respeto de \texttt{timeouts};
+    \item reanudación tras caída parcial;
+    \item invalidación correcta cuando cambia la huella upstream;
+    \item emisión de eventos de monitorización;
+    \item conciliación final entre estados de etapa y estado global.
+\end{enumerate}
 
-\section{Conclusiones y Optimizaciones Industriales}
-Este pipeline habilita swing trading reproducible como en hedge funds (Renaissance-style). Mejoras: Dockerize para cloud (Airflow/K8s), MLflow para artifacts, drift detection con KS-test $D = \sup |F_1 - F_2|$ [web:54].
+\section{Conclusión}
 
-Riesgos mitigados: override auditado vía Git commits. ¡Listo para prod ultra-rentable!
-
-\bibliographystyle{plain}
-\begin{thebibliography}{9}
-\bibitem{web44} StockFormer arXiv:2401.06139.
-\bibitem{web51} Backtesting.py GitHub.
-% Añade más refs
-\end{thebibliography}
+\texttt{ops/daily\_pipeline.py} no es un módulo de investigación ni un módulo de estrategia; es una pieza de infraestructura crítica. Su calidad no debe medirse por métricas de rentabilidad, sino por la robustez con la que convierte un conjunto de etapas heterogéneas en una ejecución diaria \textbf{determinista, reanudable, auditable y segura}. Una implementación sólida de este contrato reduce riesgo operativo, mejora trazabilidad y permite que la lógica cuantitativa evolucione sin comprometer la disciplina de producción.
 
 \end{document}
 % --- FIN PARA COPIAR Y PEGAR EN .txt ---

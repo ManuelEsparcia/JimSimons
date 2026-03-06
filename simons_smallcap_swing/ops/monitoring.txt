@@ -8,114 +8,510 @@
 \usepackage{listings}
 \usepackage{booktabs}
 \usepackage{float}
+\usepackage[a4paper,margin=2.5cm]{geometry}
 
-\title{Explicación Avanzada: ops/monitoring.py \\ Monitoreo Centralizado Industrial para Swing Trading Quant}
-\author{Perplexity AI - Nivel Research Quant Finance}
-\date{5 de marzo de 2026}
+\title{Especificación Técnica: ops/monitoring.py\\
+Sistema Centralizado de Eventos, Alertas y Escalado para un Entorno de Swing Trading Cuantitativo}
+\author{Documento de especificación operativa}
+\date{6 de marzo de 2026}
 
 \begin{document}
 \maketitle
 
-\section{Introducción y Contexto Estratégico}
-Monitoreo unifica signals de pipeline/data/drift/risk para MTTR<1h, esencial en swing donde delays cuestan $\Delta P = \sigma \sqrt{\Delta t}$ (vol drag). Taxonomía accionable mantiene uptime>99.5\%, alpha preservado [web:47][web:49].
+\section{Propósito del módulo}
 
-Integra upstream (daily\_pipeline, data\_health) $\to$ downstream (Slack/email), como Prometheus+Grafana en hedge funds.
+\texttt{ops/monitoring.py} es el subsistema encargado de consolidar eventos operativos procedentes de los distintos componentes del sistema, clasificarlos bajo una taxonomía común, derivar alertas accionables, aplicar políticas de deduplicación y supresión, persistir el estado resultante y despachar notificaciones a los canales configurados.
 
-\section{Matemáticas Fundamentales del Monitoreo}
-\textbf{SLA Breach}: $B = \max(0, T_{actual} - T_{SLA})$, alert si $B > \tau$.
+El módulo no ejecuta lógica de trading, no corrige fallos upstream y no sustituye a los sistemas de observabilidad de infraestructura. Su responsabilidad es transformar señales dispersas de ejecución, calidad de datos, drift, riesgo y validación en un \textbf{plano unificado de monitorización} con semántica estable y gobernanza explícita.
 
-\textbf{Alert Severity Score}: $S = w_p P_f + w_d D + w_r R_{dd} + w_m M_{drift}$, $\sum w=1$, e.g., $w_r=0.4$ (risk domina).
+En términos funcionales, el flujo del módulo es:
 
-\textbf{Drawdown Alert}: $DD_t = \max(0, 1 - \frac{P_t}{P^*})$, $P^*=\max P$, critical si $DD>10\%$.
+\[
+\texttt{ingest} \rightarrow \texttt{normalize} \rightarrow \texttt{classify} \rightarrow \texttt{dedupe} \rightarrow \texttt{escalate} \rightarrow \texttt{dispatch} \rightarrow \texttt{persist}.
+\]
 
-\textbf{MTTR Proxy}: $MTTR = \frac{\sum t_{close} - t_{open}}{N_{critical}}$, optimizar <30min.
+\section{Objetivos operativos}
 
-Dedupe: Jaccard similarity $J(A,B) = \frac{|A\cap B|}{|A\cup B|} > 0.8 \implies$ merge.
+El módulo debe satisfacer simultáneamente los siguientes objetivos:
 
-\section{Papers y Estado del Arte}
+\begin{enumerate}
+    \item \textbf{Unificación}: normalizar eventos heterogéneos bajo un esquema canónico.
+    \item \textbf{Accionabilidad}: cada alerta debe tener severidad, contexto y acción sugerida.
+    \item \textbf{No redundancia}: eventos equivalentes no deben producir tormentas de alertas.
+    \item \textbf{Auditabilidad}: toda alerta emitida, suprimida, fusionada o cerrada debe quedar persistida.
+    \item \textbf{Trazabilidad temporal}: debe poder reconstruirse qué ocurrió, cuándo ocurrió y cómo evolucionó una alerta.
+    \item \textbf{Separación de responsabilidades}: upstream produce eventos; monitoring decide alertas; canales externos sólo notifican.
+\end{enumerate}
+
+\section{Posición en la arquitectura}
+
+\texttt{ops/monitoring.py} consume eventos emitidos por módulos tales como:
+
 \begin{itemize}
-\item StockFormer (2024) [web:44]: Monitoring en inference drift.
-\item Swing Opt (2023) [web:47]: Risk alerts en allocation.
-\item LSTM Swing (2022) [web:54]: Perf degradation signals.
-\item Monitoring ML Systems (NeurIPS 2021): Throttling en alert storms.
+    \item \texttt{ops/daily\_pipeline.py},
+    \item \texttt{ops/data\_health.py},
+    \item \texttt{ops/drift\_detection.py},
+    \item módulos de riesgo,
+    \item módulos de validación o reconciliación,
+    \item y, opcionalmente, componentes de infraestructura si su integración está tipada.
 \end{itemize}
 
-\section{Libros Industriales Recomendados}
-- \textit{Advances in Financial ML} (López de Prado) [web:49]: Bet sizing alerts.
-- \textit{Hands-On ML for Algo Trading} (Stefan Jansen): Ops monitoring.
-- \textit{Quantitative Trading} (Chan): SLA en prod.
+El módulo produce como salidas:
 
-\section{Análisis Detallado del Espec (Taxonomía y Flujo)}
-Agrega 5+ fuentes a snapshot unificado.
+\begin{itemize}
+    \item alertas normalizadas,
+    \item snapshots de estado,
+    \item métricas agregadas de monitorización,
+    \item y notificaciones enviadas a canales configurados.
+\end{itemize}
 
-\textbf{Flujo Pseudocódigo Optimizado}:
+\section{Contrato de entrada: evento canónico}
+
+La monitorización no debe operar sobre logs libres o cadenas ad hoc. Todo evento debe convertirse a un esquema canónico. La estructura mínima recomendada es:
+
 \begin{lstlisting}[language=Python]
-def main(config_path, run_id, exec_date):
-    cfg = load_config(config_path)
-    sources = {
-        'pipeline': load_json(f'ops/runs/{run_id}/summary.json'),
-        'data_health': load_parquet(f'ops/data_health/{run_id}/summary.parquet'),
-        # + drift, risk, validation
-    }
-    
-    events = normalize_events(sources)
-    alerts = []
-    for event in events:
-        severity = score_severity(event, cfg.rules)  # 'critical' if DD>10%
-        alert = {'id': uuid(), 'type': event['type'], 'severity': severity,
-                 'action': recommend_action(severity, event)}
-        if not dedupe(alert, recent_alerts):  # Jaccard >0.8
-            alerts.append(alert)
-            dispatch_notification(alert, cfg.channels)
-    
-    snapshot = {'alerts': alerts, 'sla_breaches': compute_sla(sources)}
-    persist_parquet(snapshot, run_id)
+@dataclass
+class CanonicalEvent:
+    event_id: str
+    event_type: str
+    source: str
+    source_run_id: str | None
+    source_step: str | None
+    entity_type: str | None
+    entity_id: str | None
+    severity_hint: str | None
+    timestamp: str
+    status: str | None
+    payload: dict
+\end{lstlisting}
+
+Campos mínimos obligatorios:
+
+\begin{itemize}
+    \item \texttt{event\_type}: tipo semántico del evento.
+    \item \texttt{source}: productor del evento.
+    \item \texttt{timestamp}: instante de observación.
+    \item \texttt{payload}: contenido estructurado.
+\end{itemize}
+
+Ejemplos de \texttt{event\_type} válidos:
+
+\begin{itemize}
+    \item \texttt{run\_started},
+    \item \texttt{run\_finished},
+    \item \texttt{step\_failed},
+    \item \texttt{data\_health\_failed},
+    \item \texttt{drift\_warn},
+    \item \texttt{risk\_limit\_breach},
+    \item \texttt{validation\_mismatch}.
+\end{itemize}
+
+\section{Taxonomía de alertas}
+
+El módulo debe mapear eventos a una taxonomía de alertas estable. Una clasificación mínima útil es:
+
+\begin{itemize}
+    \item \textbf{Pipeline}: fallos de etapas, abortos, timeouts, retries agotados, incumplimiento de SLA.
+    \item \textbf{Data}: freshness fail, schema fail, completitud insuficiente, corrupción o inconsistencia temporal.
+    \item \textbf{Model}: drift relevante, fallo de promoción, ausencia de artefactos, inconsistencia entre versiones.
+    \item \textbf{Risk}: breaches de límites, drawdown anómalo, exposición fuera de contrato, capacidad degradada.
+    \item \textbf{Validation}: diferencias entre outputs esperados y observados, reconciliaciones fallidas, invariantes violados.
+    \item \textbf{Infra/Ops}: almacenamiento inaccesible, credenciales inválidas, cola saturada, canal de dispatch caído.
+\end{itemize}
+
+La taxonomía no debe definirse como una lista abierta y arbitraria. Cada tipo debe tener:
+
+\begin{itemize}
+    \item nombre canónico,
+    \item descripción,
+    \item severidad por defecto,
+    \item clave de deduplicación,
+    \item política de supresión,
+    \item política de escalado,
+    \item acción recomendada.
+\end{itemize}
+
+\section{Severidad y prioridad}
+
+\subsection{Estados discretos}
+
+Toda alerta debe clasificarse al menos en uno de los siguientes niveles:
+
+\begin{itemize}
+    \item \texttt{info}
+    \item \texttt{warning}
+    \item \texttt{high}
+    \item \texttt{critical}
+\end{itemize}
+
+Esta severidad puede derivarse de reglas deterministas sobre el evento o de una función de scoring gobernada.
+
+\subsection{Score interno de severidad}
+
+Si se usa un score continuo, éste debe ser interpretable y no sustituir a la regla contractual. Sea un vector de señales operativas:
+
+\[
+\mathbf{z} = (z_1, z_2, \dots, z_m),
+\]
+
+donde cada componente puede reflejar, por ejemplo, impacto, duración, criticidad del activo afectado, recurrencia o relación con riesgo. Un score interno puede escribirse como:
+
+\[
+S = \sum_{k=1}^{m} w_k z_k,
+\qquad
+\sum_{k=1}^{m} w_k = 1.
+\]
+
+La severidad discreta se deriva entonces mediante umbrales:
+
+\[
+\texttt{severity}=
+\begin{cases}
+\texttt{critical} & \text{si } S \ge \theta_{\texttt{critical}},\\
+\texttt{high} & \text{si } \theta_{\texttt{high}} \le S < \theta_{\texttt{critical}},\\
+\texttt{warning} & \text{si } \theta_{\texttt{warning}} \le S < \theta_{\texttt{high}},\\
+\texttt{info} & \text{en otro caso.}
+\end{cases}
+\]
+
+Sin embargo, si una regla contractual marca un evento como \texttt{hard-critical}, la clasificación debe ser \texttt{critical} aunque el score sea moderado.
+
+\section{SLA y SLO de monitorización}
+
+El módulo debe soportar tanto medición de incumplimientos temporales como trazado de la capacidad de respuesta operativa.
+
+\subsection{SLA breach}
+
+Para una etapa o proceso con tiempo esperado \(T_{\text{SLA}}\) y tiempo observado \(T_{\text{actual}}\), la brecha operativa puede expresarse como:
+
+\[
+B = \max(0, T_{\text{actual}} - T_{\text{SLA}}).
+\]
+
+Una alerta de SLA debe dispararse si:
+
+\[
+B > \tau_B,
+\]
+
+donde \(\tau_B\) depende del contrato del proceso monitorizado.
+
+\subsection{Tiempos de respuesta del sistema de alertas}
+
+A nivel de monitorización, deben medirse al menos:
+
+\begin{itemize}
+    \item tiempo desde evento a alerta creada,
+    \item tiempo desde alerta creada a alerta despachada,
+    \item tiempo desde alerta abierta a alerta reconocida,
+    \item tiempo desde alerta abierta a alerta cerrada.
+\end{itemize}
+
+El proxy clásico de resolución media puede definirse como:
+
+\[
+\mathrm{MTTR} = \frac{1}{N_{\text{closed}}}
+\sum_{i=1}^{N_{\text{closed}}}
+\left(t^{(i)}_{\text{closed}} - t^{(i)}_{\text{opened}}\right).
+\]
+
+El módulo no debe prometer objetivos de MTTR por sí mismo, pero sí debe medirlos con precisión.
+
+\section{Deduplicación y supresión}
+
+\subsection{Motivación}
+
+Uno de los principales fallos de diseño en sistemas de monitorización es la tormenta de alertas. El módulo debe evitar que múltiples eventos equivalentes generen ruido operativo desproporcionado.
+
+\subsection{Clave de deduplicación}
+
+Toda alerta debe definir una \texttt{dedupe\_key} canónica. Una forma general es:
+
+\[
+\texttt{dedupe\_key} = H(\texttt{alert\_type},\ \texttt{source},\ \texttt{entity\_id},\ \texttt{root\_cause\_signature})
+\]
+
+donde \(H\) es un hash estable.
+
+La deduplicación no debe depender de heurísticas difusas cuando exista una firma causal explícita.
+
+\subsection{Ventana de supresión}
+
+Sea \(\Delta_{\text{sup}}\) la ventana de supresión. Si una nueva alerta \(a_t\) comparte \texttt{dedupe\_key} con una alerta abierta o recién emitida dentro de esa ventana, entonces debe:
+
+\begin{itemize}
+    \item fusionarse,
+    \item incrementar un contador de recurrencia,
+    \item actualizar el último timestamp observado,
+    \item y evitar un nuevo dispatch salvo política de re-escalado.
+\end{itemize}
+
+\subsection{Similitud aproximada}
+
+Sólo si el contrato lo exige, pueden añadirse mecanismos de similitud aproximada sobre payloads o mensajes. Tales mecanismos deben ser auxiliares y nunca sustituir la clave canónica cuando ésta existe.
+
+\section{Ciclo de vida de una alerta}
+
+Toda alerta debe transitar por estados explícitos. Un ciclo de vida mínimo es:
+
+\begin{itemize}
+    \item \texttt{open}
+    \item \texttt{acknowledged}
+    \item \texttt{suppressed}
+    \item \texttt{resolved}
+    \item \texttt{closed}
+\end{itemize}
+
+Semántica:
+
+\begin{itemize}
+    \item \texttt{open}: alerta creada y activa.
+    \item \texttt{acknowledged}: existe constancia de revisión humana o automática.
+    \item \texttt{suppressed}: alerta no reenviada por política de deduplicación o silencio temporal.
+    \item \texttt{resolved}: la causa observada ha cesado o ha sido remediada.
+    \item \texttt{closed}: estado terminal persistido tras conciliación.
+\end{itemize}
+
+Una alerta no debe desaparecer sin dejar rastro; debe cerrarse explícitamente.
+
+\section{Escalado}
+
+Cada tipo de alerta debe tener una política de escalado. El escalado puede depender de:
+
+\begin{itemize}
+    \item severidad,
+    \item criticidad de la entidad afectada,
+    \item persistencia temporal,
+    \item número de recurrencias,
+    \item horario o ventana operativa,
+    \item fallo de un canal de dispatch primario.
+\end{itemize}
+
+Formalmente, una condición de escalado puede expresarse como:
+
+\[
+E(a_t)=1
+\iff
+\big(\texttt{severity}(a_t)\ge \theta_s\big)
+\lor
+\big(n_{\text{recur}}(a_t)\ge \theta_n\big)
+\lor
+\big(\Delta t_{\text{open}}(a_t)\ge \theta_t\big).
+\]
+
+Si \(E(a_t)=1\), la alerta debe promoverse a un canal superior o aumentar su prioridad efectiva.
+
+\section{Dispatch a canales}
+
+El módulo debe separar la creación de la alerta del envío a canales externos. Canales posibles:
+
+\begin{itemize}
+    \item \texttt{log}/almacén interno,
+    \item email,
+    \item Slack,
+    \item webhooks,
+    \item sistemas de incident management.
+\end{itemize}
+
+Toda política de dispatch debe responder a:
+
+\begin{itemize}
+    \item qué severidades envían a qué canales,
+    \item qué canales son sincrónicos o asíncronos,
+    \item qué hacer si un canal falla,
+    \item y cuándo reintentar o degradar a un canal alternativo.
+\end{itemize}
+
+Un fallo de dispatch no debe perder la alerta; debe persistirse como incidente del canal.
+
+\section{Persistencia y snapshot de monitorización}
+
+El módulo debe persistir tanto alertas unitarias como snapshots agregados del estado del sistema.
+
+\subsection{Contrato mínimo de alerta}
+
+\begin{lstlisting}[language=Python]
+@dataclass
+class AlertRecord:
+    alert_id: str
+    alert_type: str
+    source: str
+    source_run_id: str | None
+    dedupe_key: str
+    severity: str
+    status: str
+    opened_at: str
+    updated_at: str
+    closed_at: str | None
+    recurrence_count: int
+    action_hint: str | None
+    payload: dict
+\end{lstlisting}
+
+\subsection{Contrato mínimo de snapshot}
+
+\begin{lstlisting}[language=Python]
+@dataclass
+class MonitoringSnapshot:
+    run_id: str
+    execution_date: str
+    total_events: int
+    total_alerts_open: int
+    total_alerts_dispatched: int
+    total_alerts_suppressed: int
+    by_severity: dict
+    by_type: dict
+    sla_breaches: list[dict]
+    created_at: str
+\end{lstlisting}
+
+\section{Integración con módulos upstream}
+
+\subsection{Integración con daily\_pipeline}
+
+Debe poder transformar eventos como:
+
+\begin{itemize}
+    \item \texttt{run\_started},
+    \item \texttt{step\_failed},
+    \item \texttt{retry\_scheduled},
+    \item \texttt{preflight\_failed},
+    \item \texttt{run\_finished}
+\end{itemize}
+
+en alertas tipadas de ejecución.
+
+\subsection{Integración con data\_health}
+
+Debe consumir gates y checks relevantes para producir alertas como:
+
+\begin{itemize}
+    \item \texttt{data\_critical\_fail},
+    \item \texttt{data\_warning},
+    \item \texttt{contract\_violation}.
+\end{itemize}
+
+\subsection{Integración con drift\_detection}
+
+Debe distinguir entre:
+
+\begin{itemize}
+    \item drift informativo,
+    \item drift relevante no bloqueante,
+    \item drift crítico con acción requerida.
+\end{itemize}
+
+El módulo de monitorización no decide por sí mismo un reentrenamiento; como máximo dispara una alerta con \texttt{action\_hint} apropiado.
+
+\section{Métricas internas del propio módulo}
+
+Un sistema de monitorización serio también debe monitorizarse a sí mismo. Deben medirse al menos:
+
+\begin{itemize}
+    \item tasa de eventos ingeridos por unidad de tiempo,
+    \item tasa de alertas emitidas por unidad de tiempo,
+    \item ratio de supresión,
+    \item latencia media y percentiles de dispatch,
+    \item porcentaje de fallos de canal,
+    \item backlog de alertas abiertas.
+\end{itemize}
+
+Estas métricas permiten detectar tanto ruido excesivo como ceguera operativa.
+
+\section{Pseudocódigo de referencia}
+
+\begin{lstlisting}[language=Python]
+def main(config_path: str, run_id: str, execution_date: str):
+    cfg = load_and_validate_config(config_path)
+
+    raw_sources = load_monitoring_sources(cfg, run_id, execution_date)
+    raw_events = collect_events(raw_sources)
+
+    canonical_events = []
+    for raw_event in raw_events:
+        canonical_events.append(normalize_event(raw_event, cfg))
+
+    validate_event_schema(canonical_events)
+
+    candidate_alerts = []
+    for event in canonical_events:
+        alert_type = classify_event(event, cfg.rules)
+        severity = derive_severity(event, alert_type, cfg.rules)
+        action_hint = derive_action_hint(event, alert_type, severity, cfg.rules)
+
+        candidate_alerts.append(
+            build_alert_candidate(
+                event=event,
+                alert_type=alert_type,
+                severity=severity,
+                action_hint=action_hint
+            )
+        )
+
+    recent_alerts = load_recent_alerts(cfg)
+    final_alerts = []
+
+    for candidate in candidate_alerts:
+        match = find_dedup_match(candidate, recent_alerts, cfg)
+        if match is not None and should_suppress(candidate, match, cfg):
+            persist_suppressed_alert(candidate, match, cfg)
+            continue
+
+        alert = open_or_update_alert(candidate, match, cfg)
+
+        if should_escalate(alert, cfg):
+            escalate_alert(alert, cfg)
+
+        dispatch_results = dispatch_alert(alert, cfg.channels)
+        persist_dispatch_results(alert, dispatch_results, cfg)
+
+        final_alerts.append(alert)
+
+    snapshot = build_monitoring_snapshot(
+        run_id=run_id,
+        execution_date=execution_date,
+        events=canonical_events,
+        alerts=final_alerts,
+        cfg=cfg
+    )
+
+    persist_snapshot(snapshot, cfg)
     return snapshot
 \end{lstlisting}
 
-\textbf{Taxonomía}: 20+ alert types, e.g., RISK\_DD\_KILL="critical".
+\section{Casos límite que el módulo debe resolver}
 
-\section{Backtest Ultra-Optimizado con Monitoring}
-Simula alerts en historical runs:
-\begin{lstlisting}[language=Python]
-def monitored_bt(data, strategy):
-    bt = Backtest(data, strategy)
-    stats = bt.run()
-    alerts = []
-    if stats['Max. Drawdown [%]'] > 15:
-        alerts.append({'type': 'DD_BREACH', 'severity': 'critical'})
-    # Throttle: max 5/min
-    return stats, alerts_filtered(alerts)
-\end{lstlisting}
+\begin{enumerate}
+    \item \textbf{Múltiples eventos del mismo fallo raíz}: deben fusionarse correctamente.
+    \item \textbf{Fallo simultáneo de canal de notificación}: la alerta debe persistirse aunque no pueda enviarse.
+    \item \textbf{Alerta cerrada que reaparece}: debe reabrirse o generar una nueva según la política de recurrencia.
+    \item \textbf{Eventos fuera de orden temporal}: la normalización debe preservarlos sin corromper el estado.
+    \item \textbf{Payload incompleto}: el evento debe marcarse inválido o degradado, no aceptarse silenciosamente.
+    \item \textbf{Tormenta de alertas por fallo masivo upstream}: deben activarse mecanismos de supresión y agregación.
+    \item \textbf{Canal ruidoso de baja criticidad}: no debe ahogar alertas críticas en el mismo sink sin priorización.
+    \item \textbf{Alerta resuelta automáticamente}: el cierre debe quedar auditado con causa y timestamp.
+\end{enumerate}
 
-\begin{table}[H]
-\centering
-\begin{tabular}{llcc}
-\toprule
-Tipo & Ejemplo & Severity & Acción \\
-\midrule
-Pipeline & SLA breach & High & Resume step \\
-Data & Freshness fail & Critical & Halt pipeline \\
-Model & Drift PSI>0.25 & High & Retrain \\
-Risk & DD>10\% & Critical & Stop trading \\
-\bottomrule
-\end{tabular}
-\caption{Taxonomía Alertas Swing Industrial}
-\end{table}[web:51]
+\section{Criterios mínimos de aceptación}
 
-\section{Conclusiones y Optimizaciones Industriales}
-Centraliza para zero-blind-spots, reduce downtime 80\%. Mejoras: PagerDuty integration, anomaly en alert rates (Isolation Forest), auto-remediate low-severity [web:49].
+El módulo no debe considerarse correcto sin pruebas que verifiquen:
 
-¡Monitoreo pro = trading sin sustos!
+\begin{enumerate}
+    \item normalización correcta de eventos heterogéneos;
+    \item validación estricta del esquema canónico;
+    \item clasificación reproducible por tipo y severidad;
+    \item deduplicación basada en claves canónicas;
+    \item supresión dentro de ventana temporal configurada;
+    \item escalado correcto por recurrencia, severidad o persistencia;
+    \item persistencia íntegra del ciclo de vida de la alerta;
+    \item dispatch robusto con manejo de fallo de canal;
+    \item construcción correcta de snapshots agregados;
+    \item integración coherente con \texttt{daily\_pipeline.py}, \texttt{data\_health.py} y \texttt{drift\_detection.py}.
+\end{enumerate}
 
-\bibliographystyle{plain}
-\begin{thebibliography}{9}
-\bibitem{web44} StockFormer.
-\bibitem{web47} Swing SSRN.
-\bibitem{web49} López de Prado.
-\bibitem{web51} Backtesting.py.
-\bibitem{web54} LSTM Swing.
-\end{thebibliography}
+\section{Conclusión}
+
+\texttt{ops/monitoring.py} debe concebirse como una capa de \textbf{gobernanza de eventos y alertas}, no como un escaparate de métricas sueltas o notificaciones ad hoc. Su valor reside en imponer un lenguaje común entre subsistemas, reducir ruido, priorizar incidencias, preservar trazabilidad y convertir señales dispersas en decisiones operativas claras. Una implementación rigurosa de este contrato mejora disciplina de producción, acelera diagnóstico y reduce el riesgo de que fallos relevantes queden ocultos entre eventos redundantes o mal clasificados.
 
 \end{document}
 % --- FIN PARA COPIAR Y PEGAR EN .txt ---

@@ -1,283 +1,511 @@
-% -----------------------------
-% TEXTO LaTeX PARA fetch_prices.py
-% -----------------------------
 \section{Modulo: \texttt{data/price/fetch\_prices.py}}
 
-\subsection{Objetivo y contexto de mercado}
+\subsection{Objetivo, rol en el sistema y motivacion economica}
 
-El modulo \texttt{data/price/fetch\_prices.py} descarga y normaliza precios diarios OHLCV (open, high, low, close, volumen, y campos adicionales) para el \textbf{universo de small caps de EE. UU.} en un rango temporal definido, garantizando:
+El modulo \texttt{data/price/fetch\_prices.py} constituye la \textbf{capa primaria de ingestión de market data diaria} para el universo \textit{point-in-time} de small caps de EE.\,UU. Su responsabilidad no es “descargar precios”, sino construir una \textbf{base raw, versionada, auditable, reproducible e idempotente} sobre la que descansan ajuste corporativo, control de calidad, ingeniería de variables, etiquetado y backtesting.
 
+Desde el punto de vista economico, este modulo resuelve un problema fundacional: antes de discutir alfa, riesgo, ejecución o robustez estadística, el sistema debe saber con precisión \textbf{qué barras existían, para qué símbolo, bajo qué proveedor, en qué momento fueron observadas y con qué grado de completitud}. Un pipeline de trading falla mucho antes por defectos silenciosos de datos que por falta de sofisticación del modelo.
+
+Por ello, el modulo debe satisfacer simultáneamente siete propiedades estructurales:
+
+\begin{enumerate}
+  \item \textbf{Integridad estructural}: cada fila debe respetar un contrato canónico de esquema y tipos.
+  \item \textbf{Idempotencia}: reejecutar la misma corrida sobre el mismo estado no debe duplicar ni corromper datos.
+  \item \textbf{Reproducibilidad}: mismos inputs lógicos, misma configuración, mismo snapshot de universo y mismo proveedor deben producir la misma salida raw.
+  \item \textbf{Trazabilidad}: toda observación debe poder rastrearse a proveedor, corrida, timestamp de ingesta y política de normalización.
+  \item \textbf{Separación de responsabilidades}: este modulo ingiere y normaliza, pero no ajusta corporate actions ni “arregla” heurísticamente anomalías.
+  \item \textbf{Robustez operacional}: fallos parciales, timeouts, rate limits y errores por símbolo no deben tumbar la corrida completa.
+  \item \textbf{Disciplina temporal}: la semántica de fecha de sesión y de corte temporal debe quedar cerrada para no contaminar análisis posteriores.
+\end{enumerate}
+
+El modulo \textbf{no} debe:
 \begin{itemize}
-  \item \textbf{Trazabilidad}: cada dato se asocia explícitamente a un proveedor, run\_id y fecha de ingesta.
-  \item \textbf{Reproducibilidad}: el mismo \texttt{run\_id} + \texttt{config} debe generar exactamente el mismo dataset raw.
-  \item \textbf{Consistencia temporal PIT} (point–in–time) para que el backtest posterior no use información futura. [web:56][web:62]
+  \item imputar huecos de mercado,
+  \item deducir corporate actions a partir de saltos de precio,
+  \item mezclar proveedores sin registrar precedencia,
+  \item sobrescribir silenciosamente históricos ya persistidos,
+  \item delegar a módulos downstream decisiones críticas de identidad temporal o semántica de columnas.
 \end{itemize}
 
-Este módulo es la \textbf{capa de ingestión primaria} sobre la que se construyen ajustes corporativos, features, labels y backtest, y por tanto debe ser robusto, observable y resiliente a fallos parciales.
+\subsection{Posicion en el pipeline}
 
-\subsection{Marco de datos y convenciones de esquema}
+\texttt{fetch\_prices.py} es la frontera entre el exterior y el sistema interno. Hacia arriba consume universo PIT, calendario de sesiones y configuración de proveedor; hacia abajo expone un dataset raw homogéneo con contrato estable.
 
-El universo de small caps de EE. UU. se define aguas arriba en \texttt{data/universe/*}, y el módulo asume una lista de tickers efectiva por fecha. [web:56]
+\paragraph{Dependencias upstream}
+\begin{itemize}
+  \item Universo PIT de símbolos elegibles por fecha.
+  \item Calendario oficial de sesiones de mercado para EE.\,UU. (NYSE/NASDAQ o un calendario maestro equivalente).
+  \item Configuración del proveedor primario y, si procede, de proveedores de respaldo.
+  \item Política de ingestión: \texttt{incremental}, \texttt{full\_refresh}, \texttt{reconcile}, \texttt{backfill}.
+\end{itemize}
 
-El esquema de salida canonico es:
+\paragraph{Consumidores downstream}
+\begin{itemize}
+  \item \texttt{data/price/adjust\_prices.py}
+  \item \texttt{data/price/qc\_prices.py}
+  \item \texttt{features/build\_features.py}
+  \item \texttt{labels/build\_labels.py}
+  \item cualquier capa de investigación o backtest que necesite OHLCV raw con trazabilidad fuerte
+\end{itemize}
+
+\subsection{Contrato canónico de salida}
+
+La salida principal del modulo debe persistirse en formato columnar y contener, como minimo, las siguientes columnas:
 
 \begin{align}
-  &\texttt{symbol}        && \in \text{string} \\
-  &\texttt{date}          && \in \text{date, timezone-naive (sesión de mercado)} \\
-  &\texttt{open, high, low, close} && \in \mathbb{R}_{>0} \\
-  &\texttt{volume}        && \in \mathbb{R}_{\geq 0} \text{ o } \mathbb{N} \\
-  &\texttt{vwap}          && \in \mathbb{R}_{>0} \text{ (nullable)} \\
-  &\texttt{trades\_count} && \in \mathbb{N} \text{ (nullable)} \\
-  &\texttt{source\_provider} && \in \text{string} \\
-  &\texttt{ingest\_ts\_utc} && \in \text{timestamp} \\
-  &\texttt{run\_id}       && \in \text{string}
+  &\texttt{symbol}                && \in \text{string} \\
+  &\texttt{trade\_date}           && \in \text{date} \\
+  &\texttt{open, high, low, close}&& \in \mathbb{R}_{>0}\ \text{(salvo política explícita de tolerancia)}\\
+  &\texttt{volume}                && \in \mathbb{R}_{\ge 0}\ \text{o}\ \mathbb{N} \\
+  &\texttt{vwap}                  && \in \mathbb{R}_{>0}\ \text{nullable} \\
+  &\texttt{trades\_count}         && \in \mathbb{N}\ \text{nullable} \\
+  &\texttt{currency}              && \in \text{string nullable} \\
+  &\texttt{source\_provider}      && \in \text{string} \\
+  &\texttt{provider\_dataset\_id} && \in \text{string nullable} \\
+  &\texttt{ingest\_ts\_utc}       && \in \text{timestamp UTC} \\
+  &\texttt{run\_id}               && \in \text{string} \\
+  &\texttt{config\_hash}          && \in \text{string} \\
+  &\texttt{universe\_snapshot\_id}&& \in \text{string} \\
+  &\texttt{fetch\_mode}           && \in \{\texttt{incremental},\texttt{full\_refresh},\texttt{backfill},\texttt{reconcile}\}
 \end{align}
 
-La clave primaria lógica es:
+La clave lógica primaria del dataset raw persistido debe quedar definida como:
 
 \[
-\text{PK} = (\texttt{symbol}, \texttt{date}, \texttt{source\_provider}),
+\mathrm{PK}_{raw} = (\texttt{symbol}, \texttt{trade\_date}, \texttt{source\_provider}, \texttt{run\_id})
 \]
 
-y se exige ausencia de duplicados por esta clave. [web:56]
+cuando se persiste por corrida completa, o alternativamente como
 
-\subsection{Politicas de fetch e incrementalidad}
+\[
+\mathrm{PK}_{snapshot} = (\texttt{symbol}, \texttt{trade\_date}, \texttt{source\_provider})
+\]
 
-El módulo soporta:
-
-\begin{itemize}
-  \item \texttt{force\_full\_refresh = False}: fetch incremental detectando la última fecha disponible por ticker y descargando solo desde:
-    \[
-    t_{\min} = \max(\text{max\_local\_date} + 1, \texttt{start\_date}).
-    \]
-  \item \texttt{force\_full\_refresh = True}: reingestión completa del rango [\texttt{start\_date}, \texttt{end\_date}].
-\end{itemize}
-
-Esto se alinea con pipelines de ingestión bulk descritos en la literatura cuantitativa, donde:
+si se materializa además una vista canónica deduplicada por proveedor y fecha. La arquitectura puede soportar ambas, pero la documentación debe fijar que:
 
 \begin{itemize}
-  \item Se backfill completan los históricos una vez.
-  \item Se ejecutan runs diarios incrementales optimizando costos y latencia. [web:56][web:62]
+  \item el \textbf{raw append-only} conserva granularidad por corrida;
+  \item la \textbf{vista canónica} expone la última versión válida según política de selección;
+  \item nunca se debe confundir “dataset raw reproducible” con “vista operativa para consumo”.
 \end{itemize}
 
-\subsection{Estrategia de retry y rate limit}
+\subsection{Identidad temporal: fecha de sesión, timestamp y timezone}
 
-Para cada ticker, la función \texttt{fetch\_symbol\_prices} encapsula:
+Uno de los fallos más caros en market data diaria es dejar ambigua la identidad temporal de una barra. En este modulo la convención debe quedar cerrada:
 
 \begin{itemize}
-  \item Retries configurables para errores transitorios:
-    \begin{itemize}
-      \item time–out.
-      \item 429 (rate limiting).
-      \item 5xx (servidor proveedor).
-    \end{itemize}
-  \item Backoff exponencial con jitter:
-    \[
-    \text{delay}_k = \text{backoff\_base\_sec} \cdot \alpha^k \cdot \text{random\_jitter},
-    \]
-    con \(\alpha > 1\).
-  \item Rate limit global por provider, independiente de la lógica de negocio. [web:53][web:54]
+  \item \texttt{trade\_date} representa la \textbf{fecha de sesión de mercado}, no el timestamp UTC de recepción del proveedor.
+  \item Si el proveedor devuelve timestamps intradiarios o UTC, el modulo debe mapearlos de forma determinista a la sesión oficial del calendario configurado.
+  \item Toda lógica de comparación contra \texttt{start\_date} y \texttt{end\_date} se hace en términos de \texttt{trade\_date}, no de timestamp bruto del proveedor.
+  \item \texttt{ingest\_ts\_utc} captura cuándo entró el dato en el sistema, y nunca sustituye a \texttt{trade\_date}.
 \end{itemize}
 
-Esto es estándar en pipelines de datos financieros que usan APIs de proveedores como Polygon, Tiingo, Stooq, etc. [web:51][web:54][web:60]
+\textbf{Regla obligatoria}: el dataset raw debe contener ambas nociones cuando el proveedor las ofrezca: \textbf{fecha de sesión} para análisis financiero y \textbf{timestamp UTC de ingestión} para auditoría operativa.
+
+\subsection{Politicas de ingestión: full refresh, incremental y reconciliación}
+
+El modulo soporta exactamente cuatro modos operativos.
+
+\subsubsection{\texttt{full\_refresh}}
+
+Reingiere el rango completo \([\texttt{start\_date}, \texttt{end\_date}]\) para todos los símbolos del universo. Este modo se usa para:
+
+\begin{itemize}
+  \item construir históricos iniciales,
+  \item rehacer snapshots bajo nueva lógica de normalización,
+  \item recomputar tras cambios estructurales de proveedor,
+  \item comparar consistencia frente a datos ya persistidos.
+\end{itemize}
+
+\subsubsection{\texttt{incremental}}
+
+Para cada símbolo, detecta la última \texttt{trade\_date} persistida en la vista canónica del proveedor y solicita únicamente el sufijo no materializado:
+
+\[
+t_{\min}(s)=\max\left(\texttt{start\_date},\ \max \texttt{trade\_date}_{local}(s)+1\right).
+\]
+
+Este modo es el predeterminado en producción diaria, pero \textbf{no} debe asumir que el proveedor nunca revisa histórico. Por eso no es suficiente por sí solo.
+
+\subsubsection{\texttt{reconcile}}
+
+Permite reconsultar una ventana reciente o un subconjunto de símbolos para detectar:
+\begin{itemize}
+  \item revisiones históricas del proveedor,
+  \item barras previamente ausentes,
+  \item discrepancias de OHLCV frente a snapshots anteriores,
+  \item correcciones de sesión o cambios de mapping simbólico.
+\end{itemize}
+
+\subsubsection{\texttt{backfill}}
+
+Usado para rellenar huecos detectados en \texttt{coverage\_report} o \texttt{failures\_report}, sin necesidad de relanzar un \texttt{full\_refresh} completo.
+
+\paragraph{Regla de gobernanza}
+El pipeline de producción no debe consistir solo en \texttt{incremental}. Debe existir una política periódica de \texttt{reconcile} o \texttt{full\_refresh} parcial sobre una ventana móvil, porque los proveedores de market data sí pueden corregir el pasado.
+
+\subsection{Idempotencia y política de persistencia}
+
+La idempotencia no debe dejarse como desiderátum; debe quedar definida como propiedad contractual:
+
+\begin{quote}
+Dada una combinación fija de \texttt{provider}, \texttt{universe\_snapshot\_id}, \texttt{start\_date}, \texttt{end\_date}, \texttt{fetch\_mode}, \texttt{config\_hash} y estado externo inalterado del proveedor, ejecutar el modulo dos veces no debe producir filas duplicadas ni modificar silenciosamente snapshots previos.
+\end{quote}
+
+Para ello, la persistencia debe seguir una de estas dos estrategias, pero la elección debe ser explícita:
+
+\paragraph{Estrategia A: append-only + snapshots}
+\begin{itemize}
+  \item Cada corrida escribe en una ruta versionada por \texttt{run\_id}.
+  \item Una vista canónica posterior resuelve qué observación es la vigente por \((symbol, trade\_date, provider)\).
+  \item Máxima auditabilidad; mayor coste de almacenamiento.
+\end{itemize}
+
+\paragraph{Estrategia B: raw versionado + overwrite controlado}
+\begin{itemize}
+  \item El raw persistido conserva metadatos de snapshot.
+  \item El overwrite solo se permite en una operación explícita de reconciliación.
+  \item Toda sustitución de barra previa debe quedar registrada en un artefacto de diffs.
+\end{itemize}
+
+\textbf{Regla obligatoria}: queda prohibido que una corrida incremental normal sobreescriba silenciosamente histórico ya consolidado.
+
+\subsection{Versionado de datos y revisiones históricas}
+
+Uno de los puntos que más separa una spec buena de una realmente fuerte es cómo trata revisiones del proveedor. Este modulo debe asumir que pueden existir y definir la política exacta.
+
+Si una barra ya persistida para \((s,t)\) cambia en una corrida posterior, el sistema debe:
+
+\begin{enumerate}
+  \item detectar la discrepancia a nivel de fila y campo;
+  \item registrar la diferencia en \texttt{provider\_revisions\_report};
+  \item decidir, según \texttt{fetch\_mode}, si solo reporta o si actualiza la vista canónica;
+  \item mantener trazabilidad de la versión anterior y la nueva.
+\end{enumerate}
+
+La salida debe distinguir entre:
+\begin{itemize}
+  \item \textbf{raw as-observed}: lo que el sistema descargó en una corrida concreta;
+  \item \textbf{canonical latest}: la mejor versión materializada según política de reconciliación.
+\end{itemize}
+
+Esa dualidad es crítica para auditoría de backtests antiguos.
+
+\subsection{Normalización por proveedor}
+
+El flujo lógico por símbolo debe ser:
+
+\[
+\texttt{fetch\_symbol\_prices}
+\;\longrightarrow\;
+\texttt{normalize\_provider\_frame}
+\;\longrightarrow\;
+\texttt{validate\_ingestion\_frame}
+\;\longrightarrow\;
+\texttt{persist\_raw\_prices}.
+\]
+
+La función \texttt{normalize\_provider\_frame(...)} debe:
+
+\begin{itemize}
+  \item mapear el esquema nativo del proveedor al contrato canónico interno;
+  \item estandarizar símbolos, trim, casing y codificación textual;
+  \item fijar tipos fuertes;
+  \item convertir timestamps a \texttt{trade\_date} con la convención temporal oficial;
+  \item preservar, cuando sea útil, columnas de procedencia en namespace separado para debugging;
+  \item etiquetar campos ausentes o no soportados sin romper el contrato principal.
+\end{itemize}
+
+\textbf{Regla importante}: la normalización debe ser \textbf{determinista y pura}. Dado el mismo payload del proveedor y la misma configuración, debe producir el mismo frame canónico.
+
+\subsection{Multiproveedor, fallback y arbitraje}
+
+Si el sistema soporta más de un proveedor, el modulo debe fijar una política cerrada de arbitraje. No basta con “usar fallback”.
+
+Sea el orden de prioridad:
+
+\[
+\texttt{primary} \succ \texttt{secondary} \succ \texttt{tertiary}.
+\]
+
+Entonces:
+
+\begin{enumerate}
+  \item la corrida debe intentar primero el proveedor primario;
+  \item si el error es transitorio y reintentable, se aplican retries antes de activar fallback;
+  \item si el error es permanente a nivel de símbolo o el proveedor carece de cobertura, puede activarse el secundario;
+  \item toda barra obtenida por fallback debe quedar marcada explícitamente;
+  \item si dos proveedores ofrecen barras diferentes para la misma fecha, no se promedian ni fusionan sin política formal de reconciliación.
+\end{enumerate}
+
+\textbf{Regla de producción}: la procedencia de cada barra no puede perderse nunca. El consumidor downstream debe poder distinguir si una serie proviene de fuente primaria o de contingencia.
+
+\subsection{Retries, backoff y rate limiting}
+
+La función \texttt{fetch\_symbol\_prices(...)} encapsula la interacción operativa con el proveedor. Debe modelar separadamente:
+
+\paragraph{Errores reintentables}
+\begin{itemize}
+  \item timeout,
+  \item HTTP 429,
+  \item HTTP 5xx,
+  \item errores de conexión transitorios.
+\end{itemize}
+
+\paragraph{Errores no reintentables}
+\begin{itemize}
+  \item símbolo inválido o no soportado,
+  \item credenciales incorrectas,
+  \item request mal formada,
+  \item recurso inexistente bajo semántica permanente.
+\end{itemize}
+
+El backoff recomendado es exponencial con jitter:
+
+\[
+\mathrm{delay}_k
+=
+\min\left(\mathrm{cap},\ \mathrm{base}\cdot \alpha^k\right)\cdot U_k,
+\qquad \alpha>1,\quad U_k \sim \mathcal{U}(u_{\min},u_{\max}).
+\]
+
+El rate limit debe centralizarse a nivel de proveedor, no dispersarse en llamadas individuales. En una implementación con paralelismo, esto implica un coordinador o token bucket global por cliente.
 
 \subsection{Validaciones de integridad en ingestión}
 
-El módulo implementa validaciones mínimas para garantizar que el dataset crudo es coherente antes de pasar a \texttt{adjust\_prices.py}.
+La validación aquí no pretende “certificar verdad financiera total”; pretende garantizar que el raw ya entra con un contrato mínimo razonable.
 
-\subsubsection{Por fila}
+\subsubsection{Validaciones por fila}
 
-\begin{itemize}
-  \item \textbf{Ordenamiento de OHLC} (cuando todos no nulos):
-    \begin{align}
-      \texttt{high} &\geq \max(\texttt{open}, \texttt{close}, \texttt{low}), \\
-      \texttt{low}  &\leq \min(\texttt{open}, \texttt{close}, \texttt{high}).
-    \end{align}
-  \item \texttt{volume} \(\geq 0\).
-  \item \texttt{date} parseable y dentro de \([\texttt{start\_date}, \texttt{end\_date}]\).
-\end{itemize}
+Para toda fila con OHLC no nulos:
 
-\subsubsection{Por ticker}
+\begin{align}
+\texttt{high} &\ge \max(\texttt{open}, \texttt{close}, \texttt{low}), \\
+\texttt{low} &\le \min(\texttt{open}, \texttt{close}, \texttt{high}).
+\end{align}
+
+Además:
 
 \begin{itemize}
-  \item Fechas \texttt{date} crecientes (sin reversión).
-  \item No duplicados en \texttt{date} (por \texttt{symbol}).
-  \item Porcentaje de días faltantes frente al calendario de sesiones de mercado, registrado en \texttt{coverage\_report}.
+  \item \texttt{open, high, low, close} deben ser positivos, salvo política explícita para casos degenerados;
+  \item \texttt{volume} \(\ge 0\);
+  \item \texttt{trade\_date}\(\in[\texttt{start\_date},\texttt{end\_date}]\);
+  \item no se permiten \texttt{NaN} en campos obligatorios del modo de ingestión elegido.
 \end{itemize}
 
-Estas reglas se alinean con buenas prácticas de chequeo de calidad de datos en backtest, donde se exige que el OHLC mantenga la relación lógica derivada de la definición de vela. [web:41][web:62]
-
-\subsection{Normalización de esquema y proveedor}
-
-El flujo por ticker es:
-
-\begin{equation*}
-\texttt{fetch\_symbol\_prices} \xrightarrow{\text{parseo}} \texttt{normalize\_provider\_frame}(\cdot, \texttt{provider}) \xrightarrow{\text{validación}} \texttt{validate\_ingestion\_frame}.
-\end{equation*}
-
-La función \texttt{normalize\_provider\_frame}:
+\subsubsection{Validaciones por símbolo}
 
 \begin{itemize}
-  \item Mapea campos de proveedor (\texttt{open, close, \dots}) al esquema canonico.
-  \item Normaliza símbolos a \texttt{uppercase} y trim.
-  \item Ensaya tipificación fuerte: \texttt{open, high, \dots} como \texttt{float64}, \texttt{volume} como \texttt{float64/int64}, etc.
+  \item Fechas estrictamente crecientes tras normalización.
+  \item Ausencia de duplicados por \((symbol, trade\_date, provider)\) dentro de la misma corrida.
+  \item Cobertura frente al calendario de sesiones.
+  \item Detección explícita de huecos, barras repetidas y orden temporal revertido.
 \end{itemize}
 
-Esta capa de normalización asegura que múltiples proveedores (Polygon, Tiingo, Stooq, etc.) alimenten el mismo esquema de datos usado por el resto del pipeline de investigación cuantitativa. [web:54][web:58]
-
-\subsection{Reportes de cobertura y fallos}
-
-Además del dataset principal en Parquet, se generan:
+\subsubsection{Validaciones por corrida}
 
 \begin{itemize}
-  \item \texttt{coverage\_report}: indica por ticker:
-    \[
-    \texttt{pct\_missing\_sessions} = \frac{ \#\text{sesiones esperadas} - \#\text{sesiones recibidas} }{ \#\text{sesiones esperadas} }.
-    \]
-  \item \texttt{failures\_report}: por ticker / código de error / mensaje, para que \texttt{qc\_prices.py} pueda decidir politicas de exclusion de small caps ilíquidos o con datos escasos.
-  \item \texttt{run\_manifest.json}: con parámetros de entrada, versión de código, hash de la config, y contadores de filas/tickers procesados.
+  \item El schema canónico debe ser homogéneo entre todos los símbolos.
+  \item La corrida debe producir contadores consistentes de filas leídas, aceptadas, descartadas, reintentadas y fallidas.
+  \item Debe verificarse que la política de persistencia seleccionada preserve idempotencia.
 \end{itemize}
 
-Esto encaja con el paradigma de \textit{Data Quality} en sistemas de backtest, donde se documenta explícitamente la cobertura de datos por activo y fecha. [web:41][web:62]
+\subsection{Cobertura, missing sessions y small caps ilíquidas}
 
-\subsection{Interfaz de ejecución y configuración}
+En universos small cap, la ausencia de observaciones no siempre significa error de proveedor. Puede ser iliquidez real. El modulo no debe resolver de forma económica ese problema, pero sí dejarlo medido con precisión.
 
-CLI sugerida:
+Para cada símbolo, sea \(N_s^{\mathrm{exp}}\) el número de sesiones esperadas en la ventana y \(N_s^{\mathrm{obs}}\) el número de sesiones observadas. Entonces:
 
-\begin{verbatim}
-python -m data.price.fetch_prices                \
-  --provider polygon                               \
-  --start-date 2014-01-01                          \
-  --end-date 2026-03-01                            \
-  --universe-path data/universe/current.parquet    \
-  --frequency 1d                                   \
-  --run-id fetch_prices_20260305_001
-\end{verbatim}
+\[
+\texttt{pct\_missing\_sessions}(s)
+=
+\frac{N_s^{\mathrm{exp}} - N_s^{\mathrm{obs}}}{N_s^{\mathrm{exp}}}.
+\]
 
-Los parámetros clave son:
+Esta métrica debe registrarse en \texttt{coverage\_report} junto con:
 
 \begin{itemize}
-  \item \texttt{provider}: “polygon”, “tiingo”, “stooq”, etc.
-  \item \texttt{start\_date, end\_date}: ventana de tiempo.
-  \item \texttt{run\_id}: identificador único de ejecución para trazabilidad y replay.
-  \item \texttt{frequency}: en esta fase solo \texttt{"1d"}.
-  \item \texttt{chunk\_size\_tickers}: lote de símbolos por ejecución (para limitar memory/RAM).
+  \item primera y última fecha observadas,
+  \item número total de barras válidas,
+  \item número de huecos internos,
+  \item ratio de completitud reciente,
+  \item proveedor efectivo utilizado.
 \end{itemize}
 
-\subsection{Dependencias aguas arriba y aguas abajo}
+\textbf{Regla importante}: \texttt{fetch\_prices.py} mide cobertura, pero no decide por sí mismo si excluir una acción por iliquidez. Esa decisión pertenece a QC, universo o research.
 
-El módulo se sitúa en el eje central:
+\subsection{Sistema de severidades}
+
+Para cerrar la política operativa, el modulo debe clasificar incidencias como:
 
 \begin{itemize}
-  \item \textbf{Upstream}:
-    \begin{itemize}
-      \item Lista de tickers PIT del universo de small caps.
-      \item Calendario de sesiones de mercado (NYSE/NASDAQ).
-      \item Configuración de proveedor de datos.
-    \end{itemize}
-  \item \textbf{Downstream}:
-    \begin{itemize}
-      \item \texttt{data/price/adjust\_prices.py}.
-      \item \texttt{data/price/qc\_prices.py}.
-      \item \texttt{features/build\_features.py}.
-      \item \texttt{labels/build\_labels.py}.
-    \end{itemize}
+  \item \texttt{FAIL}: schema inválido, payload ilegible, clave duplicada no resoluble, imposibilidad total de obtener datos para un símbolo cuando eran obligatorios, colisión de tipos, corrupción de persistencia.
+  \item \texttt{WARN}: huecos de cobertura, columnas opcionales ausentes, fallback a proveedor secundario, discrepancias menores de schema, barra descartada por validación de fila.
+  \item \texttt{INFO}: símbolo sin actividad observada pero sin error técnico, corrida incremental sin nuevas fechas, columnas opcionales no suministradas por el proveedor.
 \end{itemize}
 
-\texttt{fetch\_prices.py} asegura que el resto de módulos trabajen sobre un dataset raw homogeneizado, sin decisiones de normalización diseminadas en el pipeline. [web:56][web:62]
+\textbf{Regla de agregación}: el fallo de algunos símbolos no debe tumbar la corrida global salvo que supere umbrales de tolerancia configurados a nivel de lote o proveedor.
 
-\subsection{Reglas de negocio de diseño de sistema}
+\subsection{Artefactos de salida}
 
-Entre las reglas de negocio están:
+Además del dataset raw, la corrida debe producir artefactos auxiliares obligatorios.
+
+\paragraph{1. Dataset principal}
+Parquet o formato columnar equivalente, particionado de forma estable, por ejemplo:
+\[
+\texttt{/data/price/raw/provider=\{p\}/freq=1d/run\_id=\{r\}/}
+\]
+
+\paragraph{2. Coverage report}
+Con métricas por símbolo:
+\begin{itemize}
+  \item \texttt{expected\_sessions}
+  \item \texttt{observed\_sessions}
+  \item \texttt{pct\_missing\_sessions}
+  \item \texttt{first\_date}
+  \item \texttt{last\_date}
+  \item \texttt{provider\_used}
+  \item \texttt{severity\_max}
+\end{itemize}
+
+\paragraph{3. Failures report}
+Por símbolo y error:
+\begin{itemize}
+  \item \texttt{symbol}
+  \item \texttt{error\_code}
+  \item \texttt{error\_class}
+  \item \texttt{message}
+  \item \texttt{retry\_count}
+  \item \texttt{provider}
+  \item \texttt{final\_status}
+\end{itemize}
+
+\paragraph{4. Revisions report}
+Solo si hubo reconciliación o cambios detectados:
+\begin{itemize}
+  \item \texttt{symbol, trade\_date, field\_name}
+  \item \texttt{old\_value, new\_value}
+  \item \texttt{old\_run\_id, new\_run\_id}
+\end{itemize}
+
+\paragraph{5. Manifest}
+\texttt{run\_manifest.json} debe incluir, como minimo:
 
 \begin{itemize}
-  \item \textbf{No usar información futura}: el proveedor devuelve únicamente barras historicas \textit{publicadas} para cada \texttt{date}.
-  \item \textbf{No imputar datos faltantes}: se mantienen como \texttt{null} y se delega cualquier imputación al módulo de QC o features, si procede.
-  \item \textbf{Reintentos solo para errores transitorios}: 429, time–out, 5xx; se excluyen errores permanentes (404, símbolo inválido).
-  \item \textbf{Hash/versionado de config y datasets}: para garantizar que el mismo \texttt{run\_id} + \texttt{config} produzcan exáctamente el mismo dataset raw.
+  \item \texttt{run\_id}
+  \item \texttt{provider}
+  \item \texttt{fetch\_mode}
+  \item \texttt{start\_date, end\_date}
+  \item \texttt{frequency}
+  \item \texttt{config\_hash}
+  \item \texttt{universe\_snapshot\_id}
+  \item \texttt{code\_version} o hash de commit
+  \item \texttt{tickers\_requested, tickers\_ok, tickers\_failed}
+  \item \texttt{rows\_ingested}
+  \item \texttt{provider\_http\_error\_rate}
+  \item \texttt{fallback\_usage\_rate}
+  \item \texttt{run\_duration\_sec}
 \end{itemize}
-
-Estas políticas son estándar en pipelines de datos cuantitativos donde la \textbf{auditoría de backtest} es crítica y el error de data es mucho más difícil de detectar que el error de código. [web:56][web:62]
 
 \subsection{Estructura de funciones recomendada}
 
-El módulo está organizado en capas lógicas:
+La arquitectura interna debe separar claramente orquestación, cliente de proveedor, normalización, validación y persistencia:
 
 \begin{itemize}
-  \item \texttt{load\_config(...)}, \texttt{load\_universe\_tickers(...)}.
-  \item \texttt{get\_incremental\_window(...)}: decide el rango a descargar por ticker.
-  \item \texttt{fetch\_symbol\_prices(..., provider\_client)}: capa de negocio sobre el cliente de proveedor.
-  \item \texttt{normalize\_provider\_frame(...)}, \texttt{validate\_ingestion\_frame(...)}.
-  \item \texttt{persist\_prices(...)}: escritura Parquet particionada por \texttt{provider}, \texttt{freq}, \texttt{date}.
-  \item \texttt{build\_coverage\_report(...)}, \texttt{build\_failures\_report(...)}.
-  \item \texttt{main()} que orquesta todo el flujo.
+  \item \texttt{load\_config(...)}
+  \item \texttt{load\_universe\_snapshot(...)}
+  \item \texttt{load\_market\_calendar(...)}
+  \item \texttt{get\_fetch\_window(...)}
+  \item \texttt{build\_provider\_client(...)}
+  \item \texttt{fetch\_symbol\_prices(...)}
+  \item \texttt{normalize\_provider\_frame(...)}
+  \item \texttt{validate\_ingestion\_frame(...)}
+  \item \texttt{merge\_with\_existing\_snapshot(...)}
+  \item \texttt{persist\_raw\_prices(...)}
+  \item \texttt{build\_coverage\_report(...)}
+  \item \texttt{build\_failures\_report(...)}
+  \item \texttt{build\_revisions\_report(...)}
+  \item \texttt{write\_manifest(...)}
+  \item \texttt{main()}
 \end{itemize}
 
-Esta arquitectura permite:
+\subsection{CLI de referencia}
+
+\begin{verbatim}
+python -m data.price.fetch_prices \
+  --provider polygon \
+  --start-date 2014-01-01 \
+  --end-date 2026-03-01 \
+  --universe-path data/universe/snapshots/universe_2026-03-05.parquet \
+  --frequency 1d \
+  --fetch-mode incremental \
+  --fallback-provider tiingo \
+  --chunk-size-tickers 250 \
+  --as-of-ts-utc 2026-03-05T23:59:59Z \
+  --run-id fetch_prices_20260305_001
+\end{verbatim}
+
+\subsection{Definition of Done}
+
+El modulo solo se considera terminado si cumple simultáneamente que:
+
+\begin{enumerate}
+  \item ejecuta end-to-end sin caer por el fallo aislado de un subconjunto pequeño de símbolos;
+  \item produce un dataset raw con contrato canónico estable;
+  \item respeta idempotencia bajo la política de persistencia declarada;
+  \item soporta \texttt{full\_refresh}, \texttt{incremental} y al menos una forma de \texttt{reconcile};
+  \item deja trazabilidad completa de proveedor, corrida, configuración y cobertura;
+  \item separa correctamente raw histórico, snapshot reproducible y vista canónica;
+  \item emite \texttt{coverage\_report}, \texttt{failures\_report} y \texttt{run\_manifest};
+  \item registra revisiones históricas cuando aparecen, en lugar de absorberlas silenciosamente;
+  \item fija de forma inequívoca la semántica de \texttt{trade\_date} frente a timestamps del proveedor.
+\end{enumerate}
+
+\subsection{Suite minima de tests}
+
+La batería mínima debe cubrir:
 
 \begin{itemize}
-  \item Desacoplar el cliente del proveedor hacia una interfaz (\texttt{provider\_client}).
-  \item Reutilizar la misma lógica de fetch tanto para backfill histórico como para ejecuciones diarias incrementales.
+  \item \textbf{Caso feliz}: tres símbolos, rango corto, schema correcto, sin duplicados y con métricas coherentes.
+  \item \textbf{Retry transitorio}: 429 o 5xx inicial seguido de éxito.
+  \item \textbf{Error permanente}: símbolo inválido en \texttt{failures\_report} sin abortar la corrida.
+  \item \textbf{Incremental puro}: segunda corrida sin redescargar histórico ya materializado.
+  \item \textbf{Idempotencia}: misma corrida repetida no duplica filas ni altera snapshot.
+  \item \textbf{Schema drift}: columna faltante o inesperada según política definida.
+  \item \textbf{Mapeo temporal}: payload con timestamp UTC se asigna correctamente a \texttt{trade\_date}.
+  \item \textbf{Fallback}: proveedor primario falla y secundario entrega datos con trazabilidad preservada.
+  \item \textbf{Revisión histórica}: una barra cambia entre corridas y aparece en \texttt{revisions\_report}.
+  \item \textbf{Duplicados de proveedor}: se resuelven según regla determinista sin violar PK.
 \end{itemize}
 
-\subsection{Criterios de aceptación (Definition of Done)}
+\subsection{Riesgos operativos y decisiones cerradas}
 
-El módulo cumple la definición de terminado si:
+Las decisiones que deben quedar fijadas, y no delegadas al implementador, son:
 
 \begin{itemize}
-  \item Ejecuta \textbf{end‑to‑end} sin caer por el fallo de uno o pocos tickers.
-  \item Genera un dataset Parquet con esquema canonico y sin duplicados por PK lógica.
-  \item Produce \texttt{coverage\_report} y \texttt{failures\_report} consumibles por QC.
-  \item Soporta modo \texttt{incremental} y \texttt{full\_refresh}.
-  \item Provee logs y métricas suficientes para auditar una corrida:
-    \begin{itemize}
-      \item \texttt{total\_tickers, tickers\_ok, tickers\_failed}.
-      \item \texttt{rows\_ingested}.
-      \item \texttt{pct\_missing\_sessions\_avg}.
-      \item \texttt{provider\_http\_error\_rate}.
-      \item \texttt{run\_duration\_sec}.
-    \end{itemize}
-  \item Es \textbf{reproducible} por \texttt{run\_id} + hash de la configuración.
+  \item política exacta de persistencia: append-only versus overwrite controlado con diff;
+  \item definición oficial de \texttt{trade\_date};
+  \item estrategia de arbitraje entre proveedores;
+  \item umbral tolerable de símbolos fallidos por corrida;
+  \item ventana y frecuencia de reconciliación histórica;
+  \item columnas opcionales realmente obligatorias para research downstream.
 \end{itemize}
 
-\subsection{Casos de prueba mínimos recomendados}
-
-Los tests unitarios e integrados deben cubrir:
+\subsection{Checklist de implementacion}
 
 \begin{itemize}
-  \item \textbf{Caso feliz}: 3 tickers, rango corto, salida con todas las columnas correctas, sin duplicados, OHLC coherente.
-  \item \textbf{Retry}: proveedor responde 429/5xx en la primera petición, y luego exito.
-  \item \textbf{Error permanente}: ticker inválido queda en \texttt{failures\_report} pero no aborta el pipeline.
-  \item \textbf{Incremental}: segunda corrida solo trae fechas nuevas.
-  \item \textbf{Duplicados en respuesta del proveedor}: se deduplican correctamente por PK lógica.
-  \item \textbf{Schema drift}: columna inesperada/ausente según la política de \texttt{normalize\_provider\_frame} y \texttt{validate\_ingestion\_frame}.
+  \item [ ] Cliente de proveedor desacoplado por interfaz
+  \item [ ] Rate limiting centralizado
+  \item [ ] Retries con backoff exponencial y jitter
+  \item [ ] Normalización determinista de schema por proveedor
+  \item [ ] Convención cerrada de \texttt{trade\_date} y timezone
+  \item [ ] Política explícita de idempotencia y persistencia
+  \item [ ] Soporte de \texttt{incremental}, \texttt{full\_refresh} y \texttt{reconcile}
+  \item [ ] Reportes de cobertura, fallos y revisiones
+  \item [ ] Manifest completo con hashes y metadatos de corrida
+  \item [ ] Suite de tests con casos de revisión histórica y fallback
 \end{itemize}
 
-\subsection{Riesgos, decisiones abiertas y checklist}
+\subsection{Conclusion operativa}
 
-Entre los riesgos:
-
-\begin{itemize}
-  \item Coste y licencia de proveedor primario y posible fallback.
-  \item Política de días faltantes aceptables para small caps ilíquidos.
-  \item Regla de versionado: partición por \texttt{run} vs. \texttt{overwrite} controlado.
-  \item Convención final de \texttt{timezone/date} cuando el proveedor usa \texttt{UTC timestamp} en lugar de calendario nativo.
-\end{itemize}
-
-\textbf{Checklist rápido de implementación:}
-
-\begin{itemize}
-  \item [ ] Cliente de proveedor desacoplado por interfaz.
-  \item [ ] Rate limit centralizado.
-  \item [ ] Retries con backoff exponencial y jitter.
-  \item [ ] Normalización de esquema por proveedor.
-  \item [ ] Validaciones básicas de ingestión.
-  \item [ ] Persistencia Parquet + particiones + manifest.
-  \item [ ] Reportes de cobertura y fallos.
-  \item [ ] CLI con argumentos y valores por defecto en config.
-\end{itemize}
-
-Este módulo configura así la base sólida de datos raw para todo el sistema de swing trading, asegurando que el backtest industrial que construiréis en \texttt{backtest/engine.py} se base en un dataset \textbf{limpio, reproducible y sin leakage}. [web:56][web:62]
-% -----------------------------
-% FIN DEL TEXTO PARA .TXT
-% -----------------------------
+\texttt{data/price/fetch\_prices.py} no es una utilidad de descarga, sino una \textbf{pieza de infraestructura cuantitativa crítica}. Si este modulo es ambiguo en temporalidad, idempotencia, versionado o procedencia, el resto del sistema hereda una base inestable y el backtest deja de ser auditable. Si, en cambio, el modulo fija contratos estrictos, snapshots reproducibles, reconciliación explícita y trazabilidad completa de cada barra, entonces se convierte en una capa de ingestión de nivel institucional: suficientemente rigurosa para research serio y suficientemente robusta para producción.

@@ -1,70 +1,430 @@
-% Copiar y pegar en LaTeX (guarda como .txt)
+% Copiar y pegar en LaTeX (guardar como .txt)
 \documentclass{article}
 \usepackage[utf8]{inputenc}
-\usepackage{amsmath,amssymb}
-\usepackage{hyperref}
-\usepackage{booktabs}
+\usepackage[T1]{fontenc}
 \usepackage[spanish]{babel}
-\title{Explicaci\'on SOTA: validation/multiple\_testing.py}
-\author{Perplexity Quant Research}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\title{Especificaci\'on Cuantitativa: validation/multiple\_testing.py}
+\author{JimSimons Small Cap Swing --- Validation Research Note}
 \date{Marzo 2026}
+
 \begin{document}
 \maketitle
 
-\section{Resumen Ejecutivo}
-Control de multiple testing para 1000+ experimentos swing trading. 
-BH-FDR + Deflated Sharpe Ratio filtran 92-98\% falsos positivos, 
-preservando 4-8\% edges robustos (Sharpe$_{adj}>1.8$, p$_{adj}<0.05$). 
-Backtest 500 estrategias: +38\% retorno anual survivors vs +12\% universo.
+\section{Prop\'osito del m\'odulo}
 
-\section{Metodolog\'{\i}a Matem\'atica}
+El objetivo de \texttt{multiple\_testing.py} no es ``encontrar los mejores backtests'', sino
+corregir el sesgo inevitable que aparece cuando una plataforma de research prueba muchas ideas,
+muchas variantes param\'etricas o muchas combinaciones de filtros sobre el mismo universo de datos.
 
-\subsection{Bonferroni (FWER)}
-\begin{equation}
-p_{\text{adj}} = \min\left(1, p_{\text{raw}} \cdot m \right)
-\end{equation}
+En un entorno de investigaci\'on cuantitativa, observar varios Sharpe altos no constituye evidencia
+fuerte si esos resultados emergen tras cientos o miles de ensayos. Cuanto mayor es el espacio de
+b\'usqueda, mayor es la probabilidad de que algunos resultados extremos aparezcan por azar. Por ello,
+este m\'odulo debe tratar el problema como una cuesti\'on de \textbf{inferencia post-selecci\'on} y
+no como una simple tabla de p-values ajustados.
 
-\subsection{Benjamini-Hochberg (FDR)}
-Ordenar $p_{(1)} \leq \dots \leq p_{(m)}$ y rechazar $H_0^{(k)}$ si:
-\begin{equation}
-p_{(k)} \leq \frac{k \cdot q}{m}, \quad q=0.05
-\end{equation}
+Su responsabilidad es triple:
 
-\subsection{Deflated Sharpe Ratio}
-\begin{equation}
-\text{DSR} = \frac{\text{Sharpe}}{\sqrt[3]{n_{\text{trials}}}}
-\end{equation}
-Rechazar si $\text{DSR} < 1.96$ (95\% confianza).
+\begin{itemize}[leftmargin=2em]
+    \item controlar el n\'umero esperado de falsos descubrimientos;
+    \item distinguir entre contraste estad\'istico individual y selecci\'on entre muchos candidatos;
+    \item impedir que el pipeline promueva estrategias cuya aparente significaci\'on desaparece una vez
+    corregido el espacio real de experimentaci\'on.
+\end{itemize}
 
-\section{Backtest Resultados}
-\begin{table}[h]
-\centering
-\begin{tabular}{lcccc}
-\toprule
-M\'etodo & \% Rechazos & Survivors & Sharpe Raw$\to$Adj & FDR \\
-\midrule
-Bonferroni & 97\% & 15 & 2.4$\to$1.6 & 5\% \\
-BH-FDR & 92\% & 40 & 2.3$\to$1.9 & 8\% \\
-DSR & 89\% & 55 & 2.5$\to$2.1 & 6\% \\
-\textbf{Combinado} & \textbf{98\%} & \textbf{8 (4\%)} & \textbf{2.8$\to$3.4} & \textbf{2\%} \\
-\bottomrule
-\end{tabular}
-\caption{Filtrado Multiple Testing 500 Estrategias Swing}
-\end{table}
+\section{Planteamiento formal}
 
-\section{Implementaci\'on Cr\'{\i}tica}
+Sea una familia de $m$ hip\'otesis
+\[
+\mathcal{H} = \{H_1,\dots,H_m\},
+\]
+donde cada $H_j$ representa una afirmaci\'on del tipo:
+\begin{quote}
+\emph{``la estrategia, se\~nal o configuraci\'on $j$ posee capacidad predictiva o rentabilidad ajustada
+por riesgo distinta de cero bajo el protocolo de validaci\'on definido''.}
+\end{quote}
+
+A cada hip\'otesis se asocia:
+\begin{itemize}[leftmargin=2em]
+    \item un estad\'istico de test $T_j$,
+    \item un p-value bruto $p_j$,
+    \item una m\'etrica de magnitud econ\'omica, por ejemplo $\widehat{SR}_j$,
+    \item metadatos sobre familia experimental, dependencia, horizonte y longitud de muestra.
+\end{itemize}
+
+El problema no es decidir si un $p_j$ aislado es peque\~no, sino si un subconjunto seleccionado
+de resultados sigue siendo interpretable \emph{despu\'es} de corregir por el n\'umero efectivo de pruebas.
+
+\section{Tres niveles de correcci\'on}
+
+\subsection{Nivel I: control de error familiar (FWER)}
+
+Si el objetivo es minimizar dr\'asticamente la probabilidad de un solo falso positivo dentro de
+la familia de tests, debe usarse control de family-wise error rate:
+\[
+\mathrm{FWER} = \mathbb{P}(V \ge 1),
+\]
+donde $V$ es el n\'umero de falsas reyecciones.
+
+La correcci\'on m\'as simple es Bonferroni:
+\[
+p_j^{\mathrm{Bonf}} = \min(1, m p_j).
+\]
+
+Bonferroni es v\'alido y transparente, pero a menudo demasiado conservador cuando $m$ es grande
+o cuando las hip\'otesis son dependientes. Por eso, en uso pr\'actico, suele ser preferible Holm:
+\begin{itemize}[leftmargin=2em]
+    \item ordenar $p_{(1)} \le \cdots \le p_{(m)}$;
+    \item rechazar secuencialmente mientras
+    \[
+    p_{(k)} \le \frac{\alpha}{m-k+1}.
+    \]
+\end{itemize}
+
+\subsection{Nivel II: control de falsos descubrimientos (FDR)}
+
+Cuando el sistema de research explora una familia amplia de se\~nales y quiere aceptar que un
+porcentaje peque\~no de hallazgos pueda ser falso, el objeto correcto es:
+\[
+\mathrm{FDR} = \mathbb{E}\left[\frac{V}{\max(R,1)}\right],
+\]
+donde $R$ es el n\'umero total de hip\'otesis rechazadas.
+
+El procedimiento de Benjamini--Hochberg (BH) ordena p-values
+\[
+p_{(1)} \le \cdots \le p_{(m)}
+\]
+y define
+\[
+k^\star = \max\left\{k: p_{(k)} \le \frac{k}{m}q \right\},
+\]
+donde $q$ es la FDR objetivo. Entonces se rechazan
+\[
+H_{(1)},\dots,H_{(k^\star)}.
+\]
+
+BH controla FDR bajo independencia y bajo ciertas estructuras de dependencia positiva. Si la
+dependencia entre tests es fuerte, jer\'arquica o dif\'icil de caracterizar, el m\'odulo debe
+permitir alternativas m\'as conservadoras, como Benjamini--Yekutieli o procedimientos bootstrap.
+
+\subsection{Nivel III: ajuste por selecci\'on de Sharpe}
+
+Incluso despu\'es de corregir p-values, un investigador puede seguir seleccionando el candidato
+con mejor Sharpe, mejor Calmar o mejor retorno neto. Ah\'i aparece un segundo problema:
+\emph{el mejor de muchos estimadores de performance tiende a estar inflado por selecci\'on.}
+
+Por eso, adem\'as de FWER/FDR, el m\'odulo debe auditar la significaci\'on del Sharpe observado
+frente a un benchmark nulo que ya incorpore:
+\begin{itemize}[leftmargin=2em]
+    \item n\'umero efectivo de pruebas,
+    \item longitud de la serie,
+    \item asimetr\'ia y curtosis de los retornos,
+    \item dependencia entre estrategias probadas.
+\end{itemize}
+
+\section{El papel correcto del Deflated Sharpe Ratio}
+
+El Deflated Sharpe Ratio (DSR) no debe implementarse como una divisi\'on ad hoc por el cubo
+ra\'iz del n\'umero de trials. Su funci\'on correcta es estimar la probabilidad de que un Sharpe
+observado exceda un umbral nulo \emph{ajustado por selecci\'on y por no normalidad}.
+
+Sea $\widehat{SR}$ el Sharpe observado, $T$ la longitud de la muestra, $\gamma_3$ la asimetr\'ia,
+$\gamma_4$ la curtosis y $SR_0$ el Sharpe de referencia bajo el benchmark de selecci\'on.
+Entonces el contraste DSR puede expresarse, de forma abstracta, como:
+\[
+\mathrm{DSR} = \Phi\!\left(Z_{\mathrm{DSR}}\right),
+\]
+donde
+\[
+Z_{\mathrm{DSR}}
+=
+\frac{(\widehat{SR} - SR_0)\sqrt{T-1}}
+{\sqrt{1 - \gamma_3 \widehat{SR} + \frac{\gamma_4 - 1}{4}\widehat{SR}^2}}.
+\]
+
+La cantidad clave no es solo $\widehat{SR}$, sino la construcci\'on de $SR_0$, que debe reflejar
+el mejor Sharpe esperable por azar en una familia de $N_{\mathrm{eff}}$ pruebas efectivas.
+Aqu\'i $N_{\mathrm{eff}}$ no coincide necesariamente con el n\'umero bruto de backtests, ya que
+muchos experimentos son variantes muy correlacionadas de una misma idea.
+
+\subsection{Consecuencia pr\'actica}
+
+Un DSR alto indica que el Sharpe observado sigue siendo extraordinario incluso despu\'es de tener
+en cuenta selecci\'on m\'ultiple y no normalidad. Un DSR bajo indica que el resultado puede ser
+perfectamente compatible con mining de especificaciones.
+
+Por tanto:
+\begin{quote}
+\emph{DSR no sustituye al control FDR/FWER; lo complementa desde la perspectiva de performance
+ajustada por selecci\'on.}
+\end{quote}
+
+\section{N\'umero efectivo de pruebas}
+
+Uno de los errores m\'as comunes en research es igualar el n\'umero de pruebas al n\'umero de
+backtests almacenados. Eso sobreestima o subestima el sesgo seg\'un la estructura de dependencia.
+
+El m\'odulo debe distinguir entre:
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{n\'umero bruto de ensayos}: total de configuraciones ejecutadas;
+    \item \textbf{familias experimentales}: conjuntos de variantes sobre una misma idea base;
+    \item \textbf{n\'umero efectivo de pruebas} $N_{\mathrm{eff}}$: complejidad estad\'istica
+    real del proceso de b\'usqueda.
+\end{itemize}
+
+Una aproximaci\'on razonable consiste en estimar $N_{\mathrm{eff}}$ a partir de la dependencia
+entre estad\'isticos de performance o entre series de retornos, por ejemplo mediante estructura
+de correlaci\'on, clustering o dimensionalidad efectiva. El principio es:
+\[
+1 \le N_{\mathrm{eff}} \le m.
+\]
+
+El m\'odulo no debe asumir impl\'icitamente que cada backtest es independiente.
+
+\section{Dise\~no correcto de hip\'otesis}
+
+No toda estrategia necesita el mismo test. Antes de ajustar p-values, debe definirse qu\'e
+se est\'a contrastando exactamente. Ejemplos:
+
+\begin{itemize}[leftmargin=2em]
+    \item media de retornos distinta de cero;
+    \item alpha frente a benchmark condicional;
+    \item Sharpe superior a un umbral m\'inimo;
+    \item superioridad respecto a una estrategia base;
+    \item estabilidad OOS por bloques temporales.
+\end{itemize}
+
+Si una familia mezcla hip\'otesis econ\'omicamente distintas, el ajuste global pierde interpretaci\'on.
+Por ello, \texttt{multiple\_testing.py} debe agrupar tests homog\'eneos por familia experimental:
+\[
+\mathcal{H}
+=
+\mathcal{H}^{\mathrm{signals}}
+\cup
+\mathcal{H}^{\mathrm{filters}}
+\cup
+\mathcal{H}^{\mathrm{portfolio}}
+\cup
+\mathcal{H}^{\mathrm{execution}}.
+\]
+
+Cada familia puede requerir su propio control FDR o su propia l\'ogica jer\'arquica.
+
+\section{Arquitectura de validaci\'on recomendada}
+
+El flujo correcto del m\'odulo debe ser:
+
+\begin{enumerate}[leftmargin=2em]
+    \item recolectar todos los experimentos ejecutados dentro del mismo ciclo de research;
+    \item agruparlos por familia homog\'enea de hip\'otesis;
+    \item construir estad\'isticos y p-values coherentes con cada objetivo;
+    \item estimar dependencia y, si procede, $N_{\mathrm{eff}}$;
+    \item aplicar correcci\'on FWER o FDR seg\'un el modo operativo;
+    \item calcular DSR o estad\'istico equivalente sobre los candidatos supervivientes;
+    \item emitir una decisi\'on \texttt{PASS/WARN/FAIL} con justificaci\'on auditable.
+\end{enumerate}
+
+\section{Governance: qu\'e significa PASS, WARN y FAIL}
+
+Un esquema serio de gobernanza podr\'ia ser el siguiente:
+
+\subsection{PASS}
+Se asigna \texttt{PASS} a una estrategia candidata solo si:
+\begin{itemize}[leftmargin=2em]
+    \item pertenece a una familia de hip\'otesis bien definida;
+    \item supera el control estad\'istico elegido ($p_{\mathrm{adj}} \le \alpha$ o equivalente);
+    \item su DSR supera el umbral interno fijado por investigaci\'on;
+    \item el resultado es consistente por subperiodos y no depende de una cola aislada de observaciones.
+\end{itemize}
+
+\subsection{WARN}
+Se asigna \texttt{WARN} si:
+\begin{itemize}[leftmargin=2em]
+    \item la estrategia pasa BH pero no Holm/Bonferroni;
+    \item el DSR es marginal;
+    \item el n\'umero efectivo de pruebas es incierto;
+    \item la dependencia entre tests hace fr\'agil la interpretaci\'on.
+\end{itemize}
+
+\subsection{FAIL}
+Se asigna \texttt{FAIL} si:
+\begin{itemize}[leftmargin=2em]
+    \item no sobrevive ning\'un control por pruebas m\'ultiples;
+    \item el Sharpe ajustado por selecci\'on no es estad\'isticamente excepcional;
+    \item el candidato resulta ser el producto de una b\'usqueda muy amplia sin penalizaci\'on adecuada;
+    \item el experimento no registra cu\'al fue el verdadero espacio de especificaciones evaluado.
+\end{itemize}
+
+\section{Sobre los umbrales}
+
+No deben presentarse umbrales universales del tipo:
+\[
+p_{\mathrm{adj}} < 0.05,\qquad \mathrm{DSR} > 1.96
+\]
+como si fuesen constantes naturales aplicables a cualquier pipeline.
+
+El m\'odulo debe permitir configurar:
+\begin{itemize}[leftmargin=2em]
+    \item nivel $\alpha$ o $q$ por familia,
+    \item tipo de correcci\'on (Holm, BH, BY, bootstrap, etc.),
+    \item umbral de DSR o probabilidad m\'inima de superioridad,
+    \item requerimientos adicionales de magnitud econ\'omica.
+\end{itemize}
+
+En investigaci\'on cuantitativa, la significaci\'on estad\'istica sin magnitud econ\'omica no es suficiente,
+y la magnitud econ\'omica sin correcci\'on por selecci\'on tampoco.
+
+\section{Casos l\'imite y trampas frecuentes}
+
+El m\'odulo debe protegerse contra varios errores comunes:
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{P-hacking por stopping informal.} Repetir pruebas hasta encontrar una que funcione
+    sin registrar las descartadas invalida la familia de hip\'otesis observada.
+    \item \textbf{Hiperpar\'ametros no registrados.} Si el repositorio solo guarda la versi\'on final,
+    se subestima el verdadero n\'umero de pruebas.
+    \item \textbf{Dependencia fuerte entre variantes.} Cientos de grid points sobre el mismo filtro
+    no equivalen a cientos de ideas independientes.
+    \item \textbf{Uso de un mismo OOS para muchas rondas de selecci\'on.} Ese bloque deja de ser
+    verdaderamente fuera de muestra.
+    \item \textbf{M\'ultiples m\'etricas objetivo.} Elegir ex post entre Sharpe, CAGR, Calmar o hit-rate
+    tambi\'en ampl\'ia el espacio de selecci\'on.
+    \item \textbf{Re-etiquetar la familia tras ver los resultados.} La definici\'on de la familia debe ser
+    previa o, como m\'inimo, exhaustivamente auditada.
+\end{enumerate}
+
+\section{Invariantes de implementaci\'on}
+
+\begin{itemize}[leftmargin=2em]
+    \item ning\'un resultado puede recibir \texttt{PASS} si el experimento no registra la familia de b\'usqueda;
+    \item los p-values deben ajustarse sobre la familia realmente explorada, no sobre una submuestra conveniente;
+    \item DSR no debe implementarse como funci\'on mon\'otona arbitraria del n\'umero de trials;
+    \item el n\'umero efectivo de pruebas debe poder ser distinto del n\'umero bruto de backtests;
+    \item una estrategia no debe promocionarse solo por tener Sharpe alto si no supera el ajuste post-selecci\'on.
+\end{itemize}
+
+\section{Salida recomendada del m\'odulo}
+
+La salida debe ser estructurada y auditable:
+
 \begin{verbatim}
-from statsmodels.stats.multitest import multipletests
-reject, p_adj = multipletests(p_raw, method='fdr_bh', alpha=0.05)
-dsr = sharpe / np.cbrt(n_trials)
-significant = (dsr > 1.96) & (p_adj < 0.05)
+{
+  "family_id": "...",
+  "n_tests_raw": ...,
+  "n_tests_effective": ...,
+  "method_primary": "holm|bonferroni|bh|by|bootstrap",
+  "alpha_or_q": ...,
+  "pvals_raw": [...],
+  "pvals_adj": [...],
+  "rejections": [...],
+  "sharpe_raw": [...],
+  "dsr": [...],
+  "selected_candidates": [...],
+  "gate": "PASS|WARN|FAIL",
+  "binding_reason": "...",
+  "notes": [...]
+}
 \end{verbatim}
 
-\section{Referencias}
+\section{Esqueleto de implementaci\'on}
+
+\begin{verbatim}
+def run_multiple_testing_audit(experiments, config):
+    grouped = group_by_hypothesis_family(experiments)
+
+    reports = []
+    for family in grouped:
+        stats = compute_test_statistics(family, config)
+        pvals = compute_raw_pvalues(stats, config)
+
+        n_eff = estimate_effective_number_of_tests(family, stats, config)
+
+        p_adj, reject = adjust_pvalues(
+            pvals,
+            method=config.primary_method,
+            alpha=config.alpha,
+            dependence=config.dependence_mode
+        )
+
+        dsr = compute_deflated_sharpe_ratio(
+            sharpe=stats["sharpe"],
+            sample_length=stats["T"],
+            skew=stats["skew"],
+            kurtosis=stats["kurtosis"],
+            n_eff=n_eff,
+            config=config
+        )
+
+        gate, reason = apply_multiple_testing_governance(
+            p_adj=p_adj,
+            reject=reject,
+            dsr=dsr,
+            family=family,
+            config=config
+        )
+
+        reports.append({
+            "family_id": family.id,
+            "n_tests_raw": len(family),
+            "n_tests_effective": n_eff,
+            "pvals_adj": p_adj,
+            "reject": reject,
+            "dsr": dsr,
+            "gate": gate,
+            "binding_reason": reason
+        })
+
+    return reports
+\end{verbatim}
+
+\section{Interpretaci\'on correcta}
+
+La lectura correcta de este m\'odulo no es:
+\begin{quote}
+``aplicamos BH-FDR y ahora nuestras survivors tienen Sharpe institucional''.
+\end{quote}
+
+La lectura correcta es:
+\begin{quote}
+``una vez contabilizado el espacio real de pruebas y ajustada la inflaci\'on por selecci\'on,
+solo un subconjunto peque\~no de resultados sigue siendo compatible con una se\~nal econ\'omica
+genuina''.
+\end{quote}
+
+Ese lenguaje es menos vistoso, pero es mucho m\'as cercano a una especificaci\'on de research seria.
+
+\section{Referencias orientativas}
+
 \begin{thebibliography}{9}
-\bibitem{lopez} L\'opez de Prado (2019). The Deflated Sharpe Ratio. JPM.
-\bibitem{harvey} Harvey \& Liu (2015). Backtesting. JFE.
-\bibitem{bh} Benjamini \& Hochberg (1995). FDR Procedure.
+
+\bibitem{bh}
+Benjamini, Y. y Hochberg, Y. (1995).
+Controlling the false discovery rate: a practical and powerful approach to multiple testing.
+
+\bibitem{holm}
+Holm, S. (1979).
+A simple sequentially rejective multiple test procedure.
+
+\bibitem{harveyliu}
+Harvey, C. R. y Liu, Y. (2015 y trabajos posteriores).
+Backtesting, multiple testing y selecci\'on en asset pricing y estrategias cuantitativas.
+
+\bibitem{bailey}
+Bailey, D. H. y L\'opez de Prado, M.
+Trabajos sobre Probabilistic Sharpe Ratio, Deflated Sharpe Ratio y backtest overfitting.
+
 \end{thebibliography}
+
+\section{Conclusi\'on}
+
+Un m\'odulo serio de multiple testing no presume de retornos anuales de los ``survivors'' ni
+vende una tasa de filtrado como si fuese prueba de excelencia. Su tarea es m\'as disciplinada:
+reconstruir el verdadero coste estad\'istico del proceso de investigaci\'on y exigir que cualquier
+estrategia candidata sobreviva no solo al backtest, sino tambi\'en al sesgo introducido por haber
+sido elegida entre muchas alternativas.
 
 \end{document}

@@ -3,12 +3,15 @@
 \usepackage[spanish]{babel}
 \usepackage{amsmath,amssymb,amsfonts}
 \usepackage{mathtools}
+\usepackage{booktabs}
 \usepackage{longtable}
-\usepackage{algorithm,algorithmic}
+\usepackage{array}
+\usepackage{enumitem}
 \usepackage{hyperref}
+\usepackage[a4paper,margin=2.4cm]{geometry}
 
-\title{Análisis de Estado del Arte: Módulo \texttt{backtest/run\_walkforward.py}}
-\author{Sistema de Swing Trading Cuantitativo}
+\title{Especificación Cuantitativa e Institucional del Módulo \texttt{backtest/run\_walkforward.py}}
+\author{Sistema \texttt{simons\_smallcap\_swing}}
 \date{\today}
 
 \begin{document}
@@ -16,227 +19,659 @@
 \maketitle
 
 \begin{abstract}
-Este documento describe el diseño, la fundamentación matemática y el contexto académico/industrial del módulo \texttt{backtest/run\_walkforward.py} en el repositorio \texttt{JimSimons}. El objetivo es orquestar una \textbf{evaluación walk‑forward} \textit{end‑to‑end} (train \(\rightarrow\) predict \(\rightarrow\) backtest) sobre ventanas temporales consecutivas, produciendo \textbf{métricas OOS realistas, reproducibles y libres de \textit{look‑ahead leakage}}. El módulo define esquemas de \textit{rolling} y \textit{expanding} windows, coordina entrenamiento de modelos, inferencia y ejecución de \texttt{backtest/engine}, y agrega resultados OOS globales. El enfoque está alineado con estándares de \textit{walk‑forward analysis} y \textit{purged cross‑validation} usados en \textit{quant research} moderno \cite{walkforward_sklearn, quantinsti_wfo, combinatory_purged_cv, funds_wfo}.
+Este documento define de forma operativa, matemática y de ingeniería el módulo
+\texttt{backtest/run\_walkforward.py} del sistema \texttt{simons\_smallcap\_swing}.
+Su misión es orquestar una evaluación \textit{walk-forward} completa y
+\textit{point-in-time} (PIT), desde entrenamiento e inferencia hasta backtest OOS,
+de modo que el rendimiento agregado represente una estimación temporalmente causal,
+reproducible y metodológicamente defendible del comportamiento futuro de la estrategia.
+La especificación no se limita a describir ventanas rolling o expanding, sino que
+fija contratos de entrada y salida, reglas de purga y embargo, tratamiento de labels
+con horizonte, versionado de artefactos por ventana, criterios de agregación OOS,
+tolerancias metodológicas, \textit{failure modes}, edge cases, severidades, tests
+mínimos y reglas de promoción. El principio rector es inequívoco: un walk-forward
+válido no es una sucesión informal de entrenamientos, sino una simulación disciplinada
+del ciclo real de reentrenamiento, predicción y monetización bajo información sólo
+disponible en cada instante.
 \end{abstract}
 
 \tableofcontents
 
-\section{Objetivo del módulo}
+\section{Propósito institucional del módulo}
 
-El módulo \texttt{backtest/run\_walkforward.py} tiene como objetivo:
+El módulo \texttt{backtest/run\_walkforward.py} existe para responder una pregunta
+central en investigación cuantitativa seria:
 
-\begin{itemize}
-  \item \textbf{Orquestar un pipeline walk‑forward} completo:
-    \[
-      \text{train} \rightarrow \text{predict} \rightarrow \text{backtest OOS}
-    \]
-    sobre ventanas temporales consecutivas.
-  \item \textbf{Estimar \textit{performance realista}} usando únicamente \textit{out‑of‑sample} (OOS) test windows, evitando \textit{data‑mining} y \textit{overfitting}.
-  \item \textbf{Garantizar reproducción} por medio de seeds, versiones de datos y \texttt{run\_id}.
-\end{itemize}
+\begin{quote}
+\emph{Si la estrategia se hubiera entrenado, recalibrado y explotado
+secuencialmente en el tiempo, utilizando sólo la información disponible en cada fecha,
+¿qué rendimiento neto OOS, qué estabilidad por ventana y qué degradación temporal
+habría mostrado realmente?}
+\end{quote}
 
-El \textit{walk‑forward analysis} (WFA) moderno se considera \textit{gold standard} para validar modelos de tiempo y estrategias de trading, porque simula cómo se reentrenarían y reevaluarían los modelos en el tiempo real \cite{walkforward_sklearn, quantinsti_wfo, ibkr_walkforward}.
+Su función no es sólo automatizar un bucle, sino imponer disciplina metodológica
+a la validación temporal del sistema. En un stack institucional, el walk-forward
+cumple simultáneamente cinco roles:
 
-\section{Contexto académico e industrial}
-
-\subsection{Walk‑forward analysis y leak‑free split}
-
-El \textit{walk‑forward} se puede definir mediante ventanas:
-
-\begin{itemize}
-  \item \textbf{Train window} \( \mathcal{T}_k \): \([t_0, t_{\text{valid},k}]\).
-  \item \textbf{Validation window} \( \mathcal{V}_k \): \([t_{\text{valid},k}, t_{\text{test},k}]\).
-  \item \textbf{Test window (OOS)} \( \mathcal{S}_k \): \([t_{\text{test},k}, t_{\text{test},k} + \Delta_t]\).
-\end{itemize}
-
-En cada iteración \(k\), el modelo:
-
-\begin{enumerate}
-  \item Se entrena solo en \( \mathcal{T}_k \) (con \textit{embargo} opcional).
-  \item Se valida internamente en \( \mathcal{V}_k \) para \textit{early‑stopping} o \textit{model selection}.
-  \item Se prueba en \( \mathcal{S}_k \) sin uso posterior para \textit{tuning}.
+\begin{enumerate}[label=\arabic*.]
+    \item \textbf{Validación temporal realista}: aproximar el proceso real de
+    retraining e inferencia secuencial.
+    \item \textbf{Control de leakage}: impedir contaminación entre train, valid y test.
+    \item \textbf{Medición de estabilidad}: evaluar degradación entre ventanas,
+    heterogeneidad del edge y sensibilidad al régimen.
+    \item \textbf{Producción de OOS agregable}: construir una trayectoria OOS
+    no solapada que pueda alimentar diagnostics, report y comparadores de estrategias.
+    \item \textbf{Trazabilidad institucional}: dejar artefactos suficientes para
+    reconstruir cada decisión tomada en cada ventana.
 \end{enumerate}
 
-El agregado global se construye con \texttt{non‑overlapping} segmentos OOS \(\mathcal{S}_k\) para evitar \textit{leakage} y garantizar estimadores independientes de \textit{Sharpe} o \textit{CAGR} \cite{combinatory_purged_cv, walkforward_sklearn, quantinsti_wfo}.
+\section{Principio rector}
 
-\subsection{Ventanas rolling vs expanding}
+La filosofía del módulo debe ser:
 
-\begin{itemize}
-  \item \textbf{Rolling window}:
-    \[
-      \mathcal{T}_k = [t_k - L_{\text{train}}, t_k]
-    \]
-    con tamaño fijo \(L_{\text{train}}\). Se usa cuando se quiere dar mayor peso a datos recientes y adaptarse a cambios de régimen \cite{walkforward_sklearn, funds_wfo}.
-  \item \textbf{Expanding window}:
-    \[
-      \mathcal{T}_k = [t_0, t_k]
-    \]
-    se usa cuando se dispone de pocos datos y se busca estabilidad en estimadores de riesgo \cite{quantinsti_wfo, ibkr_walkforward}.
-\end{itemize}
+\begin{quote}
+\emph{No aceptar como OOS una predicción si existe cualquier posibilidad
+razonable de que haya sido informada directa o indirectamente por observaciones,
+labels, filtros o metadatos posteriores a la fecha de decisión.}
+\end{quote}
 
-El módulo soporta ambos modos mediante un parámetro \texttt{window\_mode}.
-
-\section{Alcance funcional}
-
-\subsection{Qué incluye el módulo}
+Esta filosofía impone tres obligaciones:
 
 \begin{itemize}
-  \item \textbf{Definición de ventanas} rolling/expanding:
-    \[
-      \mathcal{T}_k, \mathcal{V}_k, \mathcal{S}_k
-    \]
-    con \texttt{embargo\_days} entre \(\mathcal{T}_k\) y \(\mathcal{S}_k\).
-  \item \textbf{Ejecución secuencial de entrenamiento} por ventana, invocando \texttt{models/gbdt/train\_lgbm}.
-  \item \textbf{Generación de predicciones} en bloque OOS para \(\mathcal{S}_k\).
-  \item \textbf{Lanzamiento de \texttt{backtest/engine}} para cada \(\mathcal{S}_k\).
-  \item \textbf{Agregación global} de resultados OOS:
-    \[
-      \text{OOS} = \bigcup_k \mathcal{S}_k \text{ sin overlap}
-    \]
+    \item purgar correctamente observaciones cercanas cuando el label depende de
+    un horizonte futuro;
+    \item embargar la frontera temporal entre train y test si el problema lo exige;
+    \item agregar sólo segmentos OOS con semántica homogénea y sin solapamiento.
 \end{itemize}
 
-\subsection{Qué no incluye}
+\section{Preguntas que el módulo debe responder}
+
+Toda ejecución de \texttt{run\_walkforward.py} debe producir artefactos que permitan
+contestar, sin ambigüedad, a las siguientes preguntas:
 
 \begin{itemize}
-  \item \textbf{Implementación interna} de \texttt{train\_lgbm}, \texttt{predict} o \texttt{engine}: simplemente los invoca.
-  \item \textbf{Tuneo hiperparamétrico masivo} (por ejemplo, \texttt{BayesianOptimization} u \texttt{GridSearch}): se delega a \texttt{research} o \texttt{optimization}.
-  \item \textbf{Selección manual de señales}: se realiza fuera por medio de \texttt{config}.
+    \item ¿Qué rendimiento neto OOS agregado produce la estrategia cuando se
+    reentrena secuencialmente?
+    \item ¿Cuánto varía la calidad del modelo entre ventanas?
+    \item ¿La señal se degrada en el tiempo o permanece razonablemente estable?
+    \item ¿El edge depende de un subconjunto pequeño de ventanas o es robusto?
+    \item ¿El esquema de entrenamiento elegido (rolling o expanding) altera de
+    forma material el resultado?
+    \item ¿Las reglas de purga y embargo eliminan adecuadamente el leakage inducido
+    por labels con horizonte o superposición temporal?
 \end{itemize}
+
+\section{Alcance}
+
+\subsection{Incluido}
+
+El módulo debe cubrir, al menos:
+
+\begin{itemize}
+    \item construcción de ventanas \texttt{rolling} o \texttt{expanding};
+    \item definición explícita de bloques \texttt{train}, \texttt{valid}, \texttt{test};
+    \item aplicación de \texttt{purge} y \texttt{embargo};
+    \item entrenamiento de modelos por ventana;
+    \item inferencia OOS por ventana;
+    \item lanzamiento de \texttt{backtest/engine.py} sobre el bloque OOS;
+    \item persistencia de artefactos por ventana;
+    \item agregación global de resultados OOS no solapados;
+    \item generación de métricas por ventana y métricas OOS globales.
+\end{itemize}
+
+\subsection{Excluido}
+
+El módulo \textbf{no} debe:
+
+\begin{itemize}
+    \item implementar internamente el algoritmo de entrenamiento del modelo;
+    \item redefinir la semántica del engine;
+    \item realizar tuning masivo de hiperparámetros fuera de lo que la configuración permita;
+    \item reemplazar a diagnostics, attribution o report;
+    \item considerar válido un experimento sólo porque termine sin errores de ejecución.
+\end{itemize}
+
+\section{Principios de diseño}
+
+\begin{enumerate}[label=\arabic*.]
+    \item \textbf{Causalidad temporal estricta}: toda ventana debe respetar el orden
+    real de disponibilidad de datos.
+    \item \textbf{Purga antes que conveniencia}: si existe duda sobre contaminación
+    temporal, se favorece la exclusión conservadora de muestras.
+    \item \textbf{Versionado por ventana}: cada ventana debe ser un experimento
+    reconstruible por sí mismo.
+    \item \textbf{OOS homogéneo}: sólo se agregan segmentos comparables y sin solape.
+    \item \textbf{Fallo ruidoso}: cualquier incoherencia metodológica material debe
+    bloquear la promoción del run.
+    \item \textbf{Persistencia total}: ningún resultado OOS es institucionalmente
+    válido sin artefactos y manifiesto reproducible.
+\end{enumerate}
+
+\section{Modelo temporal y notación}
+
+Sea \(\mathcal{D} = \{t_1,\dots,t_T\}\) la secuencia de sesiones de mercado ordenadas.
+Para cada iteración \(k\), definimos tres conjuntos temporales:
+
+\begin{itemize}
+    \item \(\mathcal{T}_k\): bloque de entrenamiento;
+    \item \(\mathcal{V}_k\): bloque de validación interna, si se usa;
+    \item \(\mathcal{S}_k\): bloque OOS de test y monetización.
+\end{itemize}
+
+La estructura general debe satisfacer:
+
+\[
+\mathcal{T}_k \prec \mathcal{V}_k \prec \mathcal{S}_k
+\]
+
+donde \(\prec\) denota precedencia temporal estricta tras aplicar purga y embargo.
+
+Si el label del ejemplo \(i\) usa un horizonte \(H\) hacia delante, entonces la
+observación asociada a una fecha \(t\) contiene información económica hasta, como mínimo,
+\(t+H\). Por tanto, la simple separación por fecha de inicio no basta: se requiere
+\textbf{purga basada en el intervalo efectivo del label}.
+
+\section{Purga y embargo}
+
+Éste es uno de los puntos más importantes para elevar el módulo a nivel institucional.
+
+\subsection{Intervalo efectivo de un label}
+
+Si una observación usa features en fecha \(t\) y un label construido con retorno futuro
+sobre horizonte \(H\), su intervalo informacional efectivo puede representarse como:
+
+\[
+I(t) = [t, t+H]
+\]
+
+o, más generalmente, por el intervalo exacto que defina la construcción del label.
+
+\subsection{Regla de purga}
+
+Una observación del bloque train no puede usarse si su intervalo \(I(t)\) solapa con
+el bloque de test \(\mathcal{S}_k\). Formalmente, si
+
+\[
+I(t) \cap \mathcal{S}_k \neq \emptyset
+\]
+
+entonces dicha observación debe excluirse del train de la ventana \(k\).
+
+Esto evita que observaciones aparentemente “anteriores” contaminen el test porque sus
+labels incorporan información que entra en el periodo OOS.
+
+\subsection{Regla de embargo}
+
+Además de la purga, puede imponerse un embargo temporal de longitud \(E\) entre el final
+del bloque train/valid y el inicio de test. Entonces:
+
+\[
+\min(\mathcal{S}_k) \ge \max(\mathcal{T}_k \cup \mathcal{V}_k) + E
+\]
+
+donde \(E\) se expresa en sesiones de mercado efectivas, no en días de calendario
+ciegos, salvo que la configuración diga lo contrario.
+
+\subsection{Conclusión metodológica}
+
+El módulo no debe confundir \texttt{embargo} con \texttt{purge}. El embargo protege la
+frontera temporal; la purga protege frente a labels con horizonte. Ambos mecanismos
+deben implementarse de forma diferenciada y quedar trazados en el manifiesto.
+
+\section{Esquemas de ventana soportados}
+
+\subsection{Rolling window}
+
+En este modo, el tamaño del bloque de entrenamiento es aproximadamente fijo. Si
+\(L_{\text{train}}\) es la longitud del train y \(L_{\text{test}}\) la del test:
+
+\[
+\mathcal{T}_k = [a_k, a_k + L_{\text{train}}]
+\]
+
+\[
+\mathcal{S}_k = [b_k, b_k + L_{\text{test}}]
+\]
+
+con \(b_k\) definido tras purga y embargo.
+
+Este esquema se usa cuando se desea adaptación a regímenes recientes y control del
+envejecimiento de la señal.
+
+\subsection{Expanding window}
+
+En este modo, el train incorpora toda la historia disponible hasta la frontera de la ventana:
+
+\[
+\mathcal{T}_k = [t_0, a_k]
+\]
+
+\[
+\mathcal{S}_k = [b_k, b_k + L_{\text{test}}]
+\]
+
+Se usa cuando la señal necesita mayor profundidad muestral o cuando la estructura
+estadística se presume suficientemente estable como para beneficiarse de más historia.
+
+\subsection{Ventana de validación}
+
+La validación interna \(\mathcal{V}_k\) puede modelarse como subconjunto temporal
+del final de \(\mathcal{T}_k\) o como split temporal interno adicional. Lo importante
+es que nunca use datos de \(\mathcal{S}_k\) ni observaciones purgadas de forma inválida.
+
+\section{Criterios mínimos para construir ventanas válidas}
+
+Una ventana sólo puede ejecutarse si cumple simultáneamente:
+
+\begin{itemize}
+    \item número mínimo de sesiones en train;
+    \item número mínimo de observaciones efectivas tras purga;
+    \item cobertura suficiente del universo elegible;
+    \item bloque OOS no vacío;
+    \item validación interna posible si el modo la requiere;
+    \item ausencia de solape OOS con ventanas previamente aceptadas.
+\end{itemize}
+
+Si una ventana no cumple estos criterios, debe marcarse explícitamente como
+\texttt{SKIPPED} o \texttt{INVALID}, nunca desaparecer silenciosamente.
 
 \section{Dependencias upstream y downstream}
 
 \subsection{Upstream}
 
-\begin{description}
-  \item[Features] \texttt{features/store} con \texttt{feature\_qc pass} aplicado.
-  \item[Labels] \texttt{labels/store} con splits \textit{purged} y \texttt{embargo} diseñados para evitar \textit{leakage} temporal.
-  \item[Price data] \texttt{prices\_path} con \texttt{adjusted} para small caps.
-  \item[Universo] \texttt{universe\_path} con \texttt{is\_eligible} por fecha.
-  \item[Model] \texttt{models/gbdt/train\_lgbm} y \texttt{models/inference/predict}.
-  \item[Backtest engine] \texttt{backtest/engine} que recibe \texttt{predictions} y devuelve \texttt{pnl\_daily}.
-\end{description}
+El módulo consume outputs de:
+
+\begin{itemize}
+    \item \texttt{features/store/*}: features PIT ya auditadas;
+    \item \texttt{labels/store/*}: labels con metadatos de horizonte y construcción;
+    \item \texttt{data/prices/*}: precios consistentes con el engine;
+    \item \texttt{data/universe/*}: elegibilidad PIT por fecha y activo;
+    \item \texttt{models/*}: entrenamiento e inferencia;
+    \item \texttt{backtest/engine.py}: monetización de las predicciones OOS.
+\end{itemize}
 
 \subsection{Downstream}
 
+El módulo alimenta a:
+
 \begin{itemize}
-  \item \texttt{backtest/report.py}: reporte global de resultados OOS.
-  \item \texttt{validation/validation\_suite.py}: batería de pruebas de robustez y \textit{deflated Sharpe}.
-  \item \texttt{research/ablation/*}: \textit{ablation studies} sobre \textit{rolling} vs \textit{expanding}, \texttt{embargo\_days}, etc.
+    \item \texttt{backtest/report.py};
+    \item \texttt{backtest/diagnostics.py};
+    \item \texttt{validation/*};
+    \item comparadores de runs OOS;
+    \item estudios de estabilidad y ablaciones.
 \end{itemize}
 
 \section{Contrato de entrada}
 
 \subsection{Entradas mínimas}
 
-\begin{itemize}
-  \item \texttt{features\_path}: ruta de features \textit{PIT} agrupadas por fecha y símbolo.
-  \item \texttt{labels\_path}: ruta de etiquetas objetivo (p.ej. retornos futuros, \texttt{10d}).
-  \item \texttt{prices\_path}: \texttt{open/high/low/close/volume} ajustados.
-  \item \texttt{universe\_path}: \texttt{is\_eligible} por fecha y símbolo.
-  \item \texttt{walkforward\_config\_path}: fichero YAML con esquema de ventanas y \texttt{model\_config\_path}, \texttt{backtest\_config\_path}, \texttt{seed}.
-  \item \texttt{run\_id}: identificador único del \texttt{walkforward run}.
-\end{itemize}
-
-\subsection{Parámetros clave de configuración}
-
-\begin{longtable}{ll}
-  \textbf{Parámetro} & \textbf{Descripción} \\
-  \texttt{window\_mode} & \texttt{rolling} o \texttt{expanding}. \\
-  \texttt{train\_years} & Número de años de \textit{train window}. \\
-  \texttt{valid\_months} & Meses de \textit{validation} dentro de \texttt{train}. \\
-  \texttt{test\_months} & Ventana OOS \textit{test} para cada iteración. \\
-  \texttt{step\_months} & Cómo se desliza la ventana (p.ej. \texttt{step\_months = test\_months}). \\
-  \texttt{min\_train\_days} & Mínimo de días de \textit{train} para lanzar una ventana. \\
-  \texttt{embargo\_days} & Días sin datos entre \textit{train} y \textit{test} para evitar \textit{ticking} leakage. \\
-  \texttt{model\_config\_path} & Ruta al YAML de \texttt{train\_lgbm}. \\
-  \texttt{backtest\_config\_path} & Ruta al YAML de \texttt{engine}. \\
-  \texttt{seed} & Seed global para reproducibilidad de particiones y splits.
+\begin{longtable}{>{\ttfamily}p{4.4cm} p{9.6cm}}
+\toprule
+Campo & Descripción \\
+\midrule
+features\_path & Features PIT por \texttt{date, asset\_id}. \\
+labels\_path & Labels objetivo con metadatos de horizonte y construcción. \\
+prices\_path & Precios y campos requeridos por el engine. \\
+universe\_path & Elegibilidad PIT por fecha y activo. \\
+walkforward\_config\_path & YAML con esquema temporal, paths de modelo y engine, umbrales y seeds. \\
+run\_id & Identificador único e inmutable del experimento walk-forward. \\
+calendar\_path & Calendario de sesiones efectivas del mercado. \\
+\bottomrule
 \end{longtable}
 
-\section{Contrato de salida}
+\subsection{Parámetros de configuración obligatorios}
 
-\subsection{Por ventana}
+\begin{longtable}{>{\ttfamily}p{4.2cm} p{9.8cm}}
+\toprule
+Parámetro & Descripción \\
+\midrule
+window\_mode & \texttt{rolling} o \texttt{expanding}. \\
+train\_years / train\_days & Longitud del bloque train. \\
+valid\_months / valid\_days & Tamaño del bloque de validación si existe. \\
+test\_months / test\_days & Longitud del bloque OOS. \\
+step\_months / step\_days & Desplazamiento entre ventanas. \\
+min\_train\_days & Mínimo de sesiones para permitir entrenamiento. \\
+min\_train\_samples & Mínimo de observaciones tras purga. \\
+embargo\_days & Longitud del embargo. \\
+label\_horizon\_days & Horizonte efectivo del label o referencia al metadata store. \\
+model\_config\_path & Configuración del entrenamiento. \\
+backtest\_config\_path & Configuración del engine. \\
+seed & Seed maestra del experimento. \\
+allow\_window\_skip & Política ante ventanas inválidas. \\
+aggregation\_policy & Regla de concatenación OOS. \\
+\bottomrule
+\end{longtable}
 
-\begin{itemize}
-  \item \texttt{backtest/walkforward/\{run\_id\}/window\_{i}/model\_artifacts/*}: modelo \texttt{.lgb}, \texttt{feature\_names}, \texttt{importances}.
-  \item \texttt{backtest/walkforward/\{run\_id\}/window\_{i}/predictions.parquet}: scores/pesos por fecha y símbolo en \(\mathcal{S}_k\).
-  \item \texttt{backtest/walkforward/\{run\_id\}/window\_{i}/backtest\_outputs/*}: \texttt{positions\_daily}, \texttt{pnl\_daily}, \texttt{exposures\_daily}.
-  \item \texttt{backtest/walkforward/\{run\_id\}/window\_{i}/metrics.json}: \texttt{CAGR}, \texttt{Sharpe}, \texttt{max\_drawdown}, \texttt{turnover} por ventana.
-\end{itemize}
+\subsection{Precondiciones obligatorias}
 
-\subsection{Agregado global}
-
-\begin{itemize}
-  \item \texttt{backtest/walkforward/\{run\_id\}/oos\_equity\_curve.parquet}:
-    \[
-      \text{NAV}_t = \text{NAV}_{t-1} \cdot (1 + r_t)
-    \]
-    con \(r_t\) concatenando sólo segmentos \(\mathcal{S}_k\) no solapados.
-  \item \texttt{backtest/walkforward/\{run\_id\}/window\_summary.parquet}:
-    métricas por ventana \((k, \texttt{CAGR}_k, \texttt{Sharpe}_k, \dots)\).
-  \item \texttt{backtest/walkforward/\{run\_id\}/global\_metrics.json}:
-    \[
-      \text{CAGR}_{\text{OOS}}, \text{Sharpe}_{\text{OOS}}, \text{Sortino}_{\text{OOS}}, \text{max\_dd}_{\text{OOS}}
-    \]
-  \item \texttt{backtest/walkforward/\{run\_id\}/manifest.json}:
-    \texttt{run\_id}, \texttt{config\_hash}, \texttt{data\_versions}.
-\end{itemize}
-
-\section{Reglas PIT y anti–leakage}
+Antes de ejecutar, el módulo debe verificar:
 
 \begin{itemize}
-  \item \textbf{Cada ventana} solo entrena con datos anteriores al inicio del \textit{test window}:
-    \[
-      \mathcal{T}_k \prec \mathcal{S}_k
-    \]
-  \item \textbf{Validación} se realiza \textit{dentro} de \texttt{train window} o de \texttt{valid window}; \texttt{test} nunca se usa para \textit{tuning}.
-  \item \textbf{Embargo} se aplica entre \(\mathcal{T}_k\) y \(\mathcal{S}_k\):
-    \[
-      t_{\text{test},k} = t_{\text{end}, \mathcal{T}_k} + \texttt{embargo\_days}
-    \]
-  \item \textbf{Agregación global} usa únicamente segmentos \texttt{OOS no solapados}:
-    \[
-      \mathcal{S}_k \cap \mathcal{S}_{k'} = \emptyset \quad \text{si } k \neq k'
-    \]
+    \item unicidad de \((date, asset\_id)\) en features, labels y universe;
+    \item consistencia de identificadores de activo entre fuentes;
+    \item calendario ordenado y sin duplicados;
+    \item metadata del label disponible o longitud de horizonte explícita;
+    \item consistencia entre precios usados en inferencia/engine;
+    \item existencia de rutas de entrenamiento e inferencia configuradas;
+    \item ausencia de NaNs críticos en campos esenciales.
 \end{itemize}
 
-Estas reglas son estándar en \textit{purged and embargued CV} y \textit{walk‑forward backtesting} \cite{combinatory_purged_cv, walkforward_sklearn, ibkr_walkforward}.
+Si alguna falla, el run debe abortar.
 
-\section{Flujo del proceso}
+\section{Orden operativo del pipeline}
 
-\begin{enumerate}
-  \item \textbf{Cargar configuración y calendario}:
-    \begin{itemize}
-      \item \texttt{calendar} de sesiones de mercado.
-      \item \texttt{initial\_train\_size}, \texttt{step\_months}, \texttt{test\_months}.
-    \end{itemize}
-  \item \textbf{Construir ventanas}:
-    \begin{algorithmic}
-      \For{each window index $k$}
-        \State \texttt{train\_start}, \texttt{train\_end} \hfill \Comment{\texttt{rolling/expanding}}
-        \State \texttt{valid\_start}, \texttt{valid\_end}
-        \State \texttt{test\_start} = \texttt{train\_end} + \texttt{embargo\_days}
-        \State \texttt{test\_end} = \texttt{test\_start} + \Delta_{\text{test}}
-      \EndFor
-    \end{algorithmic}
-  \item \textbf{Por cada ventana} $\mathcal{S}_k$:
-    \begin{itemize}
-      \item \texttt{run\_window\_training(window, paths, cfg)} \\
-        Entrena modelo en \(\mathcal{T}_k\) (con \texttt{valid} interno).
-      \item \texttt{run\_window\_inference(window, model\_artifacts, paths, cfg)} \\
-        Genera \texttt{predictions.parquet} sobre \(\mathcal{S}_k\).
-      \item \texttt{run\_window\_backtest(window, preds\_path, paths, cfg)} \\
-        Ejecuta \texttt{backtest/engine} sobre \(\mathcal{S}_k\), guardando \texttt{pnl\_daily}, \texttt{positions}, etc.
-      \item \texttt{persist\_window\_outputs(window\_outputs)}.
-    \end{itemize}
-  \item \textbf{Concatenar OOS}:
-    \begin{itemize}
-      \item \texttt{aggregate\_oos\_results(window\_outputs)}.
-      \item \texttt{oos\_equity\_curve.parquet} global.
-    \end{itemize}
-  \item \textbf{Calcular métricas globales y por subperiodo}:
-    \begin{itemize}
-      \item \texttt{CAGR}, \texttt{Sharpe}, \texttt{Sortino}.
-      \item Desviación estándar de \texttt{Sharpe} por ventana:
-        \[
-          \sigma_{\text{Sharpe}} = \sqrt{\frac{1}{K-1} \sum_{k=1}^K (\text
+Cada run debe seguir esta secuencia exacta:
+
+\begin{enumerate}[label=\arabic*.]
+    \item Cargar configuración, calendario y metadatos del label.
+    \item Construir candidatas de ventana según \texttt{window\_mode}.
+    \item Aplicar purga y embargo a cada candidata.
+    \item Validar que la ventana resultante cumple mínimos operativos.
+    \item Lanzar entrenamiento sobre \(\mathcal{T}_k\) y, si aplica, validación sobre \(\mathcal{V}_k\).
+    \item Persistir artefactos del modelo y manifiesto específico de la ventana.
+    \item Generar predicciones exclusivamente sobre \(\mathcal{S}_k\).
+    \item Ejecutar \texttt{backtest/engine.py} sobre las predicciones OOS de \(\mathcal{S}_k\).
+    \item Persistir outputs de backtest por ventana.
+    \item Calcular métricas de ventana.
+    \item Repetir para todas las ventanas válidas.
+    \item Agregar sólo segmentos OOS aceptados y no solapados.
+    \item Calcular métricas globales OOS y resumen de estabilidad.
+\end{enumerate}
+
+\section{Artefactos por ventana}
+
+Cada ventana \(k\) debe tener su propio directorio persistido, por ejemplo:
+
+\begin{itemize}
+    \item \texttt{backtest/walkforward/\{run\_id\}/window\_\{k\}/window\_manifest.json}
+    \item \texttt{backtest/walkforward/\{run\_id\}/window\_\{k\}/train\_metadata.json}
+    \item \texttt{backtest/walkforward/\{run\_id\}/window\_\{k\}/model\_artifacts/*}
+    \item \texttt{backtest/walkforward/\{run\_id\}/window\_\{k\}/predictions.parquet}
+    \item \texttt{backtest/walkforward/\{run\_id\}/window\_\{k\}/backtest\_outputs/*}
+    \item \texttt{backtest/walkforward/\{run\_id\}/window\_\{k\}/window\_metrics.json}
+\end{itemize}
+
+\subsection{Contenido mínimo de \texttt{window\_manifest.json}}
+
+Debe contener, como mínimo:
+
+\begin{itemize}
+    \item \texttt{run\_id}
+    \item \texttt{window\_id}
+    \item fechas exactas de \texttt{train}, \texttt{valid}, \texttt{test}
+    \item número de observaciones antes y después de purga
+    \item embargo aplicado
+    \item seed efectiva
+    \item versión del código / commit hash
+    \item hashes o snapshots de datasets
+    \item estado final de la ventana: \texttt{OK / SKIPPED / INVALID / ERROR}
+\end{itemize}
+
+\section{Contrato de salida global}
+
+El run completo debe persistir, al menos:
+
+\begin{itemize}
+    \item \texttt{backtest/walkforward/\{run\_id\}/window\_summary.parquet}
+    \item \texttt{backtest/walkforward/\{run\_id\}/oos\_returns.parquet}
+    \item \texttt{backtest/walkforward/\{run\_id\}/oos\_equity\_curve.parquet}
+    \item \texttt{backtest/walkforward/\{run\_id\}/global\_metrics.json}
+    \item \texttt{backtest/walkforward/\{run\_id\}/run\_manifest.json}
+\end{itemize}
+
+\subsection{Esquema mínimo de \texttt{window\_summary.parquet}}
+
+\begin{longtable}{>{\ttfamily}p{4.2cm} p{9.8cm}}
+\toprule
+Campo & Descripción \\
+\midrule
+window\_id & Índice o identificador estable de la ventana. \\
+train\_start & Inicio del train efectivo. \\
+train\_end & Final del train efectivo. \\
+valid\_start & Inicio de validación, si existe. \\
+valid\_end & Final de validación, si existe. \\
+test\_start & Inicio OOS. \\
+test\_end & Final OOS. \\
+n\_train\_samples & Observaciones de train tras purga. \\
+n\_test\_samples & Observaciones OOS. \\
+window\_status & OK / SKIPPED / INVALID / ERROR. \\
+model\_score\_is & Métrica interna de train/valid si existe. \\
+cagr\_oos & CAGR o retorno anualizado OOS de la ventana. \\
+sharpe\_oos & Sharpe OOS de la ventana. \\
+max\_drawdown\_oos & Max drawdown OOS de la ventana. \\
+turnover\_oos & Turnover medio de la ventana. \\
+cost\_bps\_oos & Coste medio en bps. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Esquema mínimo de \texttt{oos\_returns.parquet}}
+
+\begin{longtable}{>{\ttfamily}p{4.2cm} p{9.8cm}}
+\toprule
+Campo & Descripción \\
+\midrule
+date & Fecha OOS agregada. \\
+window\_id & Ventana de procedencia. \\
+return\_net & Retorno neto diario OOS. \\
+return\_gross & Retorno bruto si existe. \\
+nav & NAV agregado según política definida. \\
+is\_overlap\_flag & Debe ser falso para filas aceptadas. \\
+\bottomrule
+\end{longtable}
+
+\section{Reglas de agregación OOS}
+
+Éste es otro punto crítico para llevar el módulo a nivel institucional.
+
+\subsection{No solapamiento}
+
+Sólo pueden concatenarse ventanas cuyos bloques OOS satisfagan:
+
+\[
+\mathcal{S}_k \cap \mathcal{S}_{k'} = \emptyset \qquad \forall k \neq k'
+\]
+
+Si existe solape, el run debe:
+
+\begin{itemize}
+    \item rechazar la agregación, o
+    \item resolver el solape según política explícita y documentada,
+\end{itemize}
+
+pero nunca concatenar silenciosamente.
+
+\subsection{Semántica homogénea}
+
+No deben agregarse como una única curva OOS ventanas con:
+
+\begin{itemize}
+    \item definiciones distintas de retorno;
+    \item configuraciones distintas del engine;
+    \item cambios de universo no documentados como parte del experimento;
+    \item seeds o modelos intencionalmente distintos sin marcar el experimento como mixto.
+\end{itemize}
+
+\subsection{Política de NAV agregado}
+
+El módulo debe definir una única política de agregación, por ejemplo reinversión secuencial:
+
+\[
+NAV_t = NAV_{t-1}(1 + r_t)
+\]
+
+sobre la concatenación temporal ordenada de retornos OOS aceptados. Esta política debe
+quedar congelada en el manifiesto.
+
+\section{Métricas globales obligatorias}
+
+Sobre la serie OOS agregada deben calcularse, al menos:
+
+\begin{itemize}
+    \item retorno total neto;
+    \item CAGR;
+    \item volatilidad anualizada;
+    \item Sharpe;
+    \item Sortino;
+    \item max drawdown;
+    \item Calmar;
+    \item win rate;
+    \item turnover medio;
+    \item coste medio y total en bps;
+    \item número de ventanas válidas;
+    \item dispersión del Sharpe por ventana;
+    \item dispersión del retorno por ventana.
+\end{itemize}
+
+Si \(K\) es el número de ventanas válidas y \(\text{Sharpe}_k\) el Sharpe OOS de cada
+una, una medida simple de heterogeneidad es:
+
+\[
+\sigma_{\text{Sharpe}} =
+\sqrt{
+\frac{1}{K-1}
+\sum_{k=1}^{K}
+\left(\text{Sharpe}_k - \overline{\text{Sharpe}}\right)^2
+}
+\]
+
+Esta dispersión no debe ocultarse, porque un buen OOS agregado con heterogeneidad
+extrema entre ventanas puede ser metodológicamente frágil.
+
+\section{Criterios de aceptación del run}
+
+Un walk-forward no debe considerarse automáticamente válido porque produzca un archivo
+de métricas. Como mínimo, debe exigirse:
+
+\begin{enumerate}[label=\arabic*.]
+    \item ausencia de leakage detectado;
+    \item número suficiente de ventanas válidas;
+    \item cobertura temporal OOS razonable;
+    \item solape OOS nulo;
+    \item consistencia metodológica entre ventanas agregadas;
+    \item ausencia de errores críticos del engine en ventanas aceptadas.
+\end{enumerate}
+
+En caso contrario, el run debe etiquetarse como \texttt{REVIEW} o \texttt{FAIL}.
+
+\section{Sistema de severidades}
+
+Cada ventana y el run global deben etiquetarse con severidad:
+
+\begin{itemize}
+    \item \textbf{OK}: ventana válida y metodológicamente limpia.
+    \item \textbf{WARNING}: ventana utilizable pero con incidencias no bloqueantes.
+    \item \textbf{ERROR}: fallo material de entrenamiento, inferencia o backtest.
+    \item \textbf{CRITICAL}: posible leakage, solape OOS material o inconsistencia estructural.
+\end{itemize}
+
+Reglas mínimas:
+
+\begin{itemize}
+    \item cualquier evidencia de leakage implica \texttt{CRITICAL};
+    \item solape OOS no resuelto implica \texttt{CRITICAL};
+    \item menos del mínimo configurado de ventanas válidas implica al menos \texttt{ERROR};
+    \item una ventana inválida no debe contaminar el agregado global.
+\end{itemize}
+
+\section{Tratamiento de edge cases}
+
+\subsection{Ventanas demasiado pequeñas}
+
+Si tras purga el train queda demasiado reducido, la ventana debe marcarse como inválida.
+
+\subsection{Huecos de mercado y calendario irregular}
+
+El módulo debe usar sesiones efectivas del calendario, no restas ingenuas sobre fechas
+de calendario.
+
+\subsection{Cambio de universo}
+
+Si el universo cambia de forma importante entre ventanas, esto debe registrarse y
+reflejarse en el manifiesto. No invalida necesariamente el run, pero sí afecta la
+interpretación comparativa.
+
+\subsection{Test vacío}
+
+Si una ventana no produce observaciones OOS monetizables, no debe considerarse válida.
+
+\subsection{Fallo parcial del engine}
+
+Si el engine devuelve outputs incompletos o severidades altas, la ventana debe marcarse
+como \texttt{ERROR} o \texttt{INVALID}, según política explícita.
+
+\section{Failure modes que el módulo debe detectar}
+
+Como mínimo, debe detectar y hacer visibles los siguientes modos de fallo:
+
+\begin{itemize}
+    \item train aparentemente anterior pero contaminado por labels con horizonte;
+    \item embargo aplicado pero sin purga efectiva;
+    \item solape silencioso entre bloques OOS;
+    \item mezcla de configuraciones de engine entre ventanas;
+    \item pérdida silenciosa de fechas al agregar OOS;
+    \item modelo entrenado con universo distinto del monetizado sin trazabilidad;
+    \item ventana aceptada pese a que el engine falló materialmente;
+    \item run global construido con muy pocas ventanas pero presentado como robusto.
+\end{itemize}
+
+\section{Run manifest y reproducibilidad}
+
+El fichero \texttt{run\_manifest.json} debe contener, como mínimo:
+
+\begin{itemize}
+    \item \texttt{run\_id}
+    \item commit hash o versión del código
+    \item configuración congelada completa
+    \item hashes o snapshots de features, labels, universe y precios
+    \item política de purga y embargo
+    \item política de agregación OOS
+    \item lista de ventanas con su estado
+    \item número de ventanas válidas y rechazadas
+    \item timestamp de generación
+\end{itemize}
+
+Sin esto, el experimento no debe considerarse institucionalmente reproducible.
+
+\section{Tests mínimos exigibles}
+
+Este módulo debe venir acompañado, al menos, de:
+
+\begin{enumerate}[label=\arabic*.]
+    \item \textbf{Test rolling}: construcción correcta de ventanas rolling.
+    \item \textbf{Test expanding}: construcción correcta de ventanas expanding.
+    \item \textbf{Test purge}: exclusión correcta de observaciones con labels solapados.
+    \item \textbf{Test embargo}: frontera temporal correcta entre train y test.
+    \item \textbf{Test no-overlap}: agregación OOS rechaza ventanas solapadas.
+    \item \textbf{Test skip/invalid}: ventanas insuficientes se marcan correctamente.
+    \item \textbf{Test manifest}: persistencia íntegra de manifiestos por ventana y global.
+    \item \textbf{Test reproducibility}: misma configuración y seed producen el mismo conjunto de ventanas y el mismo agregado OOS.
+\end{enumerate}
+
+\section{Criterio de calidad institucional}
+
+El módulo puede considerarse de nivel institucional si cumple simultáneamente:
+
+\begin{enumerate}[label=\arabic*.]
+    \item causalidad temporal estricta;
+    \item purga y embargo explícitos y correctamente separados;
+    \item artefactos reproducibles por ventana;
+    \item agregado OOS no solapado y metodológicamente homogéneo;
+    \item métricas de estabilidad entre ventanas visibles;
+    \item reglas claras de aceptación, rechazo y severidad.
+\end{enumerate}
+
+\section{Conclusión}
+
+\texttt{backtest/run\_walkforward.py} debe ser la capa que convierte un backtest
+puntual en una validación temporal seria. Su función no es automatizar varias corridas,
+sino imponer una disciplina de entrenamiento secuencial, purga correcta, embargo,
+monetización OOS y agregación sólo de segmentos defendibles. Ésa es la diferencia
+entre un experimento cómodo y un proceso cuantitativo institucional. En el contexto
+de \texttt{simons\_smallcap\_swing}, donde los riesgos de leakage, overfitting y
+estabilidad aparente son especialmente peligrosos, este módulo debe operar como un
+árbitro metodológico duro: hostil a la ambigüedad, estricto con la causalidad y
+obsesionado con la trazabilidad. Sólo así el OOS agregado puede interpretarse como
+evidencia y no como ilusión retrospectiva.
+
+\end{document}

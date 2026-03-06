@@ -1,182 +1,559 @@
 \section{Módulo: \texttt{data/edgar/edgar\_qc.py}}
 
-\subsection{Objetivo general del módulo}
+\subsection{Objetivo estratégico del módulo}
 
-El módulo \texttt{edgar\_qc.py} implementa un \emph{control de calidad integral} sobre el pipeline EDGAR de datos regulatorios de la SEC, incluyendo:
+El módulo \texttt{edgar\_qc.py} implementa la capa formal de \emph{data quality assurance}, \emph{data lineage control} y \emph{point-in-time integrity enforcement} del subsistema EDGAR. Su función no es meramente diagnosticar errores, sino \textbf{decidir de forma operativa y reproducible} si los artefactos regulatorios generados por el pipeline pueden entrar en producción analítica sin introducir sesgos de selección, \emph{look-ahead bias}, contaminación temporal o degradación silenciosa de la base de features.
+
+Dentro de la arquitectura global, este módulo actúa como un \emph{risk gate} sobre la cadena completa de ingestión y transformación de datos SEC/EDGAR, incluyendo:
+
 \begin{itemize}
-  \item mapping de CIK (Central Index Key),
-  \item descarga de notas y XBRL,
-  \item parsing de facts financieros,
-  \item y construcción de una vista \emph{point‑in‑time} (PIT) de los datos.
+    \item resolución de identidad regulatoria (\texttt{ticker} $\leftrightarrow$ \texttt{CIK}),
+    \item ingestión de \texttt{submissions} y \texttt{companyfacts},
+    \item normalización y parsing XBRL hacia un esquema interno canónico,
+    \item construcción de una vista \emph{point-in-time} (PIT),
+    \item y validación final de aptitud para consumo downstream.
 \end{itemize}
-La salida del módulo es un \emph{gate de confiabilidad} que determina si los artefactos EDGAR pueden ser consumidos de forma segura en etapas downstream (por ejemplo, construcción de features financieras, backtests, modelos de riesgo).
 
-Matemáticamente, denotamos el pipeline EDGAR como una sucesión de transformaciones estocásticas:
+El principio rector del módulo es el siguiente:
+
+\begin{quote}
+\emph{Ningún dato fundamental puede ser consumido por research, backtesting, feature engineering o modelos de riesgo si no puede demostrarse, de forma auditable, que era observable por el mercado en el instante \texttt{asof}, que su linaje es trazable, y que su calidad estadística y operativa supera los umbrales mínimos del sistema.}
+\end{quote}
+
+Formalmente, sea el pipeline EDGAR una composición de transformaciones
+
 \[
-  \mathcal{P}: \Omega_{\text{raw}} \xrightarrow{\mathcal{M}} \Omega_{\text{mapped}}
-  \xrightarrow{\mathcal{D}} \Omega_{\text{downloaded}}
-  \xrightarrow{\mathcal{P}} \Omega_{\text{parsed}}
-  \xrightarrow{\mathcal{T}} \Omega_{\text{pit}},
+\Pi
+=
+\mathcal{T}_{\mathrm{pit}}
+\circ
+\mathcal{T}_{\mathrm{parse}}
+\circ
+\mathcal{T}_{\mathrm{download}}
+\circ
+\mathcal{T}_{\mathrm{map}},
 \]
-donde cada función \(\mathcal{M},\mathcal{D},\mathcal{P},\mathcal{T}\) representa una etapa del pipeline y \(\Omega\) denota el espacio de estados de datos (filings, facts, metadatos, etc.). El módulo \texttt{edgar\_qc.py} evalúa la \emph{calidad de la trayectoria} \(\mathcal{P}\) mediante un conjunto de tests estadísticos y lógicos que definen umbrales operativos sobre la calidad\cite{SECDataQualityGuidelines}.
+
+donde:
+
+\[
+\Omega_{\mathrm{id}}
+\xrightarrow{\mathcal{T}_{\mathrm{map}}}
+\Omega_{\mathrm{raw}}
+\xrightarrow{\mathcal{T}_{\mathrm{download}}}
+\Omega_{\mathrm{dl}}
+\xrightarrow{\mathcal{T}_{\mathrm{parse}}}
+\Omega_{\mathrm{facts}}
+\xrightarrow{\mathcal{T}_{\mathrm{pit}}}
+\Omega_{\mathrm{pit}}.
+\]
+
+El módulo \texttt{edgar\_qc.py} define una familia de operadores de validación
+
+\[
+\mathcal{Q}
+=
+\{
+Q_{\mathrm{schema}},
+Q_{\mathrm{coverage}},
+Q_{\mathrm{temporal}},
+Q_{\mathrm{value}},
+Q_{\mathrm{staleness}},
+Q_{\mathrm{lineage}},
+Q_{\mathrm{consistency}}
+\},
+\]
+
+y una función de decisión final
+
+\[
+\mathcal{G}: \mathbb{R}^{k} \times \mathcal{E} \to \{\texttt{pass}, \texttt{warn}, \texttt{fail}\},
+\]
+
+donde el vector de métricas \(\mathbf{q} \in \mathbb{R}^{k}\) y el conjunto de incidencias \(\mathcal{E}\) determinan si la corrida es apta para uso downstream.
+
+\subsection{Rol dentro de la arquitectura del sistema}
+
+\texttt{edgar\_qc.py} no debe entenderse como un simple módulo de QA descriptivo, sino como una \textbf{pieza de control de riesgo de datos}. En un sistema cuantitativo, el riesgo de datos es tan material como el riesgo de modelo o el riesgo de ejecución, porque errores pequeños pero sistemáticos en la base fundamental pueden inducir:
+
+\begin{itemize}
+    \item sobreestimación de la capacidad predictiva de factores,
+    \item falsas relaciones entre fundamentales y retornos,
+    \item sesgos de cobertura por supervivencia o por fallos de ingestión,
+    \item exposición inadvertida a \emph{restatements}, \emph{late filers} o datos revisados,
+    \item e invalidación silenciosa del proceso de backtesting.
+\end{itemize}
+
+Por tanto, este módulo se ubica conceptualmente entre la capa de producción de datos y la capa de consumo cuantitativo, y su salida debe ser interpretada como un \textbf{permiso formal de uso}.
 
 \subsection{Alcance del control de calidad}
 
-El alcance del módulo incluye cinco dimensiones clave de calidad de datos:
+El alcance del módulo cubre siete dimensiones de calidad, no cinco, porque para uso institucional resulta insuficiente separar únicamente cobertura, temporalidad y anomalías. La partición correcta es:
 
 \begin{enumerate}
-  \item \textbf{Cobertura}: ¿qué porcentaje del universo de tickers/CIK está presente en cada etapa?
-  \item \textbf{Consistencia temporal}: ¿los timestamps de aceptación y de corte de vista PIT están alineados?
-  \item \textbf{Calidad de valores}: ¿los valores numéricos están dentro de rangos económicos razonables y no presentan anomalías?
-  \item \textbf{Staleness}: ¿los datos están suficientemente actualizados respecto a la fecha de procesamiento?
-  \item \textbf{Trazabilidad}: ¿cada fila de datos puede ser rastreada a un archivo de origen, período de informe y metadatos de aceptación?
+    \item \textbf{Integridad estructural}: validez de schemas, tipos, claves primarias y campos obligatorios.
+    \item \textbf{Cobertura}: presencia suficiente del universo objetivo en cada capa del pipeline.
+    \item \textbf{Consistencia de identidad}: coherencia entre \texttt{ticker}, \texttt{CIK}, emisor y periodo de vigencia.
+    \item \textbf{Consistencia temporal}: ausencia estricta de leakage y correcta ordenación de eventos regulatorios.
+    \item \textbf{Calidad semántica de valores}: plausibilidad económica, coherencia entre magnitudes y estabilidad estadística.
+    \item \textbf{Staleness}: recencia suficiente de los datos en relación con \texttt{asof} y con la naturaleza de cada métrica.
+    \item \textbf{Lineage y auditabilidad}: capacidad de rastrear cada observación hasta su filing, hecho, unidad, periodo y timestamp de aceptación.
 \end{enumerate}
 
-Estos criterios se alinean con las \emph{Data Quality Assurance Guidelines} de la SEC\cite{SECDataQualityGuidelines}, que definen la calidad como una combinación de utilidad, objetividad e integridad. En el contexto de trading cuantitativo, fallos en cualquiera de estas dimensiones pueden inducir \emph{data leakage} o \emph{look‑ahead bias} en el PIT, lo que invalida la robustez estadística de cualquier estrategia de swing trading traininada sobre este universo\cite{DePrado2018Advances, CampbellEtAl2001}.
+Este diseño responde a un principio de robustez: \textbf{una corrida no es aceptable porque “parece razonable” en agregado, sino porque supera controles explícitos en cada dimensión donde típicamente nacen los fallos silenciosos.}
 
 \subsection{Entradas del módulo}
 
-Las entradas del módulo son:
+El módulo recibe como entradas:
 
 \begin{itemize}
-  \item \texttt{ticker\_cik\_outputs}: mapping de tickers a CIK y metadatos de universo.
-  \item \texttt{submissions/companyfacts raw}: archivos sin procesar descargados del EDGAR (JSON/XML de facts).
-  \item \texttt{parsed\_facts}: facts estructurados en un esquema tabular (por ejemplo, PyArrow/Parquet).
-  \item \texttt{pit\_store}: almacén de datos en formato \emph{point‑in‑time} con campos \texttt{asof} y \texttt{acceptance\_ts}.
-  \item \texttt{qc\_config\_path}: configuración YAML con umbrales de tolerancia (cobertura, tasa de fallos, staleness, etc.).
-  \item \texttt{run\_id}: identificador único de la ejecución para replicabilidad y trazabilidad.
+    \item \texttt{ticker\_cik\_outputs}: mapping historificado de identidad regulatoria.
+    \item \texttt{submissions\_raw}: artefactos raw de submissions por CIK.
+    \item \texttt{companyfacts\_raw}: artefactos raw de company facts.
+    \item \texttt{parsed\_facts}: hechos estructurados en formato tabular canónico.
+    \item \texttt{pit\_store}: vista PIT con claves de observación y timestamps de disponibilidad.
+    \item \texttt{qc\_config\_path}: archivo YAML con thresholds, severidades y reglas de arbitraje.
+    \item \texttt{run\_id}: identificador único, determinista y auditable de la ejecución.
 \end{itemize}
 
-Desde un punto de vista formal, denotamos el conjunto de entradas como:
+Formalmente, el conjunto de entradas se modela como
+
 \[
-  \mathcal{I} = \{ \mathcal{U}, \mathcal{F}_{\text{raw}}, \mathcal{F}_{\text{parsed}}, \mathcal{P}, \theta_{\text{qc}}, r \},
+\mathcal{I}
+=
+\{
+\mathcal{U},
+\mathcal{S}_{\mathrm{raw}},
+\mathcal{C}_{\mathrm{raw}},
+\mathcal{F}_{\mathrm{parsed}},
+\mathcal{P}_{\mathrm{pit}},
+\theta_{\mathrm{qc}},
+r
+\},
 \]
+
 donde:
+
 \begin{itemize}
-  \item \(\mathcal{U}\) es el universo de tickers/CIK,
-  \item \(\mathcal{F}_{\text{raw}}\) es el conjunto de facts sin procesar,
-  \item \(\mathcal{F}_{\text{parsed}}\) es el conjunto de facts estructurados,
-  \item \(\mathcal{P}\) es el conjunto de registros PIT con \texttt{asof} y \texttt{acceptance\_ts},
-  \item \(\theta_{\text{qc}}\) son los parámetros de calidad (umbrales),
-  \item \(r\) es el run\_id.
+    \item \(\mathcal{U}\) es el universo regulatorio objetivo,
+    \item \(\mathcal{S}_{\mathrm{raw}}\) es el conjunto de \texttt{submissions},
+    \item \(\mathcal{C}_{\mathrm{raw}}\) es el conjunto de \texttt{companyfacts},
+    \item \(\mathcal{F}_{\mathrm{parsed}}\) es la tabla canónica de hechos parseados,
+    \item \(\mathcal{P}_{\mathrm{pit}}\) es la vista \emph{point-in-time},
+    \item \(\theta_{\mathrm{qc}}\) es la parametrización del sistema de calidad,
+    \item \(r\) es el identificador de la corrida.
 \end{itemize}
+
+\subsection{Contrato mínimo de schema}
+
+Antes de cualquier check económico o temporal, el módulo valida un contrato mínimo de schema. Ninguna tabla puede entrar en evaluación sustantiva si incumple alguno de estos requisitos:
+
+\begin{itemize}
+    \item ausencia de columnas obligatorias;
+    \item tipos incompatibles con el contrato;
+    \item claves nulas en campos de identidad;
+    \item timestamps no parseables o sin zona horaria normalizada;
+    \item duplicados exactos en claves definidas como únicas;
+    \item imposibilidad de reconstruir el linaje del registro.
+\end{itemize}
+
+Por ejemplo, en \texttt{pit\_store} deben existir, como mínimo, las columnas:
+
+\[
+(\texttt{symbol}, \texttt{cik}, \texttt{metric}, \texttt{value}, \texttt{unit}, \texttt{period\_end}, \texttt{acceptance\_ts}, \texttt{asof}, \texttt{source\_filing\_id}, \texttt{run\_id}).
+\]
+
+Si este contrato falla, la corrida entra automáticamente en estado \texttt{fail}, ya que no existe base formal para confiar en ningún check posterior.
 
 \subsection{Salidas y artefactos}
 
-El módulo produce cuatro artefactos clave:
+El módulo produce los siguientes artefactos:
 
 \begin{itemize}
-  \item \texttt{edgar\_qc\_summary.json}: resumen de alto nivel de la calidad del pipeline, con métricas y estado del \emph{gate}.
-  \item \texttt{edgar\_qc\_metrics.parquet}: tabla de métricas de calidad por etapa (mapping, download, parse, PIT).
-  \item \texttt{edgar\_qc\_failures.parquet}: lista de filas o registros que fallaron checks específicos.
-  \item \texttt{manifest.json}: metadatos de la ejecución, incluyendo versiones, path de entrada/salida y run\_id.
+    \item \texttt{edgar\_qc\_summary.json}: resumen ejecutivo con estado del gate, score, métricas clave y motivos de decisión.
+    \item \texttt{edgar\_qc\_metrics.parquet}: tabla detallada de métricas por etapa, universo, métrica y severidad.
+    \item \texttt{edgar\_qc\_failures.parquet}: incidencias a nivel de fila, con código de error y campos diagnósticos.
+    \item \texttt{edgar\_qc\_checks.parquet}: resultado de cada check individual, incluyendo valor observado, threshold y severidad.
+    \item \texttt{manifest.json}: metadatos de ejecución, paths, versiones, hashes de configuración y \texttt{run\_id}.
 \end{itemize}
 
-Estos artefactos permiten:
-\begin{itemize}
-  \item monitorear la calidad a lo largo del tiempo (\emph{time‑series of QC metrics}),
-  \item construir dashboards de datos para el equipo de infraestructura,
-  \item rechazar runs con fallos críticos sin interferir con backtests downstream.
-\end{itemize}
+En notación formal:
 
-En términos de formalización, el módulo calcula un vector de métricas de calidad \(\mathbf{q} = (q_1, \dots, q_k)\) y un conjunto de registros fallidos \(\mathcal{E}\), tales que:
 \[
-  \mathbf{q} = f(\mathcal{I}), \quad \mathcal{E} \subseteq \mathcal{P},
+(\mathbf{q}, \mathcal{E}, s, g) = \Phi(\mathcal{I}; \theta_{\mathrm{qc}}),
 \]
-donde \(f\) es la función de QC implementada en \texttt{edgar\_qc.py} y \(\mathcal{E}\) es el conjunto de registros que violan alguno de los checks definidos.
+
+donde:
+
+\begin{itemize}
+    \item \(\mathbf{q}\) es el vector de métricas,
+    \item \(\mathcal{E}\) es el conjunto de incidencias,
+    \item \(s \in [0,100]\) es el score global de calidad,
+    \item \(g \in \{\texttt{pass}, \texttt{warn}, \texttt{fail}\}\) es el estado final del gate.
+\end{itemize}
+
+\subsection{Principio de precedencia y arbitraje}
+
+Uno de los puntos críticos en cualquier sistema serio de QC es que \textbf{no todos los checks tienen la misma jerarquía}. Por ello, el módulo define una estructura explícita de precedencia:
+
+\[
+\texttt{schema} \succ \texttt{temporal leakage} \succ \texttt{identity integrity} \succ \texttt{coverage} \succ \texttt{value quality} \succ \texttt{staleness}.
+\]
+
+Esto implica:
+
+\begin{itemize}
+    \item un fallo estructural invalida toda la corrida, aunque el resto de métricas sean excelentes;
+    \item cualquier evidencia de \emph{PIT leakage} es bloqueante;
+    \item conflictos de identidad activos (\texttt{ticker}/\texttt{CIK} ambiguos) tienen severidad crítica;
+    \item cobertura insuficiente puede degradar o bloquear según el umbral configurado;
+    \item anomalías de valores o staleness elevada suelen ser \texttt{warn}, salvo si superan límites críticos.
+\end{itemize}
+
+Esta precedencia evita un error habitual en sistemas débiles: compensar con una media agregada un fallo que en realidad debería bloquear producción.
 
 \subsection{Checks obligatorios}
 
-El módulo ejecuta una serie de checks obligatorios que definen la \emph{calidad mínima aceptable} del pipeline:
+\subsubsection{1. Cobertura regulatoria}
+
+Sea \(\mathcal{U}\) el universo objetivo de emisores y \(\mathcal{U}_{j}^{\mathrm{obs}}\) el subconjunto observado en la etapa \(j\). Definimos
+
+\[
+\rho_j = \frac{|\mathcal{U}_{j}^{\mathrm{obs}}|}{|\mathcal{U}|}.
+\]
+
+Se exigen thresholds distintos por etapa:
+
+\[
+\rho_{\mathrm{map}} \ge \tau_{\mathrm{map}}, \qquad
+\rho_{\mathrm{submissions}} \ge \tau_{\mathrm{sub}}, \qquad
+\rho_{\mathrm{facts}} \ge \tau_{\mathrm{facts}}, \qquad
+\rho_{\mathrm{pit}} \ge \tau_{\mathrm{pit}}.
+\]
+
+No basta la cobertura global. El módulo calcula adicionalmente cobertura por:
+
+\begin{itemize}
+    \item fecha,
+    \item métrica fundamental,
+    \item sector,
+    \item bucket de capitalización,
+    \item y decil de liquidez.
+\end{itemize}
+
+La razón es que una cobertura global del 95\% puede ocultar un agujero sistemático en microcaps, industriales ilíquidos o emisores recientes.
+
+\subsubsection{2. Integridad de identidad}
+
+Sea \(M\) el mapping entre \texttt{ticker} y \texttt{CIK}. El sistema exige:
+
+\begin{itemize}
+    \item unicidad de mapping activo por fecha efectiva;
+    \item \texttt{CIK} en formato canónico con zero-padding;
+    \item ausencia de solapamientos temporales para el mismo \texttt{ticker};
+    \item ausencia de múltiples \texttt{tickers} activos para el mismo emisor salvo casos permitidos explícitamente.
+\end{itemize}
+
+Si dos mappings compiten con la misma fecha de vigencia, se aplica la precedencia:
+
+\[
+\texttt{official SEC source} \succ \texttt{historical internal mapping} \succ \texttt{heuristic inference}.
+\]
+
+Cualquier conflicto no resuelto de primer nivel produce \texttt{fail}.
+
+\subsubsection{3. Tasa de fallo de descarga}
+
+Sea \(\mathcal{R}_{\mathrm{req}}\) el conjunto de recursos solicitados y \(\mathcal{R}_{\mathrm{ok}}\) el subconjunto descargado con éxito y validado estructuralmente. Se define
+
+\[
+\epsilon_{\mathrm{dl}}
+=
+1 - \frac{|\mathcal{R}_{\mathrm{ok}}|}{|\mathcal{R}_{\mathrm{req}}|}.
+\]
+
+Se desagrega además en:
+
+\begin{itemize}
+    \item errores permanentes (\texttt{404}, recurso inexistente),
+    \item errores transitorios (\texttt{429}, \texttt{5xx}),
+    \item errores de parseo post-descarga,
+    \item timeouts o corrupciones de payload.
+\end{itemize}
+
+No todos los fallos pesan igual. Un \texttt{404} consistente sobre un filing inexistente documentado no es equivalente a una ola de \texttt{429} que afecta al 12\% del universo.
+
+\subsubsection{4. Tasa de éxito de parse y canonización}
+
+Sea \(\mathcal{F}_{\mathrm{raw}}\) el conjunto raw y \(\mathcal{F}_{\mathrm{canon}}\) el conjunto de hechos que superan las reglas de parse, normalización de unidades y deduplicación. Entonces
+
+\[
+\pi_{\mathrm{parse}}
+=
+\frac{|\mathcal{F}_{\mathrm{canon}}|}{|\mathcal{F}_{\mathrm{raw}}|}.
+\]
+
+Pero este ratio por sí solo es insuficiente. El módulo informa también de:
+
+\begin{itemize}
+    \item tasa de facts descartados por contexto inconsistente,
+    \item tasa de units no normalizables,
+    \item tasa de duplicados semánticos,
+    \item tasa de conflictos entre periodos comparables,
+    \item porcentaje de métricas canónicas sin cobertura mínima.
+\end{itemize}
+
+\subsubsection{5. Integridad temporal y ausencia de PIT leakage}
+
+Este es el check más crítico del módulo. Para cada registro \(p \in \mathcal{P}_{\mathrm{pit}}\), debe cumplirse:
+
+\[
+\texttt{acceptance\_ts}(p) \le \texttt{asof}(p).
+\]
+
+Equivalentemente, el conjunto de leakage
+
+\[
+\mathcal{L}
+=
+\{p \in \mathcal{P}_{\mathrm{pit}} : \texttt{acceptance\_ts}(p) > \texttt{asof}(p)\}
+\]
+
+debe satisfacer
+
+\[
+|\mathcal{L}| = 0.
+\]
+
+No existe tolerancia positiva para este check. Cualquier ocurrencia implica \texttt{fail} automático.
+
+Además, se verifican reglas complementarias:
+
+\begin{itemize}
+    \item \(\texttt{period\_end} \le \texttt{acceptance\_ts}\),
+    \item orden temporal consistente entre filing original y amendments,
+    \item desempate determinista cuando existen múltiples hechos con mismo \texttt{acceptance\_ts},
+    \item prioridad PIT del último hecho observable y no del último hecho conocido ex post.
+\end{itemize}
+
+\subsubsection{6. Regla de arbitraje para múltiples filings y amendments}
+
+Cuando existen varias observaciones candidatas para una misma clave
+
+\[
+(\texttt{symbol}, \texttt{metric}, \texttt{asof}),
+\]
+
+el módulo aplica la siguiente política de resolución:
 
 \begin{enumerate}
-  \item \textbf{Cobertura de CIK}:
+    \item excluir cualquier hecho con \(\texttt{acceptance\_ts} > \texttt{asof}\);
+    \item entre los restantes, seleccionar el de mayor \(\texttt{acceptance\_ts}\);
+    \item si existe empate exacto, priorizar:
     \[
-      \rho_{\text{cik}} = \frac{|\mathcal{U}_{\text{covered}}|}{|\mathcal{U}|} \ge \tau_{\text{cik}},
+    \texttt{amended authoritative filing} \succ \texttt{original filing} \succ \texttt{derived or inferred record};
     \]
-    donde \(\rho_{\text{cik}}\) es la tasa de cobertura de CIK, \(\mathcal{U}_{\text{covered}}\) son los CIK presentes en la etapa de salida, y \(\tau_{\text{cik}}\) es el umbral configurado en \texttt{qc\_config\_path}.
-
-  \item \textbf{Tasa de descargas fallidas}:
-    \[
-      \epsilon_{\text{dl}} = \frac{|\mathcal{F}_{\text{failed}}|}{|\mathcal{F}_{\text{requested}}|} \le \eta_{\text{dl}},
-    \]
-    donde \(\epsilon_{\text{dl}}\) es la tasa de fallos de descarga, \(\mathcal{F}_{\text{failed}}\) son los archivos no descargados y \(\eta_{\text{dl}}\) es el umbral de tolerancia.
-
-  \item \textbf{Tasa de éxito de parse}:
-    \[
-      \pi_{\text{parse}} = \frac{|\mathcal{F}_{\text{parsed}}|}{|\mathcal{F}_{\text{raw}}|} \ge \zeta_{\text{parse}},
-    \]
-    donde \(\pi_{\text{parse}}\) es la tasa de éxito de parse y \(\zeta_{\text{parse}}\) es el umbral de calidad.
-
-  \item \textbf{No PIT leakage}:
-    \[
-      \mathbb{P}\big(\texttt{acceptance\_ts} > \texttt{asof} \mid \text{record} \in \mathmc{P}\big) = 0,
-    \]
-    es decir, se rechaza cualquier fila donde el timestamp de aceptación (cuándo el hecho fue publicado) sea posterior a la fecha de corte de vista PIT. Este check es crítico para evitar look‑ahead bias en el backtest\cite{DePrado2018Advances}.
-
-  \item \textbf{Staleness por métrica}:
-    Para cada métrica \(m\), se calcula la mediana de dias de rezago:
-    \[
-      d_m = \text{median}\big( \texttt{asof} - \texttt{acceptance\_ts} \mid \text{record} \in \mathcal{P}_m \big),
-    \]
-    y se verifica que \(d_m \le \delta_m\), donde \(\delta_m\) es el umbral de staleness por métrica.
-
-  \item \textbf{Valores extremos y anomalías}:
-    Se aplican tests estadísticos (por ejemplo, \(z\text{-score}\), rangos intercuartílicos, o tests robustos) para detectar outliers:
-    \[
-      x \text{ es anómalo } \iff |x - \mu_m| > \kappa \sigma_m,
-    \]
-    donde \(\mu_m\) y \(\sigma_m\) son la media y desviación estándar de la métrica \(m\), y \(\kappa\) es un umbral configurable. Los valores anómalos se marcan pero no se eliminan automáticamente, permitiendo auditoría humana.
+    \item si persiste el empate, seleccionar el registro con mayor calidad de linaje y unidad canónica;
+    \item si aún persiste ambigüedad, marcar incidencia crítica y no materializar el dato.
 \end{enumerate}
 
-La combinación de estos checks define una función de gate:
+Esta política elimina discrecionalidad del implementador y cierra una de las zonas clásicas donde aparecen bugs silenciosos.
+
+\subsubsection{7. Staleness por métrica}
+
+La recencia admisible depende de la naturaleza económica de cada campo. Para cada métrica \(m\), el módulo calcula
+
 \[
-  \mathcal{G}(\mathbf{q}) = 
-  \begin{cases}
-    \texttt{pass}, & \text{si todos los checks críticos están dentro de umbrales}, \\
-    \texttt{warn}, & \text{si existen degradaciones moderadas}, \\
-    \texttt{fail}, & \text{si hay leakage temporal o cobertura crítica insuficiente}.
-  \end{cases}
+d_m^{(i)} = \texttt{asof}_i - \texttt{acceptance\_ts}_i,
+\qquad
+\tilde{d}_m = \mathrm{median}\{d_m^{(i)}\}_{i \in \mathcal{P}_m}.
 \]
+
+Se exige:
+
+\[
+\tilde{d}_m \le \delta_m^{\mathrm{warn}}
+\]
+
+para estado normal, y
+
+\[
+\tilde{d}_m \le \delta_m^{\mathrm{fail}}
+\]
+
+para evitar bloqueo crítico, con
+
+\[
+\delta_m^{\mathrm{warn}} < \delta_m^{\mathrm{fail}}.
+\]
+
+Esto permite distinguir degradación moderada de inutilidad operativa. No tiene sentido aplicar el mismo threshold a \texttt{shares\_outstanding}, \texttt{assets}, \texttt{revenues} o \texttt{net\_income}.
+
+\subsubsection{8. Calidad de valores y anomalías}
+
+Para cada métrica \(m\), el módulo evalúa una combinación de checks robustos:
+
+\begin{itemize}
+    \item reglas de signo permitidas,
+    \item ratios económicos consistentes,
+    \item rangos sectoriales razonables,
+    \item outliers robustos vía mediana y MAD,
+    \item discontinuidades temporales excesivas.
+\end{itemize}
+
+La forma preferida de detección no es un simple \(z\)-score gaussiano, sino una combinación robusta:
+
+\[
+z^{\mathrm{rob}}_{i,m}
+=
+\frac{x_{i,m} - \mathrm{median}(X_m)}
+{1.4826 \cdot \mathrm{MAD}(X_m)}.
+\]
+
+Se marca anomalía cuando
+
+\[
+|z^{\mathrm{rob}}_{i,m}| > \kappa_m.
+\]
+
+Además, cuando la métrica lo permita, se calculan ratios de coherencia contable. Por ejemplo, si existen simultáneamente activos, pasivos y patrimonio, se evalúa el residual
+
+\[
+r = \texttt{assets} - \texttt{liabilities} - \texttt{equity},
+\]
+
+y se verifica
+
+\[
+\frac{|r|}{1 + |\texttt{assets}|} \le \varepsilon_{\mathrm{accounting}}.
+\]
+
+El objetivo no es “limpiar” automáticamente todos los outliers, sino distinguir entre:
+
+\begin{itemize}
+    \item evento económico real,
+    \item error de unidad o de parse,
+    \item duplicado mal resuelto,
+    \item y observación legítima pero extrema.
+\end{itemize}
+
+\subsubsection{9. Lineage y auditabilidad}
+
+Todo registro PIT debe poder reconstruirse hasta su fuente. Para cada fila, deben existir:
+
+\begin{itemize}
+    \item identificador de filing origen,
+    \item tipo de formulario,
+    \item periodo reportado,
+    \item timestamp de aceptación,
+    \item unidad original,
+    \item métrica canónica,
+    \item ruta o referencia al artefacto raw.
+\end{itemize}
+
+Definimos la tasa de trazabilidad como
+
+\[
+\lambda
+=
+\frac{|\mathcal{P}_{\mathrm{traceable}}|}{|\mathcal{P}_{\mathrm{pit}}|}.
+\]
+
+Se exige \(\lambda = 1\) para \texttt{pass}. Si \(\lambda < 1\), el sistema entra al menos en \texttt{warn}, y si la pérdida de lineage afecta métricas críticas o supera el umbral configurado, entra en \texttt{fail}.
+
+\subsection{Scoring global y función de gate}
+
+El módulo distingue entre:
+
+\begin{itemize}
+    \item \textbf{checks bloqueantes}, que dominan la decisión,
+    \item \textbf{checks penalizables}, que degradan el score pero no necesariamente bloquean.
+\end{itemize}
+
+Sea \(\mathcal{B}\) el conjunto de checks bloqueantes y \(\mathcal{N}\) el de checks no bloqueantes. El score global se define como
+
+\[
+s
+=
+100
+-
+\sum_{j \in \mathcal{N}} w_j \, \ell_j,
+\]
+
+donde \(w_j\) es el peso del check \(j\) y \(\ell_j\) su pérdida normalizada.
+
+Sin embargo, la decisión final no depende solo de \(s\). La función de gate viene dada por:
+
+\[
+\mathcal{G}(\mathbf{q}, \mathcal{E}) =
+\begin{cases}
+\texttt{fail}, & \text{si existe } b \in \mathcal{B} \text{ violado},\\
+\texttt{fail}, & \text{si } s < s_{\min}^{\mathrm{fail}},\\
+\texttt{warn}, & \text{si no hay bloqueo pero } s < s_{\min}^{\mathrm{pass}},\\
+\texttt{warn}, & \text{si hay incidencias moderadas acumuladas},\\
+\texttt{pass}, & \text{en caso contrario.}
+\end{cases}
+\]
+
+Checks típicamente bloqueantes:
+
+\begin{itemize}
+    \item fallo de schema,
+    \item \emph{PIT leakage},
+    \item conflicto crítico de identidad,
+    \item cobertura PIT por debajo de umbral mínimo,
+    \item corrupción de lineage en métricas críticas.
+\end{itemize}
+
+\subsection{Clasificación de severidad}
+
+Cada incidencia individual recibe una severidad en \(\{\texttt{info}, \texttt{warn}, \texttt{critical}\}\).
+
+\begin{itemize}
+    \item \texttt{info}: desviación diagnóstica sin impacto operativo inmediato.
+    \item \texttt{warn}: degradación relevante, pero no invalidante por sí sola.
+    \item \texttt{critical}: violación incompatible con uso downstream confiable.
+\end{itemize}
+
+Además, si múltiples \texttt{warn} afectan al mismo \texttt{symbol}, métrica o fecha, el sistema puede elevar la severidad por acumulación. Esto evita subestimar deterioros sistemáticos distribuidos en incidencias aparentemente menores.
 
 \subsection{Flujo de ejecución}
 
-El flujo del módulo se puede descomponer en tres fases:
+El flujo del módulo se estructura en seis fases:
 
 \begin{enumerate}
-  \item \textbf{Carga de artefactos}: todas las entradas se cargan en memoria (o se leen desde almacenamiento distribuido) y se validan sus schemas.
-  \item \textbf{Ejecución de checks por capa}: se aplican los checks descritos a cada etapa del pipeline (mapping, download, parse, PIT), generando un conjunto de métricas por capa.
-  \item \textbf{Consolidación, score y persistencia}: se calcula un score global de calidad, se determina el gate, y se persisten los artefactos en \texttt{data/edgar/qc/\{run\_id\}}.
+    \item \textbf{Resolución de configuración}: lectura de thresholds, pesos, severidades y paths.
+    \item \textbf{Carga y validación de schemas}: rechazo temprano de entradas estructuralmente inválidas.
+    \item \textbf{Ejecución de checks por capa}: mapping, raw, parse, PIT.
+    \item \textbf{Aplicación de arbitraje}: resolución determinista de duplicados, amendments y conflictos.
+    \item \textbf{Agregación de métricas y scoring}: cálculo de \(\mathbf{q}\), \(\mathcal{E}\), \(s\) y \(\mathcal{G}\).
+    \item \textbf{Persistencia auditable}: escritura de artefactos y metadatos bajo \texttt{data/edgar/qc/\{run\_id\}}.
 \end{enumerate}
 
-En términos de teoría de grafos dirigidos, el pipeline puede verse como un DAG:
-\[
-  G = (V, E),
-\]
-donde \(V\) es el conjunto de etapas (nodos) y \(E\) representa dependencias de datos. Cada check se asocia a un subgrafo \(G_i \subseteq G\), y el score global es una función agregada de las métricas de cada subgrafo.
+\subsection{Métricas principales}
 
-\subsection{Métricas clave de calidad}
-
-El módulo expone las siguientes métricas principales:
+Entre las métricas mínimas del módulo deben figurar:
 
 \begin{itemize}
-  \item \texttt{cik\_coverage\_rate}: \(\rho_{\text{cik}}\), como definido arriba.
-  \item \texttt{download\_failure\_rate}: \(\epsilon_{\text{dl}}\).
-  \item \texttt{parse\_success\_rate}: \(\pi_{\text{parse}}\).
-  \item \texttt{pit\_leakage\_count}: número de registros donde \texttt{acceptance\_ts} > \texttt{asof}.
-  \item \texttt{median\_staleness\_days}: \(\text{median}(\texttt{asof} - \texttt{acceptance\_ts})\).
+    \item \texttt{mapping\_coverage\_rate},
+    \item \texttt{submissions\_coverage\_rate},
+    \item \texttt{facts\_coverage\_rate},
+    \item \texttt{pit\_coverage\_rate},
+    \item \texttt{download\_failure\_rate},
+    \item \texttt{parse\_success\_rate},
+    \item \texttt{pit\_leakage\_count},
+    \item \texttt{identity\_conflict\_count},
+    \item \texttt{traceability\_rate},
+    \item \texttt{median\_staleness\_days\_by\_metric},
+    \item \texttt{robust\_outlier\_rate\_by\_metric},
+    \item \texttt{accounting\_consistency\_breach\_rate}.
 \end{itemize}
 
-Estas métricas se pueden usar para:
-\begin{itemize}
-  \item entrenar modelos de supervivencia de datos (por ejemplo, Weibull) para predecir el tiempo de vida útil de un hecho financiero,
-  \item construir charts de control estadísticos (Shewhart, CUSUM) para detectar degradación temporal del pipeline,
-  \item ajustar automáticamente umbrales de QC en función del universo de tickers y de la frecuencia de publicación.
-\end{itemize}
+No solo deben calcularse en agregado; también deben emitirse, cuando proceda, por fecha, sector, tamaño y bucket de liquidez.
 
 \subsection{CLI y uso operativo}
 
-El módulo se invoca mediante la línea de comandos:
+La interfaz de línea de comandos es:
 
 \begin{verbatim}
 python -m data.edgar.edgar_qc ^
@@ -185,33 +562,52 @@ python -m data.edgar.edgar_qc ^
   --run-id edgar_qc_20260305_001
 \end{verbatim}
 
-Esto permite:
-\begin{itemize}
-  \item integrar el QC en pipelines CI/CD,
-  \item automatizar la ejecución periódica (por ejemplo, diariamente),
-  \item alinear el run\_id con la fecha de ejecución para facilitar la auditoría.
-\end{itemize}
+El \texttt{run\_id} debe ser único y trazable. Idealmente, debe codificar timestamp, entorno y versión lógica del pipeline, de modo que cualquier corrida sea reproducible ex post.
 
-\subsection{Definición de término (DoD)}
+\subsection{Reglas operativas downstream}
 
-La definición de término del módulo establece que:
+La política de consumo es estricta:
 
 \begin{itemize}
-  \item El \emph{gate de calidad EDGAR} debe estar disponible para el siguiente módulo downstream (por ejemplo, \texttt{features/build_features.py}).
-  \item Si el gate es \texttt{fail}, el proceso downstream debe detenerse inmediatamente.
-  \item Si el gate es \texttt{warn}, se debe registrar un alert y permitir continuar con una advertencia explícita.
+    \item Si el gate es \texttt{fail}, ningún módulo downstream puede consumir los artefactos de la corrida.
+    \item Si el gate es \texttt{warn}, el consumo solo se permite si la política del entorno lo autoriza explícitamente y dejando rastro en logs y manifest.
+    \item Si el gate es \texttt{pass}, la corrida queda habilitada como versión utilizable del dataset EDGAR.
 \end{itemize}
 
-Desde un punto de vista de \emph{risk management} cuantitativo, el gate de calidad forma parte de la capa de \emph{data risk control} y se puede ver como un filtro estocástico que reduce la probabilidad de que backtests y modelos entrenados sobre datos defectuosos propaguen sesgos sistemáticos\cite{CampbellEtAl2001, Chan2009QuantitativeTrading}.
+Esto convierte el QC en una dependencia formal de producción, no en un reporte decorativo.
 
-\subsection{Conexión con estado del arte y literatura}
+\subsection{Tests mínimos obligatorios}
 
-La implementación de \texttt{edgar\_qc.py} se alinea con prácticas de:
+Para que el módulo esté realmente cerrado a nivel de producción, su DoD debe exigir al menos los siguientes tests:
 
 \begin{itemize}
-  \item \textbf{Calidad de datos en sistemas financieros}: se inspira en las \emph{Data Quality Assurance Guidelines} de la SEC\cite{SECDataQualityGuidelines}, que ubican la calidad de datos como un requisito de gobierno y riesgo regulatorio.
-  \item \textbf{Control de calidad en pipelines cuantitativos}: seguimos principios de \emph{reproducible research} y \emph{data lineage} descritos en De Prado\cite{DePrado2018Advances} y en la literatura de finanzas cuantitativas\cite{CampbellEtAl2001, Chan2009QuantitativeTrading}.
-  \item \textbf{Gestión de staleness y PIT}: el uso de \texttt{acceptance\_ts} y \texttt{asof} es consistente con la práctica industrial de construcción de vistas point‑in‑time en sistemas de riesgo y backtesting, donde se exige evitar \emph{look‑ahead bias} en el manejo de datos regulatorios XBRL\cite{SECXBRLGuide}.
+    \item test de bloqueo por \texttt{acceptance\_ts > asof};
+    \item test de conflicto de mapping activo;
+    \item test de desempate determinista entre filings con igual timestamp;
+    \item test de propagación correcta de severidades;
+    \item test de score estable bajo misma entrada y configuración;
+    \item test de persistencia íntegra de artefactos y manifest;
+    \item test de rechazo ante schema incompleto;
+    \item test de trazabilidad completa de una muestra PIT.
 \end{itemize}
 
-En resumen, \texttt{edgar\_qc.py} no es solo un módulo de QA, sino un \emph{componente de risk management} crítico para cualquier sistema de swing trading que se base en datos EDGAR: garantiza que la base de datos sobre la que se construyen los factores y modelos cumple con estándares de confiabilidad industrial y de estado del arte académico.
+Sin este set mínimo, la especificación queda incompleta desde el punto de vista de robustez industrial.
+
+\subsection{Definición de terminado (DoD)}
+
+El módulo se considera terminado únicamente si:
+
+\begin{itemize}
+    \item implementa todos los checks críticos descritos;
+    \item documenta thresholds, pesos y severidades en configuración externa;
+    \item emite score, gate, métricas y fallos con trazabilidad completa;
+    \item bloquea correctamente los casos de \emph{PIT leakage} y conflictos críticos;
+    \item persiste artefactos auditablemente bajo \texttt{run\_id};
+    \item y dispone de tests unitarios e integrados para los casos límite principales.
+\end{itemize}
+
+\subsection{Conclusión}
+
+\texttt{edgar\_qc.py} debe entenderse como la frontera formal entre ``tener datos'' y ``tener datos utilizables''. Su valor no reside solo en detectar errores manifiestos, sino en imponer disciplina probabilística, temporal y operativa a toda la cadena EDGAR. En un sistema de \emph{small-cap swing trading} apoyado en fundamentales, esta capa es indispensable: protege la validez del research, reduce el riesgo de contaminación del backtest y convierte la base regulatoria en un activo analítico confiable en sentido institucional.
+
+En consecuencia, \texttt{edgar\_qc.py} no es un módulo auxiliar. Es una pieza central de \emph{data risk control}, y su nivel de exigencia debe ser equivalente al de cualquier componente crítico de ejecución, portfolio construction o model validation.

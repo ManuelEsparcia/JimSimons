@@ -1,255 +1,758 @@
 \section{Módulo: \texttt{data/universe/universe\_qc.py}}
 \label{sec:universe_qc}
 
-\subsection{Objetivo y filosofía de diseño}
+\subsection{Objetivo, mandato y filosofía de diseño}
 \label{sec:universe_qc:objective}
 
-El módulo \texttt{universe\_qc.py} realiza una \textbf{auditoría de calidad de datos} sobre el universo de \textit{small caps} de EE.\ UU. construido en \texttt{data/universe/history}, con el objetivo de:
+El módulo \texttt{universe\_qc.py} realiza la \textbf{auditoría formal de calidad, consistencia temporal y coherencia semántica} del universo PIT construido por \texttt{build\_universe.py}. Su función no es redefinir reglas de elegibilidad ni reconstruir el universo, sino verificar que el artefacto histórico persistido como \texttt{data/universe/history} sea internamente consistente, temporalmente causal, operacionalmente estable y apto para ser promovido a research, validación y backtesting.
+
+En un stack cuantitativo serio, este módulo actúa como \textbf{control de calidad de última milla} entre la construcción del universo y su consumo downstream. El objetivo no es únicamente detectar “errores de datos”, sino también identificar:
 
 \begin{itemize}
-  \item Validar que las \textbf{reglas de elegibilidad} se aplicaron correctamente y se reflejan en \texttt{is\_eligible} y \texttt{eligibility\_reason}.
-  \item Encontrar \textbf{violationes de consistencia PIT} (ticker antes de \texttt{list\_date}, después de \texttt{delist\_date}, duplicados).
-  \item Medir \textbf{estabilidad diaria} del conteo de constituyentes y \textbf{cobertura de delistings}.
+  \item violaciones \textbf{PIT} o de lifecycle;
+  \item inconsistencias entre \texttt{is\_eligible}, estados de membresía y razones de exclusión;
+  \item discontinuidades no explicadas por corporate actions o mappings de identidad;
+  \item saltos de conteo o turnover incompatibles con la dinámica histórica esperable del universo;
+  \item pérdida encubierta de historia de nombres muertos, delisted o relinked.
 \end{itemize}
 
-La filosofía de diseño sigue principios de \textit{data quality checks} en pipelines de datos financieros \cite{mckinsey2025, montecarlo2025, dataeng2025}:
+\paragraph{Principio rector}
+\label{par:universe_qc:principle}
+
+\texttt{universe\_qc.py} debe tratar el universo como un \textbf{objeto histórico con semántica fuerte}, no como una tabla cualquiera. Por tanto, los checks no se limitan a nulls y duplicados, sino que validan la coherencia entre:
 
 \begin{itemize}
-  \item \textbf{Audits automáticos} tras cada transformación crítica.
-  \item \textbf{Unicidad} de \((\mathtt{date}, \mathtt{symbol})\).
-  \item \textbf{Consistencia temporal} con \texttt{list\_date} y \texttt{delist\_date}.
-  \item \textbf{Completo} de \texttt{is\_eligible} y \texttt{eligibility\_reason}.
+  \item identidad económica,
+  \item ventana de vida del instrumento,
+  \item reglas de elegibilidad,
+  \item motivos de exclusión,
+  \item estabilidad temporal,
+  \item continuidad PIT.
 \end{itemize}
 
-\subsection{Definiciones formales}
+\subsection{Modelo de identidad y unidad lógica de auditoría}
+\label{sec:universe_qc:identity}
+
+Una de las correcciones estructurales más importantes respecto a la versión anterior es que la unidad primaria de QC no debe ser \texttt{symbol}, sino \texttt{instrument\_id}. El ticker puede cambiar; la identidad económica auditada no.
+
+\paragraph{Regla obligatoria}
+\label{par:universe_qc:identity_rule}
+
+Sea \(\mathcal{I}\) el conjunto de instrumentos identificados por \texttt{instrument\_id}. Para cada fecha \(t \in \mathcal{D}\), el universo PIT construido debe representarse como:
+
+\[
+\mathcal{U}^{\mathrm{PIT}}_t
+=
+\{ i \in \mathcal{I} : \mathtt{is\_eligible}(i,t)=1 \}
+\]
+
+donde \texttt{symbol} es un atributo versionado, no la clave primaria.
+
+\paragraph{Clave lógica del panel}
+\label{par:universe_qc:logical_key}
+
+La unicidad del universo persistido se define sobre:
+
+\[
+(\mathtt{date}, \mathtt{instrument\_id})
+\]
+
+y solo de forma secundaria se monitoriza unicidad de \((\mathtt{date}, \mathtt{symbol})\), ya que esta puede romperse temporalmente en presencia de mappings de proveedor defectuosos, ticker recycling o errores de linkage.
+
+\subsection{Definiciones formales y datasets de entrada}
 \label{sec:universe_qc:definitions}
 
-Sea \(\mathcal{U}_t^{\text{PIT}}\) el conjunto de \textit{symbols} elegibles en fecha \(t\) construido por \texttt{build\_universe.py}, almacenado como:
+Sea \(\texttt{df\_universe}\) el dataset histórico generado por \texttt{build\_universe.py}, con dominio:
 
 \[
-  \texttt{df\_universe} : \{(t,s) \in \mathcal{D} \times \mathcal{S}\}
+\texttt{df\_universe} : \{(t,i) \in \mathcal{D} \times \mathcal{I}\}
 \]
-con campos mínimos:
+
+y con schema mínimo esperado:
+
 \begin{itemize}
-  \item \texttt{date}, \texttt{symbol}, \texttt{is\_eligible} \(\in \{0,1\}\),
-  \item \texttt{eligibility\_reason} (string o enum),
-  \item \texttt{market\_cap\_usd}, \texttt{adv20\_usd}, \texttt{close\_ref}, etc.
+  \item \texttt{date}
+  \item \texttt{instrument\_id}
+  \item \texttt{issuer\_id} (si aplica)
+  \item \texttt{symbol}
+  \item \texttt{is\_eligible} \(\in \{0,1\}\)
+  \item \texttt{membership\_state}
+  \item \texttt{primary\_exclusion\_reason}
+  \item \texttt{all\_failed\_reasons}
+  \item \texttt{market\_cap\_usd}
+  \item \texttt{adv20\_usd}
+  \item \texttt{price\_ref}
+  \item \texttt{listing\_exchange}
+  \item \texttt{security\_type}
+  \item \texttt{trading\_status}
+  \item \texttt{config\_hash}
+  \item \texttt{run\_id}
 \end{itemize}
 
-\paragraph{Listings master}
+\paragraph{Lifecycle master}
 \label{par:universe_qc:listings}
-Sea \(\mathcal{L}\) el maestro de listados con \(\mathtt{list\_date}(s)\), \(\mathtt{delist\_date}(s)\) (nullable) y \(\mathtt{status}\).
+
+Sea \(\mathcal{L}\) el maestro PIT de lifecycle con, como mínimo:
 
 \[
-  \mathcal{W}_s := [\mathtt{list\_date}(s), \mathtt{delist\_date}(s)],
-  \quad \text{con } \mathtt{delist\_date}(s) = \infty \text{ si es } \mathtt{null}.
+\mathtt{list\_date}(i),\;
+\mathtt{delist\_date}(i),\;
+\mathtt{ticker\_start\_date}(i),\;
+\mathtt{ticker\_end\_date}(i),\;
+\mathtt{status}(i)
 \]
 
-\paragraph{Cobertura de delistings}
-\label{par:universe_qc:coverage}
-Para \(\mathcal{S}_{\text{delisted}}\) el conjunto de simbolos \textit{delisted} en \(\mathcal{D}\):
+y definimos la ventana de vida económica:
 
 \[
-  \mathcal{E}_t := \{s \in \mathcal{S}_{\text{delisted}} : t \in \mathcal{W}_s\}
+\mathcal{W}_i := [\tau_i^{\mathrm{birth}}, \tau_i^{\mathrm{death}}]
 \]
 
-\[
-  \texttt{delisted\_coverage\_ratio}(t) :=
-  \frac{
-    |\{s \in \mathcal{E}_t : s \in \mathcal{U}_t^{\text{PIT}}\}|
-  }{
-    |\mathcal{E}_t|
-  }
-\]
-
-\subsection{Validaciones obligatorias (checks)}
-\label{sec:universe_qc:checks}
+donde:
 
 \begin{itemize}
-  \item \textbf{Unicidad de clave}:
-  \[
-    \forall (t_1,s_1) \neq (t_2,s_2) \Rightarrow (t,s) \text{ único en } \texttt{df\_universe}.
-  \]
-  \item \textbf{Restricción temporal por listings}:
-  \[
-    \forall (t,s) \in \texttt{df\_universe}:
-    \mathtt{list\_date}(s) \leq t \leq \mathtt{delist\_date}(s) \vee \mathtt{delist\_date}(s) = \mathtt{null}
-  \]
-  \item \textbf{Campo no nulo}:
-  \[
-    \mathtt{is\_eligible} \in \{0,1\}, \quad \text{siempre no nulo.}
-  \]
-  \item \textbf{Consistencia de motivos de exclusión}:
-  \[
-    \mathtt{eligibility\_reason}(t,s) \text{ presente} \iff \mathtt{is\_eligible}(t,s) = 0
-  \]
-  \item \textbf{Cambio brusco de tamaño diario}:
-  \[
-    \texttt{turnover\_t} :=
-    \frac{
-      |\mathcal{U}_t \setminus \mathcal{U}_{t-1}| + |\mathcal{U}_{t-1} \setminus \mathcal{U}_t|
-    }{
-      |\mathcal{U}_{t-1} \cup \mathcal{U}_t|
-    }
-  \]
-  Si \(\texttt{turnover\_t} > \tau_{\text{jump}}\), se emite \texttt{WARNING}.
-  \item \textbf{Cobertura de delistings}:
-  \[
-    \texttt{delisted\_coverage\_ratio}(t) \text{ calculado por fecha; bajo } \gamma_{\min} \Rightarrow \text{WARNING}.
-  \]
+  \item \(\tau_i^{\mathrm{birth}} = \mathtt{list\_date}(i)\),
+  \item \(\tau_i^{\mathrm{death}} = \mathtt{delist\_date}(i)\) si existe, y \(+\infty\) en caso contrario,
+\end{itemize}
+
+salvo que corporate actions canónicas redefinan una terminación económica anterior o una continuidad explícita.
+
+\paragraph{Dataset de corporate actions}
+\label{par:universe_qc:ca_input}
+
+Sea \(\mathcal{A}^{\star}\) el dataset canónico de corporate actions construido por \texttt{corporate\_actions.py}. Este input se usa para:
+
+\begin{itemize}
+  \item distinguir ticker changes de verdaderas salidas;
+  \item explicar discontinuidades por mergers, delistings, relistings o exchange changes;
+  \item reconciliar anomalías de identidad detectadas por QC.
+\end{itemize}
+
+\subsection{Objetos auditados y tipos de chequeo}
+\label{sec:universe_qc:objects}
+
+El módulo audita cuatro capas distintas:
+
+\begin{enumerate}
+  \item \textbf{Integridad estructural del dataset}: unicidad, tipos, nullability, enums válidos.
+  \item \textbf{Consistencia PIT/lifecycle}: ventanas de vida, existencia histórica, fechas válidas.
+  \item \textbf{Consistencia semántica de elegibilidad}: coherencia entre \texttt{is\_eligible}, estado y razones.
+  \item \textbf{Estabilidad temporal y cobertura}: tamaño diario, turnover, churn, cobertura de nombres muertos y delistings.
+\end{enumerate}
+
+\subsection{Checks obligatorios}
+\label{sec:universe_qc:checks}
+
+\subsubsection{Checks estructurales}
+\label{sec:universe_qc:structural_checks}
+
+\paragraph{Check 1: unicidad lógica}
+\label{par:universe_qc:unique_key}
+
+Debe cumplirse:
+
+\[
+\forall (t,i) \neq (t',i') \Rightarrow
+(\mathtt{date}, \mathtt{instrument\_id}) \text{ es único en } \texttt{df\_universe}
+\]
+
+Cualquier violación implica:
+
+\[
+\texttt{severity} = \texttt{FAIL}
+\]
+
+\paragraph{Check 2: dominio válido de \texttt{is\_eligible}}
+\label{par:universe_qc:is_eligible_domain}
+
+\[
+\mathtt{is\_eligible}(t,i) \in \{0,1\}
+\quad \forall (t,i)
+\]
+
+Valores nulos o fuera de dominio son \texttt{FAIL}.
+
+\paragraph{Check 3: catálogo válido de estados}
+\label{par:universe_qc:state_domain}
+
+\[
+\mathtt{membership\_state}(t,i) \in \Omega_{\mathrm{state}}
+\]
+
+donde \(\Omega_{\mathrm{state}}\) es el catálogo oficial del sistema. Estados no reconocidos producen \texttt{FAIL}.
+
+\paragraph{Check 4: razones de exclusión válidas}
+\label{par:universe_qc:reason_domain}
+
+\[
+\mathtt{primary\_exclusion\_reason}(t,i) \in \Omega_{\mathrm{reason}} \cup \{\varnothing\}
+\]
+
+Textos libres o razones fuera del enum estable se marcan como \texttt{FAIL} o \texttt{WARN} según configuración de strictness, pero por defecto deben bloquear promoción.
+
+\subsubsection{Checks PIT y lifecycle}
+\label{sec:universe_qc:pit_checks}
+
+\paragraph{Check 5: existencia temporal}
+\label{par:universe_qc:life_window}
+
+Para toda fila \((t,i)\) persistida en \texttt{df\_universe} debe cumplirse:
+
+\[
+t \in \mathcal{W}_i
+\]
+
+Equivalentemente:
+
+\[
+\tau_i^{\mathrm{birth}} \le t \le \tau_i^{\mathrm{death}}
+\]
+
+si \(\tau_i^{\mathrm{death}}\) es finita.
+
+Violaciones pre-listing o post-death son \texttt{FAIL}.
+
+\paragraph{Check 6: consistencia de ticker en su ventana}
+\label{par:universe_qc:ticker_window}
+
+Si el sistema dispone de historial PIT de símbolos, debe verificarse:
+
+\[
+t \in [\mathtt{ticker\_start\_date}(i,\sigma), \mathtt{ticker\_end\_date}(i,\sigma)]
+\]
+
+para el símbolo \(\sigma=\mathtt{symbol}(t,i)\). Si el símbolo aparece fuera de su ventana válida:
+
+\begin{itemize}
+  \item \texttt{WARN} si existe corporate action compatible no resuelta aún;
+  \item \texttt{FAIL} si no existe explicación plausible.
+\end{itemize}
+
+\paragraph{Check 7: coherencia con terminación económica}
+\label{par:universe_qc:economic_death}
+
+Si \(\mathcal{A}^{\star}\) contiene un evento terminal confirmado para \(i\) con fecha efectiva \(t^\star\), entonces:
+
+\[
+t > t^\star \Rightarrow \mathtt{is\_eligible}(t,i)=0
+\]
+
+y, si el sistema persiste filas post-muerte, estas solo pueden aparecer como estados inactivos explícitos bajo política autorizada. Un elegible tras muerte económica confirmada es \texttt{FAIL}.
+
+\subsubsection{Checks semánticos de elegibilidad}
+\label{sec:universe_qc:eligibility_checks}
+
+\paragraph{Check 8: coherencia binaria motivo-elegibilidad}
+\label{par:universe_qc:reason_consistency}
+
+Debe cumplirse:
+
+\[
+\mathtt{is\_eligible}(t,i)=1
+\Rightarrow
+\mathtt{primary\_exclusion\_reason}(t,i)=\varnothing
+\]
+
+y
+
+\[
+\mathtt{is\_eligible}(t,i)=0
+\Rightarrow
+\mathtt{primary\_exclusion\_reason}(t,i)\neq\varnothing
+\]
+
+Violaciones son \texttt{FAIL}.
+
+\paragraph{Check 9: consistencia entre razón primaria y razones completas}
+\label{par:universe_qc:reason_hierarchy}
+
+Si existe \(\mathtt{all\_failed\_reasons}\), debe verificarse:
+
+\[
+\mathtt{primary\_exclusion\_reason}(t,i)
+=
+\text{primer elemento de }
+\mathtt{all\_failed\_reasons}(t,i)
+\]
+
+según la precedencia oficial de filtros definida en \texttt{build\_universe.py}. Si no se cumple, hay inconsistencia de semántica de exclusión.
+
+\paragraph{Check 10: revalidación de reglas críticas}
+\label{par:universe_qc:rule_recheck}
+
+Sobre una muestra configurable o sobre el universo completo en modo estricto, el QC debe recomputar de forma independiente reglas críticas:
+
+\begin{itemize}
+  \item precio mínimo,
+  \item liquidez mínima,
+  \item banda de market cap,
+  \item edad mínima desde listing,
+  \item tipo de activo,
+  \item exchange permitido.
+\end{itemize}
+
+Si un instrumento marcado como elegible viola alguna regla material bajo la misma configuración PIT, debe emitirse \texttt{FAIL}. Si la discrepancia afecta a un porcentaje menor y está ligada a campos imputados o low-confidence, puede degradarse a \texttt{WARN} solo bajo política explícita.
+
+\subsubsection{Checks temporales y de estabilidad}
+\label{sec:universe_qc:temporal_checks}
+
+\paragraph{Check 11: tamaño diario del universo}
+\label{par:universe_qc:size_daily}
+
+Sea:
+
+\[
+N_t := |\mathcal{U}^{\mathrm{PIT}}_t|
+\]
+
+El módulo debe monitorizar:
+
+\begin{itemize}
+  \item media,
+  \item mediana,
+  \item desviación estándar,
+  \item percentiles,
+  \item z-score temporal,
+  \item saltos absolutos y relativos.
+\end{itemize}
+
+No todo salto es error, pero un cambio extremo sin explicación por calendario, rebalanceo o corporate action masiva debe escalarse.
+
+\paragraph{Check 12: turnover diario}
+\label{par:universe_qc:turnover}
+
+El turnover debe definirse a nivel \texttt{instrument\_id}:
+
+\[
+\texttt{turnover}_t :=
+\frac{
+|\mathcal{U}^{\mathrm{PIT}}_t \setminus \mathcal{U}^{\mathrm{PIT}}_{t-1}|
++
+|\mathcal{U}^{\mathrm{PIT}}_{t-1} \setminus \mathcal{U}^{\mathrm{PIT}}_t|
+}{
+|\mathcal{U}^{\mathrm{PIT}}_t \cup \mathcal{U}^{\mathrm{PIT}}_{t-1}|
+}
+\]
+
+si el denominador es no nulo.
+
+Se define un umbral duro \(\tau_{\mathrm{turnover,fail}}\) y uno blando \(\tau_{\mathrm{turnover,warn}}\), con:
+
+\[
+\texttt{turnover}_t > \tau_{\mathrm{turnover,fail}}
+\Rightarrow \texttt{FAIL}
+\]
+
+si no existe explicación estructural registrada, y:
+
+\[
+\texttt{turnover}_t > \tau_{\mathrm{turnover,warn}}
+\Rightarrow \texttt{WARN}
+\]
+
+\paragraph{Check 13: churn por razón}
+\label{par:universe_qc:reason_churn}
+
+Debe medirse el número de entradas/salidas por causa raíz:
+
+\[
+n_{r,t}^{\mathrm{exit}} =
+|\{i : i \in \mathcal{U}_{t-1}^{\mathrm{PIT}}, i \notin \mathcal{U}_{t}^{\mathrm{PIT}},
+\mathtt{primary\_exclusion\_reason}(t,i)=r \}|
+\]
+
+Una explosión súbita de una razón concreta, por ejemplo \texttt{MISSING\_ADV20}, suele señalar fallo upstream más que dinámica real del mercado.
+
+\subsubsection{Checks de cobertura y survivorship}
+\label{sec:universe_qc:coverage_checks}
+
+\paragraph{Check 14: cobertura de delistings}
+\label{par:universe_qc:delistings}
+
+Sea \(\mathcal{I}_{\mathrm{dead}}\) el conjunto de instrumentos con muerte económica o delisting observado dentro del rango. Definimos:
+
+\[
+\mathcal{E}^{\mathrm{dead}}_t
+=
+\{ i \in \mathcal{I}_{\mathrm{dead}} : t \in \mathcal{W}_i \}
+\]
+
+y la ratio diaria:
+
+\[
+\texttt{delisted\_coverage\_ratio}(t) :=
+\frac{
+|\{ i \in \mathcal{E}^{\mathrm{dead}}_t :
+i \in \texttt{df\_universe}(t)
+\}|
+}{
+|\mathcal{E}^{\mathrm{dead}}_t|
+}
+\]
+
+si \(|\mathcal{E}^{\mathrm{dead}}_t|>0\).
+
+Esta métrica debe interpretarse junto con \texttt{survivorship.py}, pero una caída abrupta es señal clara de pérdida de historia.
+
+\paragraph{Check 15: continuidad de identidad}
+\label{par:universe_qc:identity_continuity}
+
+Si un ticker desaparece y otro aparece el mismo día o en ventana muy corta, el QC debe contrastar contra mappings PIT y corporate actions para decidir si se trata de:
+
+\begin{itemize}
+  \item continuidad legítima de identidad,
+  \item relisting,
+  \item ticker recycling,
+  \item posible error de linkage.
+\end{itemize}
+
+Casos de continuidad correcta no deben inflar turnover ni coverage failures.
+
+\subsubsection{Checks de calendario y anomalías operativas}
+\label{sec:universe_qc:calendar_checks}
+
+\paragraph{Check 16: sesiones válidas}
+\label{par:universe_qc:valid_sessions}
+
+Toda fecha presente en el universo debe pertenecer al calendario de mercado autorizado:
+
+\[
+t \in \mathcal{D}_{\mathrm{market}}
+\]
+
+Fechas fuera de calendario son \texttt{FAIL}.
+
+\paragraph{Check 17: huecos temporales inesperados}
+\label{par:universe_qc:gaps}
+
+Si entre dos sesiones consecutivas del dataset falta una sesión esperada del calendario sin explicación operativa, debe emitirse \texttt{FAIL} a nivel run.
+
+\paragraph{Check 18: reactivaciones anómalas}
+\label{par:universe_qc:reactivations}
+
+Si un instrumento aparece elegible, luego desaparece y vuelve a aparecer tras una supuesta muerte económica sin evento canónico que lo explique, el caso debe marcarse como \texttt{FAIL}. Si existe relisting formal, se tratará según política de continuidad definida.
+
+\subsection{Jerarquía de severidad y agregación}
+\label{sec:universe_qc:severity}
+
+Cada check produce una severidad individual en el conjunto ordenado:
+
+\[
+\texttt{PASS} < \texttt{WARN} < \texttt{FAIL}
+\]
+
+\paragraph{Agregación por fila}
+\label{par:universe_qc:row_severity}
+
+Para cada \((t,i)\) auditado, puede definirse:
+
+\[
+\texttt{row\_severity}(t,i)
+=
+\max(\texttt{severity of all checks affecting } (t,i))
+\]
+
+\paragraph{Agregación global}
+\label{par:universe_qc:global_severity}
+
+El estado final del run se define como:
+
+\[
+\texttt{gate\_status}
+=
+\max(\texttt{severity of all checks in the run})
+\]
+
+No obstante, además del máximo, debe persistirse una tabla de conteos por severidad y por tipo de check, porque un único \texttt{FAIL} aislado no tiene la misma lectura operativa que miles de \texttt{WARN} sistemáticos.
+
+\paragraph{Política de promoción}
+\label{par:universe_qc:promotion}
+
+\begin{itemize}
+  \item Si existe cualquier \texttt{FAIL}, el universo no debe promoverse a producción ni alimentar backtests “oficiales” sin override explícito.
+  \item Si solo existen \texttt{WARN}, la promoción puede permitirse, pero el manifest debe reflejarlo y los módulos downstream deben poder leer esta degradación de calidad.
 \end{itemize}
 
 \subsection{Gates de aceptación}
 \label{sec:universe_qc:gates}
 
-Sobre la salida de \texttt{universe\_qc}, se definen gates (configurables en \texttt{universe\_qc.yaml}):
+Los gates deben ser configurables, pero la especificación debe fijar una plantilla por defecto.
+
+\paragraph{Gate 1: integridad PIT crítica}
+\label{par:universe_qc:gate1}
+
+Si existe cualquiera de las siguientes condiciones:
 
 \begin{itemize}
-  \item \texttt{Gate 1} (violaciones PIT críticas):
-  \[
-    \text{si hay duplicados o ticker fuera de } \mathcal{W}_s \Rightarrow \text{FAIL}
-  \]
-  \item \texttt{Gate 2} (cobertura de delistings):
-  \[
-    \texttt{delisted\_coverage\_ratio\_mean} \geq 0.95
-  \]
-  Si no se cumple, \texttt{WARN} o \texttt{FAIL} según umbrales.
-  \item \texttt{Gate 3} (estabilidad de turnover):
-  \[
-    \texttt{pct\_days\_high\_turnover} \leq \tau_{\text{turnover}}
-  \]
-  donde
-  \[
-    \texttt{pct\_days\_high\_turnover} :=
-    \frac{
-      |\{t \in \mathcal{D} : \texttt{turnover\_t} > \tau_{\text{turnover}}\}|
-    }{
-      |\mathcal{D}|
-    }
-  \]
+  \item duplicados en \((\mathtt{date},\mathtt{instrument\_id})\),
+  \item filas fuera de \(\mathcal{W}_i\),
+  \item fechas fuera de calendario,
+  \item \texttt{is\_eligible} nulo o fuera de dominio,
+  \item elegibles tras muerte económica confirmada,
 \end{itemize}
 
+entonces:
+
 \[
-  \texttt{gate\_status} =
-  \begin{cases}
-    \texttt{pass}  & \text{no violaciones críticas ni anomalías severas.} \\
-    \texttt{warn}  & \text{anomalías moderadas de cobertura o estabilidad.} \\
-    \texttt{fail}  & \text{violaciones PIT o pérdida importante de cobertura de delistings.}
-  \end{cases}
+\texttt{Gate 1} = \texttt{FAIL}
 \]
+
+\paragraph{Gate 2: coherencia semántica}
+\label{par:universe_qc:gate2}
+
+Si la proporción de filas con incoherencia entre \texttt{is\_eligible}, \texttt{membership\_state} y razones de exclusión supera \(\tau_{\mathrm{semantic}}\), entonces:
+
+\[
+\texttt{Gate 2} \in \{\texttt{WARN}, \texttt{FAIL}\}
+\]
+
+según severidad.
+
+\paragraph{Gate 3: cobertura de delistings}
+\label{par:universe_qc:gate3}
+
+Sea:
+
+\[
+\texttt{delisted\_coverage\_ratio\_mean}
+=
+\frac{1}{|\mathcal{D}^{\star}|}
+\sum_{t \in \mathcal{D}^{\star}}
+\texttt{delisted\_coverage\_ratio}(t)
+\]
+
+Entonces, por defecto:
+
+\[
+\texttt{delisted\_coverage\_ratio\_mean} \ge 0.95 \Rightarrow \texttt{PASS}
+\]
+
+\[
+0.90 \le \texttt{delisted\_coverage\_ratio\_mean} < 0.95 \Rightarrow \texttt{WARN}
+\]
+
+\[
+\texttt{delisted\_coverage\_ratio\_mean} < 0.90 \Rightarrow \texttt{FAIL}
+\]
+
+\paragraph{Gate 4: estabilidad temporal}
+\label{par:universe_qc:gate4}
+
+Sea:
+
+\[
+\texttt{pct\_days\_high\_turnover}
+=
+\frac{
+|\{ t \in \mathcal{D} : \texttt{turnover}_t > \tau_{\mathrm{turnover,warn}} \}|
+}{
+|\mathcal{D}|
+}
+\]
+
+y análogamente \(\texttt{pct\_days\_extreme\_turnover}\) con umbral duro. El gate se clasifica según ambos.
+
+\paragraph{Gate 5: missing metadata crítica}
+\label{par:universe_qc:gate5}
+
+Sea:
+
+\[
+\texttt{pct\_missing\_critical\_meta}
+=
+\frac{
+|\{(t,i): \text{falta metadata crítica de lifecycle/identity}\}|
+}{
+|\texttt{df\_universe}|
+}
+\]
+
+Si supera umbral duro, el run debe degradarse al menos a \texttt{WARN}, y a \texttt{FAIL} si compromete checks PIT materiales.
+
+\subsection{Métricas recomendadas}
+\label{sec:universe_qc:metrics}
+
+El módulo debe producir, como mínimo, las siguientes series y agregados:
+
+\paragraph{Tamaño del universo}
+\[
+N_t := |\mathcal{U}^{\mathrm{PIT}}_t|
+\]
+
+\paragraph{Turnover diario}
+\[
+\texttt{turnover}_t
+\]
+
+\paragraph{Entry/exit counts}
+\[
+n_t^{\mathrm{enter}} := |\mathcal{U}^{\mathrm{PIT}}_t \setminus \mathcal{U}^{\mathrm{PIT}}_{t-1}|
+\qquad
+n_t^{\mathrm{exit}} := |\mathcal{U}^{\mathrm{PIT}}_{t-1} \setminus \mathcal{U}^{\mathrm{PIT}}_t|
+\]
+
+\paragraph{Missingness crítica}
+\[
+\texttt{pct\_missing\_critical\_meta}(t)
+\]
+
+\paragraph{Cobertura de delistings}
+\[
+\texttt{delisted\_coverage\_ratio}(t)
+\]
+
+\paragraph{Counts por razón primaria}
+\[
+n_{r,t}^{\mathrm{ineligible}}
+=
+|\{ i : \mathtt{primary\_exclusion\_reason}(t,i)=r \}|
+\]
+
+Esto es especialmente útil para detectar fallos upstream masivos encubiertos bajo una única razón.
 
 \subsection{Metodología de ejecución}
 \label{sec:universe_qc:methodology}
 
 \paragraph{Entradas}
 \label{par:universe_qc:inputs}
+
 \begin{itemize}
-  \item \texttt{universe\_history\_path}: \texttt{df\_universe} PIT.
-  \item \texttt{listings\_master\_path}: \(\mathcal{L}\) con \texttt{list\_date}, \texttt{delist\_date}.
-  \item \texttt{universe\_config\_path}: \texttt{config\_hash} y reglas de elegibilidad.
-  \item \texttt{run\_id}.
+  \item \texttt{universe\_history\_path}
+  \item \texttt{listings\_master\_path}
+  \item \texttt{corporate\_actions\_path} (recomendado; obligatorio en modo estricto)
+  \item \texttt{universe\_config\_path}
+  \item \texttt{calendar\_path}
+  \item \texttt{run\_id}
 \end{itemize}
 
 \paragraph{Flujo}
 \label{par:universe_qc:flow}
+
 \begin{enumerate}
-  \item \texttt{load\_universe\_history} y \texttt{load\_listings\_master}.
-  \item \textbf{Ejecutar checks PIT}:
-  \begin{itemize}
-    \item duplicados,
-    \item ventana de vida,
-    \item no nulos en \texttt{is\_eligible} y \texttt{eligibility\_reason}.
-  \end{itemize}
-  \item \textbf{Calcular métricas diarias}:
-  \[
-    \texttt{universe\_qc\_daily} := \{
-      t,
-      \texttt{n\_symbols\_daily},
-      \texttt{turnover\_daily},
-      \texttt{pct\_missing\_listing\_meta},
-      \texttt{delisted\_coverage\_ratio}(t)
-    \}
-  \]
-  \item \textbf{Detectar failures}:
-  \[
-    \texttt{universe\_qc\_failures} := \{
-      (t,s, \texttt{check\_type}, \texttt{flag\_reason})
-    \}
-  \]
-  \item \textbf{Computar summary}:
-  \[
-    \texttt{universe\_qc\_summary.json}
-  \]
-  \item \textbf{Persistir outputs}:
-  \[
-    \texttt{manifest.json} \text{ con } \texttt{run\_id}, \texttt{config\_hash}, \texttt{gate\_status}.
-  \end{enumerate}
-\]
+  \item Cargar universo histórico, lifecycle master, calendario y corporate actions.
+  \item Validar schema, tipos, enums y unicidad lógica.
+  \item Ejecutar checks PIT/lifecycle.
+  \item Ejecutar checks semánticos de elegibilidad.
+  \item Calcular métricas temporales y coverage.
+  \item Reconciliar discontinuidades con corporate actions y mappings PIT.
+  \item Construir tabla de failures con severidad y causa raíz.
+  \item Agregar severidad y emitir \texttt{gate\_status}.
+  \item Persistir artefactos y manifest.
+\end{enumerate}
 
-\subsection{Métricas de calidad recomendadas}
-\label{sec:universe_qc:metrics}
+\paragraph{Regla de reproducibilidad}
+\label{par:universe_qc:reproducibility}
 
-\begin{itemize}
-  \item \texttt{n\_symbols\_daily}:
-  \[
-    N_t := |\mathcal{U}_t^{\text{PIT}}|
-  \]
-  \item \texttt{turnover\_daily} (como \texttt{turnover\_t} definido arriba).
-  \item \texttt{pct\_missing\_listing\_meta}:
-  \[
-    \frac{
-      |\{s \in \mathcal{U}_t^{\text{PIT}} : \text{ falta } \texttt{list\_date} \text{ o } \texttt{delist\_date}\}|
-    }{
-      N_t
-    }
-  \]
-  \item \texttt{delisted\_coverage\_ratio} (por fecha y agregado).
-\end{itemize}
+Todo rerun con mismos inputs, mismo \texttt{config\_hash} y misma versión de código debe producir exactamente los mismos resultados de QC salvo timestamps de generación si así se diseña.
 
 \subsection{Salidas y artefactos}
 \label{sec:universe_qc:outputs}
 
+\paragraph{Resumen agregado}
+\[
+\texttt{data/universe/qc/\{run\_id\}/universe\_qc\_summary.json}
+\]
+
+Debe incluir al menos:
+
 \begin{itemize}
-  \item \texttt{data/universe/qc/\{run\_id\}/universe\_qc\_summary.json}:
-  \[
-    \{
-      \texttt{n\_symbols\_daily\_mean}, \texttt{turnover\_daily\_mean},
-      \texttt{delisted\_coverage\_ratio\_mean},
-      \texttt{pct\_missing\_listing\_meta},
-      \texttt{gate\_status}, \texttt{run\_id}, \texttt{config\_hash}
-    \}
-  \]
-  \item \texttt{data/universe/qc/\{run\_id\}/universe\_qc\_daily.parquet}:
-  \[
-    t \mapsto (N_t, \texttt{turnover\_t}, \texttt{pct\_missing\_listing\_meta}, \texttt{delisted\_coverage\_ratio}(t))
-  \]
-  \item \texttt{data/universe/qc/\{run\_id\}/universe\_qc\_failures.parquet}:
-  \[
-    \text{Conjunto de \texttt{(t,s, check\_type, flag\_reason)} con violaciones.}
-  \]
-  \item \texttt{data/universe/qc/\{run\_id\}/manifest.json}:
-  \[
-    \{\texttt{run\_id}, \texttt{config\_hash}, \texttt{start\_date}, \texttt{end\_date}, \texttt{n\_rows\_processed}\}
-  \]
+  \item \texttt{gate\_status}
+  \item \texttt{n\_rows\_processed}
+  \item \texttt{n\_distinct\_instruments}
+  \item \texttt{n\_fail}, \texttt{n\_warn}
+  \item \texttt{delisted\_coverage\_ratio\_mean}
+  \item \texttt{pct\_days\_high\_turnover}
+  \item \texttt{pct\_days\_extreme\_turnover}
+  \item \texttt{pct\_missing\_critical\_meta}
+  \item \texttt{top\_failure\_types}
+  \item \texttt{run\_id}, \texttt{config\_hash}, \texttt{code\_version}
 \end{itemize}
 
-\subsection{CLI y criterios de aceptación}
+\paragraph{Serie diaria}
+\[
+\texttt{data/universe/qc/\{run\_id\}/universe\_qc\_daily.parquet}
+\]
+
+con mapeo:
+
+\[
+t \mapsto
+\left(
+N_t,
+\texttt{turnover}_t,
+n_t^{\mathrm{enter}},
+n_t^{\mathrm{exit}},
+\texttt{pct\_missing\_critical\_meta}(t),
+\texttt{delisted\_coverage\_ratio}(t),
+\dots
+\right)
+\]
+
+\paragraph{Failures detallados}
+\[
+\texttt{data/universe/qc/\{run\_id\}/universe\_qc\_failures.parquet}
+\]
+
+con schema recomendado:
+
+\begin{itemize}
+  \item \texttt{date}
+  \item \texttt{instrument\_id}
+  \item \texttt{symbol}
+  \item \texttt{check\_type}
+  \item \texttt{severity}
+  \item \texttt{flag\_reason}
+  \item \texttt{evidence\_summary}
+  \item \texttt{linked\_corporate\_action\_id} (si aplica)
+\end{itemize}
+
+\paragraph{Manifest}
+\[
+\texttt{data/universe/qc/\{run\_id\}/manifest.json}
+\]
+
+debe persistir:
+
+\begin{itemize}
+  \item \texttt{run\_id}
+  \item \texttt{config\_hash}
+  \item \texttt{code\_version}
+  \item \texttt{start\_date}, \texttt{end\_date}
+  \item hashes de inputs materiales
+  \item umbrales de gates
+  \item conteos por severidad
+  \item overrides manuales, si existen
+\end{itemize}
+
+\subsection{CLI sugerida}
 \label{sec:universe_qc:cli}
 
-\paragraph{CLI suggerida}
-\label{par:universe_qc:cli}
 \begin{verbatim}
 python -m data.universe.universe_qc ^
   --universe-history-path data/universe/history ^
   --listings-master-path data/universe/source/listings.parquet ^
+  --corporate-actions-path data/universe/corporate_actions/history.parquet ^
+  --calendar-path data/reference/us_market_calendar.parquet ^
   --config-path configs/data/universe_qc.yaml ^
   --run-id universe_qc_20260305_001
 \end{verbatim}
 
-\paragraph{Definition of Done}
-\label{par:universe_qc:dod}
-\begin{itemize}
-  \item El universo \(\mathcal{U}_t^{\text{PIT}}\) es \textbf{validado PIT} contra \(\mathcal{L}\) y reglas de elegibilidad.
-  \item Se generan \texttt{summary}, \texttt{daily} y \texttt{failures} trazables por \texttt{run\_id}.
-  \item Un \texttt{gate\_status} (\texttt{pass}/\texttt{warn}/\texttt{fail}) es consumible por el pipeline de \texttt{validation} y \texttt{backtest}.
-\end{itemize}
+\subsection{Definition of Done}
+\label{sec:universe_qc:dod}
+
+El módulo alcanza su \textbf{Definition of Done} cuando:
+
+\begin{enumerate}
+  \item valida el universo a nivel de \textbf{identidad económica}, no solo de ticker;
+  \item detecta y clasifica de forma determinista violaciones estructurales, PIT y semánticas;
+  \item traduce las anomalías detectadas a una jerarquía formal de \textbf{PASS/WARN/FAIL};
+  \item genera artefactos reproducibles y trazables por \texttt{run\_id};
+  \item produce un \texttt{gate\_status} consumible automáticamente por los pipelines de validación, research y backtest.
+\end{enumerate}
+
+\subsection{Resumen ejecutivo}
+\label{sec:universe_qc:summary}
+
+\texttt{universe\_qc.py} es la capa que certifica si el universo PIT construido por el sistema es suficientemente correcto, estable y coherente como para ser tratado como verdad histórica operativa. Su función va bastante más allá de revisar columnas o duplicados: valida identidad, lifecycle, coherencia de elegibilidad, estabilidad temporal y cobertura de historia muerta o delisted.
+
+En un sistema serio de \textit{small-cap swing trading}, este control es imprescindible, porque un universo aparentemente “bien formado” puede seguir estando contaminado por errores de causalidad temporal, mappings defectuosos o exclusiones mal codificadas. \texttt{universe\_qc.py} es precisamente el módulo que convierte esa sospecha difusa en una auditoría formal y accionable.

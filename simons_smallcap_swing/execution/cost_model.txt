@@ -1,338 +1,590 @@
 \section{Módulo: execution/cost\_model.py}
 
-\subsection{Objetivo y contexto industrial}
+\subsection{Objetivo económico y función dentro del stack de ejecución}
 \label{sec:cost-model-objective}
 
-El objetivo principal de \texttt{execution/cost_model.py} es \textbf{convertir retornos brutos en métricas netas realistas} incorporando un modelo de costes de ejecución completo, compuesto por:
-\begin{itemize}
-    \item \textbf{Costes explícitos}: comisiones, tasas de mercado y fees de corredor.
-    \item \textbf{Costes implícitos}: bid–ask spread, slippage y market impact.
-    \item \textbf{Borrow cost}: coste asociado a posiciones cortas.
-\end{itemize}
-Este diseño sigue el marco de \textit{implementation shortfall} descrito en la literatura de costes de transacción (Perold, 1988; Almgren et al., 2005) y está alineado con prácticas de trading cuantitativo industrial presentes en libros como Chan (2021) y De Prado (2018).\footnote{%
-    Perold, A. (1988). “The Implementation Shortfall: Paper vs. Reality.”\\
-    Almgren, R., et al. (2005). “Optimal Execution of Portfolio Transactions.”\\
-    Chan, E. (2021). “Quantitative Trading”; De Prado, M. (2018). “ADVANCED RISK AND PORTFOLIO MANAGEMENT.”}
+El propósito de \texttt{execution/cost\_model.py} es transformar una secuencia de órdenes y \textit{fills} en una estimación \textbf{económicamente coherente, neta y reconciliable} del coste de implementación de la estrategia. En términos de arquitectura, este módulo constituye la capa donde la cartera teórica deja de medirse en retornos brutos y pasa a evaluarse en términos de \textit{implementation shortfall}, esto es, la diferencia entre el resultado ideal de la decisión de inversión y el resultado realmente alcanzable una vez incorporadas fricciones operativas, microestructurales y de financiación.
 
-\subsection{Alcance y límites del módulo}
+No se trata simplemente de “sumar comisiones”. El objetivo es imponer una contabilidad de costes suficientemente rigurosa como para responder, sin ambigüedad, a cuatro preguntas distintas:
+
+\begin{enumerate}
+    \item ¿Cuánto costó ejecutar cada fill individual?
+    \item ¿Cuánto costó implementar cada orden completa, incluyendo fills parciales o ejecución a lo largo de múltiples cortes temporales?
+    \item ¿Cuánto costó mantener inventario short abierto a lo largo del tiempo?
+    \item ¿Cuál fue el coste agregado diario y total del run, sin doble conteo entre capas?
+\end{enumerate}
+
+El módulo debe por tanto modelar y reconciliar, de forma estricta y trazable, tres familias de costes:
+
+\begin{itemize}
+    \item \textbf{Costes explícitos:} comisiones, tasas regulatorias, exchange fees, clearing y otros cargos directamente observables.
+    \item \textbf{Costes implícitos de ejecución:} spread crossing, slippage e impacto de mercado asociado al tamaño relativo de la operación y a la liquidez del instrumento.
+    \item \textbf{Costes de financiación short:} borrow fees asociados a mantener exposición corta efectivamente abierta.
+\end{itemize}
+
+Esta separación no es estilística. Es obligatoria para que el sistema pueda:
+\begin{itemize}
+    \item comparar investigación de señales en base \textit{gross} vs \textit{net},
+    \item estimar capacidad y degradación de alpha,
+    \item construir etiquetas \textit{net-of-costs},
+    \item y validar que una mejora aparente del modelo predictivo no es una ilusión generada por una capa de ejecución demasiado benigna.
+\end{itemize}
+
+\subsection{Principio rector}
+\label{sec:cost-model-principle}
+
+La filosofía del módulo es la siguiente:
+
+\begin{quote}
+\textit{todo coste debe imputarse exactamente una vez, en la capa temporal correcta y sobre la unidad económica correcta.}
+\end{quote}
+
+Esto implica tres reglas no negociables:
+
+\begin{enumerate}
+    \item \textbf{Los costes de ejecución se imputan sobre fills realizados}, no sobre órdenes deseadas no ejecutadas.
+    \item \textbf{Los costes de inventario short se imputan sobre posiciones cortas vivas}, no sobre volumen transado.
+    \item \textbf{Ningún componente puede duplicar semánticamente a otro.} Si el impacto ya captura degradación de precio por agresividad de ejecución, el slippage no puede volver a representar el mismo fenómeno con otra etiqueta.
+\end{enumerate}
+
+\subsection{Alcance del módulo}
 \label{sec:cost-model-scope}
 
-\subsubsection{Funcionalidades incluidas}
-
-El módulo:
+\subsubsection{Incluido}
 \begin{itemize}
-    \item Estima \textbf{costes por orden/fill}, incluyendo fee, spread, slippage, impacto y borrow.
-    \item Agrega costes:
-        \begin{itemize}
-            \item \textbf{Por trade}.
-            \item \textbf{Por día}.
-            \item \textbf{Por run} de backtest.
-        \end{itemize}
-    \item Implementa \textbf{escenarios de sensibilidad} sobre parámetros de costes (por ejemplo, bajo, medio y alto).
+    \item Cálculo de costes por \textbf{fill}.
+    \item Reconciliación de fills en coste por \textbf{orden}.
+    \item Agregación de costes por \textbf{símbolo-día}.
+    \item Agregación de costes por \textbf{run}.
+    \item Separación entre costes de \textbf{ejecución instantánea} y costes de \textbf{carry short}.
+    \item Escenarios paramétricos de sensibilidad y estrés.
+    \item Producción de salidas auditables para backtest, validación y etiquetado.
 \end{itemize}
 
-\subsubsection{Funcionalidades no incluidas}
-
+\subsubsection{Explícitamente no incluido}
 \begin{itemize}
-    \item Simulación completa de \textit{fills} (capa \texttt{fills\_simulator}).
-    \item Optimización de ruta de ejecución en tiempo real (\textit{smart order routing} o \textit{execution algorithm}).
+    \item Simulación del proceso de \textit{fill} y secuencia intradía de ejecución. Eso pertenece a \texttt{execution/fills\_simulator}.
+    \item Decisión de capacidad o admisibilidad de posiciones short. Eso pertenece a \texttt{execution/borrow\_execution}.
+    \item Scheduling dinámico de child orders o smart order routing.
+    \item Optimización online del trade-off entre urgencia e impacto.
 \end{itemize}
 
-Esto permite que el cost\_model se enfoque en \textbf{estimación de costes} y no en scheduling de ejecución, siguiendo un diseño modular típico en sistemas cuantitativos industriales.
+\subsection{Relación con otros módulos}
+\label{sec:cost-model-relations}
 
-\subsection{Dependencias upstream y downstream}
-\label{sec:cost-model-deps}
-
-\textbf{Upstream:}
+\subsubsection{Dependencias upstream}
 \begin{itemize}
-    \item \texttt{backtest/engine}:
-        \begin{itemize}
-            \item \texttt{orders/fills} generados por el motor de backtest.
-        \end{itemize}
-    \item \texttt{data/price} y \texttt{data/volume}:
-        \begin{itemize}
-            \item Información de precios y volumen medios diarios (\texttt{ADV}).
-            \item Metadatos de volatilidad y spread proxy.
-        \end{itemize}
-    \item \texttt{data/borrow}:
-        \begin{itemize}
-            \item \texttt{borrow\_proxy} y costes de préstamo para posiciones cortas.
-        \end{itemize}
-    \item \texttt{configs/execution/fee\_schedules}:
-        \begin{itemize}
-            \item \texttt{fee\_fixed}, \texttt{fee\_bps}, tasas por perfil de cliente/venue.
-        \end{itemize}
+    \item \texttt{execution/fills\_simulator}: \textit{fills} efectivos, incluyendo \texttt{fill\_shares}, \texttt{fill\_price}, \texttt{fill\_timestamp} o corte temporal equivalente.
+    \item \texttt{execution/impact\_model}: si la arquitectura separa el cálculo de impacto en un módulo dedicado, este módulo debe consumir su salida en bps o en coste monetario sin volver a reconstruirla heurísticamente.
+    \item \texttt{execution/borrow\_execution}: costes diarios de borrow y eventos asociados a recalls o restricciones short.
+    \item \texttt{data/price}, \texttt{data/volume}: precios de referencia, ADV, volatilidad, spread proxy y buckets de liquidez.
+    \item \texttt{configs/execution/fee\_schedules}: tablas de fees por broker, venue, tipo de orden o perfil de cuenta.
 \end{itemize}
 
-\textbf{Downstream:}
+\subsubsection{Consumidores downstream}
 \begin{itemize}
-    \item \texttt{backtest/engine}:
-        \begin{itemize}
-            \item Capacitado para computar \texttt{net\_pnl} y \texttt{net\_returns} descontando costes estimados.
-        \end{itemize}
-    \item \texttt{labels/build\_labels}:
-        \begin{itemize}
-            \item Etiquetas \texttt{net\_of\_costs} para modelos de predicción.
-        \end{itemize}
-    \item \texttt{validation/synthetic\_shocks}:
-        \begin{itemize}
-            \item Pruebas de estrés sobre costes de ejecución.
-        \end{itemize}
+    \item \texttt{backtest/engine}: para computar \texttt{net\_pnl}, \texttt{net\_returns} y performance attribution neta.
+    \item \texttt{labels/build\_labels}: para construir objetivos predictivos netos de fricción.
+    \item \texttt{validation/*}: para reconciliación, stress testing y pruebas de consistencia.
 \end{itemize}
+
+\subsection{Semántica temporal obligatoria}
+\label{sec:cost-model-time-semantics}
+
+Una parte crítica del módulo consiste en distinguir correctamente entre el instante en que el coste nace económicamente y el instante en que el sistema lo reconoce contablemente.
+
+Adoptamos la siguiente semántica:
+
+\begin{itemize}
+    \item \textbf{Fee, spread, slippage e impacto} nacen en el momento del \textit{fill}. Son costes de ejecución.
+    \item \textbf{Borrow cost} nace por mantener abierta una posición short a lo largo del tiempo. Es un coste de inventario, no de trade.
+    \item Una orden puede producir \textbf{múltiples fills} en la misma fecha o a lo largo de varias fechas. El coste de orden es la suma de los costes de sus fills más, en su caso, los costes explícitos de ticket que por diseño contractual deban aplicarse a nivel orden y no a nivel fill.
+\end{itemize}
+
+Por tanto, el módulo debe distinguir explícitamente entre:
+
+\[
+\text{fill cost}
+\neq
+\text{order cost}
+\neq
+\text{daily inventory cost}
+\neq
+\text{run total cost}.
+\]
+
+Cualquier implementación que mezcle estos niveles rompe la reconciliación económica del sistema.
 
 \subsection{Contrato de entrada}
 \label{sec:cost-model-inputs}
 
-\subsubsection{Entradas mínimas}
-
+\subsubsection{Rutas mínimas}
 \begin{itemize}
-    \item \texttt{fills\_path}:
-        \begin{itemize}
-            \item \texttt{date, symbol, side, fill\_shares, fill\_price}: detalle de fills realizado.
-        \end{itemize}
-    \item \texttt{market\_data\_path}:
-        \begin{itemize}
-            \item Spread proxy, \texttt{ADV}, \texttt{volatilidad} por símbolo.
-        \end{itemize}
-    \item \texttt{cost\_config\_path}:
-        \begin{itemize}
-            \item Parámetros de fee, impacto, borrow y buckets de liquidez.
-        \end{itemize}
-    \item \texttt{run\_id}:
-        \begin{itemize}
-            \item Identificador único del run de backtest.
-        \end{itemize}
+    \item \texttt{fills\_path}
+    \item \texttt{market\_data\_path}
+    \item \texttt{fee\_schedule\_path}
+    \item \texttt{cost\_config\_path}
+    \item \texttt{run\_id}
 \end{itemize}
 
-\subsubsection{Entradas opcionales}
-
+\subsubsection{Rutas opcionales}
 \begin{itemize}
-    \item \texttt{borrow\_path}:
-        \begin{itemize}
-            \item Detalle de borrow proxy por símbolo y día.
-        \end{itemize}
-    \item \texttt{venue\_fee\_table\_path}:
-        \begin{itemize}
-            \item Matriz de fees por venue y tipo de orden.
-        \end{itemize}
-    \item \texttt{liquidity\_bucket\_map}:
-        \begin{itemize}
-            \item Agrupación de símbolos por bucket de liquidez para aplicar spread/impacto diferentes.
-        \end{itemize}
+    \item \texttt{impact\_costs\_path}
+    \item \texttt{borrow\_costs\_path}
+    \item \texttt{venue\_metadata\_path}
+    \item \texttt{liquidity\_bucket\_map\_path}
+\end{itemize}
+
+\subsubsection{Campos mínimos en fills}
+\begin{itemize}
+    \item \texttt{date}
+    \item \texttt{symbol}
+    \item \texttt{order\_id}
+    \item \texttt{fill\_id}
+    \item \texttt{side}
+    \item \texttt{fill\_shares}
+    \item \texttt{fill\_price}
+\end{itemize}
+
+\subsubsection{Campos mínimos en market data}
+\begin{itemize}
+    \item \texttt{date}
+    \item \texttt{symbol}
+    \item \texttt{adv}
+    \item \texttt{daily\_volatility}
+    \item \texttt{spread\_proxy\_bps}
+    \item \texttt{liquidity\_bucket}
+\end{itemize}
+
+\subsubsection{Campos mínimos en borrow costs si se proveen externamente}
+\begin{itemize}
+    \item \texttt{date}
+    \item \texttt{symbol}
+    \item \texttt{borrow\_cost\_amount}
+\end{itemize}
+
+\subsubsection{Invariantes de entrada}
+\begin{itemize}
+    \item \texttt{abs(fill\_shares) > 0}.
+    \item \texttt{adv > 0} para todo fill costable; si no se cumple, debe activarse una política explícita de \texttt{fail-closed} o de fallback.
+    \item \texttt{daily\_volatility >= 0}.
+    \item \texttt{spread\_proxy\_bps >= 0}.
+    \item La clave \texttt{(date, symbol, fill\_id)} debe ser única.
 \end{itemize}
 
 \subsection{Contrato de salida}
 \label{sec:cost-model-outputs}
 
-\textbf{Archivos generados por \texttt{run\_id}:}
+Para cada \texttt{run\_id}, el módulo debe producir como mínimo:
+
 \begin{itemize}
-    \item \texttt{execution/costs/\{run\_id\}/trade\_costs.parquet}:
-        \begin{itemize}
-            \item Costes por trade, con campos mínimos:
-                \begin{itemize}
-                    \item \texttt{date, symbol, order\_id}.
-                    \item \texttt{notional}.
-                    \item \texttt{fee\_cost}.
-                    \item \texttt{spread\_cost}.
-                    \item \texttt{slippage\_cost}.
-                    \item \texttt{impact\_cost}.
-                    \item \texttt{borrow\_cost}.
-                    \item \texttt{total\_cost, total\_cost\_bps}.
-                \end{itemize}
-        \end{itemize}
-    \item \texttt{execution/costs/\{run\_id\}/daily\_costs.parquet}:
-        \begin{itemize}
-            \item Agregación de costes por día y símbolo.
-        \end{itemize}
-    \item \texttt{execution/costs/\{run\_id\}/cost\_summary.json}:
-        \begin{itemize}
-            \item Métricas agregadas (avg\_cost\_bps, median\_cost\_bps, p95\_cost\_bps, etc.).
-        \end{itemize}
-    \item \texttt{execution/costs/\{run\_id\}/manifest.json}:
-        \begin{itemize}
-            \item Metadatos de ejecución y trazabilidad.
-        \end{itemize}
+    \item \texttt{execution/costs/\{run\_id\}/fill\_costs.parquet}
+    \item \texttt{execution/costs/\{run\_id\}/order\_costs.parquet}
+    \item \texttt{execution/costs/\{run\_id\}/daily\_costs.parquet}
+    \item \texttt{execution/costs/\{run\_id\}/run\_summary.json}
+    \item \texttt{execution/costs/\{run\_id\}/manifest.json}
 \end{itemize}
 
-\subsection{Modelo matemático de costes de ejecución}
-\label{sec:cost-model-math}
-
-Sea:
+\subsubsection{Campos mínimos de fill costs}
 \begin{itemize}
-    \item \( t \in \{1,\dots,T\} \): tiempo (días de backtest).
-    \item \( i \in \{1,\dots,N\} \): conjunto de símbolos.
-    \item \( j \in \{1,\dots,M\} \): conjunto de órdenes/fills.
-    \item \( q_{jit} \): \texttt{fill\_shares} del fill \( j \) del símbolo \( i \) en el día \( t \).
-    \item \( p_{it} \): \texttt{fill\_price} del símbolo \( i \) en el día \( t \).
-    \item \( \nu_{it} \): \texttt{volatilidad} diaria del símbolo \( i \).
-    \item \( V_{it}^{\text{ADV}} \): \texttt{ADV} (average daily volume) del símbolo \( i \) en el día \( t \).
-    \item \( \rho_{jit} = \frac{\lvert q_{jit} \rvert}{V_{it}^{\text{ADV}}} \): ratio de participación (\textit{participation rate}).
+    \item \texttt{date, symbol, order\_id, fill\_id}
+    \item \texttt{fill\_shares, fill\_price, notional}
+    \item \texttt{fee\_cost}
+    \item \texttt{spread\_cost}
+    \item \texttt{slippage\_cost}
+    \item \texttt{impact\_cost}
+    \item \texttt{execution\_cost}
+    \item \texttt{execution\_cost\_bps}
+    \item \texttt{cost\_scenario}
+    \item \texttt{policy\_version}
 \end{itemize}
 
-\subsubsection{Fee cost}
-\label{sec:cost-fee}
-
-El coste de fee por trade se modela como:
-
-\begin{equation}
-    C_{jit}^{\text{fee}} 
-    = 
-    \texttt{fee\_fixed} 
-    + 
-    \texttt{fee\_bps} \cdot \underbrace{\lvert p_{it} \cdot q_{jit} \rvert}_{\text{notional}}.
-\end{equation}
-
-Esta estructura lineal combina un coste fijo por ticket con un componente proporcional al notional, típico en comisiones de brokers y exchanges.\footnote{%
-    Deutsche Bank. (2025). “DBTradingCostModels-v1.1” — ejemplo de stack de costes paramétrico.}
-
-\subsubsection{Spread y slippage}
-\label{sec:cost-spread-slippage}
-
-Sea \( s_i^{\text{base}} \) el spread base en \texttt{bps} para el bucket de liquidez del símbolo \( i \). El coste de spread y slippage se aproxima como:
-
-\begin{equation}
-    C_{jit}^{\text{spread\_slippage}} 
-    = 
-    \frac{1}{2}
-    \cdot
-    s_i^{\text{base}}
-    \cdot
-    \rho_{jit}
-    \cdot
-    \text{sgn}(q_{jit})
-    \cdot \lvert p_{it} \cdot q_{jit} \rvert.
-\end{equation}
-
-Esta aproximación asume:
+\subsubsection{Campos mínimos de order costs}
 \begin{itemize}
-    \item Un \textit{half spread} como unidad de coste implícito.
-    \item Un multiplo de participación \(\rho_{jit}\) que refleja la profundidad relativa del orden respecto al volumen diario.
-    \item Un signo de lado de la orden (\texttt{side}) que captura si el costo se aplica en entrada (entrada al mercado) o en salida.
+    \item \texttt{date\_start, date\_end, symbol, order\_id}
+    \item \texttt{requested\_shares}
+    \item \texttt{filled\_shares}
+    \item \texttt{fill\_completion\_ratio}
+    \item \texttt{n\_fills}
+    \item \texttt{order\_execution\_cost}
+    \item \texttt{order\_execution\_cost\_bps}
 \end{itemize}
 
-\subsubsection{Impacto de mercado no lineal}
-\label{sec:cost-impact}
+\subsubsection{Campos mínimos de daily costs}
+\begin{itemize}
+    \item \texttt{date, symbol}
+    \item \texttt{execution\_cost\_amount}
+    \item \texttt{borrow\_cost\_amount}
+    \item \texttt{total\_cost\_amount}
+    \item \texttt{gross\_traded\_notional}
+    \item \texttt{cost\_bps\_on\_traded\_notional}
+\end{itemize}
 
-Siguiendo modelos de impacto no lineal de la literatura (Almgren et al.; Donier et al., 2015),\footnote{%
-    Donier, J., et al. (2015). “A fully consistent, minimal model for non-linear market impact.”}
-el impacto se formula como:
+\subsection{Definiciones formales}
+\label{sec:cost-model-definitions}
+
+Sea \( j \) un fill del símbolo \( i \) en el día \( t \). Definimos:
+
+\begin{itemize}
+    \item \( q_{jit} \): número de acciones ejecutadas en el fill.
+    \item \( p_{jit}^{\mathrm{fill}} \): precio de ejecución del fill.
+    \item \( N_{jit} = |q_{jit}|\cdot p_{jit}^{\mathrm{fill}} \): notional absoluto del fill.
+    \item \( V_{it}^{\mathrm{ADV}} \): volumen medio diario.
+    \item \( \nu_{it} \): volatilidad diaria o estimador equivalente configurado.
+    \item \( s_{it}^{\mathrm{proxy}} \): spread proxy en bps.
+    \item \( \rho_{jit} = \frac{|q_{jit}|}{V_{it}^{\mathrm{ADV}}} \): participation rate del fill.
+\end{itemize}
+
+\subsection{Descomposición exacta del coste}
+\label{sec:cost-model-decomposition}
+
+\subsubsection{1. Fee cost}
+\label{sec:cost-model-fee}
+
+El coste explícito por fill se define como:
 
 \begin{equation}
-    \texttt{impact\_bps}_{jit} 
-    =
-    \alpha
-    \cdot
-    \rho_{jit}^{\beta}
-    \cdot
-    \nu_{it}^{\gamma},
+C_{jit}^{\mathrm{fee}}
+=
+c_{jit}^{\mathrm{fixed,fill}}
++
+c_{jit}^{\mathrm{bps}}\cdot N_{jit}\cdot 10^{-4},
 \end{equation}
+
+donde el término fijo puede ser cero si el modelo contractual aplica el coste fijo a nivel orden y no a nivel fill.
+
+\paragraph{Regla importante.}
+Los costes fijos no pueden imputarse simultáneamente a nivel fill y a nivel orden salvo que se trate de conceptos distintos. El manifiesto debe indicar claramente dónde vive cada uno.
+
+\subsubsection{2. Spread cost}
+\label{sec:cost-model-spread}
+
+El spread cost representa el cruce mecánico del bid--ask y debe aproximarse como una fracción del spread observable o proxy:
+
+\begin{equation}
+C_{jit}^{\mathrm{spread}}
+=
+\lambda^{\mathrm{spread}}_{it}\cdot s_{it}^{\mathrm{proxy}}\cdot 10^{-4}\cdot N_{jit},
+\qquad
+0 \le \lambda^{\mathrm{spread}}_{it} \le \frac{1}{2},
+\end{equation}
+
+donde típicamente \(\lambda^{\mathrm{spread}}_{it}=\frac{1}{2}\) para una orden agresiva que cruza el half-spread completo.
+
+\paragraph{Interpretación.}
+Este componente captura el coste “mínimo microestructural” de entrar o salir mediante liquidez agresiva. No debe crecer con \(\rho\) salvo que el sistema decida explícitamente redefinir el spread proxy como función del tamaño.
+
+\subsubsection{3. Slippage cost}
+\label{sec:cost-model-slippage}
+
+El slippage debe modelarse como un residual de ejecución no explicado por el spread mecánico ni por el impacto externo precomputado. Una parametrización admisible es:
+
+\begin{equation}
+C_{jit}^{\mathrm{slippage}}
+=
+\eta_{it}\cdot 10^{-4}\cdot N_{jit},
+\end{equation}
+
+donde \(\eta_{it}\) puede depender de bucket de liquidez, tipo de orden, latencia simulada o calidad de ejecución.
+
+\paragraph{Regla de no solapamiento.}
+Si el \texttt{fills\_simulator} ya emite \texttt{fill\_price} deteriorado respecto al benchmark de decisión y esa diferencia incorpora spread y parte del slippage, entonces este término debe:
+\begin{itemize}
+    \item reducirse a cero, o
+    \item reinterpretarse como residual no absorbido por el simulador,
+\end{itemize}
+pero nunca volver a cargar la misma degradación de precio bajo otro nombre.
+
+\subsubsection{4. Impact cost}
+\label{sec:cost-model-impact}
+
+El impacto puede consumirse desde \texttt{execution/impact\_model} o calcularse internamente solo si no existe salida externa. En caso interno, una familia estándar es:
+
+\begin{equation}
+\mathrm{impact\_bps}_{jit}
+=
+\alpha_{b(it)} \cdot \rho_{jit}^{\beta_{b(it)}} \cdot \nu_{it}^{\gamma},
+\end{equation}
+
+donde \(b(it)\) denota el bucket de liquidez del símbolo en la fecha \(t\).
+
+El coste monetario correspondiente es:
+
+\begin{equation}
+C_{jit}^{\mathrm{impact}}
+=
+\mathrm{impact\_bps}_{jit}\cdot 10^{-4}\cdot N_{jit}.
+\end{equation}
+
+\paragraph{Condición estructural.}
+Para universos de small caps, la calibración debe ser \textbf{bucketizada} como mínimo por liquidez y, preferiblemente, también por volatilidad y tamaño relativo de operación. Un único conjunto global \((\alpha,\beta,\gamma)\) para todo el universo suele ser demasiado tosco para investigación seria de capacidad.
+
+\subsubsection{5. Borrow cost}
+\label{sec:cost-model-borrow}
+
+El borrow no debe modelarse como un coste por fill salvo cuando, por pura conveniencia de reporting, se quiera asociar el primer día de carry a la fecha de apertura. Económicamente, el borrow es un coste de inventario y debe venir dado por:
+
+\begin{equation}
+C_{it}^{\mathrm{borrow}}
+=
+r_{it}^{\mathrm{daily}} \cdot |Q_{it}^{\mathrm{live,short}}|\cdot P_{it}^{\mathrm{ref}},
+\end{equation}
+
 donde:
 \begin{itemize}
-    \item \(\alpha, \beta, \gamma\) son parámetros de ajuste, con \(\beta > 1\) para capturar concavidad típica de impacto.
-    \item \(\rho_{jit}\) es el \textit{participation rate}.
-    \item \(\nu_{it}\) es la volatilidad de precio.
+    \item \(Q_{it}^{\mathrm{live,short}}\) es la posición short viva al cierre del día o según la convención definida,
+    \item \(r_{it}^{\mathrm{daily}}\) es la tasa diaria de préstamo,
+    \item \(P_{it}^{\mathrm{ref}}\) es el precio de referencia para devengo.
 \end{itemize}
 
-El coste de impacto en términos de dólares es:
+\paragraph{Regla obligatoria.}
+Si \texttt{execution/borrow\_execution} ya produce \texttt{borrow\_costs\_daily.parquet}, este módulo debe consumir esa serie como \textbf{fuente de verdad} y no recalcularla a partir de fills.
+
+\subsection{Definición exacta del coste total}
+\label{sec:cost-model-total}
+
+Para cada fill:
 
 \begin{equation}
-    C_{jit}^{\text{impact}} 
-    = 
-    \texttt{impact\_bps}_{jit} 
-    \cdot 
-    10^{-4}
-    \cdot
-    \lvert p_{it} \cdot q_{jit} \rvert.
+C_{jit}^{\mathrm{execution}}
+=
+C_{jit}^{\mathrm{fee}}
++
+C_{jit}^{\mathrm{spread}}
++
+C_{jit}^{\mathrm{slippage}}
++
+C_{jit}^{\mathrm{impact}}.
 \end{equation}
 
-\subsubsection{Borrow cost en posiciones cortas}
-\label{sec:cost-borrow}
-
-Para posiciones cortas, el módulo incorpora un coste de préstamo sobre el \textit{short notional}:
-
-\begin{itemize}
-    \item \texttt{borrow\_rate\_annualized} (por ejemplo, interpolado de datos de Markit, D’Avolio, 2002).\footnote{%
-        D’Avolio, G. (2002). “The market for borrowing stock.” Journal of Financial Economics.}
-    \item Tasa diaria equivalente:
-        \begin{equation}
-            r_{it}^{\text{daily}} 
-            =
-            \frac{\texttt{borrow\_rate\_annualized}_{it}}{252}.
-        \end{equation}
-\end{itemize}
-
-El coste de borrow por día es:
+Para cada orden \(o\):
 
 \begin{equation}
-    C_{jit}^{\text{borrow}} 
-    = 
-    r_{it}^{\text{daily}}
-    \cdot
-    \underbrace{\lvert p_{it} \cdot q_{jit} \rvert}_{\text{short\_notional}}.
+C_{o}^{\mathrm{execution}}
+=
+\sum_{j \in \mathcal{F}(o)} C_{j}^{\mathrm{execution}}
++
+C_{o}^{\mathrm{fixed,order}},
 \end{equation}
 
-Este componente solo se aplica si la posición es corta (\texttt{side} = \texttt{short} y \texttt{short\_allowed\_flag} = \texttt{True}).
+donde \(\mathcal{F}(o)\) es el conjunto de fills pertenecientes a la orden.
 
-\subsubsection{Coste total por trade}
-\label{sec:cost-total}
-
-El coste total por trade se suma como:
+Para cada símbolo-día:
 
 \begin{equation}
-    C_{jit}^{\text{total}} 
-    = 
-    C_{jit}^{\text{fee}}
-    +
-    C_{jit}^{\text{spread\_slippage}}
-    +
-    C_{jit}^{\text{impact}}
-    +
-    C_{jit}^{\text{borrow}},
+C_{it}^{\mathrm{total}}
+=
+C_{it}^{\mathrm{execution}}
++
+C_{it}^{\mathrm{borrow}}.
 \end{equation}
 
-y la expresión en \texttt{bps} es:
+Para todo el run:
 
 \begin{equation}
-    C_{jit}^{\text{total\_bps}} 
-    = 
-    \frac{C_{jit}^{\text{total}}}{\lvert p_{it} \cdot q_{jit} \rvert} \cdot 10^4.
+C^{\mathrm{run}}
+=
+\sum_{t}\sum_{i} C_{it}^{\mathrm{total}}.
 \end{equation}
 
-\subsection{Parametrización clave y sensibilidad}
-\label{sec:cost-model-params}
+\subsection{Reconciliación obligatoria entre niveles}
+\label{sec:cost-model-reconciliation}
 
-\subsubsection{Parámetros de configuración}
+Este módulo debe garantizar las siguientes identidades:
 
-\begin{itemize}
-    \item \texttt{fee\_fixed}, \texttt{fee\_bps}: comisiones de broker.
-    \item \texttt{spread\_bps\_base} por \texttt{liquidity\_bucket}: spread base ajustado por nivel de liquidez.
-    \item \texttt{impact\_a}, \texttt{impact\_b}: coeficientes de la función de impacto \(\alpha \rho^{\beta}\nu^{\gamma}\).
-    \item \texttt{max\_participation\_assumed}: umbral máximo de \(\rho_{jit}\) usado en cálculos de impacto.
-    \item \texttt{borrow\_rate\_fallback}: tasa de préstamo por defecto cuando no hay datos específicos.
-    \item \texttt{stress\_multipliers}: factores de multiplicación para escenarios de costes (por ejemplo, \texttt{low\_cost} = 0.75, \texttt{high\_cost} = 1.25, \texttt{stress\_cost} = 1.5).
-\end{itemize}
+\begin{equation}
+\sum_{\text{fills } j \in o} C_{j}^{\mathrm{execution}}
++
+C_{o}^{\mathrm{fixed,order}}
+=
+C_{o}^{\mathrm{execution}},
+\end{equation}
 
-\subsubsection{Escenarios de sensibilidad}
-\label{sec:cost-scenarios}
+\begin{equation}
+\sum_{\text{órdenes del día } t \text{ en } i} C_{o}^{\mathrm{execution}}
+=
+C_{it}^{\mathrm{execution}},
+\end{equation}
 
-El módulo soporta calcular costes bajo distintos escenarios:
+\begin{equation}
+C_{it}^{\mathrm{execution}} + C_{it}^{\mathrm{borrow}} = C_{it}^{\mathrm{total}},
+\end{equation}
 
-\begin{itemize}
-    \item \textbf{Base} (\texttt{base}): parámetros estándar.
-    \item \textbf{Low cost} (\texttt{low\_cost}): todos los costes multiplicados por \(\sim 0.75\).
-    \item \textbf{High cost} (\texttt{high\_cost}): \(\times 1.25\).
-    \item \textbf{Stress cost} (\texttt{stress\_cost}): \(\times 1.5\) o configuración custom.
-\end{itemize}
+y finalmente:
 
-Para cada escenario, se genera:
-\begin{itemize}
-    \item \texttt{net\_return\_delta} respecto al escenario base.
-    \item Un \texttt{robustness\_flag} si el cambio de retorno neto supera un umbral predefinido.
-\end{itemize}
+\begin{equation}
+\sum_{t}\sum_{i} C_{it}^{\mathrm{total}} = C^{\mathrm{run}}.
+\end{equation}
 
-\subsection{Flujo del proceso}
-\label{sec:cost-model-flow}
+Estas identidades deben verificarse automáticamente en validación. Si no se cumplen dentro de tolerancia numérica, el run debe marcarse como inconsistente.
+
+\subsection{Precedencia semántica para evitar doble conteo}
+\label{sec:cost-model-precedence}
+
+La imputación de costes debe obedecer a la siguiente precedencia:
 
 \begin{enumerate}
-    \item \textbf{Cargar fills y datos de mercado:} leer \texttt{fills.parquet}, \texttt{market\_data} y \texttt{borrow} (si existe).
-    \item \textbf{Enriquecer fills:} añadir \texttt{ADV}, \texttt{volatilidad}, \texttt{spread\_
+    \item \textbf{Usar costes explícitos observables} si existen.
+    \item \textbf{Usar impacto externo} desde \texttt{impact\_model} si está disponible.
+    \item \textbf{Usar borrow externo} desde \texttt{borrow\_execution} si está disponible.
+    \item Solo en ausencia de esas fuentes, activar estimadores internos parametrizados.
+\end{enumerate}
+
+Además:
+
+\begin{itemize}
+    \item Si \texttt{fill\_price} ya incorpora una penalización simulada frente a benchmark, esa penalización debe atribuirse a una familia de coste concreta y las demás deben ajustarse para no volver a cargarla.
+    \item \textbf{Spread} representa cruce mecánico.
+    \item \textbf{Slippage} representa residual no explicado.
+    \item \textbf{Impact} representa degradación no lineal asociada a tamaño relativo y liquidez.
+\end{itemize}
+
+Sin esta separación, la cifra neta deja de ser interpretable.
+
+\subsection{Tratamiento de fills parciales y órdenes multiday}
+\label{sec:cost-model-partial-multiday}
+
+El sistema debe soportar de forma nativa:
+
+\begin{itemize}
+    \item órdenes con múltiples fills en el mismo día,
+    \item órdenes parcialmente completadas,
+    \item órdenes cuya ejecución se arrastra durante varios días.
+\end{itemize}
+
+La regla es:
+
+\begin{enumerate}
+    \item Cada fill genera su propio coste de ejecución.
+    \item La orden agrega todos sus fills, incluso si abarcan varias fechas.
+    \item Los costes de inventario short se imputan por día de vida de la posición, no por fecha de la orden original.
+\end{enumerate}
+
+Esto evita uno de los errores más comunes en backtesting: cargar todos los costes en la fecha de decisión aunque la implementación real ocurra en varias sesiones.
+
+\subsection{Calibración y parametrización}
+\label{sec:cost-model-calibration}
+
+\subsubsection{Parámetros mínimos}
+\begin{itemize}
+    \item \texttt{fee\_fixed\_per\_fill}
+    \item \texttt{fee\_fixed\_per\_order}
+    \item \texttt{fee\_bps}
+    \item \texttt{spread\_lambda}
+    \item \texttt{slippage\_bps\_by\_bucket}
+    \item \texttt{impact\_alpha\_by\_bucket}
+    \item \texttt{impact\_beta\_by\_bucket}
+    \item \texttt{impact\_gamma}
+    \item \texttt{adv\_fallback\_policy}
+    \item \texttt{borrow\_fallback\_policy}
+\end{itemize}
+
+\subsubsection{Principio de calibración}
+La calibración debe seguir una jerarquía realista:
+
+\begin{enumerate}
+    \item Datos observados o históricos de broker/venue si existen.
+    \item Calibración empírica interna por buckets.
+    \item Heurísticos conservadores como fallback.
+\end{enumerate}
+
+Para small caps, la parametrización por bucket de liquidez es el mínimo aceptable. Una parametrización global homogénea suele infraestimar el coste en nombres ilíquidos y sobreestimarlo en nombres líquidos, sesgando la evaluación de capacidad.
+
+\subsection{Escenarios de sensibilidad}
+\label{sec:cost-model-scenarios}
+
+El módulo debe soportar al menos los escenarios:
+
+\begin{itemize}
+    \item \texttt{base}
+    \item \texttt{low\_cost}
+    \item \texttt{high\_cost}
+    \item \texttt{stress\_cost}
+\end{itemize}
+
+Pero estos escenarios no deben implementarse como un simple multiplicador ciego sobre todos los componentes salvo como herramienta provisional. En una especificación más seria, cada escenario debe permitir alterar selectivamente:
+
+\begin{itemize}
+    \item spreads,
+    \item impacto,
+    \item slippage residual,
+    \item fee schedule,
+    \item borrow rates.
+\end{itemize}
+
+Esto es importante porque, en episodios reales de estrés, no todos los costes se escalan de la misma manera.
+
+\subsection{Políticas de missing data y fail-closed}
+\label{sec:cost-model-missing-data}
+
+El módulo debe ser explícito respecto a la falta de datos:
+
+\begin{enumerate}
+    \item Si falta \texttt{ADV}, no debe estimarse \(\rho\) silenciosamente con cero ni con un valor arbitrario. Debe usarse una política configurada.
+    \item Si falta volatilidad, debe activarse un fallback documentado o marcar el fill como no costable bajo el modelo completo.
+    \item Si falta borrow cost externo para una posición short viva, debe usarse el fallback configurado o marcar el día como de calidad reducida.
+\end{enumerate}
+
+Toda imputación por fallback debe quedar persistida con flags de calidad.
+
+\subsection{Algoritmo operativo recomendado}
+\label{sec:cost-model-algorithm}
+
+\begin{enumerate}
+    \item Cargar fills, market data, fees, impacto externo y borrow externo si existen.
+    \item Validar unicidad e integridad de claves.
+    \item Enriquecer cada fill con ADV, volatilidad, spread proxy, bucket de liquidez y parámetros de escenario.
+    \item Calcular \texttt{notional} y \(\rho\).
+    \item Imputar \texttt{fee\_cost}, \texttt{spread\_cost}, \texttt{slippage\_cost} e \texttt{impact\_cost} respetando precedencia y no doble conteo.
+    \item Agregar fills a nivel orden.
+    \item Incorporar borrow cost diario desde la fuente de verdad correspondiente.
+    \item Reconciliar fill $\rightarrow$ order $\rightarrow$ day $\rightarrow$ run.
+    \item Persistir artefactos de salida y métricas resumen.
+\end{enumerate}
+
+\subsection{Validaciones mínimas y tests de aceptación}
+\label{sec:cost-model-tests}
+
+El módulo debe superar, como mínimo, los siguientes tests de aceptación:
+
+\subsubsection{Test A: no doble conteo}
+Si \texttt{impact\_cost} se consume desde un archivo externo, la suma de costes no debe incluir una segunda estimación interna de impacto.
+
+\subsubsection{Test B: borrow separado de ejecución}
+Para una posición short mantenida varios días sin nuevos fills, deben generarse borrow costs diarios positivos aunque no exista actividad de trading adicional.
+
+\subsubsection{Test C: orden multifill}
+Una orden con tres fills parciales debe satisfacer:
+\[
+C^{\mathrm{order}} = \sum_{j=1}^{3} C_j^{\mathrm{execution}} + C^{\mathrm{fixed,order}}.
+\]
+
+\subsubsection{Test D: reconciliación run}
+La suma de \texttt{daily\_costs.total\_cost\_amount} debe coincidir con el total del \texttt{run\_summary.json}.
+
+\subsubsection{Test E: fills sin ADV}
+Un fill sin \texttt{ADV} no puede pasar silenciosamente por la ruta estándar de impacto. Debe usar fallback explícito o quedar marcado con flag de calidad.
+
+\subsubsection{Test F: coste no negativo}
+Todo componente de coste debe ser no negativo salvo que exista una política explícita para rebates o fees negativos, en cuyo caso debe etiquetarse separadamente.
+
+\subsection{CLI de ejemplo}
+\label{sec:cost-model-cli}
+
+\begin{verbatim}
+python -m execution.cost_model \
+  --fills-path execution/fills/run_latest/fills.parquet \
+  --market-data-path data/market/market_features.parquet \
+  --fee-schedule-path config/execution/fee_schedule.yaml \
+  --cost-config-path config/execution/cost_model.yaml \
+  --impact-costs-path execution/impact/run_latest/impact_costs.parquet \
+  --borrow-costs-path execution/borrow/run_latest/borrow_costs_daily.parquet \
+  --run-id simons_smallcap_swing_2026_03_06
+\end{verbatim}
+
+\subsection{Conclusión}
+\label{sec:cost-model-conclusion}
+
+\texttt{execution/cost\_model.py} no es una utilidad contable accesoria, sino la pieza que decide si la estrategia existe solo en la capa de señal o también en la capa de beneficio implementable. Su función central es imponer disciplina económica sobre la ejecución: separar coste por fill, coste por orden, coste diario de inventario y coste total del run; eliminar solapamientos semánticos entre spread, slippage, impacto y borrow; y garantizar que toda cifra neta pueda reconciliarse exactamente desde el detalle micro hasta el agregado global.
+
+En un sistema institucional, la calidad de este módulo no se mide solo por la sofisticación de una fórmula de impacto, sino por su capacidad para hacer imposible la contabilidad ambigua. Ese es el estándar que convierte un backtest atractivo en una estimación de P\&L neto realmente creíble.

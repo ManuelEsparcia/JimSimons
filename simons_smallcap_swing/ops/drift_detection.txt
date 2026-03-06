@@ -8,116 +8,579 @@
 \usepackage{listings}
 \usepackage{booktabs}
 \usepackage{float}
+\usepackage[a4paper,margin=2.5cm]{geometry}
 
-\title{Explicación Avanzada: ops/drift\_detection.py \\ Detección Industrial de Drift para Swing Trading Sostenible}
-\author{Perplexity AI - Nivel Research Quant Finance}
-\date{5 de marzo de 2026}
+\title{Especificación Técnica: ops/drift\_detection.py\\
+Gobernanza de Drift para Features, Predicciones y Performance en un Sistema de Swing Trading Cuantitativo}
+\author{Documento de especificación operativa}
+\date{6 de marzo de 2026}
 
 \begin{document}
 \maketitle
 
-\section{Introducción y Contexto Estratégico}
-En swing trading, drifts (distribución features/labels) causan $\Delta \alpha < -5\%$/mes por regime change (e.g., bull$\to$bear). Este módulo compara ventanas rolling vs baseline, triggerando retrain si PSI>0.1, clave para Sharpe persistente >2 [web:47][web:49].
+\section{Propósito del módulo}
 
-Integra como gate post-features en daily\_pipeline, governance como MLflow/Alibi Detect.
+\texttt{ops/drift\_detection.py} es el subsistema encargado de detectar, clasificar y gobernar desviaciones relevantes entre el comportamiento actual del sistema y una referencia histórica o contractual. Su responsabilidad no es maximizar rentabilidad ni decidir por sí mismo un reentrenamiento ciego, sino convertir el concepto difuso de \emph{drift} en un conjunto explícito de métricas, ventanas, umbrales, reglas de acción y registros auditables.
 
-\section{Matemáticas Fundamentales del Drift}
-\textbf{PSI (Population Stability Index)}: $PSI = \sum (p_{cur} - p_{ref}) \ln \frac{p_{cur}}{p_{ref}}$, bins=10, >0.1=drift fuerte.
+El módulo debe responder, de forma disciplinada, a tres preguntas distintas:
 
-\textbf{KS Statistic}: $KS = \sup |CDF_{cur}(x) - CDF_{ref}(x)|$, p-value via Lilliefors.
+\begin{enumerate}
+    \item \textbf{Feature drift}: ¿ha cambiado la distribución de los inputs respecto al régimen de referencia?
+    \item \textbf{Prediction drift}: ¿ha cambiado el comportamiento estadístico o calibración de las salidas del modelo?
+    \item \textbf{Performance drift}: ¿ha cambiado la relación entre señal y resultado realizado?
+\end{enumerate}
 
-\textbf{Jensen-Shannon Divergence}: $JS(P||Q) = \frac{1}{2} KL(P||M) + \frac{1}{2} KL(Q||M)$, $M=(P+Q)/2$, simétrica [0,1].
+Estas tres dimensiones no son equivalentes y no deben mezclarse en una única cifra sin tipado ni gobernanza.
 
-\textbf{Calibration Drift (ECE)}: $ECE = \sum \frac{n_k}{n} |acc_k - conf_k|$, Brier: $\frac{1}{N} \sum (p_i - y_i)^2$.
+\section{Objetivos operativos}
 
-\textbf{Performance Drift}: $\Delta IC = |IC_{rolling} - IC_{baseline}|$, $IC = corr(pred, target)$; $\Delta Sharpe = |S_{cur} - S_{ref}|$.
+El módulo debe satisfacer simultáneamente estos objetivos:
 
-Global: $D_g = \max( w_f D_f + w_p D_p + w_{perf} D_{perf} )$, fail si $D_g > \theta$.
+\begin{enumerate}
+    \item \textbf{Separación semántica}: distinguir drift distribucional, drift de calibración y deterioro de performance.
+    \item \textbf{Determinismo}: dada la misma configuración, mismas ventanas y mismos datos, el resultado debe ser reproducible.
+    \item \textbf{Accionabilidad}: cada alerta de drift debe estar asociada a una política operativa explícita.
+    \item \textbf{Robustez estadística}: ningún test debe ejecutarse por debajo del tamaño mínimo de muestra fijado por contrato.
+    \item \textbf{Auditabilidad}: toda evaluación debe persistir métricas, umbrales, ventanas, muestra efectiva y decisión derivada.
+\end{enumerate}
 
-\section{Papers y Estado del Arte}
+\section{Posición en la arquitectura}
+
+\texttt{drift\_detection.py} debe integrarse como módulo de supervisión transversal. Puede ejecutarse:
+
 \begin{itemize}
-\item \href{https://arxiv.org/abs/2401.06139}{StockFormer (2024)} [web:44]: Drift en self-attention features para swing retrain.
-\item Swing Portfolio Opt (2023) [web:47]: PSI en allocation signals.
-\item LSTM Swing (2022) [web:54]: ECE drift para decision support.
-\item \href{https://arxiv.org/abs/2202.05266}{Drift Detection Finance (2022)}: JS en quant pipelines.
+    \item \textbf{offline}, sobre artefactos diarios ya persistidos;
+    \item \textbf{nearline}, al cierre del pipeline o antes de promoción de un modelo;
+    \item \textbf{online diferido}, en ejecuciones periódicas que comparan la sesión actual contra referencias actualizadas.
 \end{itemize}
 
-\section{Libros Industriales Recomendados}
-- \textit{Advances in Financial ML} (López de Prado) [web:49]: Combinatorial Purged CV anti-drift.
-- \textit{Machine Learning for Asset Managers} (López de Prado): Meta-labeling drift.
-- \textit{Algorithmic Trading} (Chan): Rolling windows OOS.
+El flujo lógico general es:
 
-\section{Análisis Detallado del Espec (Métricas y Flujo)}
-Monitorea features/preds/performance con CLI multi-path.
+\[
+\texttt{load\_reference} \rightarrow \texttt{load\_current} \rightarrow \texttt{validate\_windows} \rightarrow \texttt{compute\_metrics} \rightarrow \texttt{classify} \rightarrow \texttt{decide\_action} \rightarrow \texttt{persist}.
+\]
 
-\textbf{Flujo Pseudocódigo SOTA}:
+\section{Definiciones fundamentales}
+
+\subsection{Ventanas de comparación}
+
+Para cada objeto monitorizado \(x\), el módulo debe definir al menos dos ventanas:
+
+\begin{itemize}
+    \item \(\mathcal{W}_{\text{ref}}\): ventana de referencia;
+    \item \(\mathcal{W}_{\text{cur}}\): ventana actual.
+\end{itemize}
+
+La comparación sólo es válida si ambas ventanas satisfacen:
+
+\[
+|\mathcal{W}_{\text{ref}}| \ge n_{\min}^{\text{ref}},
+\qquad
+|\mathcal{W}_{\text{cur}}| \ge n_{\min}^{\text{cur}}.
+\]
+
+La referencia puede ser:
+
+\begin{itemize}
+    \item una ventana rolling histórica,
+    \item una ventana estable de entrenamiento,
+    \item un baseline contractual congelado,
+    \item o una referencia segmentada por régimen, universo o calendario.
+\end{itemize}
+
+El contrato debe fijar explícitamente qué tipo de referencia se usa en cada caso. Sin esta definición, el término \emph{drift} queda infraespecificado.
+
+\subsection{Granularidad}
+
+El módulo debe soportar granularidad por:
+
+\begin{itemize}
+    \item feature individual,
+    \item grupo de features,
+    \item score o predicción,
+    \item bucket de calibración,
+    \item modelo,
+    \item universo,
+    \item segmento temporal,
+    \item y métrica agregada de performance.
+\end{itemize}
+
+No todas las métricas son válidas a todos los niveles. Por ejemplo, PSI es natural por feature o score discretizado; IC requiere una relación entre predicción y objetivo realizado.
+
+\section{Taxonomía del drift}
+
+\subsection{Feature drift}
+
+Mide si la distribución de los inputs ha cambiado respecto al baseline. Para cada feature \(j\), sea \(X_j^{\text{ref}}\) la muestra de referencia y \(X_j^{\text{cur}}\) la muestra actual. El módulo puede calcular varias estadísticas complementarias.
+
+\paragraph{Population Stability Index (PSI).}
+Si la variable se discretiza en \(B\) bins, con proporciones \(p_b^{\text{ref}}\) y \(p_b^{\text{cur}}\), entonces:
+
+\[
+\mathrm{PSI}_j = \sum_{b=1}^{B}
+\left(p_b^{\text{cur}} - p_b^{\text{ref}}\right)
+\log\left(\frac{p_b^{\text{cur}}}{p_b^{\text{ref}}}\right).
+\]
+
+El PSI es sensible al esquema de binning; por tanto, el contrato debe fijar:
+
+\begin{itemize}
+    \item número de bins,
+    \item método de discretización,
+    \item tratamiento de bins vacíos,
+    \item y estabilidad del binning entre ventanas.
+\end{itemize}
+
+\paragraph{Kolmogorov--Smirnov (KS).}
+Para variables continuas, una estadística útil es:
+
+\[
+\mathrm{KS}_j = \sup_x \left|F_j^{\text{cur}}(x) - F_j^{\text{ref}}(x)\right|,
+\]
+
+donde \(F_j^{\text{cur}}\) y \(F_j^{\text{ref}}\) son las CDF empíricas. El módulo debe persistir no sólo el estadístico, sino también la muestra efectiva y, si se utiliza, el \(p\)-value asociado.
+
+\paragraph{Jensen--Shannon divergence (JS).}
+Para distribuciones discretizadas:
+
+\[
+\mathrm{JS}(P,Q) =
+\frac{1}{2}\mathrm{KL}(P\|M) + \frac{1}{2}\mathrm{KL}(Q\|M),
+\qquad
+M=\frac{1}{2}(P+Q).
+\]
+
+Su valor es interpretable sólo si se fija correctamente la discretización o densidad estimada.
+
+\paragraph{Observación operativa.}
+Feature drift no implica necesariamente degradación del modelo. Puede señalar cambio de régimen, cambio del universo o transformación legítima de inputs. Por eso, no debe bloquear automáticamente el sistema salvo que la política lo establezca.
+
+\subsection{Prediction drift}
+
+Mide si las salidas del modelo actual se han desplazado respecto a una referencia. Esto incluye:
+
+\begin{itemize}
+    \item drift en la distribución de scores,
+    \item drift en ranking o dispersión,
+    \item drift en calibración si existen etiquetas realizadas,
+    \item drift en la tasa de señales activas o exposición inducida.
+\end{itemize}
+
+Para scores \(s^{\text{ref}}\) y \(s^{\text{cur}}\), pueden reutilizarse PSI, KS o JS sobre la distribución de scores. Si además existen etiquetas realizadas, se puede medir calibración.
+
+\paragraph{Expected Calibration Error (ECE).}
+Si las predicciones probabilísticas se agrupan en \(K\) buckets:
+
+\[
+\mathrm{ECE}
+=
+\sum_{k=1}^{K}
+\frac{n_k}{n}
+\left|
+\mathrm{acc}_k - \mathrm{conf}_k
+\right|,
+\]
+
+donde \(\mathrm{acc}_k\) es la precisión empírica del bucket y \(\mathrm{conf}_k\) la confianza media del bucket. El drift de calibración puede medirse mediante:
+
+\[
+\Delta \mathrm{ECE}
+=
+\left|
+\mathrm{ECE}^{\text{cur}} - \mathrm{ECE}^{\text{ref}}
+\right|.
+\]
+
+\paragraph{Brier score.}
+Si la salida es probabilística y existe target binario \(y_i\):
+
+\[
+\mathrm{Brier}
+=
+\frac{1}{N}\sum_{i=1}^{N}(p_i-y_i)^2.
+\]
+
+El deterioro puede monitorizarse mediante:
+
+\[
+\Delta \mathrm{Brier}
+=
+\mathrm{Brier}^{\text{cur}} - \mathrm{Brier}^{\text{ref}}.
+\]
+
+\subsection{Performance drift}
+
+Mide si la relación entre señal y resultado se ha deteriorado. A diferencia del feature drift, aquí sí se requiere una variable realizada o métrica downstream.
+
+Dependiendo del tipo de señal, el contrato puede definir una o varias métricas:
+
+\begin{itemize}
+    \item Information Coefficient (IC),
+    \item hit rate condicional,
+    \item retorno medio por bucket de score,
+    \item spread top-minus-bottom,
+    \item métricas de clasificación,
+    \item o métricas de cartera derivadas si están correctamente alineadas temporalmente.
+\end{itemize}
+
+\paragraph{Information Coefficient (IC).}
+Sea \(s_t\) una señal y \(r_{t+h}\) el retorno futuro alineado a horizonte \(h\). Entonces:
+
+\[
+\mathrm{IC} = \mathrm{corr}(s_t, r_{t+h}).
+\]
+
+El drift de performance puede expresarse como:
+
+\[
+\Delta \mathrm{IC}
+=
+\mathrm{IC}^{\text{cur}} - \mathrm{IC}^{\text{ref}}.
+\]
+
+En producción, lo relevante no es sólo el valor puntual, sino la persistencia y significación del deterioro.
+
+\paragraph{Precaución operativa.}
+No debe mezclarse performance drift con P\&L agregado si éste incorpora simultáneamente cambios de sizing, costes, restricciones de ejecución o overlays de riesgo. Si se usa una métrica de cartera, debe quedar claro qué capas están incluidas.
+
+\section{Separación entre offline y online}
+
+Una de las debilidades más comunes en este tipo de módulo es confundir contextos.
+
+\subsection{Monitorización offline}
+
+Se ejecuta una vez existe suficiente información cerrada. Es apropiada para:
+
+\begin{itemize}
+    \item análisis de features persistidas,
+    \item scores diarios ya generados,
+    \item calibración con labels realizados,
+    \item performance a horizonte completo.
+\end{itemize}
+
+\subsection{Monitorización online o nearline}
+
+Opera antes de disponer de todo el target realizado. Es apropiada para:
+
+\begin{itemize}
+    \item drift de distribución de features,
+    \item drift de distribución de scores,
+    \item tasa de activación de señales,
+    \item desplazamientos abruptos del universo.
+\end{itemize}
+
+El contrato debe especificar qué métricas son elegibles en cada modo. Por ejemplo, ECE o IC no deben computarse en ausencia de etiquetas realizadas válidas.
+
+\section{Control por régimen y estacionalidad}
+
+El drift no debe interpretarse sin contexto de régimen. Cambios por volatilidad, composición sectorial, rebalanceos de universo o calendario pueden disparar estadísticos de drift sin implicar fallo del modelo. Por ello, el módulo debe poder segmentar referencias por:
+
+\begin{itemize}
+    \item régimen de volatilidad,
+    \item entorno direccional,
+    \item mes o tramo estacional,
+    \item tamaño del universo,
+    \item o cohortes definidas por contrato.
+\end{itemize}
+
+En su forma más simple, el baseline puede condicionarse a un estado \(z\):
+
+\[
+P(X \mid z=\text{cur}) \quad \text{vs} \quad P(X \mid z=\text{ref similar}).
+\]
+
+Esto evita confundir drift estructural con heterogeneidad esperable del proceso.
+
+\section{Modelo de scoring y decisión}
+
+\subsection{Principio general}
+
+El módulo puede producir scores agregados, pero la acción no debe depender de una media opaca. Primero se clasifican métricas por dimensión; después se decide una acción.
+
+Sea el vector de métricas de feature drift:
+
+\[
+\mathbf{D}^{(f)} = (D_1^{(f)},\dots,D_p^{(f)}),
+\]
+
+el de prediction drift:
+
+\[
+\mathbf{D}^{(p)} = (D_1^{(p)},\dots,D_q^{(p)}),
+\]
+
+y el de performance drift:
+
+\[
+\mathbf{D}^{(\pi)} = (D_1^{(\pi)},\dots,D_r^{(\pi)}).
+\]
+
+Para cada dimensión se define una función de agregación gobernada:
+
+\[
+A_f = \mathcal{A}_f(\mathbf{D}^{(f)}), \qquad
+A_p = \mathcal{A}_p(\mathbf{D}^{(p)}), \qquad
+A_\pi = \mathcal{A}_\pi(\mathbf{D}^{(\pi)}).
+\]
+
+Estas funciones pueden ser máximo, cuantil, media truncada o agregación ponderada, siempre que el contrato lo fije explícitamente.
+
+\subsection{Clasificación discreta}
+
+Cada dimensión debe terminar en uno de:
+
+\begin{itemize}
+    \item \texttt{pass}
+    \item \texttt{warn}
+    \item \texttt{fail}
+    \item \texttt{insufficient\_sample}
+    \item \texttt{not\_applicable}
+\end{itemize}
+
+La clasificación por dimensión puede seguir una lógica del tipo:
+
+\[
+\texttt{status}_f =
+\begin{cases}
+\texttt{insufficient\_sample} & \text{si } n < n_{\min},\\
+\texttt{fail} & \text{si existe métrica hard-fail},\\
+\texttt{warn} & \text{si existe desviación relevante no bloqueante},\\
+\texttt{pass} & \text{en otro caso.}
+\end{cases}
+\]
+
+\subsection{Decisión global}
+
+La decisión global no debe ser una simple suma de PSI, ECE e IC. Debe obedecer una política de gobernanza. Un ejemplo robusto es:
+
+\[
+\texttt{global\_status}=
+\begin{cases}
+\texttt{fail} & \text{si performance drift crítico falla},\\
+\texttt{fail} & \text{si feature drift crítico y persistente viola política},\\
+\texttt{warn} & \text{si existe cualquier desviación relevante no bloqueante},\\
+\texttt{pass} & \text{en otro caso.}
+\end{cases}
+\]
+
+La acción asociada puede pertenecer a:
+
+\begin{itemize}
+    \item \texttt{none}
+    \item \texttt{observe}
+    \item \texttt{escalate}
+    \item \texttt{freeze\_promotion}
+    \item \texttt{request\_review}
+    \item \texttt{trigger\_retrain\_candidate}
+\end{itemize}
+
+Nótese que \texttt{trigger\_retrain\_candidate} no equivale a reentrenar automáticamente sin supervisión.
+
+\section{Persistencia y contratos de salida}
+
+Toda ejecución debe persistir:
+
+\begin{enumerate}
+    \item metadatos del run;
+    \item ventanas utilizadas;
+    \item tamaño muestral efectivo por métrica;
+    \item valor observado y umbral por métrica;
+    \item clasificación por dimensión;
+    \item decisión global y acción derivada.
+\end{enumerate}
+
+Una estructura mínima recomendada sería:
+
 \begin{lstlisting}[language=Python]
-import alibi_detect  # O alibi-detect-cd
-def main(config, feat_cur, feat_ref, pred_cur, perf_cur, run_id):
-    cfg = load_config(config)
-    # Features Drift
-    drifts_f = {}
-    for col in feat_cur.columns:
-        psi = psi_stat(feat_cur[col], feat_ref[col])
-        ks = ks_2samp(feat_cur[col], feat_ref[col])
-        drifts_f[col] = {'PSI': psi, 'KS': ks.stat}
-    
-    # Preds/Model Drift
-    ece_delta = ece(pred_cur['score'], labels_cur) - ece_ref
-    ic_delta = np.corrcoef(pred_cur['score'], perf_cur['target'])[0,1] - ic_ref
-    
-    # Aggregate
-    D_global = np.max([np.mean(list(drifts_f.values())), abs(ece_delta), abs(ic_delta)])
-    status = 'fail' if D_global > cfg.drift_threshold else 'pass'
-    actions = recommend_action(D_global)  # 'retrain' if >0.25
-    
-    persist_reports({'drifts': drifts_f, 'global': D_global, 'action': actions}, run_id)
-    return status
+@dataclass
+class DriftMetricResult:
+    name: str
+    dimension: str           # feature / prediction / performance
+    entity: str              # feature_name, score_name, model_name, etc.
+    value: float | None
+    threshold_warn: float | None
+    threshold_fail: float | None
+    sample_size_ref: int
+    sample_size_cur: int
+    status: str              # pass / warn / fail / insufficient_sample / not_applicable
+    details: dict
+
+@dataclass
+class DriftRunResult:
+    run_id: str
+    execution_date: str
+    reference_window: dict
+    current_window: dict
+    feature_status: str
+    prediction_status: str
+    performance_status: str
+    global_status: str
+    action: str
+    metrics: list[DriftMetricResult]
+    started_at: str
+    ended_at: str
 \end{lstlisting}
 
-\textbf{Reglas Acción}: Warn si persistente 3 días; fail bloquea promotion.
+\section{Interfaz recomendada}
 
-\section{Backtest Ultra-Optimizado Anti-Drift}
-Pre-drift backtest con walk-forward:
 \begin{lstlisting}[language=Python]
-from backtesting import Backtest
-def drift_aware_bt(features, predictions, ref_window):
-    drifts = compute_drifts(features.iloc[-window:], ref_window)
-    if max(drifts['PSI']) > 0.1:
-        print("Drift detected: Skip or retrain")
-        return None
-    bt = Backtest(data, DriftSafeStrategy(predictions))
-    return bt.run()  # Sharpe conditional on no-drift >2.5
+def main(
+    config_path: str,
+    run_id: str,
+    execution_date: str,
+    feat_cur_path: str | None = None,
+    feat_ref_path: str | None = None,
+    pred_cur_path: str | None = None,
+    pred_ref_path: str | None = None,
+    perf_cur_path: str | None = None,
+    perf_ref_path: str | None = None,
+) -> dict:
+    ...
 \end{lstlisting}
 
-\begin{table}[H]
-\centering
-\begin{tabular}{lccc}
+\section{Pseudocódigo de referencia}
+
+\begin{lstlisting}[language=Python]
+def main(config_path, run_id, execution_date,
+         feat_cur_path=None, feat_ref_path=None,
+         pred_cur_path=None, pred_ref_path=None,
+         perf_cur_path=None, perf_ref_path=None):
+
+    cfg = load_and_validate_config(config_path)
+    ctx = build_context(run_id, execution_date, cfg)
+
+    ref_windows = load_reference_windows(cfg, execution_date)
+    cur_windows = load_current_windows(cfg, execution_date)
+
+    validate_window_contracts(ref_windows, cur_windows, cfg)
+
+    metric_results = []
+
+    # 1) Feature drift
+    if feat_cur_path and feat_ref_path:
+        feat_cur = load_features(feat_cur_path)
+        feat_ref = load_features(feat_ref_path)
+
+        for feature_name in intersect_features(feat_cur, feat_ref):
+            sample_ok = validate_sample_size(
+                feat_cur[feature_name], feat_ref[feature_name], cfg
+            )
+            if not sample_ok:
+                metric_results.append(
+                    insufficient_sample_metric("feature", feature_name)
+                )
+                continue
+
+            metric_results.extend(
+                compute_feature_drift_metrics(
+                    feature_name, feat_cur[feature_name], feat_ref[feature_name], cfg
+                )
+            )
+
+    # 2) Prediction drift
+    if pred_cur_path and pred_ref_path:
+        pred_cur = load_predictions(pred_cur_path)
+        pred_ref = load_predictions(pred_ref_path)
+
+        metric_results.extend(
+            compute_prediction_distribution_metrics(pred_cur, pred_ref, cfg)
+        )
+
+        if has_realized_labels(pred_cur, pred_ref, cfg):
+            metric_results.extend(
+                compute_calibration_metrics(pred_cur, pred_ref, cfg)
+            )
+
+    # 3) Performance drift
+    if perf_cur_path and perf_ref_path:
+        perf_cur = load_performance_inputs(perf_cur_path)
+        perf_ref = load_performance_inputs(perf_ref_path)
+
+        if validate_performance_alignment(perf_cur, perf_ref, cfg):
+            metric_results.extend(
+                compute_performance_drift_metrics(perf_cur, perf_ref, cfg)
+            )
+
+    dimension_status = classify_by_dimension(metric_results, cfg)
+    global_status, action = derive_global_decision(dimension_status, metric_results, cfg)
+
+    persist_drift_run(
+        ctx=ctx,
+        metric_results=metric_results,
+        dimension_status=dimension_status,
+        global_status=global_status,
+        action=action
+    )
+
+    emit_monitoring_events(
+        ctx=ctx,
+        global_status=global_status,
+        action=action,
+        metric_results=metric_results
+    )
+
+    return {
+        "run_id": run_id,
+        "global_status": global_status,
+        "action": action,
+        "metrics": metric_results,
+    }
+\end{lstlisting}
+
+\section{Políticas de acción}
+
+Una especificación profesional debe distinguir entre \textbf{detectar} y \textbf{actuar}. Acciones posibles:
+
+\begin{center}
+\begin{tabular}{llll}
 \toprule
-Métrica & Fórmula & Umbral Warn & Umbral Fail \\
+Dimensión & Estado & Persistencia & Acción recomendada \\
 \midrule
-PSI & $\sum (p_c - p_r) \ln(\cdot)$ & 0.1 & 0.25 \\
-KS & $\sup |CDF_c - CDF_r|$ & 0.05 & 0.1 \\
-JS Div & $0.5 KL(P||M) + 0.5 KL(Q||M)$ & 0.01 & 0.05 \\
-$\Delta$Sharpe & $|S_c - S_r|$ & 0.2 & 0.5 \\
+Feature & warn & 1 día aislado & observar \\
+Feature & fail & varios días / crítico & revisión o freeze \\
+Prediction & warn & puntual & observar \\
+Prediction & fail & persistente & revisión de calibración \\
+Performance & warn & ruido compatible & observar \\
+Performance & fail & persistente & bloquear promoción / investigar \\
 \bottomrule
 \end{tabular}
-\caption{Drift Thresholds Industriales Swing Trading}
-\end{table}[web:51]
+\end{center}
 
-\section{Conclusiones y Optimizaciones Industriales}
-Detecta drifts tempranos para retrain oportuno, manteniendo edge en regimes volátiles. Mejoras: ADWIN para change-point online, SHAP explainability en drifts, auto-retrain via Ray Tune [web:49].
+La persistencia temporal del drift debe ser parte del contrato. Un evento aislado no debe desencadenar automáticamente una acción irreversible salvo que la métrica sea hard-fail.
 
-¡Drift cero = alpha perpetuo!
+\section{Casos límite que el módulo debe resolver}
 
-\bibliographystyle{plain}
-\begin{thebibliography}{9}
-\bibitem{web44} StockFormer.
-\bibitem{web47} Swing SSRN.
-\bibitem{web49} López de Prado.
-\bibitem{web51} Backtesting.py.
-\bibitem{web54} LSTM Swing.
-\end{thebibliography}
+\begin{enumerate}
+    \item \textbf{Muestra insuficiente}: no devolver \texttt{pass} por defecto; usar \texttt{insufficient\_sample}.
+    \item \textbf{Feature nueva o eliminada}: clasificar como cambio estructural, no como PSI estándar.
+    \item \textbf{Cambio de universo}: no comparar distribuciones si la cohorte cambió sin normalización adecuada.
+    \item \textbf{Outliers debidos a eventos corporativos}: deben tratarse mediante reglas auditadas o cohortes adecuadas.
+    \item \textbf{Etiquetas aún no realizadas}: no computar ECE, Brier ni IC.
+    \item \textbf{Cambio de régimen amplio}: permitir referencia condicionada por régimen.
+    \item \textbf{Deterioro de P\&L sin deterioro de señal}: no catalogarlo automáticamente como drift del modelo.
+    \item \textbf{Feature drift alto pero performance estable}: clasificar y observar, no bloquear ciegamente.
+\end{enumerate}
+
+\section{Criterios mínimos de aceptación}
+
+El módulo no debe considerarse correcto sin pruebas que verifiquen:
+
+\begin{enumerate}
+    \item separación correcta entre feature, prediction y performance drift;
+    \item validación de tamaños muestrales mínimos;
+    \item cálculo correcto de PSI, KS y JS bajo discretización fijada;
+    \item no cómputo de métricas de calibración o performance cuando faltan labels válidos;
+    \item referencia y ventana actual persistidas en cada run;
+    \item decisiones globales coherentes con la política contractual;
+    \item manejo correcto de features nuevas, desaparecidas o con mucha sparsity;
+    \item soporte para segmentación por régimen o cohorte;
+    \item emisión de eventos estructurados para monitorización;
+    \item persistencia auditable de métricas, estados y acciones.
+\end{enumerate}
+
+\section{Conclusión}
+
+\texttt{ops/drift\_detection.py} debe entenderse como una capa de \textbf{gobernanza estadística del comportamiento del sistema}, no como una colección informal de tests con umbrales genéricos. Su calidad depende de separar correctamente tipos de drift, fijar referencias comparables, exigir tamaños muestrales adecuados, vincular cada desviación a una política de acción y dejar una traza completa de la decisión. Sólo así el concepto de drift pasa de ser un eslogan técnico a una herramienta real de control cuantitativo en producción.
 
 \end{document}
 % --- FIN PARA COPIAR Y PEGAR EN .txt ---

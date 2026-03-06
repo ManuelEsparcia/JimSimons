@@ -2,203 +2,470 @@
 
 \subsection{Objetivo del módulo}
 
-El módulo \texttt{labels/event\_labels.py} tiene como objetivo construir \emph{labels event-driven} para capturar el comportamiento condicional de retornos (o \emph{outcomes}) alrededor de \emph{triggers} predefinidos en universos de small caps, tales como:
+El módulo \texttt{labels/event\_labels.py} construye la capa canónica de \emph{labels event-driven} del sistema, es decir, targets definidos no sobre un panel uniforme de fechas-símbolos, sino sobre \emph{episodios discretos de información} que alteran de forma material el estado informativo del mercado. En un entorno serio de \emph{small caps swing trading}, esto incluye, entre otros, eventos de resultados, sorpresas corporativas, gaps de apertura, rupturas técnicas, shocks de liquidez y señales de régimen suficientemente abruptas como para justificar una semántica distinta a la del label cross-sectional estándar.
+
+La función económica del módulo no es simplemente ``etiquetar eventos'', sino transformar cada trigger elegible en una observación PIT, con timestamp operativo, convención de entrada/salida, ventana de outcome bien definida, política explícita de solapes y reglas reproducibles de validez. En consecuencia, el módulo debe responder con precisión a cinco preguntas fundamentales:
+
+\begin{enumerate}
+  \item \textbf{Qué constituye un evento canónico.}
+  \item \textbf{Cuándo se considera conocido y operable dicho evento.}
+  \item \textbf{Qué ventana posterior define el outcome económico relevante.}
+  \item \textbf{Cómo se resuelven solapes, cascadas y conflictos entre eventos.}
+  \item \textbf{Cómo se traduce el episodio en un target continuo, rankeado o discretizado compatible con entrenamiento y validación robusta.}
+\end{enumerate}
+
+En un pipeline institucional, los labels event-driven no sustituyen necesariamente al label panel estándar de \texttt{build\_labels.py}; lo complementan. Permiten aislar regiones del espacio temporal en las que el proceso generador de retornos cambia de forma estructural: por ejemplo, microcaps alrededor de earnings, gaps con volumen anómalo o señales donde el comportamiento posterior depende más del contexto del trigger que del estado promedio del cross-section. Por ello, este módulo debe tratar el evento como una \emph{unidad semántica de información}, no como una simple fecha destacada \cite{LopezdePrado2018}.
+
+\subsection{Principios de diseño}
+
+El módulo se rige por los siguientes principios:
+
+\begin{enumerate}
+  \item \textbf{Primacía del timestamp informativo.} Todo evento debe distinguir entre hora de ocurrencia, hora de publicación, hora de conocimiento y primera hora económicamente operable.
+  
+  \item \textbf{Unicidad semántica del episodio.} Un evento es una observación con identidad propia, no una bandera difusa. Debe poseer \texttt{event\_id}, \texttt{event\_type}, \texttt{event\_timestamp}, política de entrada y outcome asociado.
+  
+  \item \textbf{Canonicidad por familia de trigger.} Cada clase de eventos debe tener una definición oficial y determinista. No se admiten taxonomías abiertas o ambiguas en configuración canónica.
+  
+  \item \textbf{Resolución explícita de solapes.} Dos eventos cercanos en el tiempo para un mismo símbolo pueden compartir o contaminar el mismo outcome. El sistema debe fijar reglas duras de prioridad, fusión o exclusión.
+  
+  \item \textbf{Separación entre trigger y outcome.} El evento activa el episodio; el label cuantifica el outcome posterior. Ambos deben persistirse por separado.
+  
+  \item \textbf{Compatibilidad con validación temporal robusta.} La ventana efectiva del evento debe exportarse de forma que \texttt{purged\_splits.py} pueda purgar solapes y aplicar embargo sin ambigüedad.
+\end{enumerate}
+
+\subsection{Taxonomía canónica de eventos}
+
+La carpeta no puede operar con una noción libre de ``evento''. El sistema debe fijar una taxonomía oficial mínima:
+
 \begin{itemize}
-  \item Earnings announcements.
-  \item Price gaps o breaks de estructura técnica.
-  \item Shocks macro o microeconómicos.
-  \item \emph{Signals} técnicas específicas (breakouts, reversals, volatilidad extrema, etc.).
+  \item \texttt{EARNINGS}: publicación de resultados periódicos o actualización material de guidance.
+  \item \texttt{CORP\_NEWS}: noticias corporativas materiales no periódicas (M\&A, financiamiento dilutivo, contratos, litigios, etc.).
+  \item \texttt{OPEN\_GAP}: gap de apertura superior a un umbral sobre volatilidad/ATR/percentil.
+  \item \texttt{TECH\_BREAK}: ruptura técnica canónica (por ejemplo, breakout de rango, breakdown o reversión extrema).
+  \item \texttt{VOL\_SHOCK}: episodio de volumen o volatilidad anómalos.
+  \item \texttt{MICROSTRUCTURE\_SHOCK}: evento de iliquidez, spread extremo o dislocación de negociación.
 \end{itemize}
 
-La idea central es transformar cada evento en un \emph{episode} de mercado con una ventana de \emph{pre} y \emph{post} y generar un \emph{label} que capture el \emph{outcome} asociado (continuo o discretizado), manteniendo rigor \emph{point‑in‑time (PIT)} y sin \emph{leakage} temporal \cite{LopezdePrado2018,mlfinlab_event_labels}.
+Toda familia adicional debe registrarse como \texttt{non-canonical event family} salvo que pase a formar parte de la taxonomía oficial. Esta decisión evita que el módulo derive hacia un catálogo incontrolado de triggers heterogéneos y no comparables.
 
-\subsection{Marco matemático de labels event‑driven}
+\subsection{Marco temporal del evento}
 
-Denotamos:
+\subsubsection{Timestamps fundamentales}
+
+Cada evento \( e \) debe incorporar, al menos, las siguientes marcas temporales:
+
 \begin{itemize}
-  \item \( e \): evento con identificador único \texttt{event\_id}.
-  \item \( t_e \): instante de publicación/conocimiento del evento (\texttt{date\_event}).
-  \item \( \mathcal{T}_e = [t_e + 1, t_e + h] \): ventana de \emph{outcome} post‑evento (horizonte \( h \) configurable).
-  \item \( i \): activo / símbolo asociado al evento.
+  \item \( t_e^{\mathrm{occ}} \): instante de ocurrencia económica del evento.
+  \item \( t_e^{\mathrm{pub}} \): instante de publicación o difusión al mercado.
+  \item \( t_e^{\mathrm{known}} \): instante en el que el evento se considera conocido para el sistema.
+  \item \( t_e^{\mathrm{trad}} \): primera sesión/barra operable bajo la convención oficial.
 \end{itemize}
 
-\subsubsection{Retorno post‑evento}
+La relación clave es:
+\[
+t_e^{\mathrm{trad}} \ge t_e^{\mathrm{known}}.
+\]
 
-El retorno post‑evento para un horizonte \( h \) se define como:
+La construcción del label debe basarse en \( t_e^{\mathrm{trad}} \), no simplemente en la fecha de calendario del evento. Esta distinción es obligatoria, en especial para:
+\begin{itemize}
+  \item earnings publicados \emph{before market open},
+  \item earnings publicados \emph{after market close},
+  \item noticias intradía,
+  \item eventos detectados por reglas técnicas al cierre.
+\end{itemize}
+
+\subsubsection{Resolución canónica del tiempo operativo}
+
+El sistema debe fijar la siguiente política oficial:
+
+\begin{itemize}
+  \item Si el evento se publica \textbf{antes de la apertura} y el pipeline puede actuar a apertura, entonces \( t_e^{\mathrm{trad}} = \text{open del mismo día} \).
+  \item Si el evento se publica \textbf{durante mercado abierto}, entonces \( t_e^{\mathrm{trad}} \) depende del \texttt{decision\_lag} configurado; por defecto, \emph{no} se asume ejecución instantánea intradía salvo que el sistema lo soporte explícitamente.
+  \item Si el evento se publica \textbf{tras el cierre}, entonces \( t_e^{\mathrm{trad}} = \text{open de la siguiente sesión} \).
+  \item Si solo se conoce una fecha sin hora y la fuente no acredita temporalidad suficiente, el evento se clasifica como \texttt{TIMESTAMP\_AMBIGUOUS} y se invalida en configuración canónica.
+\end{itemize}
+
+Este punto es uno de los más importantes del módulo: sin timestamp operativo formal, el label event-driven es vulnerable a leakage sutil pero severo.
+
+\subsection{Notación y definición general del episodio}
+
+Sea \( e \) un evento único asociado al símbolo \( i \). Denotamos:
+\begin{itemize}
+  \item \( \tau_e = t_e^{\mathrm{trad}} \): instante operativo de entrada al episodio.
+  \item \( h \in \mathcal{H}_e \): horizonte de outcome permitido para el evento.
+  \item \( \mathcal{W}_e(h) = [\tau_e, \tau_e + h] \): ventana efectiva del episodio.
+  \item \( P_{i,t}^{(x)} \): precio PIT bajo convención \( x \in \{\texttt{open}, \texttt{close}, \texttt{vwap}, \dots\} \).
+\end{itemize}
+
+El output del módulo debe entenderse como una tabla de episodios:
+\[
+\{(e, i, \tau_e, h, y_e(h), \text{metadata}_e)\},
+\]
+no como una simple expansión del panel diario.
+
+\subsection{Definición del outcome económico}
+
+\subsubsection{Retorno post-evento bruto}
+
+El retorno económico bruto del episodio se define por:
 \begin{equation}
-r_{i,h}(e) = \frac{P_{i,t_e + h}}{P_{i,t_e}} - 1,
+r^{\mathrm{gross}}_{e,h}
+=
+\frac{P_{i,\tau_e+h}^{(\mathrm{exit})}}{P_{i,\tau_e}^{(\mathrm{entry})}} - 1.
 \end{equation}
-donde \( P_{i,\cdot} \) es el precio ajustado. Alternativamente, en un setting \emph{event‑based} más avanzado se puede usar:
+
+Como en \texttt{build\_labels.py}, la convención de entrada/salida no puede quedar implícita. El módulo debe soportar, al menos:
+\begin{itemize}
+  \item \texttt{open\_to\_close},
+  \item \texttt{open\_to\_open},
+  \item \texttt{close\_to\_close},
+  \item \texttt{event\_timestamp\_to\_next\_close} para casos intradía bien soportados.
+\end{itemize}
+
+\subsubsection{Retorno neto de costes}
+
+En small caps, el outcome relevante rara vez es el bruto. Por tanto, el target principal recomendado debe ser:
 \begin{equation}
-r_{i,h}(e) = \int_{t_e}^{t_e + h} d\log P_{i,t},
+r^{\mathrm{net}}_{e,h}
+=
+r^{\mathrm{gross}}_{e,h}
+-
+C^{\mathrm{entry}}_{e,h}
+-
+C^{\mathrm{exit}}_{e,h}
+-
+C^{\mathrm{carry}}_{e,h}.
 \end{equation}
-i.e., un incremento logarítmico sobre la ventana post‑evento, alineado con la literatura de \emph{event studies} y \emph{abnormal returns} \cite{CampbellLoMackinlay1997,TheEffectBook2025}.
 
-\subsubsection{Abnormal return y benchmark}
+La política canónica será:
+\begin{center}
+\texttt{event\_target\_base = net\_return}
+\end{center}
+salvo que el experimento se marque explícitamente como \texttt{gross-only}. Para eventos en small caps, ignorar costes precisamente donde suelen expandirse spread, slippage e impacto degrada la validez económica del label.
 
-Si existe un modelo de \emph{benchmark} o \emph{neutralization} (market, sector, factor model), el retorno anómalo se define como:
+\subsubsection{Retorno anómalo o residual}
+
+Cuando se disponga de benchmark o factores PIT, el módulo podrá construir:
 \begin{equation}
-\alpha_{i,h}(e) = r_{i,h}(e) - \mu_{i,h}^{\text{null}},
+\alpha_{e,h} = r^{\star}_{e,h} - \mu^{\mathrm{null}}_{e,h},
 \end{equation}
-donde \( \mu_{i,h}^{\text{null}} \) es el retorno esperado según el modelo de \emph{null} (por ejemplo, un modelo de CAPM o factorial). Este enfoque conecta directamente con la metodología clásica de \emph{event studies} en finanzas \cite{Fama1969Findings,Patell1976,Petersen2009}.
+donde \( r^{\star}_{e,h} \) será, por defecto, el retorno neto del episodio, y \( \mu^{\mathrm{null}}_{e,h} \) el retorno esperado bajo un modelo nulo. Este benchmark podrá ser:
+\begin{itemize}
+  \item market-adjusted,
+  \item sector-adjusted,
+  \item factor-adjusted,
+  \item matched-control portfolio.
+\end{itemize}
 
-\subsubsection{Etiquetado binario/trinario}
+La decisión por defecto recomendada será:
+\begin{center}
+\texttt{abnormal\_mode = sector\_market\_adjusted}
+\end{center}
+para eventos de naturaleza corporativa o earnings, y \texttt{none} para eventos puramente técnicos salvo configuración contraria.
 
-El label de \emph{outcome} puede ser binario:
+\subsection{Transformaciones del outcome}
+
+\subsubsection{Label continuo}
+
+La forma primaria del outcome será:
 \begin{equation}
-\texttt{label\_event\_outcome}(e) = \mathbb{I}\left\{ r_{i,h}(e) > \theta \right\},
+y_e(h) = r^{\mathrm{net}}_{e,h}
+\quad \text{o} \quad
+y_e(h) = \alpha_{e,h}.
 \end{equation}
-o trinario (positivo/neutral/negativo):
+
+\subsubsection{Label binario}
+
 \begin{equation}
-\texttt{label\_event\_outcome}(e) =
+y^{\mathrm{bin}}_e(h)
+=
+\mathbb{I}\{y_e(h) > \theta_{e,h}\}.
+\end{equation}
+
+\subsubsection{Label trinario}
+
+\begin{equation}
+y^{\mathrm{tri}}_e(h)=
 \begin{cases}
-+1 & \text{si } r_{i,h}(e) > \theta_{\text{up}}, \\
-0  & \text{si } \theta_{\text{up}} \geq r_{i,h}(e) \geq \theta_{\text{down}}, \\
--1 & \text{si } r_{i,h}(e) < \theta_{\text{down}}.
++1, & y_e(h) \ge \theta^{\mathrm{up}}_{e,h},\\
+0,  & \theta^{\mathrm{down}}_{e,h} < y_e(h) < \theta^{\mathrm{up}}_{e,h},\\
+-1, & y_e(h) \le \theta^{\mathrm{down}}_{e,h}.
 \end{cases}
 \end{equation}
 
-Este tipo de binning es muy usado en \emph{meta‑labeling} y \emph{triple‑barrier method} de \emph{event‑based} trading labels \cite{LopezdePrado2018,mlfinlab_triple_barrier}.
+\paragraph{Default canónico.}
+Para reducir arbitrariedad experimental, el módulo debe fijar:
+\begin{center}
+\texttt{event\_classification\_default = ternary\_tail\_20\_20\_on\_net}
+\end{center}
+calculado dentro de la familia homogénea de eventos correspondiente. Es decir, no deben mezclarse por defecto earnings con gaps técnicos al definir umbrales de colas.
 
-\subsubsection{Manufactura de labels continuos}
+\subsection{Normalización entre familias de eventos}
 
-En lugar de binarizar, se puede usar directamente el retorno (o retorno anómalo) como label continuo:
+Uno de los puntos débiles habituales en labels event-driven es mezclar triggers heterogéneos sin normalización. El módulo debe evitarlo explícitamente.
+
+Para cada familia \(\mathcal{E}_k\), el sistema puede trabajar con:
 \begin{equation}
-y(e) = r_{i,h}(e) \quad \text{o} \quad y(e) = \alpha_{i,h}(e).
+z_{e,h}
+=
+\frac{y_e(h)-\mu_{k,h}}{\sigma_{k,h}},
 \end{equation}
-Este enfoque introduce un \emph{learning} de \emph{regression} sobre la magnitud del impacto del evento, alineado con la literatura de \emph{event‑based regression} y \emph{impact functions} \cite{EasleyLoO'Hara2011,Kyle1985,Petersen2009}.
+donde \(\mu_{k,h}\) y \(\sigma_{k,h}\) se estiman sobre episodios comparables de la misma familia, régimen y horizonte.
 
-\subsection{Definición de eventos y ventanas}
+Esta capa no es obligatoria para todo experimento, pero el módulo debe soportarla porque un gap técnico del 8\% y una sorpresa de earnings del 8\% no tienen necesariamente la misma semántica predictiva ni la misma base rates distribution.
 
-El módulo define:
+\subsection{Definición de ventanas y horizontes}
+
+Cada evento debe declarar de forma explícita:
 \begin{itemize}
-  \item \texttt{event\_type}: tipo de evento (earnings, gap, shock, technical signal, etc.).
-  \item \texttt{horizon\_days}: horizonte de \emph{outcome} post‑evento (configurable por tipo de evento).
-  \item Ventana pre/post evento: \([t_e - w_{\text{pre}}, t_e - 1]\) y \([t_e + 1, t_e + w_{\text{post}}]\).
+  \item \texttt{pre\_window},
+  \item \texttt{post\_window},
+  \item \texttt{horizon\_set},
+  \item \texttt{entry\_convention},
+  \item \texttt{exit\_convention}.
 \end{itemize}
 
-Esta estructura es comparable a la de un \emph{event study window} en econometría financiera, donde se calcula el \emph{cumulative abnormal return} (CAR) en torno a \( t_e \) \cite{CampbellLoMackinlay1997,TheEffectBook2025}.
+\paragraph{Default oficial por familia.}
+Se recomienda fijar una tabla canónica:
 
-\subsection{Reglas PIT y anti‑leakage}
-
-Las reglas de \emph{point‑in‑time} son:
 \begin{itemize}
-  \item El evento debe ser \emph{conocido} antes del \emph{decision cut} (fecha de construcción de \emph{features}).
-  \item El \emph{outcome} solo puede usar el periodo \emph{posterior} configurado \( \mathcal{T}_e \).
-  \item Se excluyen eventos superpuestos conflictivos según política (por ejemplo, earnings muy cercanas, eventos de la misma clase).
+  \item \texttt{EARNINGS}: horizontes \([1, 3, 5, 10]\).
+  \item \texttt{OPEN\_GAP}: horizontes \([1, 2, 5]\).
+  \item \texttt{TECH\_BREAK}: horizontes \([3, 5, 10]\).
+  \item \texttt{VOL\_SHOCK}: horizontes \([1, 3, 5]\).
 \end{itemize}
-Estas reglas evitan el \emph{look‑ahead bias} y garantizan que el \emph{label} es condicional a la información disponible en \( t_e \), en línea con la práctica industrial en \emph{event‑based} strategies \cite{LopezdePrado2018,mlfinlab_event_labels}.
 
-\subsection{Flujo del proceso (alto nivel)}
+Si una familia carece de horizonte oficial, el experimento debe marcarse como no canónico. Esto evita la proliferación arbitraria de ventanas elegidas ex post.
 
-El flujo interno del módulo es:
+\subsection{Solapes y conflictos entre eventos}
+
+Este es uno de los puntos más importantes del módulo y uno de los que más elevan su nivel si queda bien cerrado.
+
+\subsubsection{Tipos de solape}
+
+Deben distinguirse al menos cuatro casos:
+
 \begin{enumerate}
-  \item \texttt{Cargar eventos} desde \texttt{event\_source\_path} y \texttt{prices\_adjusted\_path}.
-  \item \texttt{Filtrar eventos elegibles} usando el universo \texttt{universe\_path} y la configuración \texttt{event\_labels\_config}.
-  \item \texttt{Calcular labels} por evento y horizonte \( h \) (retorno post‑evento, binning, etc.).
-  \item \texttt{Aplicar validaciones y exclusiones} (univocidad, no leakage, cobertura).
-  \item \texttt{Persistir outputs} en formato parquet y JSON.
+  \item \textbf{Solape mismo símbolo, misma familia.}
+  \item \textbf{Solape mismo símbolo, distinta familia.}
+  \item \textbf{Cascada informativa}: varios eventos muy próximos que forman parte del mismo episodio económico.
+  \item \textbf{Contaminación de outcome}: un segundo evento entra dentro de la ventana post-evento del primero.
 \end{enumerate}
 
-Este diseño permite:
+\subsubsection{Política canónica de resolución}
+
+La política oficial recomendada será:
+\begin{center}
+\texttt{overlap\_policy = first\_event\_wins\_with\_cooldown}
+\end{center}
+es decir:
 \begin{itemize}
-  \item Combinar múltiples \texttt{event\_type}s en un mismo pipeline.
-  \item Definir políticas de \emph{event blurring} y \emph{overlap} (por ejemplo, solo un evento activo por activo en un rango de tiempo).
+  \item una vez activado un evento para un símbolo, no se acepta un nuevo evento del mismo símbolo dentro de un \texttt{cooldown} predefinido;
+  \item el \texttt{cooldown} por defecto será la longitud del mayor horizonte del evento activo;
+  \item si un nuevo trigger llega dentro de la ventana activa, se marca como \texttt{OVERLAP\_REJECTED}.
 \end{itemize}
 
-\subsection{Estructura de salida y campos clave}
+Para eventos corporativos relacionados dentro de un intervalo muy corto, podrá usarse opcionalmente:
+\begin{center}
+\texttt{overlap\_policy = merge\_same\_episode}
+\end{center}
+pero solo si existe una lógica formal de fusión y un \texttt{episode\_group\_id}. En configuración canónica, la fusión no debe ser implícita ni heurística.
 
-El output principal se guarda en:
+\subsection{Reglas PIT y anti-leakage}
+
+Las reglas PIT deben endurecerse respecto a una formulación genérica:
+
+\begin{itemize}
+  \item El evento debe estar presente en una fuente con timestamp verificable.
+  \item La marca temporal utilizada para decidir operabilidad debe ser \( t_e^{\mathrm{known}} \), no una fecha documental aproximada.
+  \item La entrada al episodio debe respetar la convención de ejecución del sistema; no se admiten ejecuciones imposibles sobre noticias conocidas demasiado tarde.
+  \item El outcome solo puede usar información estrictamente posterior a \( \tau_e \).
+  \item Los eventos cuya hora exacta sea desconocida en una fuente intrínsecamente sensible al tiempo deben invalidarse bajo política canónica.
+  \item Si la familia del evento se deriva de una señal técnica calculada al cierre, el primer instante operable por defecto será la siguiente apertura, salvo que el pipeline sea explícitamente intradía.
+\end{itemize}
+
+\subsection{Jerarquía formal de exclusión}
+
+Cuando un evento presenta varios problemas, \texttt{event\_exclusion\_reason} debe seguir una prioridad fija:
+
+\begin{enumerate}
+  \item \texttt{UNKNOWN\_EVENT\_TYPE}
+  \item \texttt{TIMESTAMP\_AMBIGUOUS}
+  \item \texttt{NOT\_IN\_UNIVERSE}
+  \item \texttt{MISSING\_ENTRY\_PRICE}
+  \item \texttt{MISSING\_EXIT\_PRICE}
+  \item \texttt{INCOMPLETE\_OUTCOME\_WINDOW}
+  \item \texttt{OVERLAP\_REJECTED}
+  \item \texttt{TRADING\_HALT\_OR\_SUSPENSION}
+  \item \texttt{CORPORATE\_ACTION\_UNSAFE}
+  \item \texttt{MISSING\_COST\_INPUT}
+  \item \texttt{BENCHMARK\_UNAVAILABLE}
+  \item \texttt{QC\_REJECTED}
+\end{enumerate}
+
+Esta jerarquía debe ser estable y auditable. Opcionalmente, causas secundarias podrán persistirse en \texttt{event\_exclusion\_details}.
+
+\subsection{Flujo operativo del pipeline}
+
+El flujo de alto nivel recomendado es:
+
+\begin{enumerate}
+  \item \texttt{load\_event\_config(...)}
+  \item \texttt{load\_event\_source(...)}
+  \item \texttt{canonicalize\_event\_types(...)}
+  \item \texttt{resolve\_event\_timestamps\_and\_tradability(...)}
+  \item \texttt{filter\_eligible\_events\_by\_universe(...)}
+  \item \texttt{resolve\_overlaps\_and\_episode\_conflicts(...)}
+  \item \texttt{compute\_event\_returns(...)}
+  \item \texttt{attach\_costs\_and\_benchmarks(...)}
+  \item \texttt{derive\_continuous\_and\_discrete\_labels(...)}
+  \item \texttt{apply\_event\_validity\_hierarchy(...)}
+  \item \texttt{run\_event\_qc(...)}
+  \item \texttt{persist\_event\_labels\_and\_metadata(...)}
+\end{enumerate}
+
+La etapa \texttt{canonicalize\_event\_types(...)} es crítica: el sistema no debe operar sobre taxonomías sucias procedentes directamente de fuentes externas.
+
+\subsection{Estructura de salida}
+
+El output principal puede persistirse en:
 \begin{verbatim}
 labels/events/date={yyyy-mm-dd}/part-*.parquet
 \end{verbatim}
-con campos mínimos:
+
+Cada fila debe incluir, como mínimo:
+
 \begin{itemize}
-  \item \texttt{event\_id}: identificador único del evento.
-  \item \texttt{date\_event}: fecha de publicación del evento.
-  \item \texttt{symbol}: identificador del activo.
-  \item \texttt{event\_type}: tipo de evento.
-  \item \texttt{label\_event\_outcome}: label binario/trinario o continuo.
-  \item \texttt{horizon\_days}: horizonte de \emph{outcome}.
-  \item \texttt{label\_valid\_flag}: flag booleano de validez del label.
-  \item \texttt{run\_id}: identificador de ejecución.
+  \item \texttt{event\_id}
+  \item \texttt{episode\_group\_id} si aplica
+  \item \texttt{symbol}
+  \item \texttt{event\_type}
+  \item \texttt{event\_source}
+  \item \texttt{event\_timestamp\_occ}
+  \item \texttt{event\_timestamp\_pub}
+  \item \texttt{event\_timestamp\_known}
+  \item \texttt{event\_timestamp\_tradable}
+  \item \texttt{entry\_px}
+  \item \texttt{exit\_px}
+  \item \texttt{horizon\_days}
+  \item \texttt{event\_ret\_gross}
+  \item \texttt{event\_ret\_net}
+  \item \texttt{event\_alpha} si aplica
+  \item \texttt{label\_event\_outcome}
+  \item \texttt{label\_valid\_flag}
+  \item \texttt{event\_exclusion\_reason}
+  \item \texttt{run\_id}
 \end{itemize}
 
-Además se generan:
+Además, toda ejecución debe generar:
 \begin{itemize}
-  \item \texttt{labels/events/event\_labels\_summary_{run\_id}.json}: resumen estadístico por \texttt{event\_type} y horizonte.
-  \item \texttt{labels/events/manifest_{run\_id}.json}: metadatos de configuración, cobertura y exclusiones.
+  \item \texttt{event\_labels\_summary\_\{run\_id\}.json}
+  \item \texttt{event\_manifest\_\{run\_id\}.json}
+  \item \texttt{event\_coverage\_\{run\_id\}.parquet}
+  \item \texttt{event\_qc\_\{run\_id\}.json}
+  \item \texttt{event\_windows\_\{run\_id\}.json} para compatibilidad con purged splits
 \end{itemize}
 
-\subsection{Validaciones y métricas de calidad}
+\subsection{Validaciones y QC}
 
-Las validaciones incluyen:
+El QC debe incluir, al menos:
+
 \begin{itemize}
-  \item Unicidad de \texttt{event\_id}.
-  \item Ausencia de \emph{leakage} temporal en \texttt{date\_event}.
-  \item Cobertura suficiente por tipo de evento (mínimo de \emph{samples} por \texttt{event\_type} y horizonte).
-  \item Consistencia de \texttt{label\_event\_outcome} con la definición de retorno y \emph{binning}.
+  \item unicidad estricta de \texttt{event\_id},
+  \item unicidad de episodio efectivo por símbolo y timestamp operativo bajo la política activa,
+  \item verificación de monotonía temporal entre \texttt{occ}, \texttt{pub}, \texttt{known}, \texttt{tradable},
+  \item cobertura mínima por familia y horizonte,
+  \item distribución del outcome por familia de evento,
+  \item ratio de exclusión por motivo,
+  \item chequeo de contaminaciones por eventos posteriores dentro de la ventana,
+  \item validación de consistencia entre trigger y outcome calculado.
 \end{itemize}
 
-Métricas de observabilidad:
+\paragraph{Severidad.}
+Cada check debe clasificarse como \texttt{FAIL}, \texttt{WARN} o \texttt{INFO}. Por ejemplo:
 \begin{itemize}
-  \item Número de eventos procesados y válidos.
-  \item Tasa de exclusión por tipo de evento.
-  \item Distribución de \texttt{label\_event\_outcome} (por horizonte y por tipo).
-  \item Tiempo de ejecución total.
+  \item \texttt{FAIL}: timestamps incoherentes, leakage, falta masiva de precios.
+  \item \texttt{WARN}: cobertura modesta en una familia secundaria.
+  \item \texttt{INFO}: deriva de la distribución de outcomes entre periodos.
 \end{itemize}
 
-\subsection{Interfaz de ejecución CLI}
+\subsection{Defaults canónicos}
 
-Ejemplo de invitación CLI:
+Para que el módulo suene a sistema institucional y no a framework abierto indefinidamente, debe fijar defaults:
+
+\begin{itemize}
+  \item \texttt{event\_target\_base = net\_return}
+  \item \texttt{overlap\_policy = first\_event\_wins\_with\_cooldown}
+  \item \texttt{cooldown = max(horizon\_set)}
+  \item \texttt{timestamp\_policy = strict}
+  \item \texttt{missing\_cost\_policy = strict\_invalidate}
+  \item \texttt{classification\_default = ternary\_tail\_20\_20\_on\_net}
+  \item \texttt{benchmark\_default = sector\_market\_adjusted} para eventos corporativos
+\end{itemize}
+
+Todo experimento que se aparte de estos defaults debe etiquetarse como \texttt{non-canonical} en el manifest.
+
+\subsection{Interfaz CLI}
+
+Ejemplo:
 \begin{verbatim}
-python -m labels.event_labels ^
-  --event-source-path data/events/source.parquet ^
-  --prices-path data/price/adjusted/mode=dual_output ^
-  --config-path configs/labels/event_labels.yaml ^
+python -m labels.event_labels \
+  --event-source-path data/events/source.parquet \
+  --prices-path data/price/adjusted/mode=dual_output \
+  --universe-history-path data/universe/history \
+  --costs-path execution/costs/latest.parquet \
+  --benchmark-path risk/event_benchmarks/latest.parquet \
+  --config-path configs/labels/event_labels.yaml \
   --run-id event_labels_20260305_001
 \end{verbatim}
 
-Este comando activa el pipeline de \emph{event‑based labeling}, produciendo un \emph{label store} compatible con modelos cross‑sectionales o de \emph{event‑driven} strategies \cite{LopezdePrado2018,HudsonThames_meta_labeling}.
-
-\subsection{Criterios de aceptación (DoD)}
-
+La CLI debe abortar si:
 \begin{itemize}
-  \item \textbf{Reproducibilidad}: los labels event‑driven deben ser \emph{reproducibles} dado el mismo \texttt{run\_id}, \texttt{config\_hash} y datos de entrada.
-  \item \textbf{PIT‑safe}: no debe haber \emph{leakage} temporal en el \emph{event timestamp} ni en el \emph{outcome window}.
-  \item \textbf{Robustez}: el sistema debe manejar \emph{missing events}, \emph{overlapping events} y \emph{data gaps} según la política definida.
-  \item \textbf{Cobertura}: los eventos clave (por ejemplo, earnings en small caps) deben tener un número suficiente de observaciones para entrenamiento de modelos.
+  \item la taxonomía del evento no puede canonicalizarse,
+  \item el timestamp operativo no puede resolverse,
+  \item la política de entrada/salida es inconsistente con el tipo de evento,
+  \item o se solicita abnormal return sin benchmark válido.
 \end{itemize}
 
-Estos criterios sitúan el módulo en el nivel de \emph{research industrial event‑driven system}, donde la calidad del \emph{event label} determina el potencial de \emph{alpha} capturable en un entorno de swing trading \cite{LopezdePrado2018,EventStudy_Methodology}.
+\subsection{Criterios de aceptación}
+
+La \emph{Definition of Done} del módulo exige:
+
+\begin{itemize}
+  \item eventos con definición canónica y timestamp operativo verificable,
+  \item labels PIT sin leakage temporal,
+  \item política formal de solapes y contaminación de episodios,
+  \item soporte para outcome bruto, neto y abnormal,
+  \item persistencia reproducible con metadatos completos,
+  \item exportación de ventanas efectivas compatible con purged splits,
+  \item QC con severidad formal y trazabilidad por motivo de exclusión.
+\end{itemize}
+
+No basta con detectar triggers y calcular retornos posteriores. El módulo debe producir una capa de episodios económicamente interpretable, temporalmente válida y suficientemente cerrada como para que un investigador distinto pueda implementarla sin introducir ambigüedades metodológicas.
+
+\subsection{Casos de prueba mínimos}
+
+La batería mínima de tests debe cubrir:
+
+\begin{itemize}
+  \item earnings pre-market, post-market e intradía con distinta resolución de \( t_e^{\mathrm{trad}} \),
+  \item gaps y señales técnicas generadas al cierre con ejecución al día siguiente,
+  \item rechazo correcto de eventos con hora desconocida bajo política estricta,
+  \item cálculo correcto de outcomes netos con costes,
+  \item resolución determinista de eventos solapados,
+  \item contaminación de ventana por un segundo evento del mismo símbolo,
+  \item construcción correcta de abnormal returns bajo benchmark conocido,
+  \item persistencia reproducible de manifest, coverage y QC,
+  \item compatibilidad de ventanas con purged splits.
+\end{itemize}
 
 \subsection{Bibliografía y referencias de estado del arte}
 
 \begin{itemize}
-  \item \cite{LopezdePrado2018}: \emph{Advances in Financial Machine Learning} (labeling event‑based, meta‑labeling, triple‑barrier).
-  \item \cite{CampbellLoMackinlay1997}: \emph{The Econometrics of Financial Markets} (event studies, abnormal returns).
-  \item \cite{EasleyLoO'Hara2011}: \emph{Event‑based sampling} y \emph{volume/dollar bars} en mercados financieros.
-  \item \cite{mlfinlab_event_labels}: \emph{mlfinlab} implementation de event‑based labels y \emph{triple‑barrier}.
-  \item \cite{EventStudy_Methodology}: \emph{Event study methodology} y correcciones por correlación cross‑sectional de retornos anómalos.
-  \item \cite{TheEffectBook2025}: \emph{Event studies} en el contexto de inferencia causal.
+  \item \cite{LopezdePrado2018}: \emph{Advances in Financial Machine Learning}.
+  \item \cite{CampbellLoMackinlay1997}: \emph{The Econometrics of Financial Markets}.
+  \item \cite{Fama1969Findings,Patell1976,Petersen2009}: abnormal returns y metodología de event studies.
+  \item \cite{EasleyLoO'Hara2011}: muestreo basado en eventos y estructura de mercado.
+  \item \cite{Kolari2017}: correcciones por correlación cross-sectional en event studies.
 \end{itemize}
-
-\begin{thebibliography}{9}
-\bibitem{LopezdePrado2018}
-López de Prado, M. (2018). \emph{Advances in Financial Machine Learning}. Wiley.
-
-\bibitem{CampbellLoMackinlay1997}
-Campbell, J. Y., Lo, A. W., \& MacKinlay, A. C. (1997). \emph{The Econometrics of Financial Markets}. Princeton University Press.
-
-\bibitem{EasleyLoO'Hara2011}
-Easley, D., López de Prado, M., \& O’Hara, M. (2011). \emph{Event‑based sampling of high‑frequency data}. Journal of Financial Econometrics.
-
-\bibitem{mlfinlab_event_labels}
-Hudson \& Thames. (2019–2025). \emph{mlfinlab} documentation: data labeling, event‑based sampling, triple‑barrier. \texttt{mlfinpy.readthedocs.io}.
-
-\bibitem{EventStudy_Methodology}
-Kolari, J. T. et al. (2017). \emph{Event‑Study Methodology: Correction for Cross‑Sectional Correlation of Abnormal Returns}. \texttt{SemanticScholar}.
-
-\bibitem{TheEffectBook2025}
-Angrist, J. D., \& Pischke, J. S. (2025). \emph{The Effect: An Introduction to Causal Inference}. Chap. 17: Event Studies.
-\end{thebibliography}

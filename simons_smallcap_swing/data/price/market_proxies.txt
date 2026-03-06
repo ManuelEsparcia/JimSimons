@@ -1,255 +1,560 @@
-% -----------------------------
-% TEXTO LaTeX PARA market_proxies.py
-% -----------------------------
 \section{Modulo: \texttt{data/price/market\_proxies.py}}
 
-\subsection{Objetivo y marco de regímenes de mercado}
+\subsection{Objetivo, rol economico y posicion en la arquitectura}
 
-El módulo \texttt{data/price/market\_proxies.py} calcula series \textbf{diarias de proxies de mercado y régimen} (volatilidad, liquidez, amplitud “breadth”, y tendencia) a partir de un universo PIT de small caps, con el fin de:
+El modulo \texttt{data/price/market\_proxies.py} construye una capa diaria de \textbf{proxies agregados de estado de mercado} para el universo \textit{point-in-time} de small caps. Su finalidad no es etiquetar formalmente regímenes mediante un modelo supervisado o latente, sino producir una representación \textbf{parsimoniosa, robusta, auditable y temporalmente limpia} de las condiciones sistémicas bajo las que opera la estrategia.
 
+En un sistema de \textit{swing trading} sobre small caps, la señal individual nunca vive en el vacío. Su distribución de retornos, su capacidad de ejecución, su tasa de falsos positivos y su fragilidad ante shocks dependen del estado global de la cross-section. La misma señal de momentum puede tener una esperanza matemática distinta en un entorno de rally amplio y líquido que en uno de mercado estrecho, volátil y con deterioro de amplitud. Por ello, esta capa resume la dinámica del universo en un conjunto reducido de variables que puedan ser consumidas por \textit{features}, filtros de riesgo, controles de exposición, validaciones de QC y diagnóstico de backtest.
+
+El modulo debe satisfacer simultáneamente cinco funciones:
+
+\begin{enumerate}
+  \item \textbf{Medir estado sistémico}: volatilidad agregada, amplitud, liquidez y cohesión cross-sectional.
+  \item \textbf{Servir como feature de régimen}: exponer variables estables y reproducibles para modelos downstream.
+  \item \textbf{Actuar como risk control}: permitir inhibir, escalar o modular riesgo bajo condiciones de mercado adversas.
+  \item \textbf{Aportar contexto interpretativo}: explicar por qué una estrategia gana o pierde bajo ciertos entornos.
+  \item \textbf{Mantener disciplina PIT}: asegurar que cada proxy en fecha \(t\) use exclusivamente información observable hasta \(t\).
+\end{enumerate}
+
+Este modulo \textbf{no} debe:
 \begin{itemize}
-  \item Alimentar \textbf{features de régimen} en el sistema de swing trading.
-  \item Actuar como \textbf{risk controls} (por ejemplo, reducir tamaño de posición en altas volatilidad o baja liquidez).
-  \item Proporcionar \textbf{validaciones de mercado} para QC y diagnóstico de señales.
+  \item reclasificar el universo,
+  \item ajustar corporate actions,
+  \item corregir anomalías de precios,
+  \item entrenar modelos de régimen como HMMs o clustering,
+  \item mezclar proxies exploratorios con proxies de producción sin un contrato explícito.
 \end{itemize}
 
-Estos proxies se sitúan en el marco de la \textit{market regime detection} y la \textit{systemic risk} en sistemas de trading cuantitativo, donde se busca mapear el mercado a estados como \textit{high volatility / low volatility}, \textit{broad rally / narrow rally}, \textit{trending / choppy} para adaptar el comportamiento de la estrategia. [web:71][web:74][web:75]
+\subsection{Principio rector: proxies, no narrativa}
 
-\subsection{Alcance y flujos de datos}
-
-El módulo:
+La filosofía del modulo es deliberadamente operativa: no intenta “explicar” el mercado con una taxonomía verbal difusa, sino producir variables numéricas con semántica económica clara, reglas de cálculo cerradas y estabilidad suficiente para investigación y producción. Cada proxy debe responder a una pregunta concreta:
 
 \begin{itemize}
-  \item Lee \texttt{prices\_adjusted} y \texttt{universe\_history} para construir \textbf{agregados diarios cross‑sectional}.
-  \item Calcula \textbf{proxies de riesgo sistemico} y condiciones de ejecución (liquidez, spread, breadth, etc.).
-  \item Persiste un dataset versionado y auditado en Parquet, con \texttt{run\_id} como clave de trazabilidad.
+  \item \textbf{Retorno agregado}: ¿cómo se está moviendo la cross-section en bloque?
+  \item \textbf{Dispersión}: ¿las acciones se mueven juntas o existe heterogeneidad transversal?
+  \item \textbf{Breadth}: ¿el movimiento está respaldado por participación amplia o es estrecho?
+  \item \textbf{Liquidez}: ¿las condiciones de ejecución son sanas o se están deteriorando?
+  \item \textbf{Cohesión/correlación}: ¿el mercado está dominado por un factor común fuerte?
 \end{itemize}
 
-No incluye:
+\subsection{Entradas y contrato de dependencias}
 
-\begin{itemize}
-  \item Modelos de clasificación explícita de régimen (por ejemplo, HMMs, clustering, etc.); se espera que ese modelo se entrene en \texttt{features} o \texttt{risk\_filters} a partir de estos proxies.
-  \item Re‑ingesta de precios ni manejo de eventos corporativos.
-\end{itemize}
+El modulo consume como mínimo los siguientes datasets versionados:
 
-\subsection{Entradas y contexto PIT}
-
-Las entradas principales son:
-
-\begin{itemize}
-  \item \texttt{prices\_adjusted\_path}: serie de precios diarios \texttt{OHLCV} ajustados por splits y dividendos, para el universo PIT.
-  \item \texttt{universe\_history\_path}: calendario de universo efectivo por fecha.
-  \item \texttt{benchmark\_series\_path} (opcional): serie de mercado de referencia para comparar retorno agregado.
-  \item \texttt{market\_proxy\_config\_path}: fichero de configuración indicando qué proxies calcular y sus ventanas (20d, 5d, etc.).
-  \item \texttt{run\_id}: identificador único de corrida para trazabilidad y reproducibilidad.
-\end{itemize}
-
-El universo por fecha se usa para:
-
-\begin{itemize}
-  \item Definir la \textbf{cross‑section} de stocks que entran en el cálculo de cada proxy en la fecha \(t\).
-  \item Evitar survivorship bias y asegurar que el régimen de mercado se mide siempre sobre el \textbf{universo vigente en el momento} \(t\) (PIT). [web:73][web:74]
-\end{itemize}
-
-\subsection{Definición matemática de los proxies sugeridos}
-
-Sea \( \mathcal{U}_t \) el conjunto de símbolos del universo en la fecha \(t\), y \( r_{i,t} \) el retorno diario del activo \(i\) en el universo small cap.
-
-\subsubsection{Retorno agregado de mercado}
-
+\paragraph{1. Precios ajustados PIT}
+Ruta \texttt{prices\_adjusted\_path}, con columnas equivalentes a:
 \[
-\text{market\_ret}_{k,t} = \frac{1}{|\mathcal{U}_t|} \sum_{i \in \mathcal{U}_t} r_{i,t:k} ,
+\texttt{symbol, date, close\_adj, volume\_adj, ret\_1d\_adj}
+\]
+y, si están disponibles, \texttt{dollar\_volume}, \texttt{spread\_proxy} u otras magnitudes auxiliares.
+
+\paragraph{2. Universo PIT por fecha}
+Ruta \texttt{universe\_history\_path}, que define el conjunto elegible:
+\[
+\mathcal{U}_t = \{i: i \text{ pertenece al universo vigente en la fecha } t\}.
 \]
 
-donde \(r_{i,t:k}\) es el retorno acumulado en la ventana \(k\) días hacia atrás (\(k=1,5,20\)). En versiones pesadas por capitalización, se puede usar:
-
-\[
-\text{market\_ret}_{k,t}^{\text{cap}} = \sum_{i \in \mathcal{U}_t} w_{i,t} \cdot r_{i,t:k},
-\quad
-w_{i,t} = \frac{\text{cap}_{i,t}}{\sum_{j \in \mathcal{U}_t} \text{cap}_{j,t}}.
-\]
-
-\subsubsection{Volatilidad histórica de mercado de \(k\) días}
-
-\[
-\text{market\_realized\_vol}_{k,t} =
-\sqrt{
-  \frac{1}{k-1}
-  \sum_{s=t-k+1}^{t}
-  \left(
-    \text{market\_ret}_{1,s} - \overline{\text{market\_ret}}_{k}
-  \right)^2
-},
-\]
-
-donde \(\overline{\text{market\_ret}}_{k}\) es el retorno medio de mercado en la ventana \(k\). Alternativamente se puede usar volatilidad agregada de cross‑section, como la \textit{cross‑sectional standard deviation}:
-
-\[
-\text{cross\_section\_dispersion}_{t} =
-\sqrt{
-  \frac{1}{|\mathcal{U}_t|-1}
-  \sum_{i \in \mathcal{U}_t}
-  \left( r_{i,t} - \bar{r}_{t} \right)^2
-},
-\quad
-\bar{r}_t = \frac{1}{|\mathcal{U}_t|} \sum_{i \in \mathcal{U}_t} r_{i,t}.
-\]
-
-Estas medidas de \textit{dispersion} aparecen en la literatura como \textbf{predictores robustos de volatilidad futura de mercado} y variables de estado de riesgo sistemico. [web:70][web:73][web:76]
-
-\subsubsection{Liquidez y condiciones de ejecución}
-
-\emph{Breadth} y liquidez se capturan con:
-
+\paragraph{3. Configuración del modulo}
+Ruta \texttt{market\_proxy\_config\_path}, donde se fijan:
 \begin{itemize}
-  \item \textbf{Porcentaje de tickers subiendo}: 
-    \[
-    \text{breadth\_pct\_up}_t = \frac{
-      \#\{i \in \mathcal{U}_t : r_{i,t} > 0\}
-    }{|\mathcal{U}_t|}.
-    \]
-  \item \textbf{Ratio de avance/declive}:
-    \[
-    \text{advance\_decline\_ratio}_t = \frac{N_{\text{up},t}}{N_{\text{down},t} + \epsilon},
-    \]
-    donde \(N_{\text{up}/\text{down},t}\) cuentan los activos con retorno positivo/negativo y \(\epsilon\) es un pequeño regularizador.
-  \item \textbf{Proxy de liquidez}:
-    \[
-    \text{market\_turnover\_proxy}_t = \frac{1}{|\mathcal{U}_t|} \sum_{i \in \mathcal{U}_t} \frac{V_{i,t}}{V_{i,t}^{\text{ref}}},
-    \]
-    donde \(V_{i,t}^{\text{ref}}\) es un volumen de referencia (por ejemplo, media histórica de volumen del símbolo).
-  \item \textbf{Proxy de spread}:
-    \[
-    \text{market\_spread\_proxy}_t = \frac{1}{|\mathcal{U}_t|} \sum_{i \in \mathcal{U}_t}
-    \frac{\text{bid\_ask\_spread}_{i,t}}{P_{i,t}},
-    \]
-    donde \(\text{bid\_ask\_spread}_{i,t}\) puede estimarse a partir de la diferencia entre high y low relativa al precio, o de datos de nivel de librería si están disponibles.
+  \item ventanas temporales,
+  \item conjunto de proxies habilitados,
+  \item método de agregación,
+  \item política de winsorización,
+  \item umbrales de cobertura mínima,
+  \item pesos y reglas de normalización.
 \end{itemize}
 
-Estos indicadores de \textit{market breadth} y liquidez se usan en la literatura de trading para detectar fragilidad de rallies, liquidez de mercado general y condiciones de ejecución adversas. [web:68][web:72][web:75]
-
-\subsubsection{Correlación de mercado agregada}
-
-\[
-\text{cross\_section\_corr\_proxy}_t = \rho_{\mathcal{U}_t}
-\left( r_{i,t}, \text{market\_ret}_{1,t} \right),
-\]
-
-es decir, la correlación entre los retornos individuales \(r_{i,t}\) y el retorno agregado de mercado. Si la correlación cruza valores extremos cercanos a \(1\) o \(-1\), el mercado opera como un “single factor”, lo que puede degradar el diverso de una estrategia de equities long/short.
+\paragraph{4. Benchmark opcional}
+Ruta \texttt{benchmark\_series\_path}, usada solo para comparativas o validaciones auxiliares; el cálculo de proxies del universo no debe depender de la existencia de un benchmark externo.
 
 \subsection{Reglas PIT y consistencia temporal}
 
-Las reglas clave son:
+Las reglas temporales no son decorativas; son la condición de validez del modulo.
 
-\begin{itemize}
-  \item \textbf{Sólo observaciones \(\leq t\)}: el cálculo de cada proxy en la fecha \(t\) utiliza exclusivamente datos históricos disponibles hasta \(t\) (PIT).
-  \item \textbf{Univ. efectivo del día}: la cross‑section \(\mathcal{U}_t\) se toma de \texttt{universe\_history} para evitar survivorship bias.
-  \item \textbf{Sin backfill futuro}: el dataset \texttt{market\_proxies} no se recalcula con información posterior; se versiona por \texttt{run\_id} y fecha de \texttt{asof}.
-\end{itemize}
-
-Esto encaja con el paradigma de \textit{point‑in‑time} que se requiere para backtest limpios en small caps, donde el survivorship bias y la información futura contaminan dramáticamente el rendimiento aparente de la estrategia. [web:73][web:74]
-
-\subsection{Flujo de procesamiento (alto nivel)}
-
-El flujo es:
+Para cada fecha \(t\):
 
 \begin{enumerate}
-  \item \texttt{load\_prices\_and\_universe(...)}.  
-  \item \texttt{build\_daily\_market\_aggregates(...)}:
-    \begin{itemize}
-      \item \texttt{market\_ret\_1d/5d/20d}.
-      \item \texttt{market\_realized\_vol\_20d}.
-      \item \texttt{market\_turnover\_proxy}, \texttt{market\_spread\_proxy}.
-      \item \texttt{breadth\_pct\_up}, \texttt{advance\_decline\_ratio}.
-      \item \texttt{cross\_section\_dispersion}, \texttt{cross\_section\_corr\_proxy}.
-    \end{itemize}
-  \item Aplicar \texttt{smoothing} opcional (por ejemplo, media móvil exponencial) y normalización (\(z\text{‑score}\)).
-  \item \texttt{validate\_market\_proxies(...)}:
-    \begin{itemize}
-      \item Cobertura mínima de tickers por día.
-      \item Rangos plausibles (por ejemplo, volatilidad > 0, \texttt{breadth\_pct\_up} \(\in [0,1]\), \texttt{advance\_decline\_ratio} > 0).
-      \item Fechas \texttt{t} monótonas crecientes.
-    \end{itemize}
-  \item \texttt{persist\_market\_proxies(...)} en formato Parquet, particionado por fecha.
+  \item solo se puede usar información con fecha \(\le t\);
+  \item la cross-section debe ser exactamente \(\mathcal{U}_t\), el universo vigente ese día;
+  \item si un proxy usa ventanas históricas de longitud \(k\), solo puede mirar el intervalo \([t-k+1, t]\);
+  \item no se permite recalcular retrospectivamente una serie histórica con información de composición del universo revelada después;
+  \item la salida debe quedar ligada a un \texttt{run\_id}, un \texttt{as\_of\_ts\_utc} y un snapshot de universo.
 \end{enumerate}
 
-\subsection{Resultados y salidas}
+\textbf{Regla de oro}: ningún proxy puede depender de la supervivencia futura de los nombres ni de una composición del universo reconstruida ex post.
 
-El módulo genera:
+\subsection{Taxonomia oficial: proxies core y proxies exploratorios}
+
+Para evitar que el modulo derive en una colección difusa de métricas elegantes pero poco gobernadas, se fija una taxonomía obligatoria.
+
+\subsubsection{Proxies core obligatorios}
+
+Todo \texttt{run} de producción debe construir, como mínimo, los siguientes proxies:
+
+\begin{enumerate}
+  \item \texttt{market\_ret\_1d}
+  \item \texttt{market\_ret\_5d}
+  \item \texttt{market\_ret\_20d}
+  \item \texttt{market\_realized\_vol\_20d}
+  \item \texttt{breadth\_pct\_up}
+  \item \texttt{advance\_decline\_ratio}
+  \item \texttt{cross\_section\_dispersion}
+  \item \texttt{market\_turnover\_proxy}
+\end{enumerate}
+
+\subsubsection{Proxies exploratorios opcionales}
+
+Solo se calculan si la configuración lo habilita y si la cobertura de datos lo permite:
+
+\begin{enumerate}
+  \item \texttt{market\_spread\_proxy}
+  \item \texttt{cross\_section\_corr\_proxy}
+  \item \texttt{market\_ret\_cap\_weighted}
+  \item \texttt{breadth\_ma\_distance}
+  \item \texttt{liquidity\_stress\_proxy}
+\end{enumerate}
+
+\textbf{Regla de gobernanza}: ningún proxy exploratorio puede consumirse en producción como filtro o feature crítica si antes no ha superado validación de estabilidad e incrementalidad.
+
+\subsection{Convencion oficial de agregación cross-sectional}
+
+Una de las carencias más frecuentes en módulos de este tipo es dejar ambigua la agregación. Aquí se fija una política explícita.
+
+Salvo indicación en contrario, el metodo canónico de agregación es:
 
 \begin{itemize}
-  \item Dataset principal:
-    \begin{itemize}
-      \item Carpeta: \texttt{data/price/market\_proxies/date=\{yyyy-mm-dd\}/part-*.parquet}.
-      \item Columnas: \texttt{date, market\_ret\_1d, market\_ret\_5d, market\_ret\_20d, market\_realized\_vol\_20d, market\_turnover\_proxy, market\_spread\_proxy, breadth\_pct\_up, advance\_decline\_ratio, cross\_section\_dispersion, cross\_section\_corr\_proxy} y metadatos como \texttt{run\_id, ingest\_ts\_utc}.
-    \end{itemize}
-  \item Resumen:
-    \begin{itemize}
-      \item \texttt{data/price/market\_proxies/summary\_{run\_id}.json}: estadísticas por proxy (media, std, percentiles, contadores de días no nulos, etc.).
-    \end{itemize}
-  \item Manifest de corrida:
-    \begin{itemize}
-      \item \texttt{data/price/market\_proxies/manifest\_{run\_id}.json}: hash de config, versión de código, fechas de inicio/fin, cuentas de universo y filas generadas.
-    \end{itemize}
+  \item universo PIT del día \(\mathcal{U}_t\),
+  \item exclusión de observaciones con datos obligatorios ausentes,
+  \item winsorización cross-sectional previa al agregado,
+  \item media robusta o mediana según proxy,
+  \item registro explícito de la cobertura efectiva \(N_t^{\mathrm{eff}}\).
 \end{itemize}
 
-\subsection{Interfaz CLI y configuración}
+Sea \(x_{i,t}\) una variable diaria individual. Entonces, si el proxy usa media robusta:
 
-CLI sugerida:
+\[
+\widetilde{x}_{i,t} = \mathrm{winsorize}(x_{i,t}; q_{\ell}, q_u),
+\]
+\[
+\mathrm{agg}(x_t) = \frac{1}{N_t^{\mathrm{eff}}}\sum_{i \in \mathcal{U}_t^{\mathrm{valid}}}\widetilde{x}_{i,t}.
+\]
+
+Por defecto, la winsorización recomendada es a percentiles cross-sectional \((1\%,99\%)\), configurable por YAML.
+
+\textbf{Regla importante}: en small caps, la media simple sin robustificación queda prohibida como default para proxies de liquidez, dispersión o spread, porque uno o dos nombres extremos pueden dominar artificialmente la serie agregada.
+
+\subsection{Definiciones matematicas oficiales}
+
+Sea \(\mathcal{U}_t\) el universo vigente en fecha \(t\), y sea \(r_{i,t}\) el retorno diario ajustado del activo \(i\).
+
+\subsubsection{Retorno agregado de mercado}
+
+La versión canónica es la media robusta de retornos diarios:
+
+\[
+\texttt{market\_ret\_1d}_t
+=
+\mathrm{agg}\left(\{r_{i,t}\}_{i \in \mathcal{U}_t}\right).
+\]
+
+Para horizontes \(k \in \{5,20\}\), el retorno agregado se define como:
+
+\[
+\texttt{market\_ret\_k}_t
+=
+\mathrm{agg}\left(\{R_{i,t}^{(k)}\}_{i \in \mathcal{U}_t}\right),
+\qquad
+R_{i,t}^{(k)} = \prod_{s=t-k+1}^{t}(1+r_{i,s})-1.
+\]
+
+\textbf{Decisión cerrada}: la versión por defecto es \textbf{equal-weight robusta}. Las versiones ponderadas por capitalización o liquidez son opcionales y deben persistirse con nombre distinto.
+
+\subsubsection{Volatilidad realizada agregada}
+
+La volatilidad oficial de mercado a \(k\) días se calcula sobre la serie de \texttt{market\_ret\_1d}:
+
+\[
+\texttt{market\_realized\_vol\_k}_t
+=
+\sqrt{
+\frac{1}{k-1}
+\sum_{s=t-k+1}^{t}
+\left(
+\texttt{market\_ret\_1d}_s
+-
+\overline{\texttt{market\_ret\_1d}}_{t,k}
+\right)^2
+},
+\]
+
+donde
+
+\[
+\overline{\texttt{market\_ret\_1d}}_{t,k}
+=
+\frac{1}{k}
+\sum_{s=t-k+1}^{t}\texttt{market\_ret\_1d}_s.
+\]
+
+Por defecto, el módulo debe producir \texttt{market\_realized\_vol\_20d}. Ventanas adicionales son opcionales.
+
+\subsubsection{Dispersión cross-sectional}
+
+La dispersión diaria oficial se define como la desviación típica cross-sectional robustificada:
+
+\[
+\texttt{cross\_section\_dispersion}_t
+=
+\sqrt{
+\frac{1}{N_t^{\mathrm{eff}}-1}
+\sum_{i \in \mathcal{U}_t^{\mathrm{valid}}}
+\left(
+\widetilde{r}_{i,t} - \overline{\widetilde{r}}_t
+\right)^2
+}.
+\]
+
+Esta variable es crítica porque separa un mercado con movimiento agregado uniforme de uno donde domina la heterogeneidad transversal, algo especialmente importante para estrategias basadas en ranking.
+
+\subsubsection{Breadth: porcentaje de nombres subiendo}
+
+\[
+\texttt{breadth\_pct\_up}_t
+=
+\frac{
+\#\{i \in \mathcal{U}_t^{\mathrm{valid}} : r_{i,t} > 0\}
+}{
+N_t^{\mathrm{eff}}
+}.
+\]
+
+Esta métrica debe pertenecer al intervalo \([0,1]\) por construcción.
+
+\subsubsection{Advance/decline ratio}
+
+\[
+N_{\texttt{up},t} = \#\{i : r_{i,t}>0\}, \qquad
+N_{\texttt{down},t} = \#\{i : r_{i,t}<0\}.
+\]
+
+La versión oficial incorpora regularización para evitar explosiones cuando \(N_{\texttt{down},t}=0\):
+
+\[
+\texttt{advance\_decline\_ratio}_t
+=
+\frac{N_{\texttt{up},t} + \lambda}{N_{\texttt{down},t} + \lambda},
+\qquad
+\lambda > 0.
+\]
+
+Por defecto, \(\lambda = 1\). Queda prohibido usar \(\epsilon\) arbitrario sin fijarlo contractualmente.
+
+\subsubsection{Turnover proxy agregado}
+
+Si se dispone de volumen ajustado y precio ajustado, el proxy oficial de liquidez se basa en \textit{dollar volume} relativo:
+
+\[
+\texttt{dollar\_vol}_{i,t} = P_{i,t}^{\mathrm{adj}} \cdot V_{i,t}^{\mathrm{adj}}.
+\]
+
+Sea una referencia histórica robusta por símbolo, por ejemplo la mediana móvil de 20 días:
+
+\[
+\texttt{dollar\_vol\_ref}_{i,t}
+=
+\mathrm{median}\left(
+\texttt{dollar\_vol}_{i,s}: s \in [t-19,t]
+\right).
+\]
+
+Entonces el turnover proxy agregado se define como:
+
+\[
+\texttt{market\_turnover\_proxy}_t
+=
+\mathrm{median}\left(
+\left\{
+\frac{\texttt{dollar\_vol}_{i,t}}
+{\texttt{dollar\_vol\_ref}_{i,t} + \lambda}
+\right\}_{i \in \mathcal{U}_t^{\mathrm{valid}}}
+\right),
+\]
+
+con \(\lambda>0\) pequeño solo para estabilización numérica.
+
+\textbf{Decisión cerrada}: para small caps, la mediana cross-sectional es el default preferido a la media, porque reduce la dominancia de episodios extremos de volumen en pocos nombres.
+
+\subsubsection{Spread proxy agregado}
+
+Si no se dispone de bid-ask spread explícito, el proxy debe tratarse como \textbf{aproximación exploratoria}, nunca como spread verdadero. Una definición aceptable es:
+
+\[
+\texttt{spread\_proxy}_{i,t}
+=
+\frac{\texttt{high}_{i,t} - \texttt{low}_{i,t}}
+{\texttt{close}_{i,t}^{\mathrm{adj}}}.
+\]
+
+El agregado oficial, si se habilita, es:
+
+\[
+\texttt{market\_spread\_proxy}_t
+=
+\mathrm{median}\left(
+\{\texttt{spread\_proxy}_{i,t}\}_{i \in \mathcal{U}_t^{\mathrm{valid}}}
+\right).
+\]
+
+\textbf{Advertencia contractual}: esta variable no debe presentarse como bid-ask spread observado, sino como proxy de fricción intradiaria.
+
+\subsubsection{Correlacion cross-sectional agregada}
+
+La definición previa “correlación entre \(r_{i,t}\) y market return” era demasiado abierta y, tal como estaba formulada, no era suficientemente operativa. La versión oficial debe construirse sobre una ventana temporal corta \(k\), calculando para cada activo la correlación con el retorno de mercado agregado, y agregando luego transversalmente:
+
+\[
+\rho_{i,t}^{(k)} = \mathrm{corr}\left(
+\{r_{i,s}\}_{s=t-k+1}^{t},
+\{\texttt{market\_ret\_1d}_s\}_{s=t-k+1}^{t}
+\right).
+\]
+
+Entonces:
+
+\[
+\texttt{cross\_section\_corr\_proxy}_t
+=
+\mathrm{median}\left(
+\{\rho_{i,t}^{(k)}\}_{i \in \mathcal{U}_t^{\mathrm{valid}}}
+\right).
+\]
+
+Por defecto, si se habilita, \(k=20\). Esta definición sí mide cohesión del mercado en torno a un factor común.
+
+\subsection{Tratamiento de outliers, missing data y universos cambiantes}
+
+Aquí está uno de los puntos decisivos para subir de 86 a >95. La política debe quedar cerrada.
+
+\subsubsection{Outliers}
+
+Toda variable individual usada en un agregado cross-sectional debe pasar por una política explícita de robustificación. Por defecto:
+
+\begin{itemize}
+  \item retornos: winsorización al 1\% y 99\% cross-sectional diario;
+  \item proxies de volumen/spread: transformación logarítmica opcional y luego winsorización;
+  \item ratios extremos: truncado superior según configuración.
+\end{itemize}
+
+\subsubsection{Missing data}
+
+Para un símbolo \(i\) en fecha \(t\):
+
+\begin{itemize}
+  \item si faltan columnas obligatorias del proxy, ese símbolo queda excluido de ese proxy ese día;
+  \item no se imputan retornos o volúmenes de forma automática;
+  \item la cobertura efectiva \(N_t^{\mathrm{eff}}\) debe persistirse por proxy.
+\end{itemize}
+
+\subsubsection{Universo cambiante}
+
+La composición \(\mathcal{U}_t\) puede variar significativamente en small caps. Por ello:
+
+\begin{itemize}
+  \item todo proxy debe acompañarse de su \(\texttt{coverage\_count}_t\);
+  \item la interpretación temporal de un proxy debe considerar cambios de base transversal;
+  \item si \(N_t^{\mathrm{eff}}\) cae por debajo del umbral mínimo, el proxy de ese día debe marcarse como inválido o \texttt{warn}.
+\end{itemize}
+
+\subsection{Cobertura minima y validez diaria}
+
+Sea \(N_t^{\mathrm{univ}} = |\mathcal{U}_t|\) y \(N_t^{\mathrm{eff}}\) el número de observaciones válidas para un proxy concreto.
+
+La cobertura relativa es:
+
+\[
+\texttt{coverage\_ratio}_{p,t}
+=
+\frac{N_{p,t}^{\mathrm{eff}}}{N_t^{\mathrm{univ}}}.
+\]
+
+La política oficial debe fijar:
+
+\begin{itemize}
+  \item un umbral mínimo absoluto \(N_{\min}\),
+  \item y un umbral mínimo relativo \(c_{\min}\).
+\end{itemize}
+
+Por defecto, un proxy diario es válido solo si:
+
+\[
+N_{p,t}^{\mathrm{eff}} \ge N_{\min}
+\qquad \text{y} \qquad
+\texttt{coverage\_ratio}_{p,t} \ge c_{\min}.
+\]
+
+Valores recomendados de arranque:
+\[
+N_{\min}=50,
+\qquad
+c_{\min}=0.25,
+\]
+aunque deben quedar configurables.
+
+\subsection{Normalizacion y smoothing}
+
+El modulo puede exponer tanto la serie cruda como versiones suavizadas o normalizadas, pero esto debe hacerse sin mezclar semánticas.
+
+\begin{itemize}
+  \item \textbf{Serie raw}: valor directo del proxy en fecha \(t\).
+  \item \textbf{Serie smooth}: por ejemplo EMA o media móvil.
+  \item \textbf{Serie z-score}: estandarización rolling sobre ventana histórica.
+\end{itemize}
+
+\textbf{Regla obligatoria}: la salida debe nombrar de forma distinta cada transformación, por ejemplo:
+\[
+\texttt{market\_realized\_vol\_20d},
+\quad
+\texttt{market\_realized\_vol\_20d\_ema10},
+\quad
+\texttt{market\_realized\_vol\_20d\_z252}.
+\]
+
+Nunca debe sobrescribirse el proxy raw con una versión suavizada.
+
+\subsection{Flujo de procesamiento oficial}
+
+La ejecución debe seguir esta secuencia determinista:
+
+\begin{enumerate}
+  \item Cargar precios ajustados, universo PIT y configuración.
+  \item Validar schema, tipos y cobertura temporal.
+  \item Para cada fecha \(t\), construir \(\mathcal{U}_t\) y el subconjunto válido por proxy.
+  \item Calcular variables individuales necesarias: retornos \(k\)-días, dollar volume, spread proxy, etc.
+  \item Aplicar robustificación (winsorización, truncado, transformaciones).
+  \item Agregar cross-sectionalmente según el método oficial de cada proxy.
+  \item Calcular coberturas y flags de validez.
+  \item Aplicar smoothing/normalización opcional en una segunda capa explícita.
+  \item Validar rangos, monotonicidad y completitud.
+  \item Persistir dataset principal, resumen y manifest.
+\end{enumerate}
+
+\subsection{Contrato de salida}
+
+La salida principal debe contener al menos:
+
+\[
+\texttt{date, run\_id, as\_of\_ts\_utc, universe\_snapshot\_id}
+\]
+
+junto con las columnas core:
+
+\[
+\texttt{market\_ret\_1d, market\_ret\_5d, market\_ret\_20d,}
+\]
+\[
+\texttt{market\_realized\_vol\_20d, breadth\_pct\_up, advance\_decline\_ratio,}
+\]
+\[
+\texttt{cross\_section\_dispersion, market\_turnover\_proxy.}
+\]
+
+Y además, por transparencia operativa:
+
+\[
+\texttt{coverage\_count\_ret, coverage\_count\_breadth, coverage\_count\_liq,}
+\]
+\[
+\texttt{coverage\_ratio\_ret, coverage\_ratio\_breadth, coverage\_ratio\_liq,}
+\]
+\[
+\texttt{severity\_max.}
+\]
+
+Los proxies exploratorios, si existen, deben persistirse en columnas adicionales claramente etiquetadas.
+
+\subsection{Sistema de severidades}
+
+El modulo debe clasificar incidencias al menos como:
+
+\begin{itemize}
+  \item \texttt{FAIL}: universo PIT ausente, fechas duplicadas, imposibilidad de construir la serie temporal base, schema incompatible.
+  \item \texttt{WARN}: cobertura insuficiente para uno o varios proxies, proxy exploratorio no calculable, rangos anómalos pero no imposibles.
+  \item \texttt{INFO}: proxy opcional deshabilitado, día válido sin benchmark externo.
+\end{itemize}
+
+\textbf{Regla de agregación}: un \texttt{FAIL} estructural invalida la corrida; un \texttt{WARN} invalida únicamente el proxy o fecha afectada, no necesariamente todo el dataset.
+
+\subsection{Validacion economica e incrementalidad}
+
+Aquí está la parte que eleva el módulo desde “bonito” a “research-grade”. No basta con calcular proxies plausibles; hay que verificar que aportan información útil y estable.
+
+Todo proxy que aspire a ser consumido por modelos o filtros debe pasar, al menos, estas pruebas:
+
+\begin{enumerate}
+  \item \textbf{Estabilidad temporal}: la serie no debe ser dominada por huecos, saltos mecánicos o cambios de cobertura.
+  \item \textbf{Coherencia económica}: signos y magnitudes razonables en episodios conocidos de estrés o rally.
+  \item \textbf{No redundancia excesiva}: correlación no trivial pero tampoco casi perfecta con proxies ya existentes.
+  \item \textbf{Aporte incremental}: mejora medible en un análisis downstream respecto a una baseline sin ese proxy.
+\end{enumerate}
+
+La validación de incrementalidad debe medirse fuera de este modulo, pero el modulo debe dejar preparado todo lo necesario para ello: persistencia limpia, definiciones estables y versionado fuerte.
+
+\subsection{Artefactos de salida}
+
+Deben persistirse al menos los siguientes artefactos:
+
+\begin{itemize}
+  \item \texttt{data/price/market\_proxies/date=\{yyyy-mm-dd\}/part-*.parquet}
+  \item \texttt{data/price/market\_proxies/summary\_\{run\_id\}.json}
+  \item \texttt{data/price/market\_proxies/manifest\_\{run\_id\}.json}
+  \item \texttt{data/price/market\_proxies/validation\_\{run\_id\}.json}
+\end{itemize}
+
+El \texttt{summary} debe incluir media, desviación típica, percentiles, nulos, cobertura media y extrema por proxy. El \texttt{manifest} debe incluir hash de configuración, versión de código, fechas de inicio/fin, universo y recuentos de filas.
+
+\subsection{CLI de referencia}
 
 \begin{verbatim}
-python -m data.price.market_proxies                 \
+python -m data.price.market_proxies \
   --prices-path data/price/adjusted/mode=dual_output \
-  --universe-path data/universe/history              \
-  --config-path configs/data/market_proxies.yaml     \
+  --universe-path data/universe/history \
+  --config-path configs/data/market_proxies.yaml \
+  --as-of-ts-utc 2026-03-05T23:59:59Z \
   --run-id market_proxies_20260305_001
 \end{verbatim}
 
-En la configuración YAML se pueden definir:
+\subsection{Definition of Done}
+
+El modulo solo se considera terminado si:
+
+\begin{enumerate}
+  \item produce una serie PIT reproducible de proxies core obligatorios;
+  \item fija una convención explícita de agregación y robustificación;
+  \item registra cobertura efectiva por proxy y fecha;
+  \item distingue claramente proxies core de proxies exploratorios;
+  \item no mezcla universo futuro con composición histórica;
+  \item valida rangos, monotonicidad y coherencia básica;
+  \item persiste dataset, summary, manifest y validación;
+  \item deja los proxies en formato directamente consumible por \texttt{features}, \texttt{risk\_filters} y backtest.
+\end{enumerate}
+
+\subsection{Suite minima de tests}
+
+La batería mínima debe cubrir:
 
 \begin{itemize}
-  \item Ventanas de cálculo de \texttt{market\_ret\_k}, \texttt{market\_realized\_vol\_k}.
-  \item Parámetros de \texttt{smoothing} (por ejemplo, \texttt{ema\_span} para volatilidad o \texttt{breadth\_pct\_up}).
-  \item Umbrales de cobertura mínima de tickers por día.
-  \item Habilitación de proxies opcionales (por ejemplo, \texttt{cross\_section\_corr\_proxy} sólo si se dispone de volumen de referencia).
+  \item cálculo correcto de \texttt{market\_ret\_1d/5d/20d} con universo fijo;
+  \item cambio de universo PIT entre fechas;
+  \item cobertura insuficiente que invalida un proxy concreto;
+  \item winsorización que limita outliers extremos;
+  \item \texttt{breadth\_pct\_up} dentro de \([0,1]\);
+  \item \texttt{advance\_decline\_ratio} estable cuando no hay declinantes;
+  \item \texttt{market\_turnover\_proxy} robusto ante un nombre con volumen anómalo;
+  \item \texttt{cross\_section\_corr\_proxy} calculado correctamente sobre ventana rolling;
+  \item persistencia correcta de coverage counts y severity;
+  \item reproducibilidad bit a bit bajo mismos inputs y configuración.
 \end{itemize}
 
-\subsection{Criterios de aceptación (Definition of Done)}
+\subsection{Conclusion operativa}
 
-El módulo cumple la definición de terminado cuando:
-
-\begin{itemize}
-  \item Genera \textbf{proxies de mercado consistentes y reproducibles} por \texttt{run\_id}.
-  \item Cumple reglas PIT: sólo observaciones \(\leq t\), universo efectivo del día, sin backfill.
-  \item Ocupa un rango de valores razonable (por ejemplo, \texttt{breadth\_pct\_up} \(\in [0,1]\), \texttt{market\_realized\_vol\_20d} > 0, \texttt{advance\_decline\_ratio} razonable).
-  \item Mantiene fechas \texttt{t} monótonas ascendentes.
-  \item Persiste outputs en formato Parquet versionado y con manifest JSON que permite auditoría de una corrida.
-\end{itemize}
-
-Estos proxies se convierten en \textbf{features de primer orden} para:
-
-\begin{itemize}
-  \item \texttt{features/build\_features.py}: añadir \texttt{regime\_vol\_regime}, \texttt{regime\_breadth\_regime}, \texttt{regime\_liquidity\_regime}, etc.
-  \item \texttt{risk\_control} en backtest: ajustar tamaño de posición, stop‑loss, o inhibir trading en volatilidad extrema o liquidez anómala.
-  \item \texttt{qc\_prices.py} y \texttt{qc\_features.py}: detectar comportamientos anómalos de mercado compatibles con eventos de estrés. [web:71][web:74][web:75]
-\end{itemize}
-
-\subsection{Validaciones y observabilidad}
-
-Se recomiendan las siguientes validaciones:
-
-\begin{itemize}
-  \item \textbf{Cobertura diaria mínima}: \(\#\mathcal{U}_t \geq N_{\min}\) (por ejemplo, \(N_{\min} = 0.1 \cdot |\mathcal{U}|_{\text{total}}\)).
-  \item \textbf{Rangos plausibles}:
-    \begin{itemize}
-      \item \texttt{breadth\_pct\_up} \(\in [\epsilon, 1-\epsilon]\) (con \(\epsilon \approx 0.01\)).
-      \item \texttt{advance\_decline\_ratio} \(\in (0, \texttt{max\_ratio})\).
-    \end{itemize}
-  \item \textbf{Monotonía de fechas} y ausencia de duplicados de \texttt{date}.
-  \item \textbf{Reporting de estadísticas} por \texttt{run\_id} en \texttt{summary\_{run\_id}.json} para comparar entre periodos o universos.
-\end{itemize}
-
-Con este módulo, el sistema swing trading industrial que construyes cuenta con un \textbf{riesgo sistemico y features de régimen de nivel de industria}, listos para integrarse en el backtest y en el risk management de \texttt{backtest/engine.py}. [web:70][web:73][web:74]
-% -----------------------------
-% FIN DEL TEXTO PARA .TXT
-% -----------------------------
+\texttt{data/price/market\_proxies.py} debe entenderse como una \textbf{capa de compresión sistémica del universo}. Su trabajo no consiste en adornar el dataset con indicadores macro-estéticos, sino en traducir la dinámica transversal diaria del mercado a un conjunto pequeño de variables económicamente interpretables, robustas frente a outliers, consistentes con PIT y suficientemente estables como para gobernar señales y riesgo. Si esta capa queda ambigua, el sistema downstream aprende ruido contextual; si queda bien cerrada, se convierte en una pieza de infraestructura cuantitativa real, capaz de aportar contexto de régimen con disciplina de producción.

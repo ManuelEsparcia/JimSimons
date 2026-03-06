@@ -1,274 +1,470 @@
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%% DOCUMENTACIÓN: models/ensemble/blender.py %%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%% DOCUMENTACIÓN TÉCNICA: models/ensemble/blender.py
+%%% Standard: production-grade quant research / execution specification
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 \section*{Módulo: \texttt{models/ensemble/blender.py}}
 \label{sec:blender}
 
-\subsection*{1. Objetivo del módulo}
+\subsection*{1. Propósito estratégico del módulo}
 
-El módulo \texttt{blender.py} implementa un \textbf{ensemble blending} para la combinación de predicciones de modelos base en el contexto de \textit{trading algorítmico de swing} y gestión de cartera. El objetivo es:
+El módulo \texttt{blender.py} implementa la capa de \textbf{forecast combination} encargada de transformar un conjunto heterogéneo de predicciones de modelos base en una única señal agregada, estable, trazable y apta para producción. Su función no es “promediar modelos”, sino resolver un problema de \textbf{agregación robusta de información predictiva} bajo restricciones de estabilidad temporal, control de concentración, ausencia de leakage y degradación segura ante fallos parciales del panel de entrada.
 
-\begin{itemize}
-  \item Combinar predicciones de modelos base mediante reglas simples y robustas (promedio, media ponderada, media recortada, etc.).
-  \item Producir una señal \textbf{estable en el tiempo} y fácilmente operable en producción.
-  \item Aumentar la \textbf{robustez} frente al ruido de modelos individuales, la sobreajuste y la rotura de régimen.
-\end{itemize}
-
-La meta es que el ensemble \texttt{blender} pase a ser el \textbf{input de entrada para gestión de tamaño de posición y backtest}, no solo un agregador de opiniones.
-
-\subsection*{2. Formulación matemática del blending}
-
-Sea \( \mathcal{M} = \{m_1, \dots, m_S\} \) un conjunto de \(S\) modelos base cuyas predicciones sobre un activo \( \texttt{symbol} \) en fecha \(t\) son \( \{y_{m_i, t}\}_{i=1}^S \). El blender produce una señal combinada:
-
-\begin{equation}
-  y_{\text{blend},t} = \sum_{i=1}^{S_t} w_{i,t} \, y_{m_i, t}
-\end{equation}
-
-donde:
-\begin{itemize}
-  \item \( S_t \) es el número de modelos disponibles en la fecha \(t\).
-  \item \( w_{i,t} \in \mathbb{R} \) son los pesos del blend, con \( \sum_{i=1}^{S_t} w_{i,t} = 1 \).
-\end{itemize}
-
-El problema de blend se puede formalizar como:
-
-\begin{equation}
-  \min_{\mathbf{w}} \,\,
-  \mathcal{L}(\mathbf{w})
-  \quad
-  \text{s.a.} \quad
-  \mathbf{1}^\top \mathbf{w} = 1,\,\,
-  w_i \geq 0,\,\,
-  w_i \leq \overline{w}_i
-\end{equation}
-
-donde:
-\begin{itemize}
-  \item \( \mathcal{L}(\mathbf{w}) \) es una función de pérdida sobre el conjunto \textbf{OOF} (out‑of‑fold), por ejemplo MSE, Sharpe-like, o una métrica de calidad de señal.
-  \item \( \overline{w}_i \) es el máximo peso permitido para el modelo \(m_i\).
-\end{itemize}
-
-Este tipo de formulación está alineada con la literatura de \textbf{forecast combination} y \textbf{ensemble methods} en finanzas \cite{clemen1989, clemen1996, timmermann2006, kapetanios2008, deribas2016}.
-
-\subsection*{3. Modos de blend soportados}
-
-El módulo soporta los siguientes tipos de combinación de pesos:
-
-\begin{itemize}
-  \item \texttt{mean\_equal\_weight}:  
-    \[ w_i = \frac{1}{S_t} \quad \forall i \]
-    Es el promedio simple, ampliamente usado como baseline en combinatoria de modelos \cite{clemen1989}.
-        
-  \item \texttt{weighted\_static}:  
-    Pesos fijos \( \mathbf{w} \) definidos en configuración.  
-    \[ y_{\text{blend},t} = \sum_{i=1}^{S_t} w_{i} \, y_{m_i, t} \]
-    con \( \sum_{i} w_i = 1 \), típico en sistemas industriales donde se busca simplicidad y estabilidad.
-
-  \item \texttt{weighted\_by\_regime} (opcional):  
-    Se estima un conjunto de pesos por régimen \( r \in \mathcal{R} \):
-    \[ y_{\text{blend},t}^{(r)} = \sum_{i=1}^{S_t} w_{i,t}^{(r)} \, y_{m_i, t} \]
-    con pesos estimados sobre ventana de OOF condicionada al régimen \(r\) (por ejemplo: volatilidad, trend, régimen markoviano).  
-    Es análogo a \textit{regime‑dependent model averaging} o \textit{state‑dependent ensemble} \cite{hamilton1994, timmermann2006, orlov2010}.
-
-  \item \texttt{robust\_trimmed\_mean} (opcional):  
-    Se elimina un porcentaje de los modelos extremos (por desempeño o dispersión) y se aplica media ponderada sobre el resto:
-    \[ y_{\text{blend},t} = \sum_{i \in \mathcal{I}_{\text{trimmed}}} w_{i,t} \, y_{m_i, t} \]
-    Este esquema es cercano a \textit{robust forecast combination} basado en media recortada o truncada \cite{stockwatson1999, kapetanios2008, deribas2016}.
-\end{itemize}
-
-\subsection*{4. Estimación y selección de pesos}
-
-Los pesos pueden provenir de tres fuentes principales:
-
-\begin{itemize}
-  \item \textbf{Pesos fijos} (configuración manual o por reglas de negocio).  
-  \item \textbf{Pesos optimizados sobre OOF}:
-    \[ \mathbf{w}^* = \argmin_{\mathbf{w}} \mathcal{L}(\mathbf{w}; \text{panel OOF}) \]
-    donde el panel OOF contiene predicciones base y labels históricos.  
-    Esta aproximación es equivalente a resolver un problema de \textit{model averaging} o \textit{forecast combination} con restricciones de suma unitaria y no negatividad \cite{clemen1986, clemen1996, timmermann2006, kapetanios2008, deribas2016}.
-  \item \textbf{Pesos heurísticos} (performance \( \times \) diversidad):
-    \[ w_i \propto \text{Metric}_i \cdot \text{Diversity}_i \]
-    donde:
-    \begin{itemize}
-      \item \( \text{Metric}_i \) puede ser Sharpe, Sortino, retorno medio, o cualquiera de las métricas recomendadas en el backtest.
-      \item \( \text{Diversity}_i \) se obtiene de métricas de diversidad de modelos (ver módulo \texttt{diversity\_metrics}).
-    \end{itemize}
-\end{itemize}
-
-La combinación de “performance” y “diversidad” está alineada con la literatura de gestores de fondos que combinan estrategias por Sharpe ajustado y correlación cruzada \cite{edhec2009, harryporter2017}.
-
-\subsection*{5. Constraints sobre pesos}
-
-El código impone o recomienda los siguientes constraints:
-
-\begin{itemize}
-  \item No negatividad: \( w_i \geq 0 \) (excepto si se configura explícitamente permitir pesos negativos).
-  \item Suma unitaria: \( \sum w_i = 1 \).
-  \item Cota superior por modelo: \( w_i \leq \overline{w}_i \).
-\end{itemize}
-
-Este espacio de pesos definido sobre el simplex:
-
-\[
-  \mathcal{W} = \left\{ \mathbf{w} \in \mathbb{R}^S \colon \mathbf{1}^\top \mathbf{w} = 1,\, w_i \geq 0,\, w_i \leq \overline{w}_i \right\}
-\]
-
-es el estándar en combinatoria de modelos siguiendo la literatura de Clemen y Winkler \cite{clemen1986, clemen1996} y derivados modernos \cite{kapetanios2008, deribas2016, weiss2018, radchenko2023}.
-
-\subsection*{6. Flujo del proceso}
-
-El flujo implementado en \texttt{blender.py} sigue este pipeline:
+En un sistema de \textit{small-cap swing trading}, esta capa cumple cuatro objetivos simultáneos:
 
 \begin{enumerate}
-  \item Cargar predicciones base y conjunto de modelos candidatos.
-  \item Seleccionar el método de blend (por configuración).
-  \item Obtener pesos:
-  \begin{itemize}
-    \item fijos, o
-    \item estimados optimizando sobre panel OOF bajo restricciones.
-  \end{itemize}
-  \item Aplicar el blend por fecha y símbolo:
-  \[ y_{\text{blend},t,\text{symbol}} = \sum_{i \in \mathcal{M}_t} w_{i,t} \, y_{m_i, t,\text{symbol}} \]
-  \item Calcular métricas OOF y OOS.
-  \item Persistir scores blend y pesos versionados.
+    \item \textbf{Mejorar la relación señal/ruido} respecto a cualquier modelo individual, reduciendo varianza idiosincrática.
+    \item \textbf{Mitigar riesgo de modelo} evitando que el sistema dependa estructuralmente de un único predictor o de un subconjunto excesivamente correlacionado.
+    \item \textbf{Preservar operabilidad en producción} mediante reglas deterministas de combinación, fallback y renormalización.
+    \item \textbf{Entregar una señal final gobernable} para sizing, portfolio construction, execution simulation y backtesting.
 \end{enumerate}
 
-Este diseño es compatible con sistemas de backtest multi‑activo y de producción de trading, donde se requiere \textbf{reproducibilidad completa} (pesos, versiones, fechas, símbolos).
+El \texttt{blender} debe concebirse como una capa de decisión intermedia entre los modelos base y la asignación de capital. En consecuencia, sus criterios de diseño priorizan no solo performance OOS, sino también \textbf{robustez, estabilidad intertemporal, interpretabilidad operativa y reproducibilidad exacta}.
 
-\subsection*{7. Rol de OOF y reglas \textit{PIT} / anti‑leakage}
+\subsection*{2. Definición matemática del problema}
+
+Sea \( \mathcal{M}_t = \{m_1,\dots,m_{S_t}\} \) el conjunto de modelos disponibles en fecha \(t\), y sea \( \hat{y}_{i,t,s} \) la predicción del modelo \(m_i\) para el activo \(s\) en la fecha \(t\). El módulo genera una predicción agregada:
+
+\begin{equation}
+\hat{y}^{\text{blend}}_{t,s}
+=
+\sum_{i=1}^{S_t} w_{i,t,s}\,\hat{y}_{i,t,s}
+\end{equation}
+
+donde los pesos satisfacen, por defecto,
+
+\begin{equation}
+\sum_{i=1}^{S_t} w_{i,t,s}=1,
+\qquad
+w_{i,t,s}\ge 0,
+\qquad
+w_{i,t,s}\le \bar{w}_i
+\end{equation}
+
+salvo que la configuración habilite explícitamente otro dominio admisible.
+
+La forma general del problema de estimación es:
+
+\begin{equation}
+\mathbf{w}^{\star}
+=
+\arg\min_{\mathbf{w}\in\mathcal{W}}
+\mathcal{L}(\mathbf{w};\mathcal{D}_{\text{OOF}})
++
+\lambda_{\text{conc}}\Omega_{\text{conc}}(\mathbf{w})
++
+\lambda_{\text{turn}}\Omega_{\text{turn}}(\mathbf{w},\mathbf{w}_{\text{prev}})
++
+\lambda_{\text{div}}\Omega_{\text{div}}(\mathbf{w},\Sigma_{\text{models}})
+\end{equation}
+
+donde:
 
 \begin{itemize}
-  \item Los pesos deben estimarse \textbf{exclusivamente sobre el panel OOF}:  
+    \item \( \mathcal{D}_{\text{OOF}} \) es el panel alineado de predicciones OOF y labels históricos.
+    \item \( \mathcal{L} \) es la función objetivo principal.
+    \item \( \Omega_{\text{conc}} \) penaliza concentración excesiva de pesos.
+    \item \( \Omega_{\text{turn}} \) penaliza variaciones abruptas respecto a la versión previa de pesos.
+    \item \( \Omega_{\text{div}} \) penaliza exposición agregada a modelos altamente redundantes.
+\end{itemize}
+
+Esta formulación recoge la idea correcta para producción: el mejor blend no es simplemente el que maximiza una métrica \textit{in sample}, sino el que ofrece el mejor compromiso entre \textbf{calidad predictiva, robustez estructural y estabilidad operativa}.
+
+\subsection*{3. Universo admisible de pesos y política por defecto}
+
+Por defecto, el módulo trabaja sobre el simplex truncado:
+
+\[
+\mathcal{W}
+=
+\left\{
+\mathbf{w}\in\mathbb{R}^{S}:
+\sum_i w_i=1,\;
+0\le w_i\le \bar{w}_i
+\right\}
+\]
+
+con las siguientes políticas \textbf{obligatorias por defecto}:
+
+\begin{itemize}
+    \item \textbf{No negatividad}: activada.
+    \item \textbf{Suma unitaria}: activada.
+    \item \textbf{Peso máximo por modelo}: activado.
+    \item \textbf{Peso mínimo efectivo}: opcional, para eliminar contribuciones numéricamente irrelevantes.
+    \item \textbf{Pesos negativos}: desactivados salvo \texttt{allow\_short\_weights=true}.
+\end{itemize}
+
+La razón de diseño es explícita: en una capa de agregación para trading, permitir pesos negativos sin una gobernanza estricta tiende a introducir cancelaciones frágiles, sensibilidad extrema a drift y una interpretación menos robusta de la señal final. El modo por defecto debe ser, por tanto, conservador y estable.
+
+\subsection*{4. Objetivo de optimización y jerarquía formal de métricas}
+
+Uno de los problemas habituales en documentos de ensemble es dejar abierta la función objetivo. Aquí esa ambigüedad se elimina. El módulo debe implementar una \textbf{jerarquía formal de optimización}:
+
+\begin{enumerate}
+    \item \textbf{Objetivo primario}: la métrica definida en configuración como \texttt{primary\_objective}.
+    \item \textbf{Desempate 1}: menor concentración de pesos.
+    \item \textbf{Desempate 2}: mayor estabilidad temporal de pesos en ventanas adyacentes.
+    \item \textbf{Desempate 3}: menor sensibilidad local a perturbaciones de pesos.
+\end{enumerate}
+
+La política por defecto recomendada es:
+
+\begin{itemize}
+    \item Si la señal se usa como \textbf{score transversal}: optimizar IC/Rank IC, AUC, precision@k o una métrica de ordenación equivalente.
+    \item Si la señal se usa directamente en \textbf{portfolio/backtest}: optimizar una métrica neta de trading robusta, por ejemplo Sharpe OOF penalizado por turnover, o retorno ajustado por drawdown.
+    \item Si existen múltiples objetivos simultáneos, usar una función escalarizada definida ex ante:
+\end{itemize}
+
+\begin{equation}
+\mathcal{L}_{\text{scalar}}
+=
+-\alpha \cdot \text{Sharpe}
+-\beta \cdot \text{IC}
++\gamma \cdot \text{Turnover}
++\delta \cdot \text{Concentration}
+\end{equation}
+
+con coeficientes fijados en configuración y no ajustados ex post.
+
+\paragraph{Regla obligatoria.}
+No se permite seleccionar el blend final tras inspeccionar múltiples métricas OOS sin haber fijado previamente la prioridad de decisión. Eso constituiría una forma de \textit{selection leakage}. Toda elección debe venir determinada por la jerarquía definida antes de correr el experimento.
+
+\subsection*{5. Modos de blending soportados}
+
+El módulo debe soportar al menos los siguientes modos:
+
+\subsubsection*{5.1 \texttt{mean\_equal\_weight}}
+
+\[
+w_i = \frac{1}{S_t}
+\]
+
+Es el baseline obligatorio. Debe estar siempre disponible, porque en la práctica numerosos ensembles complejos fallan en superar de forma robusta a la media simple fuera de muestra.
+
+\subsubsection*{5.2 \texttt{weighted\_static}}
+
+\[
+\hat{y}^{\text{blend}}_{t,s}=\sum_i w_i \hat{y}_{i,t,s}
+\]
+
+Los pesos se fijan ex ante y permanecen constantes durante todo el intervalo de inferencia. Este modo se usa cuando prima la estabilidad institucional y la gobernanza de riesgo sobre la adaptación.
+
+\subsubsection*{5.3 \texttt{weighted\_oof\_optimized}}
+
+Los pesos se estiman resolviendo el problema restringido sobre el panel OOF histórico. Es el modo por defecto cuando se pretende extraer valor de diferencias persistentes de calidad entre modelos base.
+
+\subsubsection*{5.4 \texttt{weighted\_by\_regime}}
+
+Sea \(r_t\in\mathcal{R}\) una etiqueta de régimen disponible en tiempo real. Entonces:
+
+\[
+\hat{y}^{\text{blend}}_{t,s}
+=
+\sum_i w_i^{(r_t)} \hat{y}_{i,t,s}
+\]
+
+Cada vector \( \mathbf{w}^{(r)} \) se estima exclusivamente con observaciones OOF pertenecientes al régimen \(r\). Este modo solo es admisible si el régimen es:
+\begin{itemize}
+    \item definible \textbf{PIT},
+    \item suficientemente frecuente,
+    \item estable en el tiempo,
+    \item y estadísticamente soportado por tamaño muestral mínimo.
+\end{itemize}
+
+Si no se cumplen estas condiciones, el módulo debe degradar automáticamente a \texttt{weighted\_static} o al blend global.
+
+\subsubsection*{5.5 \texttt{robust\_trimmed\_mean}}
+
+Se ordenan modelos según criterio configurado y se recortan extremos antes de combinar. La regla debe fijarse ex ante. Se admiten dos familias:
+
+\begin{itemize}
+    \item \textbf{Trim por predicción instantánea}: elimina outliers de score en cada fila.
+    \item \textbf{Trim por calidad estructural}: excluye modelos persistentemente dominados o inestables.
+\end{itemize}
+
+No se permite mezclar ambos mecanismos sin definición explícita, porque sus implicaciones estadísticas y operativas son distintas.
+
+\subsection*{6. Fuentes de pesos y política de precedencia}
+
+La política de precedencia del módulo debe quedar completamente cerrada. El orden correcto es:
+
+\begin{enumerate}
+    \item \textbf{Pesos explícitos de configuración} si \texttt{blend\_mode=weighted\_static}.
+    \item \textbf{Pesos versionados preexistentes} si \texttt{load\_existing\_weights=true}.
+    \item \textbf{Estimación OOF} si el modo requiere optimización y no hay artefacto válido previo.
+    \item \textbf{Fallback a equal-weight} si falla cualquiera de las capas anteriores.
+\end{enumerate}
+
+\paragraph{Regla crítica.}
+Toda caída a fallback debe:
+\begin{itemize}
+    \item registrarse en logs,
+    \item persistirse en metadatos de ejecución,
+    \item y marcar el output final con un \texttt{blend\_status} explícito.
+\end{itemize}
+
+Nunca debe producirse un fallback silencioso.
+
+\subsection*{7. Panel OOF, reglas PIT y prohibición estricta de leakage}
+
+La estimación de pesos solo puede usar un panel OOF válidamente alineado en tiempo y símbolo. Eso implica:
+
+\begin{itemize}
+    \item Cada predicción base utilizada para entrenar el blend debe provenir de una observación no vista por el modelo base correspondiente.
+    \item El label asociado debe pertenecer al mismo horizonte temporal que se pretende predecir.
+    \item La alineación temporal entre \texttt{timestamp\_prediction}, \texttt{timestamp\_feature\_cutoff} y \texttt{label\_horizon\_end} debe ser verificable.
+\end{itemize}
+
+Para estimación dinámica de pesos, el módulo debe exigir:
+
+\begin{itemize}
+    \item longitud exacta de ventana,
+    \item frecuencia de actualización,
+    \item mínimo de observaciones por re-estimación,
+    \item y versionado de cada bloque temporal de calibración.
+\end{itemize}
+
+\paragraph{Prohibición operativa.}
+Queda prohibido recalibrar pesos históricos usando paneles extendidos que incluyan observaciones futuras respecto a la fecha simulada. Si se hace walk-forward, cada fecha debe recibir exclusivamente el vector de pesos que habría estado disponible entonces.
+
+\subsection*{8. Selección de modelos candidatos y gobernanza del universo de entrada}
+
+No todos los modelos producidos por el sistema deben ser automáticamente elegibles para blending. El módulo debe incorporar un filtro previo de admisibilidad:
+
+\begin{itemize}
+    \item cobertura mínima temporal,
+    \item tasa máxima de \texttt{NaN},
+    \item calidad mínima OOF,
+    \item estabilidad mínima por subperiodos,
+    \item y diversidad mínima respecto al conjunto ya admitido.
+\end{itemize}
+
+Sea \( \mathcal{M}^{\text{eligible}} \subseteq \mathcal{M} \) el conjunto de modelos elegibles. La optimización de pesos se realiza solo sobre ese subconjunto.
+
+\paragraph{Regla recomendada.}
+Un modelo con buena performance pero redundante respecto a otros modelos mejor calibrados puede ser excluido si su contribución marginal esperada al blend es inferior a un umbral mínimo predefinido.
+
+\subsection*{9. Tratamiento de diversidad y penalización de redundancia}
+
+El blend no debe maximizar únicamente calidad marginal; debe evitar concentración implícita en familias de modelos casi equivalentes. Para ello, el módulo debe poder incorporar una penalización basada en redundancia:
+
+\begin{equation}
+\Omega_{\text{div}}(\mathbf{w},\Sigma)
+=
+\mathbf{w}^{\top}\Sigma\mathbf{w}
+\end{equation}
+
+donde \( \Sigma \) representa una matriz de similitud entre modelos, construida por ejemplo con correlación de predicciones, correlación de errores o una combinación robusta de ambas.
+
+La interpretación es directa: un vector de pesos muy concentrado en modelos que se equivocan juntos no diversifica realmente el riesgo de predicción aunque aparente combinar múltiples fuentes.
+
+\subsection*{10. Política exacta de actualización de pesos}
+
+La actualización de pesos no debe dejarse ambigua. El módulo debe soportar tres modos explícitos:
+
+\begin{itemize}
+    \item \texttt{frozen}: pesos constantes durante todo el periodo.
+    \item \texttt{scheduled\_refit}: recalibración periódica cada \(K\) fechas o cada \(K\) barras.
+    \item \texttt{event\_driven\_refit}: recalibración disparada por criterio de deterioro documentado.
+\end{itemize}
+
+\paragraph{Política por defecto recomendada.}
+Usar \texttt{scheduled\_refit} con:
+\begin{itemize}
+    \item ventana retrospectiva fija,
+    \item frecuencia inferior a la del modelo base,
+    \item y penalización de turnover de pesos.
+\end{itemize}
+
+La razón es que recalibrar demasiado frecuentemente aumenta varianza estimativa y vuelve el blend procíclico; recalibrar demasiado poco lo vuelve ciego a drift real.
+
+\subsection*{11. Definición formal de “mejora o estabilidad” frente a \texttt{best\_base}}
+
+El documento original dejaba este punto abierto. Aquí se cierra.
+
+El blend será considerado \textbf{aceptable} frente a \texttt{best\_base} si cumple al menos una de las siguientes condiciones:
+
+\begin{enumerate}
+    \item \textbf{Mejora estricta}: supera al mejor modelo base en la métrica primaria por un margen \(\Delta_{\min}\).
+    \item \textbf{Estabilidad equivalente}: no mejora materialmente la métrica primaria, pero reduce una métrica de riesgo secundaria al menos en \(\Gamma_{\min}\) (por ejemplo varianza de performance, drawdown, concentración o sensibilidad).
+    \item \textbf{Robustez de subperiodos}: no domina en agregado, pero presenta superioridad estadísticamente más estable entre ventanas, regímenes o universos.
+\end{enumerate}
+
+\paragraph{No aceptable.}
+Si el blend solo supera al \texttt{best\_base} en una ventana aislada o bajo una única métrica secundaria no priorizada ex ante, no debe promoverse a producción.
+
+\subsection*{12. Tratamiento de modelos faltantes y reglas de fallback}
+
+Sea \( \mathcal{M}_t^{\text{avail}} \subseteq \mathcal{M}_t \) el subconjunto de modelos disponibles en una fila dada. La política correcta es:
+
+\begin{enumerate}
+    \item Si faltan modelos no críticos y la masa disponible supera un umbral \(\tau_{\text{mass}}\), renormalizar:
     \[
-      \mathcal{L}(\mathbf{w}; \text{panel OOF})
+    w_i^{\text{renorm}}
+    =
+    \frac{w_i}{\sum_{j\in\mathcal{M}_t^{\text{avail}}} w_j}
     \]
-    para evitar optimismo en OOS.
-  \item En inferencia histórica, \textbf{no usar información futura} al re‑calcular pesos.  
-    Si se usa estimación dinámica (por ventanas móviles), se debe:
-    \begin{itemize}
-      \item fijar la ventana de estimación,
-      \item versionar explícitamente dicha ventana.
-    \end{itemize}
-  \item El blend debe ser \textbf{calculable en producción} usando únicamente información disponible en tiempo \(t\).
-\end{itemize}
+    \item Si falta un modelo crítico o la masa remanente cae por debajo del umbral, aplicar fallback.
+    \item Si el número de modelos disponibles es inferior a \texttt{min\_models\_required}, invalidar la fila o degradar al baseline configurado.
+\end{enumerate}
 
-Estas reglas siguen estándares de backtesting robusto descritos en \cite{lo2001, lopez2016, lopez2020}, donde se enfatiza la separación estricta entre OOF y OOS y la prohibición de uso de información futura.
+\paragraph{Precedencia exacta de fallback.}
+\begin{enumerate}
+    \item \texttt{renormalize\_available}
+    \item \texttt{fallback\_to\_equal\_weight\_on\_available}
+    \item \texttt{fallback\_to\_best\_base}
+    \item \texttt{drop\_row}
+\end{enumerate}
 
-\subsection*{8. Validaciones y métricas recomendadas}
+La precedencia debe fijarse en configuración y persistirse junto a los resultados.
 
-El módulo establece:
+\subsection*{13. Cambio de composición del panel OOF}
 
-\begin{itemize}
-  \item \textbf{Validaciones mínimas}:
-  \begin{itemize}
-    \item Cobertura completa de modelos requeridos.
-    \item Pesos válidos: \( \sum w_i = 1 \), bounds dentro de rangos permitidos.
-    \item \( y_{\text{blend}} \) sin \texttt{NaN} o \texttt{inf}.
-    \item Mejora o estabilidad frente al \texttt{best\_base} dentro de umbrales predefinidos.
-  \end{itemize}
-  \item \textbf{Métricas recomendadas}:
-  \begin{itemize}
-    \item Métrica principal OOS del blend (por ejemplo Sharpe, retorno, o métrica de señal).
-    \item \texttt{improvement\_vs\_best\_base} (ganancia frente al mejor modelo base).
-    \item Estabilidad por ventana o régimen (volatilidad de pesos, robustez de la métrica).
-    \item Sensibilidad a perturbaciones de pesos (¿cómo cambia el Vermiding cuando se perturban los pesos?).
-  \end{itemize}
-\end{itemize}
-
-La sensibilidad de pesos está alineada con la literatura de \textit{ensemble robustness} y \textit{weight perturbation analysis} en sistemas de forecasting combinado \cite{deribas2016, regert2020, kapetanios2008}.
-
-\subsection*{9. Tratamiento de casos especiales}
-
-El módulo contempla:
+Cuando cambia el conjunto de modelos presentes en el panel histórico, no se debe recalcular el pasado con una composición distinta sin dejar rastro. El módulo debe distinguir entre:
 
 \begin{itemize}
-  \item \textbf{Modelo base faltante}:
-  \begin{itemize}
-    \item Renormalizar pesos de los modelos disponibles:
-    \[
-      w_i^{\text{renorm}} = \frac{w_i}{\sum_{j \in \mathcal{M}_t} w_j}
-    \]
-    \item O usar regla de \textit{fallback} definida en configuración.
-  \end{itemize}
-  \item \textbf{Drift de modelo}:
-  \begin{itemize}
-    \item Si un modelo degrada su desempeño OOF, el sistema puede \textit{downweight} automáticamente si la configuración lo permite.
-  \end{itemize}
-  \item \textbf{Alta correlación entre modelos}:
-  \begin{itemize}
-    \item Limitar pesos concentrados en modelos altamente correlacionados, usando métricas de diversidad.
-    \item Esto reduce exceso de concentración de riesgo y mejora la robustez del ensemble.
-  \end{itemize}
+    \item \textbf{Cambio estructural del universo}: entrada o salida definitiva de modelos.
+    \item \textbf{Fallo transitorio}: ausencia puntual de predicciones.
 \end{itemize}
 
-Este tratamiento es consistente con la literatura de \textit{drift‑aware ensemble models} \cite{drift2013, drift2024} y con prácticas de gestión de riesgo en fondos de hedge.
-
-\subsection*{10. Observabilidad y trazabilidad}
-
-El módulo implementa:
-
+En caso de cambio estructural, se debe:
 \begin{itemize}
-  \item \textbf{Logging}:
-  \begin{itemize}
-    \item \texttt{INFO}: pesos finales, métricas, número de modelos combinados.
-    \item \texttt{WARNING}: frecuencias de renormalización, modelos faltantes.
-    \item \texttt{ERROR}: pesos inválidos o panel inconsistente.
-  \end{itemize}
-  \item \textbf{Métricas operativas}:
-  \begin{itemize}
-    \item \( n_{\text{models\_blended}} \): número de modelos mezclados.
-    \item \texttt{pct\_rows\_renormalized}: porcentaje de filas donde se renormalizan pesos.
-    \item \texttt{weight\_concentration\_hhi}: índice de Herfindahl‑Hirschman sobre pesos:
-      \[
-        \text{HHI} = \sum_{i} w_i^2
-      \]
-      que mide concentración de peso.
-    \item \texttt{runtime\_sec}: tiempo de ejecución.
-  \end{itemize}
+    \item crear una nueva versión de blend,
+    \item recalibrar pesos solo desde el punto donde el nuevo universo es válido,
+    \item y evitar mezclar resultados no comparables bajo una misma etiqueta de artefacto.
 \end{itemize}
 
-La monitorización de concentración de pesos y su evolución en el tiempo es una práctica en fondos de trading que utilizan ensembles de modelos para controlar riesgo de dependencia excesiva en un subconjunto reducido de señales \cite{edhec2018, cambridge2020}.
+\subsection*{14. Robustez local y análisis de sensibilidad obligatorios}
 
-\subsection*{11. Interfaz de ejecución (CLI) y estructura interna}
+El módulo debe ejecutar, al menos opcionalmente y recomendado por defecto en research, una batería mínima de análisis de sensibilidad:
 
 \begin{itemize}
-  \item CLI sugerida:
-  \begin{verbatim}
-  python -m models.ensemble.blender \
-    --base-predictions-path models/predictions/base_models/oof_panel.parquet \
-    --config-path configs/models/blender.yaml \
-    --run-id blender_20260305_001
-  \end{verbatim}
-  \item Funciones recomendadas dentro del módulo:
-  \begin{itemize}
+    \item perturbación aditiva de pesos,
+    \item perturbación multiplicativa,
+    \item eliminación leave-one-model-out,
+    \item stress de concentración,
+    \item stress por degradación sintética del mejor modelo base.
+\end{itemize}
+
+Sea \( \mathbf{w}^{\star} \) el vector óptimo. Se evalúa:
+
+\[
+\Delta \mathcal{M}
+=
+\mathcal{M}(\mathbf{w}^{\star}+\varepsilon) - \mathcal{M}(\mathbf{w}^{\star})
+\]
+
+para perturbaciones pequeñas admisibles. Si una variación ínfima de pesos altera violentamente la métrica, el blend está sobreajustado aunque su score puntual sea alto.
+
+\subsection*{15. Validaciones obligatorias}
+
+Además de comprobaciones estándar, el módulo debe fallar explícitamente si no se satisfacen las siguientes condiciones:
+
+\begin{itemize}
+    \item panel OOF vacío o no alineado,
+    \item duplicados por clave \((date,symbol,model)\),
+    \item pesos fuera de dominio,
+    \item suma de pesos no unitaria tras tolerancia numérica,
+    \item presencia de \texttt{NaN}/\texttt{inf} en inputs críticos,
+    \item uso de labels no compatibles con el horizonte de las predicciones,
+    \item cardinalidad insuficiente del conjunto de modelos,
+    \item inconsistencia entre metadatos de configuración y artefactos cargados.
+\end{itemize}
+
+\paragraph{Principio de diseño.}
+En un módulo de ensemble para producción, es preferible \textbf{fallar ruidosamente} que producir una señal aparentemente válida pero metodológicamente contaminada.
+
+\subsection*{16. Observabilidad, logging y artefactos persistidos}
+
+El módulo debe persistir tanto outputs como contexto de decisión. Como mínimo:
+
+\begin{itemize}
+    \item señal blend por \((date,symbol)\),
+    \item pesos usados,
+    \item modo de blend,
+    \item universo de modelos elegibles,
+    \item universo de modelos finalmente usados,
+    \item versión de configuración,
+    \item ventana OOF empleada,
+    \item métrica objetivo,
+    \item estado de fallback,
+    \item y hash de artefactos fuente.
+\end{itemize}
+
+Las métricas operativas mínimas recomendadas son:
+
+\begin{itemize}
+    \item \texttt{n\_models\_eligible}
+    \item \texttt{n\_models\_blended}
+    \item \texttt{pct\_rows\_renormalized}
+    \item \texttt{pct\_rows\_fallback}
+    \item \texttt{weight\_concentration\_hhi}
+    \item \texttt{effective\_n\_models} = 1/\sum_i w_i^2
+    \item \texttt{weight\_turnover}
+    \item \texttt{runtime\_sec}
+\end{itemize}
+
+\paragraph{Interpretación clave.}
+No basta con saber que el blend “funciona”; hay que saber \textbf{cómo} está funcionando, sobre cuántos modelos, con qué grado de concentración y con cuánta degradación operacional.
+
+\subsection*{17. Interfaz interna recomendada}
+
+La interfaz interna debe reflejar separación clara entre configuración, validación, estimación, inferencia y persistencia. Se recomienda:
+
+\begin{itemize}
     \item \texttt{load\_blend\_config}
     \item \texttt{load\_base\_predictions}
+    \item \texttt{validate\_base\_prediction\_panel}
     \item \texttt{select\_candidate\_models}
-    \item \texttt{estimate\_or\_load\_blend\_weights}
+    \item \texttt{build\_oof\_blend\_panel}
+    \item \texttt{estimate\_blend\_weights}
     \item \texttt{apply\_blend}
-    \item \texttt{evaluate\_blend\_performance}
-    \item \texttt{run\_weight\_sensitivity}
-    \item \texttt{persist\_blend\_outputs}
+    \item \texttt{evaluate\_blend}
+    \item \texttt{run\_blend\_sensitivity\_suite}
+    \item \texttt{persist\_blend\_artifacts}
     \item \texttt{main}
-  \end{itemize}
 \end{itemize}
 
-Esta modularidad permite:
+\subsection*{18. Contrato de integración con el resto del sistema}
+
+\paragraph{Entradas.}
 \begin{itemize}
-  \item Testing unitario y reutilización de componentes.
-  \item Integración homogénea en pipelines de backtest y producción.
+    \item panel de predicciones base OOF y/o OOS,
+    \item labels históricos alineados,
+    \item configuración de blend,
+    \item opcionalmente etiquetas de régimen,
+    \item opcionalmente métricas de diversidad precalculadas.
 \end{itemize}
 
-\subsection*{12. Relación con el resto del sistema}
+\paragraph{Salidas.}
+\begin{itemize}
+    \item \texttt{blended\_scores.parquet}
+    \item \texttt{blend\_weights.parquet}
+    \item \texttt{blend\_metrics.json}
+    \item \texttt{blend\_metadata.json}
+    \item \texttt{sensitivity\_report.json}
+\end{itemize}
+
+La salida del módulo constituye el \textbf{score agregado oficial} que debe alimentar sizing, ranking, filtros de cartera y backtest, salvo que una configuración superior del sistema indique otra ruta.
+
+\subsection*{19. Filosofía cuantitativa del módulo}
+
+El valor del blender no proviene de complejidad ornamental. Proviene de resolver bien un problema clásico: \textbf{cómo combinar predictores imperfectos sin destruir la información útil y sin amplificar el sobreajuste}. En dominios financieros, donde la señal es débil, no estacionaria y costosa de explotar, una capa de combinación bien diseñada suele aportar más por robustez acumulada que por ganancias espectaculares de una sola métrica puntual.
+
+Por ello, este módulo debe juzgarse con una filosofía estricta:
+
+\begin{quote}
+Un buen blend no es el que gana una carrera puntual en backtest, sino el que conserva capacidad predictiva, control de riesgo de modelo y estabilidad operacional cuando el entorno deja de parecerse al periodo en el que fue calibrado.
+\end{quote}
+
+\subsection*{20. Resumen ejecutivo de diseño}
 
 \begin{itemize}
-  \item \textbf{Entradas}:
-  \begin{itemize}
-    \item Panel de predicciones base OOF/OOS.
-    \item Configuración de blend.
-    \item (opcional) labels y \texttt{regime\_labels} para calibrar pesos.
-  \end{itemize}
-  \item \textbf{Salidas}:
-  \begin{itemize}
-    \item \texttt
+    \item El \texttt{blender} es una capa de combinación robusta, no un promedio informal.
+    \item Los pesos se estiman o cargan bajo reglas PIT, con gobernanza de universo, fallback y versionado.
+    \item La optimización está subordinada a una jerarquía ex ante de métricas y penalizaciones.
+    \item La diversidad entre modelos debe formar parte explícita de la lógica de combinación.
+    \item La producción exige trazabilidad completa, degradación segura y validaciones duras.
+\end{itemize}
+
+En consecuencia, \texttt{models/ensemble/blender.py} debe implementarse como una pieza de infraestructura cuantitativa crítica: metodológicamente limpia, estadísticamente defendible y operacionalmente resistente.

@@ -1,194 +1,506 @@
 \section{Módulo: \texttt{features/feature\_store.py}}
 
 \paragraph{Objetivo general}
-Este módulo implementa un \textbf{feature store inmutable y versionado} para almacenar la matriz de señales PIT, garantizando que tanto el entrenamiento como la inferencia de modelos de swing trading consuman datos consistentes, reproducibles y bien tipados. El objetivo es separar la construcción de features de su consumo, manteniendo un contrato de lectura estable entre \texttt{build\_features.py} y \texttt{models/*/train\_*.py} o \texttt{backtest/run\_walkforward.py}.
+Este módulo implementa el \textbf{feature store canónico, inmutable y versionado} del sistema de señales PIT. Su función no es simplemente persistir un \texttt{DataFrame} a disco, sino establecer un \textbf{contrato de almacenamiento y consumo} estable entre la construcción de features y todos los consumidores \textit{downstream} ---entrenamiento, validación \textit{walk-forward}, backtesting e inferencia--- garantizando reproducibilidad experimental, consistencia semántica y aislamiento frente a cambios de definición.
 
-\subsection{Marco teórico y notación}
+En términos de arquitectura cuantitativa, el \texttt{feature store} es la frontera entre:
+\begin{itemize}
+    \item la \textbf{fase de fabricación} de señales, donde existen transformaciones, filtros, políticas PIT y decisiones metodológicas;
+    \item y la \textbf{fase de consumo}, donde los modelos deben leer una representación estable, tipada, auditada e inmutable del estado de features.
+\end{itemize}
 
-Sea \( \mathcal{T} \) el conjunto de fechas de almacenamiento y \( \mathcal{S} \) el conjunto de símbolos de small caps observados en esas fechas. El \textbf{feature store} se define como un conjunto de snapshots:
+La premisa central es que, en un sistema de \textit{small caps swing trading}, la reproducibilidad no depende solo de conservar el código, sino de poder reconstruir exactamente \textbf{qué señales existían}, \textbf{con qué definición}, \textbf{en qué intervalo temporal}, \textbf{bajo qué configuración}, y \textbf{en qué snapshot} fueron consumidas. Por ello, \texttt{feature\_store.py} debe entenderse como una pieza de \textbf{infraestructura crítica de research y producción}, no como una capa de persistencia genérica.
 
+\subsection{Rol dentro de la arquitectura}
+
+El módulo se sitúa aguas abajo de:
+\begin{itemize}
+    \item \texttt{features/build\_features.py},
+    \item \texttt{features/cross\_sectional.py},
+    \item \texttt{features/feature\_qc.py} (según el orden efectivo del pipeline),
+\end{itemize}
+y aguas arriba de:
+\begin{itemize}
+    \item \texttt{models/*/train\_*.py},
+    \item \texttt{validation/*},
+    \item \texttt{backtest/run\_walkforward.py},
+    \item \texttt{inference/*}.
+\end{itemize}
+
+Sus responsabilidades son:
+\begin{enumerate}
+    \item persistir snapshots de features \textbf{inmutables} por \texttt{run\_id};
+    \item exponer un \textbf{contrato de lectura estable} por rango de fechas, proyección de columnas y versión;
+    \item gestionar \textbf{metadatos de lineage, schema y configuración};
+    \item impedir corrupción silenciosa, sobreescrituras parciales o ambigüedad entre versiones;
+    \item y garantizar que cada consumidor lea exactamente el artefacto previsto.
+\end{enumerate}
+
+Su contrato es cuádruple:
+\begin{itemize}
+    \item \textbf{contrato físico}: los archivos deben existir, ser legibles y consistentes;
+    \item \textbf{contrato lógico}: la clave \texttt{(date, symbol)} y el schema deben ser válidos;
+    \item \textbf{contrato semántico}: la versión leída debe corresponder a un diccionario y configuración concretos;
+    \item \textbf{contrato temporal}: las observaciones almacenadas deben representar un snapshot PIT ya validado.
+\end{itemize}
+
+\subsection{Marco formal y notación}
+
+Sea \( \mathcal{T} \) el conjunto de fechas de trading, \( \mathcal{S}_t \) el universo PIT elegible en la fecha \( t \), y \( \mathcal{F}_\kappa \) el conjunto de features disponibles en la versión \( \kappa \), identificada por un \texttt{run\_id}. Definimos el feature store como una familia de snapshots:
 \[
-\mathcal{X}^{(\kappa)} = \big\{ X_{t}^{(\kappa)} \in \mathbb{R}^{|\mathcal{S}_t| \times F_\kappa} \big\}_{t \in \mathcal{T}_\kappa},
+\mathcal{X}^{(\kappa)}
+=
+\left\{
+X_t^{(\kappa)} \in \mathbb{R}^{|\mathcal{S}_t| \times |\mathcal{F}_\kappa|}
+\right\}_{t \in \mathcal{T}_\kappa},
 \]
 donde:
 \begin{itemize}
-    \item \( \kappa \) indexa la versión o \texttt{run\_id} del store.
-    \item \( F_\kappa \) es el conjunto de features disponibles en dicha versión.
-    \item \( \mathcal{T}_\kappa \subseteq \mathcal{T} \) es el rango de fechas cubiertas.
+    \item \( \kappa \) indexa una versión materializada del store;
+    \item \( \mathcal{T}_\kappa \subseteq \mathcal{T} \) es el rango efectivo de fechas cubiertas;
+    \item \( X_t^{(\kappa)}(s,f) \) es el valor persistido de la feature \( f \) para el símbolo \( s \) en fecha \( t \).
 \end{itemize}
 
-El objetivo de \texttt{feature\_store.py} es:
-\begin{itemize}
-    \item Escribir snapshots inmutables \( \mathcal{X}^{(\kappa)} \).
-    \item Proporcionar lecturas eficientes por rango de fechas y proyección de columnas.
-    \item Gestionar versiones coherentes y metadatos consistentes.
-\end{itemize}
-
-\subsection{Contrato de interfaz y esquema de almacenamiento}
-
-\paragraph{Entradas}
-\begin{itemize}
-    \item \texttt{features\_df(date,symbol,feature\_cols)}: \texttt{DataFrame} con:
-        \begin{itemize}
-            \item \texttt{date} \(: \mathbb{T}\),
-            \item \texttt{symbol} \(: \mathcal{S}\),
-            \item columnas de features numéricas \( \mathcal{F} \).
-        \end{itemize}
-    \item \texttt{feature\_dictionary}: definiciones de cada feature (nombre, tipo, descripción, lineage, etc.).
-    \item \texttt{store\_config\_path}: configuración de particionado, codificación, compresión, rutas.
-    \item \texttt{run\_id}: identificador único del snapshot.
-\end{itemize}
-
-\paragraph{Salidas}
-\begin{itemize}
-    \item \texttt{features/store/date=YYYY-MM-DD/part-*.parquet}:
-        \begin{itemize}
-            \item Particiones particionadas por \texttt{date} en formato Parquet.
-            \item Clave lógica primaria: \texttt{(date, symbol)}.
-        \end{itemize}
-    \item \texttt{features/store/\_meta/feature\_dictionary\_<run\_id>.json}:
-        \begin{itemize}
-            \item Definiciones actualizadas de features para la versión \( \kappa \).
-        \end{itemize}
-    \item \texttt{features/store/\_meta/store\_manifest\_<run\_id>.json}:
-        \begin{itemize}
-            \item \texttt{run\_id}, \texttt{store\_config\_hash}, \texttt{features\_hash}, \texttt{start\_date}, \texttt{end\_date}.
-        \end{itemize}
-    \item \texttt{features/store/\_meta/schema\_<run\_id>.json}:
-        \begin{itemize}
-            \item Esquema de columnas (tipo, requerido/nullable).
-        \end{itemize}
-\end{itemize}
-
-\subsection{Reglas de diseño y consistencia}
+El snapshot \( \mathcal{X}^{(\kappa)} \) es válido si y solo si cumple simultáneamente:
+\begin{enumerate}
+    \item integridad física de particiones y metadatos;
+    \item unicidad lógica de \((t,s)\);
+    \item compatibilidad exacta con el schema declarado;
+    \item trazabilidad completa hacia \texttt{feature\_dictionary}, configuración y lineage.
+\end{enumerate}
 
 \paragraph{Clave lógica primaria}
+Para cada versión \( \kappa \), debe cumplirse:
+\[
+\forall t \in \mathcal{T}_\kappa,\ \forall s \in \mathcal{S}_t:\quad
+\#\{(t,s)\} \le 1.
+\]
+Es decir, \texttt{(date, symbol)} es una clave lógica primaria. Esta condición es irrenunciable: si falla, las lecturas de training, inferencia o backtest dejan de estar bien definidas.
+
+\subsection{Principios de diseño}
+
+\paragraph{1. Inmutabilidad real, no solo nominal}
+Un \texttt{run\_id} no debe comportarse como una etiqueta mutable. Una vez publicado, debe referenciar un snapshot fijo e irreescribible. Cualquier cambio material en datos, esquema, configuración o definiciones de feature debe producir un nuevo \texttt{run\_id}.
+
+\paragraph{2. Separación estricta entre escritura y publicación}
+El snapshot no debe considerarse visible para consumidores hasta que haya superado validación y se haya escrito un manifest final de éxito. Esto evita que lectores consuman estados parcialmente construidos.
+
+\paragraph{3. Atomicidad de publicación}
+La escritura puede requerir múltiples archivos y particiones, pero la transición entre “snapshot no existente” y “snapshot válido y visible” debe ser atómica a nivel lógico.
+
+\paragraph{4. Schema gobernado}
+El esquema no puede inferirse de forma oportunista en cada lectura. Debe existir un \textbf{schema declarado}, versionado y validado contra los archivos físicos.
+
+\paragraph{5. Compatibilidad explícita entre versiones}
+No toda diferencia de schema implica incompatibilidad total, pero tampoco debe asumirse compatibilidad por defecto. Las reglas de \textit{schema evolution} deben ser explícitas.
+
+\paragraph{6. Lectura reproducible}
+Todo consumidor debe poder fijar:
 \begin{itemize}
-    \item \texttt{(date, symbol)} debe ser única en cada partición; se valida ausencia de duplicados.
-    \item La unicidad asegura que cada señal \( X_{t}^{(f)}(s) \) esté bien definida y reproducible en training e inferencia.
+    \item un \texttt{run\_id},
+    \item un rango temporal,
+    \item un subconjunto de columnas,
+    \item y opcionalmente una política estricta o tolerante de lectura.
+\end{itemize}
+La misma consulta debe producir el mismo resultado mientras el snapshot exista.
+
+\subsection{Artefactos del feature store}
+
+\paragraph{Estructura principal del snapshot}
+La estructura recomendada es:
+\begin{verbatim}
+features/store/
+  run_id=<RUN_ID>/
+    data/
+      date=YYYY-MM-DD/part-*.parquet
+    _meta/
+      feature_dictionary.json
+      schema.json
+      store_manifest.json
+      quality_summary.json
+      lineage.json
+      commit_provenance.json
+\end{verbatim}
+
+Esta organización es superior a un layout global por fecha sin \texttt{run\_id} aislado, porque:
+\begin{itemize}
+    \item evita colisiones entre versiones;
+    \item hace explícita la frontera física de un snapshot;
+    \item y simplifica inmutabilidad, rollback, auditoría y lectura reproducible.
 \end{itemize}
 
-\paragraph{Versionado y snapshots inmutables}
+\paragraph{Manifest}
+El \texttt{store\_manifest.json} debe contener, como mínimo:
 \begin{itemize}
-    \item Cada \texttt{run\_id} produce un snapshot inmutable de \texttt{features/store/date=...}.
-    \item Cambios de definición de feature se versionan en \texttt{feature\_dictionary} y \texttt{schema}.
+    \item \texttt{run\_id},
+    \item \texttt{snapshot\_status} \(\in \{\texttt{staging}, \texttt{committed}, \texttt{failed}, \texttt{quarantined}\}\),
+    \item \texttt{created\_utc},
+    \item \texttt{start\_date}, \texttt{end\_date},
+    \item \texttt{n\_dates}, \texttt{n\_rows}, \texttt{n\_features},
+    \item \texttt{store\_config\_hash},
+    \item \texttt{feature\_dictionary\_hash},
+    \item \texttt{schema\_hash},
+    \item \texttt{lineage\_hash},
+    \item \texttt{upstream\_run\_ids},
+    \item \texttt{git\_commit} o hash equivalente de provenance,
+    \item y \texttt{publish\_success=true/false}.
 \end{itemize}
 
-\paragraph{Schema enforcement}
+\paragraph{Schema}
+El \texttt{schema.json} debe declarar:
 \begin{itemize}
-    \item Al escribir, se valida:
-        \begin{itemize}
-            \item \texttt{required\_columns} presentes.
-            \item Tipos numéricos coherentes (por ejemplo, \texttt{float64} para features).
-        \end{itemize}
-    \item Al leer, se pueden aplicar coerciones mínimas o rechazo de particiones corruptas.
+    \item nombre de columna,
+    \item tipo,
+    \item nulabilidad,
+    \item rol lógico (\texttt{pk}, \texttt{feature}, \texttt{flag}, \texttt{metadata}),
+    \item compatibilidad de versión,
+    \item y opcionalmente familia económica.
 \end{itemize}
 
-\subsection{Operaciones core del feature store}
-
-\subsubsection{Escritura de snapshots}
+\paragraph{Feature dictionary}
+El \texttt{feature\_dictionary.json} debe registrar para cada feature:
 \begin{itemize}
-    \item \texttt{write\_features\_snapshot(features\_df, feature\_dictionary, config, run\_id)}:
-        \begin{enumerate}
-            \item Validar PK y schema.
-            \item Particionar por \texttt{date} y escribir Parquet.
-            \item Escribir \texttt{feature\_dictionary\_<run\_id>.json}, \texttt{store\_manifest\_<run\_id>.json}, \texttt{schema\_<run\_id>.json}.
-        \end{enumerate}
+    \item nombre canónico,
+    \item familia,
+    \item definición matemática o textual,
+    \item parámetros,
+    \item reglas PIT relevantes,
+    \item política de missing si aplica,
+    \item lineage hash,
+    \item y estado (\texttt{canonical}, \texttt{experimental}, \texttt{deprecated}).
 \end{itemize}
 
-\subsubsection{Lectura de rangos de fechas}
+\subsection{Contrato de interfaz}
+
+\subsubsection{Entradas}
+
+\paragraph{\texttt{features\_df}}
+DataFrame con:
 \begin{itemize}
-    \item \texttt{read\_features\_range(run\_id, start\_date, end\_date, columns=None)}:
-        \begin{itemize}
-            \item Filtra particiones \texttt{date} entre \texttt{start\_date} y \texttt{end\_date}.
-            \item Aplica \texttt{column projection} para evitar lectura de features innecesarias.
-        \end{itemize}
-    \item Útil para training por ventanas o walk‑forward.
+    \item \texttt{date} \(\in \mathbb{T}\),
+    \item \texttt{symbol} \(\in \mathcal{S}\),
+    \item columnas de feature numéricas y flags documentados.
 \end{itemize}
 
-\subsubsection{Lectura de snapshot más reciente}
+Debe venir ya:
 \begin{itemize}
-    \item \texttt{read\_latest\_snapshot(columns=None)}:
-        \begin{itemize}
-            \item Resuelve el \texttt{run\_id} más reciente en el catálogo de versiones.
-            \item Lee el snapshot completo o con proyección de columnas.
-        \end{itemize}
-    \item Útil para inference en producción o evaluación de último modelo.
+    \item alineado PIT,
+    \item validado a nivel estructural básico,
+    \item y libre de ambigüedad en nombres de columna.
 \end{itemize}
 
-\subsubsection{Validación de schema y metadatos}
+\paragraph{\texttt{feature\_dictionary}}
+Catálogo formal de definiciones, dependencias y semántica de cada columna de feature.
+
+\paragraph{\texttt{store\_config}}
+Configuración efectiva de:
 \begin{itemize}
-    \item \texttt{validate\_store\_schema(run\_id)}:
-        \begin{itemize}
-            \item Compara el esquema de Parquet con \texttt{schema\_<run\_id>.json}.
-        \end{itemize}
-    \item \texttt{list\_store\_versions(pattern=None)}:
-        \begin{itemize}
-            \item Lista run\_ids y metadatos de versiones disponibles.
-        \end{itemize}
+    \item rutas,
+    \item compresión,
+    \item particionado,
+    \item política de tipos,
+    \item modo de publicación,
+    \item y reglas de tolerancia ante particiones dañadas o incompatibles.
 \end{itemize}
+
+\paragraph{\texttt{run\_id}}
+Identificador único y monotónicamente auditable del snapshot.
+
+\subsubsection{Salidas}
+
+\paragraph{Snapshot persistido}
+Un conjunto de particiones Parquet por fecha, aisladas dentro del directorio del \texttt{run\_id}.
+
+\paragraph{Metadatos de versión}
+Un conjunto coherente de:
+\begin{itemize}
+    \item schema,
+    \item diccionario,
+    \item manifest,
+    \item métricas de calidad,
+    \item lineage/provenance.
+\end{itemize}
+
+\paragraph{Contrato de lectura}
+El store debe exponer lecturas por:
+\begin{itemize}
+    \item \texttt{run\_id},
+    \item rango de fechas,
+    \item subconjunto de columnas,
+    \item o snapshot más reciente dentro de un catálogo permitido.
+\end{itemize}
+
+\subsection{Schema evolution y compatibilidad}
+
+\paragraph{Motivación}
+En un pipeline de research serio, las features evolucionan: se añaden columnas, se corrigen definiciones, cambian tipos o se retiran señales obsoletas. El store debe permitir esta evolución sin romper reproducibilidad histórica.
+
+\paragraph{Clases de cambio}
+Los cambios de schema deben clasificarse como:
+
+\begin{itemize}
+    \item \textbf{backward compatible}:
+    \begin{itemize}
+        \item añadir una nueva feature opcional,
+        \item añadir un flag nuevo nullable,
+        \item ampliar metadata no requerida.
+    \end{itemize}
+
+    \item \textbf{conditionally compatible}:
+    \begin{itemize}
+        \item cambio de tipo numérico con coerción segura,
+        \item deprecación de columna aún presente pero marcada,
+        \item renombrado con alias explícito documentado.
+    \end{itemize}
+
+    \item \textbf{breaking change}:
+    \begin{itemize}
+        \item eliminación de feature requerida,
+        \item cambio semántico de una columna manteniendo nombre,
+        \item cambio de clave,
+        \item cambio de nulabilidad incompatible,
+        \item o redefinición de feature sin cambio de nombre.
+    \end{itemize}
+\end{itemize}
+
+\paragraph{Regla de compatibilidad}
+Toda lectura debe poder solicitar uno de dos modos:
+\begin{itemize}
+    \item \texttt{strict}: rechaza snapshots incompatibles;
+    \item \texttt{compatible}: admite cambios backward-compatible y coerciones declaradas.
+\end{itemize}
+
+\paragraph{Cambios semánticos}
+Si una feature cambia económicamente de significado, no basta con actualizar el diccionario: debe cambiar su \texttt{lineage\_hash} y, preferiblemente, su nombre o versión semántica. Mantener el mismo nombre para dos definiciones distintas degrada la credibilidad del store.
+
+\subsection{Escritura de snapshots}
+
+\subsubsection{Fase de staging}
+
+La escritura debe ocurrir primero en una ruta de staging:
+\begin{verbatim}
+features/store/run_id=<RUN_ID>/_staging/
+\end{verbatim}
+Durante esta fase:
+\begin{enumerate}
+    \item se valida PK y schema;
+    \item se escriben particiones por fecha;
+    \item se valida legibilidad inmediata de los archivos escritos;
+    \item se generan metadatos provisionales;
+    \item se calculan hashes de contenido y manifest.
+\end{enumerate}
+
+\subsubsection{Fase de commit lógico}
+
+Solo tras superar las validaciones de staging, el módulo debe:
+\begin{enumerate}
+    \item promover el snapshot a estado \texttt{committed};
+    \item escribir el manifest final;
+    \item y publicar el snapshot en el catálogo de versiones visibles.
+\end{enumerate}
+
+\paragraph{Principio de atomicidad}
+Si una ejecución se interrumpe antes del commit:
+\begin{itemize}
+    \item el snapshot debe quedar en \texttt{failed} o \texttt{staging},
+    \item nunca en \texttt{committed},
+    \item y ningún lector estándar debe consumirlo.
+\end{itemize}
+
+\subsubsection{Firma de contenido}
+Es recomendable persistir:
+\[
+\texttt{content\_hash} = H(\texttt{partitions} + \texttt{schema} + \texttt{dictionary} + \texttt{manifest\_inputs}),
+\]
+para asegurar que un snapshot declarado coincide con sus artefactos físicos.
+
+\subsection{Lecturas core del feature store}
+
+\subsubsection{\texttt{write\_features\_snapshot(...)}} 
+
+La rutina de escritura debe:
+\begin{enumerate}
+    \item validar integridad estructural de entrada;
+    \item aplicar normalización final de tipos;
+    \item verificar ausencia de duplicados \texttt{(date,symbol)};
+    \item particionar por fecha;
+    \item escribir en staging;
+    \item verificar lectura inmediata;
+    \item escribir diccionario, schema y manifest;
+    \item ejecutar commit lógico;
+    \item devolver handle o metadata del snapshot comprometido.
+\end{enumerate}
+
+\subsubsection{\texttt{read\_features\_range(run\_id, start\_date, end\_date, columns=None, mode="strict")}}
+
+Debe:
+\begin{itemize}
+    \item resolver el snapshot por \texttt{run\_id};
+    \item verificar que el estado es \texttt{committed};
+    \item proyectar solo columnas requeridas;
+    \item filtrar particiones por fecha;
+    \item comprobar compatibilidad de schema según \texttt{mode};
+    \item y devolver un dataframe consistente o lanzar error explícito.
+\end{itemize}
+
+\subsubsection{\texttt{read\_latest\_snapshot(columns=None, mode="strict")}}
+
+Debe resolver el snapshot más reciente \textbf{entre los committed y visibles}, no simplemente el último directorio escrito. Esto evita consumir snapshots fallidos o incompletos.
+
+\subsubsection{\texttt{list\_store\_versions(...)}} 
+
+Debe listar:
+\begin{itemize}
+    \item \texttt{run\_id},
+    \item fecha de creación,
+    \item rango temporal,
+    \item número de filas/features,
+    \item estado,
+    \item hashes,
+    \item y compatibilidad de schema declarada.
+\end{itemize}
+
+\subsubsection{\texttt{validate\_store\_schema(run\_id)}} 
+
+Debe comparar:
+\[
+\mathrm{schema}_{\mathrm{declared}}^{(\kappa)}
+\stackrel{?}{=}
+\mathrm{schema}_{\mathrm{physical}}^{(\kappa)}.
+\]
+Cualquier discrepancia material invalida el snapshot para consumo estándar.
+
+\subsection{Manejo de particiones corruptas, faltantes o parciales}
+
+\paragraph{Clasificación}
+Las incidencias físicas deben distinguirse entre:
+\begin{itemize}
+    \item \textbf{missing partition}: partición esperada no encontrada;
+    \item \textbf{corrupt partition}: archivo ilegible o schema inválido;
+    \item \textbf{partial partition}: existe, pero no satisface integridad esperada;
+    \item \textbf{foreign partition}: archivo no perteneciente al snapshot declarado.
+\end{itemize}
+
+\paragraph{Política de lectura}
+En modo \texttt{strict}, cualquiera de estas incidencias debe provocar error y rechazo del snapshot.
+
+En modo \texttt{tolerant}, solo pueden tolerarse incidencias explícitamente marcadas como recuperables y nunca si afectan a:
+\begin{itemize}
+    \item PK,
+    \item schema crítico,
+    \item o manifest comprometido.
+\end{itemize}
+
+\paragraph{Cuarentena}
+Las particiones o snapshots anómalos deben poder moverse a estado:
+\[
+\texttt{quarantined}
+\]
+para impedir consumo accidental sin destruir evidencia forense del problema.
 
 \subsection{Validaciones de calidad y consistencia}
 
 \paragraph{Validaciones de escritura}
 \begin{itemize}
-    \item \textbf{PK uniqueness}: ausencia de duplicados \texttt{(date, symbol)}.
-    \item \textbf{Schema coherence}: columnas requeridas presentes y tipos correctos.
-    \item \textbf{Numeric sanity}: features numéricas sin corrupción de tipo.
-    \item \textbf{Partition integrity}: particiones Parquet sin errores de formato.
+    \item \textbf{PK uniqueness}: ausencia total de duplicados \texttt{(date,symbol)}.
+    \item \textbf{Schema coherence}: columnas requeridas presentes y tipos válidos.
+    \item \textbf{Numeric sanity}: columnas de feature en tipos numéricos esperados.
+    \item \textbf{Partition integrity}: cada partición recién escrita es legible.
+    \item \textbf{Metadata coherence}: hashes y conteos coinciden entre datos y manifest.
 \end{itemize}
 
 \paragraph{Validaciones de lectura}
 \begin{itemize}
-    \item Comprobación de consistencia de esquema entre múltiples particiones.
-    \item Manejo robusto de particiones faltantes o dañadas.
+    \item consistencia de schema entre particiones;
+    \item coherencia entre manifest y contenido físico;
+    \item estado committed del snapshot;
+    \item ausencia de particiones corruptas o no declaradas;
+    \item compatibilidad del subconjunto de columnas solicitado.
+\end{itemize}
+
+\paragraph{Checks de coherencia temporal}
+Aunque el store no reconstruye PIT, sí debe verificar que:
+\begin{itemize}
+    \item las fechas pertenecen al rango declarado;
+    \item el particionado por fecha es consistente;
+    \item no existen fechas duplicadas fuera de PK;
+    \item y el snapshot no mezcla periodos fuera del manifiesto.
 \end{itemize}
 
 \subsection{Observabilidad y métricas operativas}
 
-\paragraph{Métricas de escritura}
+\paragraph{Métricas mínimas de escritura}
 \begin{itemize}
-    \item \texttt{n\_rows\_written}.
-    \item \texttt{n\_dates\_written}.
-    \item \texttt{n\_features}.
-    \item \texttt{write\_read\_latency\_sec} para diagnóstico de performance de I/O.
+    \item \texttt{n\_rows\_written}
+    \item \texttt{n\_dates\_written}
+    \item \texttt{n\_features}
+    \item \texttt{n\_partitions}
+    \item \texttt{bytes\_written}
+    \item \texttt{write\_latency\_sec}
+    \item \texttt{post\_write\_validation\_sec}
+\end{itemize}
+
+\paragraph{Métricas de lectura}
+\begin{itemize}
+    \item \texttt{n\_rows\_read}
+    \item \texttt{n\_dates\_read}
+    \item \texttt{n\_columns\_projected}
+    \item \texttt{read\_latency\_sec}
+    \item \texttt{schema\_coercions\_applied}
+    \item \texttt{partitions\_skipped} en modo tolerante
 \end{itemize}
 
 \paragraph{Logging}
 \begin{itemize}
-    \item \texttt{INFO}: inicio de escritura, número de particiones, progreso por fecha.
-    \item \texttt{WARNING}: fechas con baja densidad de features, warnings de schema débil.
-    \item \texttt{ERROR}: fallo de escritura de partición o corrupción de manifest.
+    \item \texttt{INFO}: inicio de staging, número de particiones, commit exitoso, lecturas resueltas.
+    \item \texttt{WARNING}: coerciones de tipos, columnas deprecadas, compatibilidad condicional, snapshots antiguos.
+    \item \texttt{ERROR}: corrupción física, manifest inconsistente, commit fallido, snapshot ilegible.
 \end{itemize}
 
 \subsection{CLI y uso en el pipeline global}
 
-\paragraph{Interfaz de CLI recomendada}
+\paragraph{CLI recomendada}
 \begin{verbatim}
 python -m features.feature_store ^
   --input-path features/tmp/build_features_20260305_001.parquet ^
   --config-path configs/features/store.yaml ^
-  --run-id feature_store_20260305_001
+  --run-id feature_store_20260305_001 ^
+  --publish-mode strict
 \end{verbatim}
 
 \paragraph{Conexión con el sistema}
 \begin{itemize}
-    \item \texttt{models/*/train\_*.py}: lee snapshots por \texttt{run\_id} para entrenamiento reproducible.
-    \item \texttt{backtest/run\_walkforward.py}: consume snapshots históricos versionados para simulación.
-    \item \texttt{inference} ofrece acceso a \texttt{read\_latest\_snapshot} para producir señales en tiempo real.
+    \item \texttt{models/*/train\_*.py} debe leer snapshots fijando \texttt{run\_id} para entrenamiento reproducible.
+    \item \texttt{backtest/run\_walkforward.py} debe consumir snapshots históricos committed, nunca “latest” implícito.
+    \item \texttt{inference/*} puede usar \texttt{read\_latest\_snapshot()} solo sobre catálogo de snapshots committed y aprobados para producción.
+    \item \texttt{validation/*} puede comparar versiones del store sin alterar su contenido.
 \end{itemize}
 
 \subsection{Definition of Done}
 
+\paragraph{El módulo se considerará terminado únicamente si:}
+\begin{enumerate}
+    \item cada \texttt{run\_id} produce un snapshot físicamente aislado e inmutable;
+    \item la publicación del snapshot es atómica a nivel lógico;
+    \item schema, diccionario, manifest y datos físicos son coherentes entre sí;
+    \item existe política explícita de compatibilidad entre versiones;
+    \item las lecturas rechazan snapshots corruptos, parciales o no committed;
+    \item los consumidores downstream pueden fijar exactamente qué versión leen;
+    \item y el store soporta auditoría retrospectiva completa de cualquier experimento.
+\end{enumerate}
+
+\subsection{Casos de prueba mínimos}
+
 \begin{itemize}
-    \item Feature store \textbf{estable, inmutable y consultable} por training e inferencia.
-    \item Metadatos completos de versionado: \texttt{run\_id}, \texttt{feature\_dictionary}, \texttt{schema}, \texttt{manifest}.
-    \item Garantía de unicidad \texttt{(date, symbol)} y consistencia de tipos numéricos.
+    \item Verificación de fallo por duplicados en \texttt{(date, symbol)}.
+    \item Confirmación de que un snapshot interrumpido no aparece como \texttt{committed}.
+    \item Validación de lectura correcta con proyección de columnas.
+    \item Rechazo en modo \texttt{strict} de partición corrupta.
+    \item Aceptación controlada en modo \texttt{compatible} solo para cambios backward-compatible.
+    \item Detección de mismatch entre \texttt{schema.json} y schema físico.
+    \item Confirmación de que \texttt{read\_latest\_snapshot()} ignora snapshots fallidos o en staging.
+    \item Verificación de que un cambio semántico de feature obliga a nuevo lineage hash y nueva versión consumible.
 \end{itemize}
 
-\subsection{Patrones de referencia y referencias}
-
-\begin{itemize}
-    \item \textit{Feature Store} patterns de \textit{Principles of Machine Learning} y \textit{Production Machine Learning} (e.g., T. Zinkevich). \cite{zink2020}
-    \item Uso de Parquet particionado por fecha, inspirado en arquitecturas de data warehouse modernas (e.g., Delta Lake, Snowflake patterns). \cite{delta2019}
-\end{itemize}
+\paragraph{Síntesis final}
+\texttt{features/feature\_store.py} no es un simple repositorio de parquet; es el registro oficial de la representación del alpha en cada estado del sistema. Si esta capa es débil, los experimentos dejan de ser auditables, las comparaciones entre modelos se contaminan y la producción puede consumir señales ambiguas o parcialmente corruptas. Si, por el contrario, esta capa está blindada con inmutabilidad real, publicación atómica, gobernanza de schema y contratos de lectura explícitos, el sistema gana una propiedad esencial en cualquier plataforma cuantitativa seria: \textbf{memoria experimental fiable}.

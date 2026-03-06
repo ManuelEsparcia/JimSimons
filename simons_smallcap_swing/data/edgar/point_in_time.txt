@@ -1,208 +1,551 @@
 \section{Módulo: \texttt{data/edgar/point\_in\_time.py}}
 
-\subsection{Objetivo general del módulo}
+\subsection{Objetivo estratégico del módulo}
 
-El módulo \texttt{point\_in\_time.py} construye un \emph{conjunto de datos fundamentales \emph{point‑in‑time} (PIT)} por \texttt{date} y \texttt{symbol}, asegurando que cada observación solo utiliza información disponible en la fecha de corte \texttt{asof}, sin \emph{look‑ahead leakage} ni uso de datos futuros.
+El módulo \texttt{point\_in\_time.py} implementa la capa formal de \emph{observabilidad temporal}, \emph{materialización as-of}, \emph{control de staleness} y \emph{quality-aware exposure} del subsistema fundamental EDGAR. Su función no es simplemente hacer un \emph{forward-fill} sobre hechos canónicos, sino construir una \textbf{vista fundamental point-in-time (PIT)} por \texttt{asof}, \texttt{symbol} y \texttt{metric} tal que cada observación represente exclusivamente información que era legítimamente observable por el mercado en el instante de corte, sin contaminación temporal, sin \emph{backfill} futuro y sin ambigüedad sobre su linaje regulatorio.
 
-Formalmente, el módulo define una función de \emph{PIT lookup}:
+El principio rector del módulo es el siguiente:
+
+\begin{quote}
+\emph{Un dato fundamental no es válido para investigación cuantitativa porque describa un periodo económico pasado, sino porque el mercado podía conocerlo en el instante \texttt{asof} y porque su persistencia temporal hasta dicho instante es metodológicamente aceptable dadas la naturaleza de la métrica, la edad del dato y la calidad del filing que la sustenta.}
+\end{quote}
+
+Formalmente, el módulo define un operador PIT:
+
 \[
-  \mathcal{P}_{\text{PIT}}: \mathcal{M} \times \mathcal{D}_{\text{asof}} \longrightarrow \mathcal{F}^{\text{PIT}},
+\mathcal{P}_{\mathrm{PIT}} :
+(\mathcal{F}^{\mathrm{can}}, \mathcal{A}, \Theta, r)
+\longrightarrow
+(\mathcal{P}, \mathcal{C}, \mathcal{M}),
 \]
+
 donde:
-\begin{itemize}
-  \item \(\mathcal{M}\) es el conjunto de métricas fundamentales \texttt{fact\_canonical},
-  \item \(\mathcal{D}_{\text{asof}}\) es el conjunto de fechas de corte \texttt{asof},
-  \item \(\mathcal{F}^{\text{PIT}}\) es el conjunto de valores \texttt{metric\_value\_pit} expuestos en \texttt{asof} para cada \texttt{symbol}.
-\end{itemize}
-
-Este módulo es \emph{la capa central} para la construcción de series PIT en sistemas de swing trading cuantitativo, conectando los facts fundamentales normalizados del módulo \texttt{parse\_xbrl.py} con el alisado de series \texttt{forward‑fill} y \texttt{staleness} controlado\cite{DePrado2018Advances, Chan2009QuantitativeTrading}.
-
-\subsection{Alcance del módulo}
-
-El alcance incluye:
 
 \begin{itemize}
-  \item \textbf{Selección PIT por \texttt{asof\_date}}: para cada \texttt{date} y \texttt{symbol}, seleccionar la última observación disponible con \texttt{acceptance\_ts} \(\le \texttt{asof}\).
-  \item \textbf{Forward‑fill controlado}: permitir \texttt{forward‑fill} pero con límites de \texttt{max\_staleness} por métrica.
-  \item \textbf{Horizonte máximo por métrica}: definir cuánto tiempo puede permanecer una observación antes de considerarla \emph{stale} y no utilizarse en modelos de trading.
-  \item \textbf{Exclusión/penalización de observaciones con flags de calidad}: si un filing está asociado a un \texttt{filings\_flag} severo, puede excluirse del PIT o penalizarse en el peso de la métrica.
-  \item \textbf{Output listo para features}: la tabla PIT se estructura de forma directamente consumible por módulos de construcción de \emph{features fundamentales} y \emph{labeling} para backtesting.
+  \item \(\mathcal{F}^{\mathrm{can}}\) es el conjunto de \emph{facts canonical} procedentes de \texttt{parse\_xbrl.py};
+  \item \(\mathcal{A}\) es el conjunto de fechas o timestamps \texttt{asof};
+  \item \(\Theta\) es la configuración PIT con políticas de selección, \texttt{max\_staleness}, penalización, exclusión y arbitraje;
+  \item \(r\) es el \texttt{run\_id};
+  \item \(\mathcal{P}\) es la tabla PIT materializada;
+  \item \(\mathcal{C}\) es el conjunto de métricas de cobertura, frescura y calidad PIT;
+  \item \(\mathcal{M}\) es el \emph{manifest} auditable de ejecución.
 \end{itemize}
 
-El módulo se alinea con la práctica industrial de \emph{point‑in‑time data construction} para cuant trading, donde se exige que el \texttt{acceptance\_timestamp} (fecha de aceptación) no sea posterior a la fecha de corte \texttt{asof}\cite{SECEDGARAPI, QuantConnectPIT}.
+Este módulo constituye la frontera entre ``tener hechos fundamentales canónicos'' y ``tener una base de datos utilizable en backtesting, ranking, selección y modelización cuantitativa''. Por ello, es la capa más delicada de todo el pipeline fundamental: errores aquí no suelen verse como errores sintácticos, sino como \textbf{falsas mejoras de señal, leakage silencioso y sobreestimación de capacidad predictiva}.
+
+\subsection{Rol dentro de la arquitectura EDGAR}
+
+\texttt{point\_in\_time.py} se sitúa aguas abajo de:
+
+\begin{itemize}
+  \item \texttt{ticker\_cik.py}, que resuelve la identidad regulatoria;
+  \item \texttt{fetch\_submissions.py}, que materializa la cronología de filings;
+  \item \texttt{fetch\_companyfacts.py}, que ingiere la base raw de facts;
+  \item \texttt{parse\_xbrl.py}, que canoniza tags, unidades y contextos;
+  \item \texttt{filings\_flags.py}, que anota riesgo regulatorio y calidad de reporting;
+\end{itemize}
+
+y aguas arriba de:
+
+\begin{itemize}
+  \item la construcción de \emph{features fundamentales};
+  \item el etiquetado y ensamblado de datasets de research;
+  \item la capa de universe filtering y factor building;
+  \item y cualquier subsistema de backtesting o producción que consuma fundamentales observables.
+\end{itemize}
+
+El módulo sí debe:
+
+\begin{itemize}
+  \item imponer la restricción temporal \(\texttt{acceptance\_ts} \le \texttt{asof}\);
+  \item resolver qué observación es la \emph{best available fact} para cada métrica y fecha;
+  \item controlar la caducidad o \emph{staleness} de cada dato;
+  \item aplicar la política configurada de exclusión, penalización o aceptación ante flags de calidad.
+\end{itemize}
+
+Pero el módulo no debe:
+
+\begin{itemize}
+  \item rehacer la semántica XBRL ya resuelta aguas abajo;
+  \item imputar artificialmente hechos inexistentes;
+  \item mezclar PIT con construcción de factores finales;
+  \item ni usar información ex post para “mejorar” cobertura.
+\end{itemize}
+
+\subsection{Alcance funcional}
+
+El alcance del módulo incluye, como mínimo:
+
+\begin{enumerate}
+  \item \textbf{Selección PIT estricta por \texttt{asof}}: para cada \((d,s,m)\), seleccionar el último hecho canónico observable con \(\texttt{acceptance\_ts} \le d\).
+  \item \textbf{Forward-fill controlado}: permitir persistencia temporal del dato solo mientras no exceda la edad máxima admitida por métrica.
+  \item \textbf{Control de staleness por métrica}: cada métrica tiene su propia política de envejecimiento, no un umbral universal.
+  \item \textbf{Integración con flags de calidad}: una observación puede ser permitida, penalizada o excluida según la severidad del filing subyacente.
+  \item \textbf{Materialización para consumo downstream}: salida tabular lista para construir features y paneles de research.
+  \item \textbf{Cobertura auditable}: emisión de métricas de cobertura, frescura, exclusión y degradación PIT.
+\end{enumerate}
+
+El alcance no incluye:
+
+\begin{itemize}
+  \item inferencia del valor “verdadero” económico cuando faltan hechos;
+  \item reparación manual de conflictos semánticos que debieron resolverse antes;
+  \item selección oportunista ex post del mejor filing;
+  \item ni agregación de métricas en factores finales.
+\end{itemize}
 
 \subsection{Entradas del módulo}
 
-Las entradas del módulo son:
+Las entradas son:
 
 \begin{itemize}
-  \item \texttt{parsed\_facts\_path}: ruta a los facts fundamentales canónicos (por ejemplo, \texttt{data/edgar/parsed/facts\_canonical\_latest.parquet}).
-  \item \texttt{filings\_flags\_path} (opcional): ruta a los flags de calidad de filings generados por \texttt{filings\_flags.py}.
-  \item \texttt{ticker\_cik\_mapping\_path}: ruta al mapping \texttt{ticker} \(\leftrightarrow\) \texttt{cik} utilizada para jerarquizar el universo de símbolos.
-  \item \texttt{pit\_config\_path}: archivo YAML con parámetros de \texttt{max\_staleness}, políticas de \texttt{forward‑fill} y reglas de penalización por flags.
-  \item \texttt{run\_id}: identificador único de la ejecución para trazabilidad y replicabilidad.
+  \item \texttt{parsed\_facts\_path}: facts canónicos procedentes de \texttt{parse\_xbrl.py}.
+  \item \texttt{filings\_flags\_path} (opcional pero altamente recomendado): flags regulatorios y de calidad.
+  \item \texttt{ticker\_cik\_mapping\_path}: mapping historificado entre \texttt{symbol} y \texttt{cik}.
+  \item \texttt{pit\_config\_path}: configuración de reglas PIT.
+  \item \texttt{run\_id}: identificador único de ejecución.
+  \item \texttt{start\_date}, \texttt{end\_date} o conjunto explícito de \texttt{asof}, según modo operativo.
 \end{itemize}
 
-En notación formal, el conjunto de entradas es:
+En notación formal:
+
 \[
-  \mathcal{I} = \{ \mathcal{F}^{\text{c}}, \mathcal{F}_{\text{flags}}, \mathcal{M}, \Theta_{\text{pit}}, r \},
+\mathcal{I}
+=
+\{
+\mathcal{F}^{\mathrm{can}},
+\mathcal{G},
+\mathcal{U},
+\Theta_{\mathrm{pit}},
+r,
+\mathcal{A}
+\},
 \]
+
 donde:
+
 \begin{itemize}
-  \item \(\mathcal{F}^{\text{c}}\) es el conjunto de facts canónicos PIT,
-  \item \(\mathcal{F}_{\text{flags}}\) es el conjunto de flags de calidad de filings,
-  \item \(\mathcal{M}\) es el mapping \texttt{ticker} \(\leftrightarrow\) \texttt{cik},
-  \item \(\Theta_{\text{pit}}\) es el conjunto de parámetros de lag máximo y penalización,
+  \item \(\mathcal{F}^{\mathrm{can}}\) es la tabla de facts canónicos;
+  \item \(\mathcal{G}\) es la tabla de flags de filings;
+  \item \(\mathcal{U}\) es el mapping \texttt{symbol} \(\leftrightarrow\) \texttt{cik};
+  \item \(\Theta_{\mathrm{pit}}\) es la parametrización de selección, staleness y tratamiento de flags;
+  \item \(r\) es el \texttt{run\_id};
+  \item \(\mathcal{A}\) es el conjunto de cortes PIT a materializar.
+\end{itemize}
+
+\subsection{Contrato mínimo de entrada}
+
+Antes de materializar ningún dato PIT, el módulo debe validar:
+
+\begin{itemize}
+  \item existencia y legibilidad de todos los inputs obligatorios;
+  \item presencia de campos mínimos en \texttt{facts canonical}:
+  \[
+  (\texttt{cik}, \texttt{metric\_name}, \texttt{value}, \texttt{period\_end}, \texttt{filed\_date}, \texttt{acceptance\_datetime}),
+  \]
+  además de la unidad y el linaje regulatorio;
+  \item posibilidad de resolver el \texttt{symbol} activo a partir del mapping PIT-safe;
+  \item coherencia temporal básica:
+  \[
+  \texttt{period\_end} \le \texttt{filed\_date} \le \texttt{acceptance\_datetime}
+  \]
+  cuando todos los campos existan;
+  \item validez sintáctica y semántica de \(\Theta_{\mathrm{pit}}\).
+\end{itemize}
+
+Si este contrato falla, la corrida no debe materializar un PIT parcial silencioso. Debe abortarse o degradarse formalmente según política explícita de severidad.
+
+\subsection{Unidad de observación PIT}
+
+La unidad de observación del módulo debe ser inequívoca. Cada registro PIT representa una exposición fundamental observable para un símbolo y una métrica en una fecha de corte:
+
+\[
+p = (d, s, c, m, v^{\mathrm{pit}}, \alpha, f_d, e, \delta, q, \eta, r),
+\]
+
+donde:
+
+\begin{itemize}
+  \item \(d\) es \texttt{asof};
+  \item \(s\) es \texttt{symbol};
+  \item \(c\) es \texttt{cik};
+  \item \(m\) es \texttt{metric\_name};
+  \item \(v^{\mathrm{pit}}\) es el valor materializado;
+  \item \(\alpha\) es \texttt{source\_acceptance\_ts};
+  \item \(f_d\) es \texttt{source\_filed\_date};
+  \item \(e\) es \texttt{period\_end};
+  \item \(\delta\) es \texttt{staleness\_days};
+  \item \(q\) es un \texttt{quality\_weight} o score PIT;
+  \item \(\eta\) es la política aplicada (\texttt{allow}, \texttt{penalize}, \texttt{exclude}, \texttt{stale});
   \item \(r\) es el \texttt{run\_id}.
 \end{itemize}
 
-\subsection{Salidas y artefactos}
+\subsection{Modelo de salida y campos mínimos}
 
-El módulo genera tres artefactos clave:
+La salida principal debe contener al menos:
 
-\begin{itemize}
-  \item \texttt{data/edgar/pit/date=\{yyyy‑mm‑dd\}/part‑*.parquet}: tabla de datos PIT particionada por \texttt{asof} y \textit{symbol}.
-  \item \texttt{data/edgar/pit/pit\_coverage\_\{run\_id\}.parquet}: resumen de cobertura de métricas por \texttt{symbol} y \texttt{asof}, incluyendo \texttt{staleness} y flags de calidad.
-  \item \texttt{data/edgar/pit/manifest\_\{run\_id\}.json}: metadatos de la ejecución (rango de fechas procesado, métricas incluidas, etc.).
-\end{itemize}
-
-Estos artefactos permiten:
-\begin{itemize}
-  \item reconstruir exactamente la misma versión de datos PIT a partir de \texttt{run\_id},
-  \item monitorizar la cobertura de métricas fundamentales por \texttt{symbol} y por periodo de tiempo,
-  \item y ajustar automáticamente umbrales de \texttt{max\_staleness} y \texttt{forward‑fill} en base a la evolución de la calidad de datos.
-\end{itemize}
-
-\subsection{Modelo de datos y campos mínimos}
-
-El módulo asegura que cada fila de PIT contenga al menos los siguientes campos:
-
-\begin{itemize}
-  \item \texttt{date} (\texttt{asof}): fecha de corte.
-  \item \texttt{symbol}: símbolo de la acción.
-  \item \texttt{cik}: CIK asociado a \texttt{symbol}.
-  \item \texttt{metric\_name}: nombre de métrica canonica interna.
-  \item \texttt{metric\_value\_pit}: valor de la métrica expuesto en \texttt{asof}.
-  \item \texttt{source\_filed\_date}: fecha de presentación del filing que contiene el hecho.
-  \item \texttt{source\_acceptance\_ts}: timestamp de aceptación en EDGAR.
-  \item \texttt{staleness\_days}: diferencia \texttt{asof} \(-\) \texttt{acceptance\_ts} en días.
-  \item \texttt{run\_id}: identificador de la ejecución.
-\end{itemize}
-
-En notación matemática, cada registro PIT se representa como:
 \[
-  p^{\text{PIT}} = (d, s, c, m, v_{\text{pit}}, f_d, \alpha, \delta, r),
+(
+\texttt{asof},
+\texttt{symbol},
+\texttt{cik},
+\texttt{metric\_name},
+\texttt{metric\_value\_pit},
+\texttt{source\_period\_end},
+\texttt{source\_filed\_date},
+\texttt{source\_acceptance\_ts},
+\texttt{staleness\_days},
+\texttt{pit\_action},
+\texttt{quality\_weight},
+\texttt{is\_stale},
+\texttt{run\_id}
+).
 \]
-donde:
-\begin{itemize}
-  \item \(d\) es la \texttt{date} (asof),
-  \item \(s\) es el \texttt{symbol},
-  \item \(c\) es el \texttt{cik},
-  \item \(m\) es el \texttt{metric\_name},
-  \item \(v_{\text{pit}}\) es el \texttt{metric\_value\_pit},
-  \item \(f_d\) es el \texttt{source\_filed\_date},
-  \item \(\alpha\) es el \texttt{source\_acceptance\_ts},
-  \item \(\delta\) es el \texttt{staleness\_days},
-  \item \(r\) es el \texttt{run\_id}.
-\end{itemize}
 
-\subsection{Reglas de construcción de datos PIT}
-
-El módulo aplica varias reglas clave para evitar leakage y controlar staleness:
+Campos de alta prioridad recomendados:
 
 \begin{itemize}
-  \item \textbf{Disponibilidad condicionada a \texttt{acceptance\_ts} \(\le \texttt{asof}\)}:
-    \[
-      \forall p^{\text{PIT}} \in \mathcal{F}^{\text{PIT}}, \ \alpha \le d,
-    \]
-    es decir, solo se permite usar un hecho si su \texttt{acceptance\_ts} es anterior o igual a la fecha de corte \texttt{asof}\cite{SECEDGARAPI}. Esto previene \emph{look‑ahead leakage} en el backtest.
-
-  \item \textbf{Sin backfill futuro}:
-    No se permite usar ninguna observación con \texttt{acceptance\_ts} > \texttt{asof} como \texttt{forward‑fill} para observaciones futuras, conservando integridad temporal de los datos.
-
-  \item \textbf{Forward‑fill limitado por métrica}:
-    Para cada métrica \(m\), se define un \texttt{max\_staleness\_days} \(h_m\). La observación se mantiene como \texttt{forward‑fill} mientras:
-    \[
-      \delta \le h_m.
-    \]
-    Si \(\delta > h_m\), la observación se considera \emph{stale} y se omite del PIT, forzando \texttt{NaN} o cero en la métrica. Esto permite diferenciar entre métricas de alta frecuencia (por ejemplo, \texttt{Revenue}) y métricas de baja frecuencia (por ejemplo, \texttt{TotalAssets}).
-
-  \item \textbf{Tratamiento de observaciones con flags de calidad severos}:
-    Para cada registro \texttt{p} asociado a un filing con flag severo (por ejemplo, \texttt{flag\_late\_filer}=1, \texttt{flag\_restatement}=1), se puede:
-    \begin{itemize}
-      \item \textbf{excluir} del PIT: \(\tilde{v}_{\text{pit}}^{(m)} = \texttt{NaN}\),
-      \item o \textbf{penalizar} la confianza de la métrica mediante un peso:
-        \[
-          w_p = 1 - \epsilon_m \sum_{i} f_i,
-        \]
-        donde \(\epsilon_m \in [0,1]\) es un peso de penalización específico por métrica y \(f_i\) es el flag de calidad. El PIT se ajustaría como:
-        \[
-          v_{\text{pit}}^{(m)} \rightarrow w_p \cdot v_{\text{pit}}^{(m)}.
-        \]
-    \end{itemize}
-    Esta práctica se alinea con literatura de \emph{data quality risk} en sistemas de trading cuantitativo\cite{DePrado2018Advances, DeepQuarryRestatements}.
+  \item \texttt{source\_accession\_number},
+  \item \texttt{source\_form\_type},
+  \item \texttt{flag\_severity},
+  \item \texttt{selection\_reason},
+  \item \texttt{ffill\_applied},
+  \item \texttt{age\_bucket},
+  \item \texttt{mapping\_version},
+  \item \texttt{pit\_config\_version}.
 \end{itemize}
+
+\subsection{Principio central de observabilidad}
+
+La regla central del módulo es estricta:
+
+\[
+\forall p \in \mathcal{P}, \qquad \texttt{source\_acceptance\_ts}(p) \le \texttt{asof}(p).
+\]
+
+Equivalentemente, si definimos el conjunto de candidatos observables para una combinación \((d,s,m)\) como
+
+\[
+\mathcal{K}(d,s,m)
+=
+\left\{
+f \in \mathcal{F}^{\mathrm{can}}
+:
+\texttt{symbol}(f)=s,\,
+\texttt{metric}(f)=m,\,
+\texttt{acceptance\_datetime}(f)\le d
+\right\},
+\]
+
+entonces la selección PIT solo puede operar sobre \(\mathcal{K}(d,s,m)\). Cualquier hecho con \(\texttt{acceptance\_datetime} > d\) queda excluido de forma absoluta. No existe tolerancia positiva para esta restricción.
+
+\subsection{Sin backfill futuro}
+
+La política PIT correcta exige dos prohibiciones simultáneas:
+
+\begin{enumerate}
+  \item No usar observaciones futuras para explicar o rellenar el pasado.
+  \item No permitir que una observación posterior “reconstruya” retroactivamente el valor que el modelo habría visto antes de su publicación.
+\end{enumerate}
+
+Esto implica que la construcción PIT debe ser estrictamente causal. Un hecho solo entra en juego a partir de su \texttt{acceptance\_datetime}, nunca desde su \texttt{period\_end} ni desde el cierre del trimestre al que hace referencia.
+
+\subsection{Regla de selección PIT}
+
+Para cada combinación \((d,s,m)\), el módulo debe seleccionar un único candidato dominante o declarar ausencia de valor PIT elegible. La regla base es:
+
+\[
+f^{\star}(d,s,m)
+=
+\arg\max_{f \in \mathcal{K}(d,s,m)}
+\texttt{acceptance\_datetime}(f),
+\]
+
+pero esa formulación, por sí sola, no es suficiente para una spec fuerte. Debe completarse con una política explícita de desempate.
+
+\subsection{Regla de arbitraje y desempate}
+
+Cuando existen múltiples candidatos con la misma \texttt{acceptance\_datetime} o con timestamps prácticamente equivalentes para una misma clave económica, el módulo debe aplicar la siguiente precedencia:
+
+\[
+\texttt{authoritative amended filing}
+\succ
+\texttt{original authoritative filing}
+\succ
+\texttt{lower-priority canonical candidate}.
+\]
+
+Más concretamente, para dos candidatos \(f_1, f_2 \in \mathcal{K}(d,s,m)\), el orden lexicográfico recomendado es:
+
+\[
+\Big(
+\texttt{acceptance\_datetime},
+\texttt{filing\_authority\_rank},
+\texttt{amendment\_priority},
+\texttt{fact\_quality\_score},
+\texttt{filed\_date},
+\texttt{accession\_number}
+\Big).
+\]
+
+Esto implica:
+
+\begin{enumerate}
+  \item seleccionar el hecho con mayor \texttt{acceptance\_datetime} observable;
+  \item en empate, priorizar el filing con mejor jerarquía documental;
+  \item en empate, priorizar el amendment sustantivo sobre la versión previa si así lo permite la política de configuración;
+  \item en empate, priorizar el candidato canónico de mayor calidad;
+  \item si persiste el empate, usar una regla determinista final documentada;
+  \item si aún no puede resolverse, marcar conflicto crítico y no materializar el dato.
+\end{enumerate}
+
+\subsection{Tratamiento de amendments y revisiones}
+
+Una de las zonas donde nacen muchos errores silenciosos es el tratamiento de filings corregidos. La política correcta es:
+
+\begin{itemize}
+  \item un amendment solo puede desplazar a un filing previo a partir de su propio \texttt{acceptance\_datetime};
+  \item no se permite reescribir ex post las fechas anteriores a la aceptación del amendment;
+  \item si la política del sistema distingue entre \texttt{technical amendment} y \texttt{substantive amendment}, esa jerarquía debe respetarse;
+  \item el \texttt{selection\_reason} debe indicar si el valor PIT procede de filing original o corregido.
+\end{itemize}
+
+Esto es fundamental para evitar pseudo-PIT “bonitos” pero incorrectos.
+
+\subsection{Forward-fill controlado}
+
+El \emph{forward-fill} no debe entenderse como un relleno arbitrario, sino como la persistencia temporal explícita de un hecho que sigue siendo la mejor información disponible. Para cada métrica \(m\), se define un horizonte máximo de envejecimiento:
+
+\[
+h_m = \texttt{max\_staleness\_days}(m).
+\]
+
+Sea \(f^{\star}(d,s,m)\) el mejor candidato observable. Su edad es:
+
+\[
+\delta(d,s,m)
+=
+d - \texttt{acceptance\_datetime}(f^{\star}(d,s,m)).
+\]
+
+El valor puede mantenerse mientras:
+
+\[
+\delta(d,s,m) \le h_m.
+\]
+
+Si no se cumple esta condición, el dato entra en estado \texttt{stale} y debe aplicarse la política definida en configuración.
+
+\subsection{Política explícita NaN vs exclusión vs cero}
+
+El texto original dejaba demasiado abierta una decisión muy sensible: qué hacer cuando un dato se vuelve \emph{stale} o debe excluirse por calidad. Una especificación robusta no puede dejar esto implícito.
+
+La política recomendada distingue tres casos:
+
+\begin{enumerate}
+  \item \textbf{Dato no observable o excluido}: el registro PIT puede persistirse con
+  \[
+  \texttt{metric\_value\_pit} = \texttt{NaN},
+  \qquad
+  \texttt{pit\_action} = \texttt{exclude},
+  \]
+  para preservar trazabilidad de cobertura sin inventar valor económico.
+  \item \textbf{Dato materializable pero penalizado}: el dato conserva valor numérico, pero con
+  \[
+  \texttt{pit\_action} = \texttt{penalize},
+  \qquad
+  \texttt{quality\_weight} \in (0,1).
+  \]
+  \item \textbf{Ausencia estructural legítima}: en casos muy concretos de métricas donde el cero tenga interpretación económica real, el uso de cero debe venir definido métrica por métrica y nunca como política global por defecto.
+\end{enumerate}
+
+La regla general debe ser: \textbf{NaN antes que cero} cuando el problema es ausencia o invalidez de información, no valor económico nulo.
+
+\subsection{Tratamiento de flags de calidad}
+
+Sea \(\mathbf{g}(f)\) el vector de flags asociado al filing que soporta el hecho \(f\). El módulo debe transformar dichos flags en una decisión PIT explícita:
+
+\[
+\texttt{pit\_action}(f)
+\in
+\{
+\texttt{allow},
+\texttt{penalize},
+\texttt{exclude}
+\}.
+\]
+
+Una política fuerte debe distinguir:
+
+\begin{itemize}
+  \item \textbf{allow}: sin flags materiales;
+  \item \textbf{penalize}: flags moderados como late filing puntual o amendment no severo;
+  \item \textbf{exclude}: restatement duro, conflicto contable grave, degradación crítica o política explícita de exclusión.
+\end{itemize}
+
+\subsection{Función de penalización}
+
+Si la observación no se excluye, el módulo puede definir un peso PIT:
+
+\[
+w(f) = \varphi(\mathbf{g}(f), m, \Theta_{\mathrm{pit}}),
+\qquad
+w(f)\in(0,1].
+\]
+
+Una forma simple pero útil es:
+
+\[
+w(f)
+=
+\max\left\{
+0,\,
+1 - \sum_{j=1}^{J}\lambda_{m,j} g_j(f)
+\right\},
+\]
+
+donde \(\lambda_{m,j}\) es la penalización del flag \(j\) para la métrica \(m\).
+
+Importante: la penalización no debe alterar silenciosamente el significado del dato. Por ello, es preferible persistir ambos campos:
+
+\[
+\texttt{metric\_value\_pit},
+\qquad
+\texttt{quality\_weight},
+\]
+
+y dejar al consumidor downstream decidir si utiliza el valor crudo, el valor ponderado o ambos.
+
+\subsection{Integridad de mapping symbol--CIK}
+
+El PIT no puede construirse con un mapping de identidad ingenuo. Para cada \((d,c)\), la resolución del \texttt{symbol} debe ser PIT-safe y respetar el mapping historificado. Esto implica:
+
+\begin{itemize}
+  \item no usar un ticker nuevo para fechas donde aún no era el identificador activo;
+  \item no colapsar automáticamente share classes o mappings conflictivos;
+  \item excluir o marcar incidencias cuando la identidad activa del símbolo no pueda resolverse sin ambigüedad.
+\end{itemize}
+
+\subsection{Cobertura, no solo existencia de filas}
+
+Una buena spec PIT no mide solo cuántas filas se generaron, sino cuánta cobertura útil existe por métrica, fecha y universo. Para cada métrica \(m\), definimos:
+
+\[
+\rho_m
+=
+\frac{
+|\{(d,s): \texttt{metric\_value\_pit}(d,s,m)\ \text{es utilizable}\}|
+}{
+|\mathcal{A}\times\mathcal{S}|
+}.
+\]
+
+Además, conviene desagregar:
+
+\begin{itemize}
+  \item cobertura bruta;
+  \item cobertura tras aplicar staleness;
+  \item cobertura tras aplicar exclusiones por flags;
+  \item cobertura por sector, tamaño y bucket de liquidez.
+\end{itemize}
+
+Esto permite saber si la pérdida de cobertura proviene de ausencia estructural, envejecimiento o mala calidad regulatoria.
 
 \subsection{Flujo de ejecución}
 
-El flujo del módulo se puede descomponer en cinco pasos:
+El flujo correcto del módulo se compone de siete etapas:
 
 \begin{enumerate}
-  \item \textbf{Cargar facts canónicos y mappings}:
-    Se leen \texttt{parsed\_facts\_path} y \texttt{ticker\_cik\_mapping\_path}, y se unen para obtener una tabla de \texttt{facts\_canonical} con \texttt{symbol} y \texttt{cik}.
-
-  \item \textbf{Expandir panel \texttt{asof} \(\times\) symbol}:
-    Se genera un panel completo de \texttt{asof} por \texttt{symbol} para el rango de fechas definido (por ejemplo, una serie diaria de \texttt{asof}).
-
-  \item \textbf{Seleccionar último dato disponible por métrica/asof}:
-    Para cada combinación \((d, s, m)\), se selecciona:
-    \[
-      p^{\text{best}} = \arg\max_{p \in \mathcal{P}(d,s,m)} \alpha,
-    \]
-    donde \(\mathcal{P}(d,s,m)\) es el conjunto de facts disponibles hasta \texttt{asof} \(d\).
-
-  \item \textbf{Aplicar caps de staleness y flags de calidad}:
-    Se aplican los límites de \texttt{max\_staleness} y políticas de penalización según \texttt{filings\_flags}, generando la tabla \texttt{metric\_value\_pit} definitiva.
-
-  \item \textbf{Persistir PIT store + coverage}:
-    \begin{itemize}
-      \item Se guarda \texttt{data/edgar/pit/date=\{yyyy‑mm‑dd\}/part‑*.parquet} con la vista PIT final.
-      \item Se genera \texttt{pit\_coverage\_\{run\_id\}.parquet} con métricas de cobertura por métrica y \texttt{symbol}.
-      \item Se guarda \texttt{manifest\_\{run\_id\}.json} con metadatos de la ejecución.
-    \end{itemize}
+  \item \textbf{Carga y validación de inputs}: facts canónicos, mapping, flags y configuración.
+  \item \textbf{Resolución PIT-safe de identidad}: enlazado de \texttt{cik} con \texttt{symbol} vigente por fecha.
+  \item \textbf{Construcción del panel \texttt{asof} \(\times\) symbol \(\times\) metric}}: expansión del universo objetivo.
+  \item \textbf{Filtrado de candidatos observables}: restricción estricta a \(\texttt{acceptance\_datetime} \le \texttt{asof}\).
+  \item \textbf{Selección determinista del mejor candidato}: aplicación de precedencias y desempates.
+  \item \textbf{Aplicación de staleness y calidad}: allow / penalize / exclude / stale.
+  \item \textbf{Persistencia}: escritura de la tabla PIT, cobertura y manifest.
 \end{enumerate}
 
-Este flujo implementa un patrón de \emph{PIT panel construction} para datos fundamentales, donde se combina sampling de series temporales con manejo de \emph{staleness} y \emph{data quality}, crucial para la robustez de estrategias de swing trading cuantitativo\cite{CampbellEtAl2001, DePrado2018Advances}.
+\subsection{Artefactos de salida}
 
-\subsection{Validaciones aplicadas}
-
-El módulo ejecuta varias validaciones para asegurar consistencia:
+El módulo debe generar, como mínimo:
 
 \begin{itemize}
-  \item \textbf{No hay observaciones con \texttt{source\_acceptance\_ts} > \texttt{asof}}:
-    \[
-      \forall p^{\text{PIT}} \in \mathcal{F}^{\text{PIT}}, \ \alpha \le d,
-    \]
-    garantizando la ausencia de \emph{look‑ahead leakage} en el conjunto de datos PIT.
+  \item \texttt{data/edgar/pit/date=\{yyyy-mm-dd\}/part-*.parquet}
+  \item \texttt{data/edgar/pit/pit\_coverage\_\{run\_id\}.parquet}
+  \item \texttt{data/edgar/pit/pit\_issues\_\{run\_id\}.parquet}
+  \item \texttt{data/edgar/pit/manifest\_\{run\_id\}.json}
+\end{itemize}
 
-  \item \textbf{Cobertura por métrica y símbolo reportada}:
-    Se calcula la cobertura \(\rho_m\) de cada métrica \(m\) como:
-    \[
-      \rho_m = \frac{|\mathcal{P}^{\text{PIT}}_{m}|}{|\mathcal{D}_{\text{asof}} \times \mathcal{S}|},
-    \]
-    donde \(\mathcal{P}^{\text{PIT}}_{m}\) es el número de observaciones PIT no nulas de la métrica \(m\), \(\mathcal{D}_{\text{asof}}\) es el rango de fechas y \(\mathcal{S}\) es el universo de símbolos. Esto permite detectar métricas con baja cobertura (por ejemplo, \texttt{CashFlow\_Op} faltante en muchos sectores).
+El \emph{manifest} debe incluir, como mínimo:
 
-  \item \textbf{staleness dentro de límites configurados}:
-    Para cada registro, se verifica que:
-    \[
-      \delta \le h_m,
-    \]
-    y se marcan como \texttt{stale} las observaciones que exceden este umbral para posterior análisis.
+\begin{itemize}
+  \item \texttt{run\_id};
+  \item rango de \texttt{asof} procesado;
+  \item número de símbolos y métricas materializados;
+  \item cobertura bruta y neta;
+  \item porcentaje de observaciones penalizadas, excluidas y stale;
+  \item hash de configuración;
+  \item timestamps de inicio y fin.
+\end{itemize}
+
+\subsection{Validaciones obligatorias}
+
+El módulo debe ejecutar, como mínimo, las siguientes validaciones:
+
+\begin{itemize}
+  \item \textbf{No leakage}:
+  \[
+  \forall p \in \mathcal{P},\quad
+  \texttt{source\_acceptance\_ts}(p)\le \texttt{asof}(p).
+  \]
+
+  \item \textbf{Unicidad PIT por clave}:
+  para cada
+  \[
+  (\texttt{asof}, \texttt{symbol}, \texttt{metric\_name}),
+  \]
+  debe existir como máximo un registro PIT materializado.
+
+  \item \textbf{Consistencia de staleness}:
+  \[
+  \texttt{staleness\_days}
+  =
+  \texttt{asof} - \texttt{source\_acceptance\_ts}.
+  \]
+
+  \item \textbf{Cobertura reportada}: toda caída de cobertura debe quedar cuantificada.
+
+  \item \textbf{Resolución de conflictos}: cualquier empate no resuelto debe ir a \texttt{pit\_issues}, nunca resolverse de forma implícita y no determinista.
+\end{itemize}
+
+\subsection{Precedencia de errores}
+
+No todos los fallos PIT tienen la misma gravedad. La jerarquía correcta debe ser:
+
+\[
+\texttt{temporal leakage}
+\succ
+\texttt{identity ambiguity}
+\succ
+\texttt{selection conflict}
+\succ
+\texttt{coverage collapse}
+\succ
+\texttt{row-level staleness}.
+\]
+
+Esto implica:
+
+\begin{itemize}
+  \item cualquier leakage temporal invalida la corrida;
+  \item conflictos de identidad o de selección pueden bloquear parte relevante del PIT;
+  \item la staleness fila a fila degrada cobertura, pero no necesariamente invalida toda la corrida;
+  \item una buena tasa agregada de filas no compensa un fallo estructural de causalidad temporal.
 \end{itemize}
 
 \subsection{CLI y uso operativo}
 
-El módulo se invoca mediante la línea de comandos:
+La interfaz operativa recomendada es:
 
 \begin{verbatim}
 python -m data.edgar.point_in_time ^
@@ -210,19 +553,43 @@ python -m data.edgar.point_in_time ^
   --flags-path data/edgar/flags/filings_flags_latest.parquet ^
   --mapping-path data/edgar/mappings/ticker_cik_current.parquet ^
   --config-path configs/data/edgar_point_in_time.yaml ^
-  --run-id edgar_pit_20260305_001
+  --run-id edgar_pit_20260305_001 ^
+  --start-date 2020-01-01 ^
+  --end-date 2026-03-05
 \end{verbatim}
 
-Esto permite:
+\subsection{Tests mínimos obligatorios}
+
+Para que el módulo quede cerrado a nivel de producción, su DoD debe exigir al menos:
+
 \begin{itemize}
-  \item integrar el módulo en pipelines de construcción de features fundamentales,
-  \item actualizar periódicamente el PIT store conforme llegan nuevos filings,
-  \item y mantener versiones reproducibles de series PIT mediante \texttt{run\_id}.
+  \item test de bloqueo absoluto cuando \texttt{acceptance\_ts > asof};
+  \item test de selección correcta del último hecho observable;
+  \item test de desempate determinista con timestamps iguales;
+  \item test de amendment que solo entra en vigor desde su aceptación;
+  \item test de política \texttt{NaN} vs \texttt{exclude} vs \texttt{penalize};
+  \item test de staleness por métrica;
+  \item test de resolución PIT-safe de symbol--CIK;
+  \item test de unicidad por \((\texttt{asof}, \texttt{symbol}, \texttt{metric})\);
+  \item test de persistencia íntegra de coverage, issues y manifest;
+  \item test de estabilidad bajo misma entrada y misma configuración.
 \end{itemize}
 
-\subsection{Definición de término (DoD)}
+\subsection{Definición de terminado (DoD)}
 
-La definición de término del módulo establece que:
+El módulo se considera terminado únicamente si:
 
 \begin{itemize}
-  \item El conjunto de
+  \item materializa una vista PIT estrictamente causal y sin leakage;
+  \item selecciona de forma determinista el mejor hecho observable por métrica y fecha;
+  \item aplica políticas explícitas y configurables de staleness y calidad;
+  \item preserva trazabilidad completa hasta filing, aceptación y razón de selección;
+  \item emite artefactos reproducibles bajo \texttt{run\_id};
+  \item y supera los tests mínimos de robustez temporal y operativa.
+\end{itemize}
+
+\subsection{Conclusión}
+
+\texttt{point\_in\_time.py} es la pieza que convierte una base fundamental canónica en una base fundamental verdaderamente utilizable para trading cuantitativo. Si esta capa es débil, todo el research posterior puede parecer sofisticado y, sin embargo, descansar sobre una ventaja espuria generada por leakage, por backfill ex post o por un tratamiento ingenuo de hechos corregidos y datos envejecidos. Por ello, el estándar de diseño del módulo debe ser equivalente al de cualquier infraestructura crítica de un stack cuantitativo serio: \textbf{causalidad temporal estricta, arbitraje determinista, staleness explícito, política cerrada de exclusión/penalización, identidad PIT-safe y trazabilidad auditable}.
+
+Bien implementado, este módulo protege la validez estadística del research y convierte el subsistema EDGAR en una fuente fundamental realmente explotable. Mal implementado, introduce la forma más peligrosa de error cuantitativo: la que mejora artificialmente el backtest sin romper nunca el código.

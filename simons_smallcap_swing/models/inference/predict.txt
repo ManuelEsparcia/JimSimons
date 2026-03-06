@@ -1,232 +1,578 @@
 \section{Módulo \texttt{models/inference/predict.py}}
 
 \subsection{Objetivo}
-El módulo \texttt{models/inference/predict.py} tiene como objetivo generar \textbf{predicciones de inferencia} (scores, probabilidades, retornos esperados) de forma:
+
+El módulo \texttt{models/inference/predict.py} implementa la capa de \textbf{inferencia batch canónica}
+del sistema. Su responsabilidad no es simplemente “llamar a \texttt{predict()}”, sino transformar un
+universo de observaciones \((\texttt{date}, \texttt{symbol})\) y un conjunto de features \textit{point-in-time correct}
+en un conjunto de scores \textbf{reproducibles, trazables, temporalmente válidos y directamente consumibles}
+por los módulos de cartera, backtesting y control de riesgo.
+
+Formalmente, el módulo resuelve la aplicación de una versión concreta de modelo
+\(\mathcal{M}_{v}\), obtenida desde \texttt{model\_registry}, sobre una matriz de entrada
+\(\mathbf{X}_{t,s}\) consistente con el contrato de entrenamiento, para producir una salida
+\(\hat{\mathbf{y}}_{t,s}\) acompañada de metadatos completos de inferencia.
+
+Su función real en una plataforma cuantitativa es triple:
+
+\begin{enumerate}
+    \item \textbf{Resolución determinista}: decidir qué modelo exacto debe ejecutarse.
+    \item \textbf{Scoring reproducible}: aplicar ese modelo sobre features válidas sin ambigüedad temporal ni estructural.
+    \item \textbf{Materialización operativa}: persistir salidas y manifiestos en un formato listo para consumo posterior.
+\end{enumerate}
+
+En un sistema de \textit{small-cap swing trading}, esta capa es crítica porque cualquier desalineación
+entre modelo, features, timestamp de decisión y postprocesado se traduce en una señal espuria que puede
+inflar el backtest y destruir alpha en producción.
+
+\subsection{Principio de diseño}
+
+El módulo sigue un principio conservador:
+
+\begin{quote}
+\textit{Toda predicción servida por el sistema debe poder reconstruirse ex post de manera exacta o
+numéricamente equivalente a tolerancia fijada, usando el mismo modelo, la misma entrada, la misma configuración
+y el mismo orden de transformaciones.}
+\end{quote}
+
+Este principio implica:
+
 \begin{itemize}
-    \item \textbf{Reproducible}: trazabilidad completa desde \texttt{model\_ref} \(\leftrightarrow\) \texttt{model\_registry} \(\leftrightarrow\) \texttt{features\_store}.
-    \item \textbf{Trazable}: metadatos de \texttt{run\_id}, \texttt{inference\_ts\_utc}, \texttt{model\_version}, \texttt{output\_schema\_version}.
-    \item \textbf{Batch}: optimizado para procesar \texttt{date} \(\times\) \texttt{symbol} en grandes volúmenes.
-    \item \textbf{Listo para consumo} por \texttt{portfolio/sizing}, \texttt{backtest/engine} y \texttt{risk/exposure\_report}, sin transformaciones manuales adicionales.
+    \item prohibición de heurísticas implícitas en la resolución del modelo;
+    \item validación estricta del contrato de features;
+    \item orden fijo y documentado del pipeline de postprocesado;
+    \item persistencia atómica de outputs y manifiestos;
+    \item política \textbf{fail-closed} ante ambigüedad, incompatibilidad o posible leakage.
 \end{itemize}
 
-La salida típica de este módulo es crucial para estrategias de \textit{swing trading} de alta rotación, donde la calidad de la señal \texttt{y\_pred} y la robustez de la \texttt{feature\_pipeline} antes del punto de decisión determinan la \textit{alpha} realizable.
+\subsection{Contexto Operativo}
 
-\subsection{Contexto de Batch Inference Industrial}
-En sistemas de \textit{quant trading}, el \textbf{batch scoring} (batch inference) es el estándar de facto para generar señales en carteras amplias de activos \cite{mlbatchscoring2024azure}. El patrón habitual combina:
+En producción cuantitativa, la inferencia batch no es un componente accesorio, sino el punto exacto donde
+la investigación se convierte en una señal ejecutable. Para que esa transición sea válida, el sistema debe
+garantizar simultáneamente:
+
 \begin{itemize}
-    \item \textbf{Model registry} como fuente de verdad de \texttt{model\_version}.
-    \item \textbf{Feature store} con \textit{point‑in‑time} \texttt{features} \cite{featurestore2025pointintime}.
-    \item \textbf{Post‑processing configurable} (calibración, ranking, clipping) para adaptar la salida del modelo a la función de \textit{portfolio sizing} y \textit{risk management}.
+    \item corrección temporal (\textit{point-in-time correctness});
+    \item consistencia estructural entre entrenamiento e inferencia;
+    \item reproducibilidad de los scores servidos;
+    \item idempotencia operativa ante reejecuciones;
+    \item estabilidad de esquema para consumidores downstream.
 \end{itemize}
 
-La gestión estricta de \textit{data leakage} y \textit{temporal correctness} en el pipeline de inferencia es crítica para evitar rendimientos engañosos en backtesting y degradación de \textit{alpha} en producción \cite{leakage2022overview}.
+Por ello, \texttt{predict.py} debe tratarse como un módulo de infraestructura de modelo, no como una utilidad
+de conveniencia.
 
 \subsection{Alcance Funcional}
 
 \subsubsection{Incluye}
+
 \begin{itemize}
-    \item \textbf{Carga de modelo versionado} desde \texttt{model\_registry} usando \texttt{model\_ref}.
-    \item \textbf{Validación de compatibilidad} entre modelo y feature set:
+    \item resolución de \texttt{model\_ref} a una \texttt{model\_version} única mediante \texttt{model\_registry};
+    \item carga del artefacto de modelo y de su manifiesto de contrato;
+    \item lectura de features de inferencia desde store \textit{point-in-time friendly};
+    \item validación de:
     \begin{itemize}
-        \item Compatibilidad de \texttt{feature\_set\_hash}, \texttt{schema} y \texttt{training\_feature\_list}.
+        \item \texttt{feature\_set\_hash},
+        \item \texttt{training\_feature\_list},
+        \item orden de columnas,
+        \item \texttt{dtype} esperado,
+        \item ventana temporal y universo elegible;
     \end{itemize}
-    \item \textbf{Predicción batch} por \texttt{date} y \texttt{symbol}:
-    \[
-    \big\{ (t, s) \in \mathcal{T} \times \mathcal{S} \big\} \mapsto \mathbf{\hat{y}}_{t,s} \in \mathbb{R}^{n}.
-    \]
-    \item \textbf{Post‑procesado de scores}:
-    \begin{itemize}
-        \item \texttt{clip} (e.g.\ percentiles \texttt{score\_clip\_percentiles}).
-        \item \texttt{ranking} (e.g.\ normalización \texttt{y\_score\_rank}).
-        \item \texttt{calibration} opcional (isotonic, Platt, o \texttt{calibrator\_ref} externo).
-    \end{itemize}
-    \item \textbf{Persistencia de outputs y metadata}:
-    \begin{itemize}
-        \item Outputs listos para \texttt{portfolio/sizing} y \texttt{backtest/engine}.
-    \end{itemize}
+    \item scoring batch por \texttt{date} y \texttt{symbol};
+    \item postprocesado explícito y configurable;
+    \item persistencia de outputs, resúmenes y manifiestos;
+    \item trazabilidad completa de la ejecución mediante \texttt{run\_id}.
 \end{itemize}
 
 \subsubsection{No incluye}
+
 \begin{itemize}
-    \item \textbf{Entrenamiento del modelo}: asume que el modelo ya está registrado en \texttt{model\_registry}.
-    \item \textbf{Selección final de pesos de cartera}: decisión de \textit{position sizing} y \textit{optimización} se delega a módulos de cartera y risk.
-    \item \textbf{Ejecución real de órdenes}: este módulo solo genera señales, no interactúa con brokers.
+    \item entrenamiento de modelos;
+    \item recalibración del modelo durante inferencia;
+    \item construcción de pesos de cartera;
+    \item optimización de ejecución;
+    \item interacción con brokers o motores de órdenes.
 \end{itemize}
 
 \subsection{Dependencias}
 
 \subsubsection{Upstream}
+
 \begin{itemize}
-    \item \texttt{models/inference/model\_registry}: resolución de \texttt{model\_ref} \(\rightarrow\) \texttt{model\_version} + \texttt{artifact\_uri}.
-    \item \texttt{features/store}: \texttt{features} versionados y \textit{point‑in‑time friendly}.
-    \item \texttt{feature\_dictionary/lineage}: definición de \texttt{training\_feature\_list} y metadata de cada feature.
-    \item \texttt{calibrator} opcional: modelo o función de calibración (e.g.\ \texttt{isotonic\_regression}, \texttt{Platt\_scaling}).
+    \item \texttt{models/inference/model\_registry}:
+    resolución determinista de \texttt{model\_ref} \(\rightarrow\) artefacto ejecutable;
+    \item \texttt{features/store}:
+    features versionadas y temporalmente válidas;
+    \item \texttt{feature\_dictionary/lineage}:
+    lista de features, grupos, tipos y trazabilidad;
+    \item \texttt{calibrator} opcional:
+    transformador ya ajustado y versionado;
+    \item \texttt{universe definition} opcional:
+    universo elegible por fecha y activo.
 \end{itemize}
 
 \subsubsection{Downstream}
+
 \begin{itemize}
-    \item \texttt{portfolio/sizing}: consume \texttt{y\_pred\_calibrated} o \texttt{y\_score\_rank} para generar \textit{weights}.
-    \item \texttt{backtest/engine}: ejecuta backtesting y walk‑forward usando \texttt{scores.parquet}.
-    \item \texttt{risk/exposure\_report}: analiza exposición y \textit{factor risk} basado en \texttt{y\_pred}.
+    \item \texttt{portfolio/sizing}:
+    consume scores crudos o transformados;
+    \item \texttt{backtest/engine}:
+    usa salidas versionadas para simulación y walk-forward;
+    \item \texttt{risk/exposure\_report}:
+    evalúa concentración y sensibilidad de señales;
+    \item \texttt{models/inference/explain}:
+    explica predicciones persistidas y su contexto exacto.
 \end{itemize}
+
+\subsection{Invariantes Operativos}
+
+El módulo debe mantener siempre los siguientes invariantes:
+
+\begin{enumerate}
+    \item \textbf{Resolución única}: \texttt{model\_ref} debe resolver a una sola versión o fallar explícitamente.
+    \item \textbf{Contrato fuerte de features}: la matriz servida al modelo debe coincidir exactamente con el
+    espacio de entrada esperado, salvo transformaciones explícitamente permitidas.
+    \item \textbf{Corrección temporal}: ninguna fila puede usar información posterior a su \texttt{decision\_cut}.
+    \item \textbf{Orden fijo de pipeline}: el postprocesado debe ejecutarse siempre en el mismo orden.
+    \item \textbf{Idempotencia}: reejecutar la misma inferencia con el mismo \texttt{run\_spec} no debe producir
+    una segunda versión silenciosamente distinta.
+    \item \textbf{Persistencia atómica}: \texttt{scores.parquet}, \texttt{summary.json} y \texttt{manifest.json}
+    deben publicarse juntos o no publicarse.
+\end{enumerate}
 
 \subsection{Contrato de Entrada}
 
 \subsubsection{Entradas mínimas}
+
 \begin{itemize}
-    \item \texttt{model\_ref}: \texttt{model\_id} o \texttt{run\_id} + \texttt{fold/policy} para resolver la versión activa.
-    \item \texttt{features\_path}: ruta a los features de inferencia (store parquet).
-    \item \texttt{inference\_config\_path}: configuración de \texttt{predict.yaml}.
-    \item \texttt{run\_id}: identificador único del experimento de inferencia.
+    \item \texttt{model\_ref}: alias, versión exacta o referencia lógica resoluble;
+    \item \texttt{features\_path}: ruta a los features de inferencia;
+    \item \texttt{inference\_config\_path}: configuración del pipeline de scoring;
+    \item \texttt{run\_id}: identificador único de la ejecución;
+    \item \texttt{decision\_calendar\_spec}: especificación temporal que define qué filas son válidas para scoring.
 \end{itemize}
 
 \subsubsection{Entradas opcionales}
+
 \begin{itemize}
-    \item \texttt{calibration\_ref}: referencia a calibrador específico (e.g.\ \texttt{calibrator\_v1}).
-    \item \texttt{date\_from} / \texttt{date\_to}: ventana de tiempo de inferencia.
-    \item \texttt{universe\_filter\_path}: filtro de universo de activos (sector, tamaño, etc.).
+    \item \texttt{calibration\_ref}: calibrador ya ajustado y versionado;
+    \item \texttt{date\_from}, \texttt{date\_to}: ventana temporal explícita;
+    \item \texttt{universe\_filter\_path}: universo elegible o subconjunto operativo;
+    \item \texttt{partition\_spec}: reglas de lectura por bloques/fechas;
+    \item \texttt{idempotency\_key}: clave formal de reejecución si se separa de \texttt{run\_id}.
 \end{itemize}
 
 \subsubsection{Campos mínimos esperados en features}
+
 \begin{itemize}
-    \item \texttt{date}, \texttt{symbol} como identificadores de tiempo y activo.
-    \item \texttt{columnas de features requeridas} por el modelo, según \texttt{training\_feature\_list}.
+    \item \texttt{date}
+    \item \texttt{symbol}
+    \item todas las columnas de \texttt{training\_feature\_list}
+    \item opcionalmente:
+    \begin{itemize}
+        \item \texttt{decision\_ts\_utc}
+        \item \texttt{feature\_asof\_ts}
+        \item claves de partición
+    \end{itemize}
 \end{itemize}
 
 \subsubsection{Parámetros clave}
+
 \begin{itemize}
-    \item \texttt{prediction\_mode}: \texttt{raw} | \texttt{calibrated} | \texttt{ranked}.
-    \item \texttt{batch\_size}: tamaño de lote para procesamiento en memoria.
-    \item \texttt{missing\_feature\_policy}: \texttt{fail} | \texttt{impute} | \texttt{drop}.
-    \item \texttt{score\_clip\_percentiles}: percentiles para clipping robusto de scores extremos.
-    \item \texttt{output\_schema\_version}: versión de esquema de salida para backward compatibility.
+    \item \texttt{prediction\_mode}: \texttt{raw} | \texttt{calibrated} | \texttt{ranked} | \texttt{full};
+    \item \texttt{batch\_size}: tamaño de lote;
+    \item \texttt{missing\_feature\_policy}: \texttt{fail} | \texttt{impute} | \texttt{drop};
+    \item \texttt{row\_missingness\_policy}: \texttt{fail} | \texttt{drop\_rows} | \texttt{impute\_rows};
+    \item \texttt{score\_clip\_percentiles}: percentiles de clipping;
+    \item \texttt{rank\_scope}: \texttt{by\_date} | \texttt{by\_date\_sector} | \texttt{global\_window};
+    \item \texttt{output\_schema\_version}: versión del esquema de salida;
+    \item \texttt{min\_coverage\_pct}: cobertura mínima aceptable;
+    \item \texttt{max\_pct\_imputed}: umbral máximo de imputación tolerada.
 \end{itemize}
+
+\subsection{Semántica Temporal y PIT}
+
+El módulo debe imponer una semántica temporal explícita. Para cada observación \((t,s)\), el vector de entrada
+\(\mathbf{x}_{t,s}\) debe construirse exclusivamente con información disponible no más tarde que el instante
+de decisión asociado:
+
+\[
+\mathbf{x}_{t,s} = \mathbf{x}\big(\mathcal{I}_{\leq \tau(t,s)}\big),
+\]
+
+donde \(\tau(t,s)\) representa el \texttt{decision\_cut} de esa observación.
+
+Esto implica:
+
+\begin{itemize}
+    \item prohibición de columnas derivadas de información futura;
+    \item prohibición de usar calibradores ajustados con datos posteriores a la ventana inferida;
+    \item prohibición de resolver una versión de modelo “futura” para inferencia histórica salvo que el caso
+    sea explícitamente un replay documental y quede marcado como tal;
+    \item verificación de que \texttt{features\_path} y \texttt{model\_version} son compatibles temporalmente.
+\end{itemize}
+
+\subsection{Contrato de Compatibilidad de Features}
+
+La compatibilidad entre modelo y features no debe reducirse a “las columnas existen”. Debe validarse:
+
+\begin{itemize}
+    \item igualdad exacta del conjunto de columnas requeridas;
+    \item igualdad exacta del orden cuando el modelo lo requiera;
+    \item compatibilidad de \texttt{dtype};
+    \item consistencia con \texttt{feature\_set\_hash};
+    \item consistencia con transformaciones esperadas del pipeline;
+    \item ausencia de columnas extra si la política es \texttt{strict};
+    \item presencia de defaults de imputación únicamente para features autorizadas.
+\end{itemize}
+
+Formalmente, si \(F_{\text{train}}\) es la lista ordenada de features del entrenamiento y
+\(F_{\text{inf}}\) la lista ordenada de inferencia, entonces bajo política estricta debe cumplirse:
+
+\[
+F_{\text{inf}} = F_{\text{train}}.
+\]
+
+Cualquier violación debe provocar fallo salvo que una política explícita permita corrección controlada.
+
+\subsection{Política Precisa de Missing Features}
+
+Uno de los puntos que debe quedar completamente cerrado es la semántica de \texttt{missing\_feature\_policy}.
+
+\paragraph{\texttt{fail}}
+La ejecución se detiene si falta cualquier columna requerida o si una columna requerida no puede convertirse
+al tipo esperado.
+
+\paragraph{\texttt{impute}}
+Solo se permite si el modelo y el manifiesto de entrenamiento incluyen una política de imputación registrada.
+No se acepta “imputación ad hoc” durante inferencia. Debe quedar fijado:
+
+\begin{itemize}
+    \item qué features admiten imputación;
+    \item qué valor o transformador se usa;
+    \item si la imputación se aplica a columnas enteras o a celdas faltantes;
+    \item umbrales máximos de imputación por fila, columna y fecha.
+\end{itemize}
+
+\paragraph{\texttt{drop}}
+No elimina columnas; elimina observaciones no servibles. Debe registrar:
+
+\begin{itemize}
+    \item número de filas descartadas;
+    \item porcentaje descartado por fecha;
+    \item razones del descarte;
+    \item impacto sobre cobertura del universo.
+\end{itemize}
+
+La política por defecto recomendada para producción es \texttt{fail}, salvo universos bien controlados donde
+la imputación haya sido parte explícita del contrato de entrenamiento.
+
+\subsection{Orden Formal del Pipeline de Inferencia}
+
+Para eliminar ambigüedad operativa, el pipeline debe ejecutarse siempre en este orden:
+
+\begin{enumerate}
+    \item resolver \texttt{model\_ref};
+    \item cargar artefacto y manifiesto;
+    \item leer features elegibles;
+    \item aplicar filtros temporales y de universo;
+    \item validar schema, orden y \texttt{dtype};
+    \item aplicar política de missingness;
+    \item generar \texttt{y\_pred\_raw};
+    \item aplicar clipping sobre \texttt{y\_pred\_raw} si está configurado;
+    \item aplicar calibración sobre la variable definida por contrato;
+    \item aplicar ranking sobre la salida final que consume downstream;
+    \item persistir outputs y manifiesto.
+\end{enumerate}
+
+Este orden es importante. En particular:
+
+\begin{itemize}
+    \item el \textbf{clipping} debe aplicarse antes del ranking si el objetivo es controlar colas extremas;
+    \item la \textbf{calibración} no debe aplicarse después del ranking, porque el ranking destruye la escala original;
+    \item el \textbf{ranking} es la última transformación funcional de score antes de persistir la variante operativa.
+\end{itemize}
+
+\subsection{Modelo de Salida}
+
+Dado un conjunto elegible de observaciones
+\[
+\mathcal{D} = \{(t_i,s_i,\mathbf{x}_{i})\}_{i=1}^{N},
+\]
+el modelo produce una salida cruda:
+\[
+\hat{y}^{\text{raw}}_i = f_{\theta_v}(\mathbf{x}_i),
+\]
+donde \(f_{\theta_v}\) representa la versión exacta \(v\) del modelo.
+
+Opcionalmente, se aplican transformaciones:
+
+\[
+\hat{y}^{\text{clip}}_i = \mathrm{Clip}\left(\hat{y}^{\text{raw}}_i\right),
+\]
+
+\[
+\hat{y}^{\text{cal}}_i = g\left(\hat{y}^{\text{clip}}_i\right),
+\]
+
+\[
+\hat{y}^{\text{rank}}_i
+= \mathrm{RankWithinScope}\left(\hat{y}^{\text{final}}_i\right),
+\]
+
+donde \(\hat{y}^{\text{final}}\) es la salida inmediatamente anterior al ranking según la configuración.
 
 \subsection{Contrato de Salida}
 
 \subsubsection{Persistencia}
+
 \begin{itemize}
-    \item \texttt{models/predictions/\{model\_id\}/\{run\_id\}/scores.parquet}:
-    \begin{itemize}
-        \item Salida principal de \texttt{y\_pred} por \texttt{date} y \texttt{symbol}.
-    \end{itemize}
-    \item \texttt{models/predictions/\{model\_id\}/\{run\_id\}/scores\_summary.json}:
-    \begin{itemize}
-        \item Estadísticas de distribución de \texttt{y\_pred} (media, std, percentiles, skewness, kurtosis).
-    \end{itemize}
-    \item \texttt{models/predictions/\{model\_id\}/\{run\_id\}/manifest.json}:
-    \begin{itemize}
-        \item Metadatos de \texttt{run\_id}, \texttt{model\_id}, \texttt{model\_version}, \texttt{inference\_ts\_utc}, \texttt{features\_path}, \texttt{calibration\_ref}, \texttt{batch\_size}.
-    \end{itemize}
+    \item \texttt{models/predictions/\{model\_id\}/\{run\_id\}/scores.parquet}
+    \item \texttt{models/predictions/\{model\_id\}/\{run\_id\}/scores\_summary.json}
+    \item \texttt{models/predictions/\{model\_id\}/\{run\_id\}/manifest.json}
 \end{itemize}
+
+La publicación debe ser atómica: los tres artefactos aparecen juntos en la ruta final solo tras completar
+todas las validaciones críticas.
 
 \subsubsection{Campos mínimos en \texttt{scores.parquet}}
-\begin{itemize}
-    \item \texttt{date}, \texttt{symbol}.
-    \item \texttt{model\_id}, \texttt{model\_version}.
-    \item \texttt{y\_pred\_raw}: predicción cruda del modelo.
-    \item \texttt{y\_pred\_calibrated} (opcional): calibración probabilística.
-    \item \texttt{y\_score\_rank} (opcional): ranking de scores dentro de la ventana de tiempo.
-    \item \texttt{inference\_ts\_utc}: timestamp de ejecución de inferencia.
-    \item \texttt{run\_id}.
-\end{itemize}
-
-\subsection{Reglas de PIT y Anti‑Leakage}
 
 \begin{itemize}
-    \item \textbf{Únicamente features disponibles a \texttt{decision\_cut}}:
-    \begin{itemize}
-        \item Cada \texttt{feature} debe computarse exclusivamente a partir de información \(\leq t\) en inferencia.
-        \item Evita \textit{look‑ahead} y \textit{target leakage} en señales de retorno \cite{leakage2022overview}.
-    \end{itemize}
-    \item \textbf{Prohibido usar columnas no presentes en \texttt{training\_feature\_list}}:
-    \begin{itemize}
-        \item Implementa \textit{feature equality} rigurosa para evitar \textit{feature leakage} \cite{leakage2024time}.
-    \end{itemize}
-    \item \textbf{Calibración fitting en datos pasados al periodo de inferencia}:
-    \begin{itemize}
-        \item Si se usa calibrador, debe ser ajustado en \texttt{t\_train} \(\ll\) \texttt{t\_inference}.
-    \end{itemize}
-    \item \textbf{No mezclar modelos de fecha futura para inferencia histórica}:
-    \begin{itemize}
-        \item Evitar \textit{temporal misalignment} entre \texttt{model\_version} y \texttt{features\_path}.
-    \end{itemize}
+    \item \texttt{date}
+    \item \texttt{symbol}
+    \item \texttt{model\_id}
+    \item \texttt{model\_version}
+    \item \texttt{run\_id}
+    \item \texttt{inference\_ts\_utc}
+    \item \texttt{output\_schema\_version}
+    \item \texttt{y\_pred\_raw}
+    \item \texttt{y\_pred\_clipped} (si aplica)
+    \item \texttt{y\_pred\_calibrated} (si aplica)
+    \item \texttt{y\_score\_rank} (si aplica)
+    \item \texttt{score\_serving\_field}: nombre lógico del campo que debe consumir downstream
 \end{itemize}
 
-Estas reglas siguen el patrón de \textit{point‑in‑time} correctness descrito en \cite{featurestore2025pointintime} y recomendaciones de \textit{data leakage} en sistemas de time series \cite{leakage2022overview}.
+\subsubsection{Contenido mínimo de \texttt{manifest.json}}
 
-\subsection{Flujo de Predicción}
+\begin{itemize}
+    \item \texttt{run\_id}
+    \item \texttt{idempotency\_key}
+    \item \texttt{model\_id}
+    \item \texttt{model\_version}
+    \item \texttt{resolved\_from\_ref}
+    \item \texttt{artifact\_hash}
+    \item \texttt{feature\_set\_hash}
+    \item \texttt{features\_path}
+    \item \texttt{features\_snapshot\_hash}
+    \item \texttt{calibration\_ref}
+    \item \texttt{postprocess\_policy}
+    \item \texttt{decision\_window}
+    \item \texttt{universe\_filter\_path}
+    \item \texttt{coverage\_stats}
+    \item \texttt{pct\_imputed}
+    \item \texttt{code\_commit}
+\end{itemize}
+
+\subsection{Idempotencia y Reejecución}
+
+Una inferencia batch seria debe ser idempotente. Si una ejecución con la misma especificación lógica
+ya existe, el módulo no debe regenerar silenciosamente una nueva salida incompatible.
+
+Definimos una clave lógica de inferencia:
+
+\[
+K_{\text{infer}} =
+(\texttt{model\_version},
+\texttt{features\_snapshot\_hash},
+\texttt{decision\_window},
+\texttt{universe\_filter\_hash},
+\texttt{postprocess\_config\_hash}).
+\]
+
+La política recomendada es:
+
+\begin{itemize}
+    \item si ya existe un \texttt{run} con la misma \(K_{\text{infer}}\), devolver ese artefacto o fallar por colisión;
+    \item no sobrescribir resultados previos salvo modo explícito de \texttt{replace};
+    \item registrar toda reejecución como evento independiente si cambia cualquier componente de \(K_{\text{infer}}\).
+\end{itemize}
+
+\subsection{Universos Parciales y Filtros Dinámicos}
+
+El módulo debe tratar explícitamente los casos donde el universo inferido no coincide con el universo teórico.
+
+Hay tres situaciones distintas:
 
 \begin{enumerate}
-    \item \textbf{Cargar \texttt{inference\_config} y resolver \texttt{model\_ref}} en \texttt{model\_registry}:
-    \begin{itemize}
-        \item \texttt{resolve\_model\_ref\_from\_registry(...)}.
-    \end{itemize}
-    \item \textbf{Cargar artefacto de modelo + metadata}:
-    \begin{itemize}
-        \item Comprobar \texttt{model\_version}, \texttt{feature\_set\_hash}, \texttt{code\_commit}.
-    \end{itemize}
-    \item \textbf{Cargar features} y filtrar \texttt{date\_from} \(\rightarrow\) \texttt{date\_to} y \texttt{universe\_filter}:
-    \begin{itemize}
-        \item Lectura \textit{lazy} desde \texttt{features/store} optimizada para filtros por \texttt{date} y \texttt{symbol}.
-    \end{itemize}
-    \item \textbf{Validar schema y feature order}:
-    \begin{itemize}
-        \item Verificar coincidencia con \texttt{training\_feature\_list} y \texttt{expected\_dtype}.
-    \end{itemize}
-    \item \textbf{Aplicar política de features faltantes}:
-    \begin{itemize}
-        \item \texttt{missing\_feature\_policy=fail} bloquea ejecución si hay columnas ausentes.
-        \item \texttt{impute} reemplaza con valores predefinidos (media/mode).
-        \item \texttt{drop} elimina instancias con features faltantes.
-    \end{itemize}
-    \item \textbf{Ejecutar prediccion por lotes}:
-    \begin{itemize}
-        \item Procesamiento \texttt{batch} con \texttt{batch\_size} configurable.
-    \end{itemize}
-    \item \textbf{Aplicar post‑procesado}:
-    \begin{itemize}
-        \item \texttt{clip} basado en \texttt{score\_clip\_percentiles}.
-        \item \texttt{ranking} (e.g.\ \texttt{y\_score\_rank = rank(y\_pred\_raw)}).
-        \item \texttt{calibration} opcional (isotonic/Platt o \texttt{calibrator\_ref}).
-    \end{itemize}
-    \item \textbf{Persistir scores + resumen + manifest}:
-    \begin{itemize}
-        \item \texttt{persist\_prediction\_outputs(...)}.
-    \end{itemize}
+    \item \textbf{Universo objetivo}: conjunto de activos deseado por política.
+    \item \textbf{Universo elegible}: subconjunto con datos suficientes y válidos.
+    \item \textbf{Universo puntuado}: subconjunto finalmente servido tras missingness y validaciones.
 \end{enumerate}
 
-Este flujo se alinea con estándares de \textit{batch inference pipelines} en MLOps \cite{mlbatchscoring2024azure}.
+Estas tres cardinalidades deben registrarse por fecha. El sistema no debe ocultar reducciones de cobertura.
+Si el porcentaje puntuado cae por debajo de \texttt{min\_coverage\_pct}, la ejecución debe advertir o fallar
+según política.
+
+\subsection{Backward Compatibility del Esquema}
+
+\texttt{output\_schema\_version} no debe ser decorativo. Debe gobernar la compatibilidad hacia atrás.
+
+\paragraph{Cambios compatibles}
+\begin{itemize}
+    \item añadir columnas opcionales;
+    \item añadir campos al manifiesto sin romper consumidores existentes.
+\end{itemize}
+
+\paragraph{Cambios incompatibles}
+\begin{itemize}
+    \item renombrar campos servidos;
+    \item cambiar semántica de \texttt{score\_serving\_field};
+    \item cambiar definición del ranking;
+    \item cambiar tipo de una columna obligatoria.
+\end{itemize}
+
+Los cambios incompatibles requieren incremento de versión mayor y adaptación explícita de consumidores downstream.
+
+\subsection{Flujo de Ejecución}
+
+\begin{enumerate}
+    \item \textbf{Resolver modelo}
+    \begin{itemize}
+        \item expandir \texttt{model\_ref};
+        \item obtener versión única desde el registry;
+        \item verificar integridad del artefacto.
+    \end{itemize}
+
+    \item \textbf{Cargar contrato}
+    \begin{itemize}
+        \item recuperar \texttt{training\_feature\_list};
+        \item recuperar hashes, tipos, política de imputación y metadatos.
+    \end{itemize}
+
+    \item \textbf{Leer features}
+    \begin{itemize}
+        \item filtrar por ventana temporal;
+        \item aplicar universo objetivo;
+        \item construir universo elegible.
+    \end{itemize}
+
+    \item \textbf{Validar entrada}
+    \begin{itemize}
+        \item comprobar schema;
+        \item comprobar orden;
+        \item comprobar \texttt{dtype};
+        \item comprobar corrección PIT.
+    \end{itemize}
+
+    \item \textbf{Aplicar política de missingness}
+    \begin{itemize}
+        \item fallar, imputar o descartar según contrato.
+    \end{itemize}
+
+    \item \textbf{Scoring batch}
+    \begin{itemize}
+        \item ejecutar \texttt{predict} o \texttt{predict\_proba};
+        \item persistir resultados intermedios solo en staging temporal.
+    \end{itemize}
+
+    \item \textbf{Postprocesado}
+    \begin{itemize}
+        \item clipping;
+        \item calibración;
+        \item ranking;
+        \item definición del \texttt{score\_serving\_field}.
+    \end{itemize}
+
+    \item \textbf{Validaciones finales}
+    \begin{itemize}
+        \item no \texttt{NaN}/\texttt{Inf};
+        \item cobertura;
+        \item cardinalidades;
+        \item consistencia de modelo y run.
+    \end{itemize}
+
+    \item \textbf{Publicación atómica}
+    \begin{itemize}
+        \item escribir en staging;
+        \item validar;
+        \item promover a ruta final.
+    \end{itemize}
+\end{enumerate}
 
 \subsection{Validaciones Mínimas}
 
 \begin{itemize}
-    \item \textbf{Features requeridas presentes o gestionadas por \texttt{missing\_feature\_policy}}.
-    \item \textbf{Tipos numéricos compatibles} con \texttt{model\_input\_dtype}.
-    \item \textbf{Sin \texttt{NaN}/\texttt{Inf} en salida final}:
+    \item existencia del \texttt{model\_ref};
+    \item resolución unívoca de versión;
+    \item coincidencia de \texttt{feature\_set\_hash};
+    \item ausencia de columnas requeridas faltantes salvo política explícita;
+    \item compatibilidad de \texttt{dtype};
+    \item ausencia de \texttt{NaN}/\texttt{Inf} en las salidas servidas;
+    \item cobertura mínima por fecha;
+    \item consistencia de \texttt{model\_id}, \texttt{model\_version} y \texttt{run\_id} en todos los artefactos;
+    \item cardinalidad coherente entre universo elegible y universo puntuado;
+    \item validación de esquema de salida.
+\end{itemize}
+
+\subsection{Manejo de Errores y Política de Fallo}
+
+La política general debe ser \textbf{fail-closed}.
+
+\begin{itemize}
+    \item \textbf{\texttt{model\_ref} inexistente} \(\rightarrow\) fallo inmediato.
+    \item \textbf{Artefacto corrupto o incompatible} \(\rightarrow\) fallo inmediato.
+    \item \textbf{Schema mismatch severo} \(\rightarrow\) fallo inmediato.
+    \item \textbf{Cobertura insuficiente} \(\rightarrow\) warning o fallo según política.
+    \item \textbf{Imputación excesiva} \(\rightarrow\) warning fuerte o fallo.
+    \item \textbf{Fallo en un lote}:
     \begin{itemize}
-        \item \texttt{isnan(\mathbf{\hat{y}}) \equiv \emptyset}.
-    \end{itemize}
-    \item \textbf{Cobertura de predicción por fecha \(\geq\) umbral}:
-    \begin{itemize}
-        \item \texttt{pct\_covered\_by\_date} debe ser \(\geq\) \texttt{min\_coverage\_pct}.
-    \end{itemize}
-    \item \textbf{Consistencia de \texttt{model\_id}/\texttt{version} en todos los registros}:
-    \begin{itemize}
-        \item Evitar \textit{model drift} espurio durante la inferencia.
+        \item no se publica resultado parcial como definitivo;
+        \item puede reintentarse a nivel de staging temporal;
+        \item la ejecución final solo se considera válida si todos los lotes comprometidos pasan validación.
     \end{itemize}
 \end{itemize}
 
-\subsection{Manejo de Errores}
+\subsection{Observabilidad}
+
+\subsubsection{Logging}
 
 \begin{itemize}
-    \item \textbf{\texttt{model\_ref} inexistente} \(\rightarrow\) \texttt{fail} inmediato.
-    \item \textbf{Schema mismatch severo} \(\rightarrow\) \texttt{fail} (o \texttt{warn} si la política lo permite):
-    \begin{itemize}
-        \item \texttt{missing\_feature\_policy=fail} \(\rightarrow\) \texttt{validate\_feature\_schema} falla.
-    \end{itemize}
-    \item \textbf{Porcentaje alto de imputación} \(\rightarrow\) \texttt{warn/fail} por umbral:
-    \begin{itemize}
-        \item \texttt{pct\_imputed\_features} \(\geq\) \texttt{max\_pct\_imputed} \rightarrow \texttt{WARNING}.
-    \end{itemize}
-    \item \textbf{Lote fallido} \(\rightarrow\) \texttt
+    \item \texttt{INFO}: resolución de modelo, lectura de features, scoring completado, publicación exitosa;
+    \item \texttt{WARNING}: imputación elevada, caída de cobertura, universo parcial;
+    \item \texttt{ERROR}: ambigüedad de versión, incompatibilidad de schema, fallo PIT, artefacto corrupto, publicación parcial.
+\end{itemize}
+
+\subsubsection{Métricas}
+
+\begin{itemize}
+    \item \texttt{n\_rows\_requested}
+    \item \texttt{n\_rows\_eligible}
+    \item \texttt{n\_rows\_scored}
+    \item \texttt{pct\_coverage}
+    \item \texttt{pct\_imputed}
+    \item \texttt{n\_rows\_dropped}
+    \item \texttt{prediction\_latency\_sec}
+    \item \texttt{postprocess\_latency\_sec}
+    \item \texttt{publish\_latency\_sec}
+\end{itemize}
+
+\subsection{Resumen}
+
+\texttt{models/inference/predict.py} debe entenderse como la especificación operativa del paso donde una
+hipótesis cuantitativa ya validada se transforma en una señal servible. Su calidad no depende solo de producir
+un número, sino de producirlo bajo reglas suficientemente estrictas como para que ese número sea defendible
+en producción, auditable ex post y reutilizable por el resto de la plataforma.
+
+Por eso, un diseño serio del módulo debe:
+
+\begin{itemize}
+    \item resolver el modelo sin ambigüedad;
+    \item imponer corrección temporal estricta;
+    \item cerrar completamente el contrato de features;
+    \item fijar el orden del postprocesado;
+    \item tratar la reejecución con idempotencia real;
+    \item publicar outputs de forma atómica y versionada.
+\end{itemize}
+
+Ese es el estándar adecuado para una plataforma cuantitativa institucional: la inferencia no es una función auxiliar,
+sino el punto de control donde se decide si el alpha investigado puede convertirse en una señal operativamente válida.

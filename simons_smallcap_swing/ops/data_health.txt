@@ -8,113 +8,455 @@
 \usepackage{listings}
 \usepackage{booktabs}
 \usepackage{float}
+\usepackage[a4paper,margin=2.5cm]{geometry}
 
-\title{Explicación Avanzada: ops/data\_health.py \\ Monitoreo Industrial de Salud de Datos para Swing Trading Cuantitativo}
-\author{Perplexity AI - Nivel Research Quant Finance}
-\date{5 de marzo de 2026}
+\title{Especificación Técnica: ops/data\_health.py\\
+Gobernanza de Salud de Datos y Control de Gates para un Sistema de Swing Trading Cuantitativo}
+\author{Documento de especificación operativa}
+\date{6 de marzo de 2026}
 
 \begin{document}
 \maketitle
 
-\section{Introducción y Contexto Estratégico}
-En sistemas de swing trading, datos degradados (e.g., late prices) erosionan edge: $\alpha_t = f(\mathbf{X}_t) - \lambda \|\mathbf{X}_t - \hat{\mathbf{X}}_t\|^2$, donde $\hat{\mathbf{X}}$ es baseline sano [web:47]. Este módulo gatea el pipeline diario, detectando freshness/schema/anomalías para backtests limpios (Sharpe >2, low bias) [web:49].
+\section{Propósito del módulo}
 
-Integra con daily\_pipeline como pre-gate, bloqueando si health\_score\_global < 0.95, clave en prod como QuantConnect o Renaissance [web:51].
+\texttt{ops/data\_health.py} es el subsistema encargado de evaluar si los datasets requeridos por la ejecución diaria cumplen condiciones mínimas de \textbf{disponibilidad, integridad, consistencia estructural y plausibilidad estadística}. Su responsabilidad no es ``mejorar'' datos ni imputarlos de forma silenciosa, sino \textbf{medir su estado, clasificar incidencias, decidir el gate operativo y dejar una traza auditable} para el resto del pipeline.
 
-\section{Matemáticas Fundamentales del Monitoreo}
-\textbf{Freshness}: $F = 1 - \frac{t_{now} - t_{last}}{ \tau_{expected} }$, $\tau$=cutoff (e.g., 1h post-close), fail si $F<0.9$.
+El módulo actúa como control de calidad previo y, en ciertos casos, también como control intermedio o posterior sobre artefactos persistidos. Su salida principal es una decisión de tipo:
 
-\textbf{Completeness}: $C = 1 - \frac{N_{missing}}{N_{expected}}$, $N_{expected} = |\mathcal{U}| \times T$, $\mathcal{U}$=universe, $T$=days.
+\[
+\texttt{gate} \in \{\texttt{pass},\ \texttt{warn},\ \texttt{fail}\},
+\]
 
-\textbf{Schema Drift}: Distancia Kolmogorov-Smirnov $D = \sup_x |F_n(x) - F_{ref}(x)|$, ref=histórico.
+acompañada por métricas detalladas por dataset, por check y por severidad.
 
-\textbf{Anomalías}: Z-score $Z = \frac{x - \mu}{\sigma}$, outlier si $|Z|>3$; o Mahalanobis $\chi^2 = (\mathbf{x}-\boldsymbol{\mu})^T \Sigma^{-1} (\mathbf{x}-\boldsymbol{\mu})$.
+\section{Objetivos operativos}
 
-\textbf{Health Score}: $H_d = \sum w_i h_i$, $\sum w_i=1$, e.g., $w_{fresh}=0.4$; global $H_g = \sum c_d H_d / \sum c_d$, $c_d$=criticidad (price=10x features).
+El módulo debe satisfacer simultáneamente estos objetivos:
 
-Gates: Bayesian P(fail|data) >0.05 $\implies$ alert [web:54].
+\begin{enumerate}
+    \item \textbf{Medición determinista}: dado el mismo dataset, misma configuración y misma fecha lógica, el resultado de salud debe ser reproducible.
+    \item \textbf{Contratos explícitos}: cada dataset debe tener definidos checks obligatorios, umbrales, criticidad y política de gate.
+    \item \textbf{No ambigüedad}: un fallo operativo debe quedar clasificado por tipo y causa, no como excepción genérica.
+    \item \textbf{Gobernanza}: todo override manual o degradación de gate debe quedar persistido con razón y responsable.
+    \item \textbf{Integración}: la salida debe ser consumible de forma inequívoca por \texttt{daily\_pipeline.py}, \texttt{monitoring.py} y módulos de auditoría.
+\end{enumerate}
 
-\section{Papers y Estado del Arte}
+\section{Posición en la arquitectura}
+
+\texttt{data\_health.py} debe ejecutarse como etapa de control antes de que etapas sensibles consuman datos. Conceptualmente, se sitúa entre el descubrimiento de datasets y el uso analítico de esos datos:
+
+\[
+\texttt{discover} \rightarrow \texttt{validate\_contracts} \rightarrow \texttt{run\_checks} \rightarrow \texttt{score} \rightarrow \texttt{gate} \rightarrow \texttt{publish}.
+\]
+
+No es función del módulo decidir lógica de trading, ni generar señales, ni entrenar modelos. Su papel es proteger el sistema frente a contaminación operativa y evitar que una ejecución aparentemente correcta se apoye en inputs defectuosos.
+
+\section{Unidad básica de control: dataset contract}
+
+Todo dataset supervisado debe estar descrito por un contrato formal. El contrato mínimo debe incluir:
+
 \begin{itemize}
-\item \href{https://arxiv.org/abs/2401.06139}{StockFormer (2024)} [web:44]: Data quality en STL para swing, reduce noise 20\%.
-\item Portfolio Optimization Swing (SSRN 2023) [web:47]: Schema checks evitan bias en allocation.
-\item LSTM Swing Trading (2022) [web:54]: Anomaly detection pre-training, +15\% accuracy.
-\item Data Quality Finance (López de Prado extensions) [web:49]: Purging outliers en ML pipelines.
+    \item \texttt{name}: identificador único del dataset.
+    \item \texttt{dataset\_type}: clase funcional (\texttt{price}, \texttt{universe}, \texttt{borrow}, \texttt{features}, \texttt{labels}, \texttt{predictions}, etc.).
+    \item \texttt{path\_or\_table}: localización lógica o física.
+    \item \texttt{criticality}: nivel de criticidad para el pipeline.
+    \item \texttt{expected\_schema}: columnas, tipos y restricciones mínimas.
+    \item \texttt{freshness\_sla}: ventana máxima de retraso admisible.
+    \item \texttt{required\_checks}: lista de checks obligatorios.
+    \item \texttt{gating\_policy}: reglas de paso, warning o bloqueo.
 \end{itemize}
 
-\section{Libros Industriales Recomendados}
-- \textit{Advances in Financial ML} (López de Prado) [web:49]: Labels clean, anomaly flagging.
-- \textit{Algorithmic Trading} (Chan): Freshness para HFT$\to$Swing scaling.
-- \textit{Evidence-Based Technical Analysis} (Aronson): Stats para completeness/outliers.
+Un dataset sin contrato válido no puede evaluarse como \texttt{pass}; debe clasificarse como \texttt{fail\_contract}.
 
-\section{Análisis Detallado del Espec (Checks y Flujo)}
-Monitorea 7 fuentes (price/universe/edgar/borrow/features/labels/preds). CLI ingesta $\to$ Parquet outputs.
+\section{Taxonomía de checks}
 
-\textbf{Flujo Pseudocódigo Optimizado}:
+El módulo debe distinguir checks de naturaleza diferente. Mezclarlos sin tipado deteriora la interpretabilidad y complica la acción correctiva. Se recomienda, como mínimo, la siguiente taxonomía.
+
+\subsection{Checks de disponibilidad}
+
+Verifican existencia y accesibilidad del dataset:
+
+\begin{itemize}
+    \item presencia del recurso;
+    \item permisos de lectura;
+    \item formato legible;
+    \item tamaño no nulo;
+    \item latencia de acceso dentro de umbral.
+\end{itemize}
+
+Estos checks responden a la pregunta: \emph{¿el dataset está realmente disponible para ser consumido?}
+
+\subsection{Checks de freshness}
+
+Miden si el dataset ha sido actualizado dentro de la ventana operativa esperada. Una formulación general es:
+
+\[
+\Delta t_d = t_{\text{eval}} - t_{\text{last\_update},d},
+\]
+
+donde \(t_{\text{eval}}\) es el instante de evaluación y \(t_{\text{last\_update},d}\) el timestamp efectivo del dataset \(d\). El check se considera conforme si:
+
+\[
+\Delta t_d \le \tau_d,
+\]
+
+siendo \(\tau_d\) el SLA de freshness definido por contrato.
+
+No todos los datasets comparten el mismo \(\tau_d\). Por ejemplo, un feed de precios de cierre y un catálogo de universo pueden admitir ventanas distintas. Por ello, freshness no debe resumirse en un único número global sin contexto contractual.
+
+\subsection{Checks de completitud}
+
+Miden si la cobertura observada coincide con la cobertura esperada. En un dataset con universo esperado \(\mathcal{U}_d\) y fechas esperadas \(\mathcal{T}_d\), una métrica básica es:
+
+\[
+C_d = \frac{N_{\text{observado},d}}{N_{\text{esperado},d}},
+\qquad
+N_{\text{esperado},d} = |\mathcal{U}_d| \cdot |\mathcal{T}_d|
+\]
+
+cuando la estructura es panel completo. En casos no cartesianos, la completitud debe definirse respecto del contrato real esperado, no de una malla ficticia.
+
+Este check debe poder desagregarse en:
+
+\begin{itemize}
+    \item completitud por fila,
+    \item completitud por columna,
+    \item cobertura por activo,
+    \item cobertura por fecha,
+    \item y tasa de \texttt{nulls} en campos críticos.
+\end{itemize}
+
+\subsection{Checks de consistencia estructural}
+
+Verifican que el dataset cumpla el esquema pactado:
+
+\begin{itemize}
+    \item columnas requeridas presentes;
+    \item ausencia de columnas prohibidas si aplica;
+    \item tipos compatibles;
+    \item unicidad de claves primarias o compuestas;
+    \item dominios válidos;
+    \item restricciones básicas de integridad.
+\end{itemize}
+
+Es importante distinguir entre \textbf{schema validation} y \textbf{distribution drift}. Una columna puede existir con el tipo correcto y aun así contener una distribución anómala. Por tanto, ambos problemas deben modelarse por separado.
+
+\subsection{Checks de consistencia temporal}
+
+Verifican propiedades de orden y continuidad temporal:
+
+\begin{itemize}
+    \item timestamps monotónicos donde corresponda;
+    \item ausencia de duplicados temporales inconsistentes;
+    \item alineación con calendario de mercado;
+    \item no existencia de fechas futuras indebidas;
+    \item no existencia de huecos no explicados por festivos o suspensiones.
+\end{itemize}
+
+\subsection{Checks de plausibilidad estadística}
+
+Evalúan si los datos contienen valores incompatibles con un comportamiento razonable del dataset. No deben confundirse con inferencia económica; son controles de plausibilidad operacional.
+
+Ejemplos:
+
+\begin{itemize}
+    \item precios \(\le 0\),
+    \item volúmenes negativos,
+    \item retornos de magnitud imposible o extremadamente improbable,
+    \item features fuera de dominio físico o lógico,
+    \item densidad anómala de outliers.
+\end{itemize}
+
+Una métrica genérica de outlier univariante puede definirse mediante:
+
+\[
+Z_{i,j} = \frac{x_{i,j} - \mu_j}{\sigma_j},
+\]
+
+aunque en producción no debe asumirse normalidad salvo justificación. Para checks robustos conviene admitir métricas basadas en mediana y MAD, cuantiles o reglas específicas por campo.
+
+\subsection{Checks de drift distribucional}
+
+Su función es medir desviaciones respecto a una referencia histórica o contractual. Pueden emplearse estadísticas como PSI, KS, Jensen--Shannon o Wasserstein, siempre que el contrato fije:
+
+\begin{itemize}
+    \item ventana de referencia,
+    \item tamaño mínimo de muestra,
+    \item preprocesado permitido,
+    \item y umbral de acción.
+\end{itemize}
+
+Este tipo de drift no implica necesariamente corrupción del dataset; puede reflejar cambio de régimen o composición del universo. Por ello, su efecto sobre el gate debe estar gobernado por política y criticidad, no por una regla universal.
+
+\section{Modelo de scoring}
+
+\subsection{Principio general}
+
+El módulo puede producir scores, pero el score no debe sustituir la lógica contractual. Un score agregado es útil para priorización y visualización; no debe ser el único criterio de gate.
+
+Para cada dataset \(d\), definimos un vector de checks:
+
+\[
+\mathbf{h}_d = \left(h_{d,1}, h_{d,2}, \dots, h_{d,m_d}\right),
+\qquad h_{d,k}\in[0,1]
+\]
+
+donde \(h_{d,k}=1\) representa conformidad total en el check \(k\), y \(0\) representa fallo máximo.
+
+Un score interno de dataset puede expresarse como:
+
+\[
+H_d = \sum_{k=1}^{m_d} w_{d,k} h_{d,k},
+\qquad \sum_{k=1}^{m_d} w_{d,k}=1.
+\]
+
+Sin embargo, si un check es \textbf{hard-fail} por contrato, entonces el gate del dataset debe fallar independientemente del valor de \(H_d\).
+
+\subsection{Separación entre score y gate}
+
+Debe diferenciarse entre:
+
+\begin{itemize}
+    \item \textbf{score}: medida agregada continua para priorización y observabilidad;
+    \item \textbf{gate}: decisión discreta operativa.
+\end{itemize}
+
+Por ejemplo, el gate de un dataset puede definirse mediante reglas como:
+
+\[
+\texttt{gate}_d =
+\begin{cases}
+\texttt{fail} & \text{si existe hard-fail contractual},\\
+\texttt{warn} & \text{si no hay hard-fail pero } H_d < \theta^{\texttt{warn}}_d,\\
+\texttt{pass} & \text{en otro caso.}
+\end{cases}
+\]
+
+Esta separación evita errores clásicos de gobernanza donde un promedio alto oculta un fallo crítico en una dimensión concreta.
+
+\subsection{Agregación global}
+
+Si el pipeline necesita una visión global, ésta debe derivarse de los gates por dataset y de la criticidad contractual:
+
+\[
+H_{\text{global}} =
+\frac{\sum_{d=1}^{D} c_d H_d}{\sum_{d=1}^{D} c_d},
+\]
+
+donde \(c_d > 0\) representa criticidad relativa.
+
+Pero la decisión global del sistema no debe descansar sólo en \(H_{\text{global}}\). Una política más robusta es:
+
+\[
+\texttt{global\_gate} =
+\begin{cases}
+\texttt{fail} & \text{si existe } d \text{ crítico con } \texttt{gate}_d=\texttt{fail},\\
+\texttt{warn} & \text{si no hay fail crítico, pero sí warnings relevantes},\\
+\texttt{pass} & \text{si todos los datasets críticos están conformes.}
+\end{cases}
+\]
+
+\section{Estados operativos}
+
+Cada evaluación de un dataset debe terminar exactamente en uno de los siguientes estados:
+
+\begin{itemize}
+    \item \texttt{pass}
+    \item \texttt{warn}
+    \item \texttt{fail}
+    \item \texttt{error}
+    \item \texttt{skipped}
+\end{itemize}
+
+Semántica:
+
+\begin{itemize}
+    \item \texttt{pass}: el contrato se cumple.
+    \item \texttt{warn}: hay desviación no bloqueante, pero el dataset sigue siendo consumible bajo política.
+    \item \texttt{fail}: el dataset no es apto para consumo en el contexto actual.
+    \item \texttt{error}: la evaluación no pudo completarse correctamente.
+    \item \texttt{skipped}: el dataset no aplicaba en esa ejecución por política explícita.
+\end{itemize}
+
+A nivel global, el run de salud de datos debe acabar en:
+
+\begin{itemize}
+    \item \texttt{success}
+    \item \texttt{partial}
+    \item \texttt{failed}
+\end{itemize}
+
+\section{Overrides y gobernanza}
+
+Un sistema profesional necesita \textbf{overrides auditados}, no atajos silenciosos. Un override sólo puede aplicarse si se registran:
+
+\begin{itemize}
+    \item dataset afectado,
+    \item check afectado,
+    \item motivo del override,
+    \item responsable,
+    \item timestamp,
+    \item duración de validez,
+    \item evidencia asociada si aplica.
+\end{itemize}
+
+Un override no debe borrar el fallo original; debe convivir con él como decisión excepcional trazable. Además, los overrides deben expirar automáticamente salvo renovación explícita.
+
+\section{Integración con el pipeline}
+
+\texttt{daily\_pipeline.py} debe consumir la salida de \texttt{data\_health.py} mediante un contrato explícito, no leyendo logs libres. La salida mínima recomendada es:
+
 \begin{lstlisting}[language=Python]
-def main(config_path, run_id, exec_date):
-    cfg = load_config(config_path)
-    datasets = discover_datasets(cfg.catalog)
-    healths = []
-    for ds in datasets:
-        checks = {
-            'freshness': check_freshness(ds, exec_date),
-            'completeness': check_completeness(ds),
-            'schema': check_schema_drift(ds, ref_schema),
-            'anomaly': check_anomalies(ds, method='mahalanobis')
-        }
-        H_ds = compute_score(checks, cfg.weights)
-        status = 'pass' if H_ds > cfg.threshold else 'fail'
-        healths.append({'dataset': ds.name, 'score': H_ds, 'status': status})
-    
-    H_global = weighted_avg([h['score'] for h in healths], weights=cfg.criticidad)
-    alerts = build_alerts(healths, H_global < 0.9)
-    persist_parquet(healths + alerts, run_id)
-    return {'global_score': H_global, 'gate': H_global > 0.95}
+@dataclass
+class DatasetHealthResult:
+    dataset_name: str
+    dataset_type: str
+    criticality: int
+    status: str              # pass / warn / fail / error / skipped
+    score: float | None
+    hard_fail: bool
+    checks: dict
+    observed_at: str
+    details: dict
+
+@dataclass
+class DataHealthRunResult:
+    run_id: str
+    execution_date: str
+    global_gate: str         # pass / warn / fail
+    global_score: float | None
+    datasets: list[DatasetHealthResult]
+    overrides_applied: list[dict]
+    started_at: str
+    ended_at: str
 \end{lstlisting}
 
-\textbf{Casos Especiales}: Holidays ajustan $N_{expected}$ vía calendario (e.g., NYSE).
+El pipeline debe utilizar \texttt{global\_gate} y, cuando sea necesario, inspeccionar \texttt{datasets} para decidir si puede continuar, degradarse o abortar.
 
-\section{Backtest Ultra-Optimizado con Data Health}
-Extiende gates a backtest: filtra datos fail en simulación.
+\section{Persistencia}
+
+La persistencia debe conservar tanto el resumen como el detalle de checks. Se recomienda guardar al menos:
+
+\begin{enumerate}
+    \item \textbf{nivel run}: metadata del proceso de evaluación;
+    \item \textbf{nivel dataset}: score, estado, criticidad y resumen;
+    \item \textbf{nivel check}: valor observado, umbral, resultado, severidad y evidencia.
+\end{enumerate}
+
+Una estructura mínima de check podría ser:
+
 \begin{lstlisting}[language=Python]
-import backtesting as bt
-def health_filtered_bt(data_raw, health_df):
-    data_clean = data_raw[health_df['status']=='pass']
-    bt = Backtest(data_clean, SwingStrategy)
-    stats = bt.run()
-    # Gate: si cleanliness <0.98, discard run
-    return stats if stats['Return [%]'] > 20 else None  # Annual target
+@dataclass
+class CheckResult:
+    check_name: str
+    check_type: str
+    status: str              # pass / warn / fail / error
+    observed_value: object
+    threshold: object | None
+    severity: str
+    hard_fail: bool
+    message: str
 \end{lstlisting}
-Métricas clave [web:51]:
 
-\begin{table}[H]
-\centering
-\begin{tabular}{lcc}
-\toprule
-Check & Fórmula & Umbral Swing \\
-\midrule
-Freshness & $1 - \Delta t / \tau$ & >0.95 \\
-Completeness & $1 - missing/exp$ & >0.98 \\
-Anomaly Score & $\max |Z|$ & <3.5 \\
-\bottomrule
-\end{tabular}
-\caption{Gates Industriales para Datos Swing}
-\end{table}
+\section{Pseudocódigo de referencia}
 
-\section{Conclusiones y Optimizaciones Industriales}
-Pipeline data-health gatea alpha leakage, esencial para rentabilidad sostenida (Calmar >3). Mejoras: AutoML thresholds (Bayesian opt), Great Expectations integration, real-time via Kafka [web:49].
+\begin{lstlisting}[language=Python]
+def main(config_path: str, run_id: str, execution_date: str):
+    cfg = load_and_validate_config(config_path)
+    contracts = load_dataset_contracts(cfg.catalog)
 
-¡Datos sanos = trades ganadores!
+    validate_contracts(contracts)
 
-\bibliographystyle{plain}
-\begin{thebibliography}{9}
-\bibitem{web44} StockFormer arXiv.
-\bibitem{web47} SSRN Swing Opt.
-\bibitem{web49} López de Prado Book.
-\bibitem{web51} Backtesting.py.
-\bibitem{web54} LSTM Swing.
-\end{thebibliography}
+    run_ctx = create_run_context(run_id, execution_date, cfg)
+    mark_run_started(run_ctx)
+
+    dataset_results = []
+
+    for contract in contracts:
+        if not applies_to_execution(contract, execution_date, cfg):
+            dataset_results.append(mark_skipped(contract, run_ctx))
+            continue
+
+        try:
+            dataset = load_dataset(contract)
+            check_results = []
+
+            check_results.append(check_availability(dataset, contract))
+            check_results.append(check_freshness(dataset, contract, execution_date))
+            check_results.append(check_completeness(dataset, contract, execution_date))
+            check_results.append(check_schema(dataset, contract))
+            check_results.append(check_temporal_consistency(dataset, contract, execution_date))
+            check_results.extend(run_statistical_checks(dataset, contract))
+
+            dataset_status = derive_dataset_gate(check_results, contract)
+            dataset_score = compute_dataset_score(check_results, contract)
+
+            dataset_results.append(
+                persist_dataset_result(
+                    contract=contract,
+                    run_ctx=run_ctx,
+                    checks=check_results,
+                    status=dataset_status,
+                    score=dataset_score
+                )
+            )
+
+        except Exception as exc:
+            dataset_results.append(
+                persist_dataset_error(contract, run_ctx, exc)
+            )
+
+    overrides = load_active_overrides(run_ctx)
+    final_results = apply_overrides(dataset_results, overrides)
+
+    global_score = compute_global_score(final_results)
+    global_gate = derive_global_gate(final_results)
+
+    persist_run_summary(run_ctx, final_results, overrides, global_score, global_gate)
+    emit_monitoring_events(run_ctx, final_results, global_gate)
+
+    return {
+        "run_id": run_id,
+        "execution_date": execution_date,
+        "global_gate": global_gate,
+        "global_score": global_score,
+        "datasets": final_results,
+    }
+\end{lstlisting}
+
+\section{Casos límite que deben resolverse}
+
+\begin{enumerate}
+    \item \textbf{Festivos y cierres de mercado}: la falta de filas no debe penalizarse si está explicada por calendario válido.
+    \item \textbf{Dataset existente pero vacío}: debe tratarse como fallo de disponibilidad o completitud, no como pass trivial.
+    \item \textbf{Cambio de esquema compatible hacia atrás}: puede ser \texttt{warn} si la política lo permite.
+    \item \textbf{Drift fuerte en un dataset no crítico}: no debe bloquear necesariamente el pipeline.
+    \item \textbf{Timestamp atrasado pero dentro de tolerancia contractual}: debe reflejarse como \texttt{warn} o \texttt{pass} según SLA.
+    \item \textbf{Outliers esperables por eventos corporativos}: deben poder excluirse mediante reglas auditadas, no por borrado manual opaco.
+    \item \textbf{Muestra demasiado pequeña para un test estadístico}: el resultado debe marcarse como \texttt{insufficient\_sample}, no como pass automático.
+\end{enumerate}
+
+\section{Criterios mínimos de aceptación}
+
+El módulo no debe considerarse correcto sin pruebas que verifiquen:
+
+\begin{enumerate}
+    \item validación de contratos de dataset;
+    \item diferenciación correcta entre schema validation y drift distribucional;
+    \item freshness dependiente del contrato y del calendario;
+    \item cálculo correcto de completitud bajo panel completo y bajo contratos no cartesianos;
+    \item hard-fails que bloquean aunque el score agregado sea alto;
+    \item agregación global sensible a criticidad;
+    \item persistencia detallada por check;
+    \item overrides con expiración y auditoría;
+    \item emisión de eventos estructurados para monitorización;
+    \item comportamiento correcto ante datasets vacíos, corruptos o parcialmente accesibles.
+\end{enumerate}
+
+\section{Conclusión}
+
+\texttt{ops/data\_health.py} debe concebirse como una capa de \textbf{gobernanza cuantitativa de inputs}, no como una colección informal de heurísticas. Su valor reside en convertir el concepto difuso de ``datos sanos'' en un sistema explícito de contratos, checks, scoring interpretable, gates operativos y trazabilidad. En un entorno de producción, eso reduce riesgo operativo, evita contaminación silenciosa del pipeline y permite que la investigación cuantitativa descanse sobre una base de datos verificable y disciplinada.
 
 \end{document}
 % --- FIN PARA COPIAR Y PEGAR EN .txt ---

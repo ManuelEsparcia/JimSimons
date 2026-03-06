@@ -1,71 +1,355 @@
 \documentclass{article}
-\usepackage{amsmath}
+\usepackage{amsmath,amssymb}
 \usepackage{parskip}
-\usepackage{listings} % Para código
-\lstset{language=Python, basicstyle=\ttfamily\small}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{listings}
+\lstset{language=Python, basicstyle=\ttfamily\small, columns=fullflexible, showstringspaces=false}
 
 \begin{document}
-\title{Análisis Exhaustivo: crowding\_detector.py --- Detector de Crowding para Swing Trading Ultra-Rentable}
+
+\title{crowding\_detector.py --- Crowding Diagnostics and Capacity Risk Control}
+\author{}
+\date{}
 \maketitle
 
-\section{Objetivo y Matemáticas Fundamentales}
-Detectar crowding para anticipar degradación de edge. HHI: 
-\begin{equation}
-HHI_t = \sum_{i=1}^N w_{i,t}^2, \quad \theta_{warn} = 0.25
-\end{equation}
-Cosine overlap: 
-\begin{equation}
-\cos(\mathbf{p}_A, \mathbf{p}_B) = \frac{\mathbf{p}_A^\top \mathbf{p}_B}{\|\mathbf{p}_A\| \|\mathbf{p}_B\|}
-\end{equation}
-Ref: Greenwood et al. (2020) ``Crowded Trades and Tail Risk'' \cite{greenwood2020}.
+\section{Purpose}
 
-Liquidity-Adjusted: 
-\begin{equation}
-LA\text{-}HHI_t = HHI_t \times \left( \sum_i \frac{|pos_{i,t}|}{ADV_i} \right)^{-1}
-\end{equation}
-\cite{lopez2025}.
+The goal of \texttt{crowding\_detector.py} is to quantify whether the strategy is becoming too concentrated in a small subset of names and whether that concentration is large relative to available liquidity. This is a \emph{diagnostic and risk-control} module, not a stand-alone alpha source. Its job is to produce daily crowding diagnostics that can be consumed by portfolio construction, rebalance throttling, execution, and capacity research.
 
-\section{Flujo del Código (Pseudocódigo Optimizado)}
+The module must answer four operational questions:
+
+\begin{enumerate}[label=\arabic*.]
+    \item Is the book becoming excessively concentrated in a small number of names?
+    \item Is the concentration large relative to the liquidity of the traded universe?
+    \item Is the live book too aligned with the strongest cross-sectional signals, increasing the probability of common-position risk and forced overlap?
+    \item Are crowding conditions deteriorating fast enough to require an alert, a position cap, or a rebalance reduction?
+\end{enumerate}
+
+Accordingly, the module outputs a daily panel of crowding metrics, a normalized crowding score, and a discrete alert state.
+
+\section{Module Contract}
+
+\subsection{Required Inputs}
+
+At minimum, the module consumes the following daily inputs after all point-in-time alignment has already been enforced upstream:
+
+\begin{itemize}
+    \item \texttt{positions\_history}: one row per \((date, asset)\) with columns
+    \[
+    \{\texttt{date}, \texttt{asset}, \texttt{shares}, \texttt{close}, \texttt{dollar\_position}, \texttt{side}, \texttt{gross\_weight}\}.
+    \]
+    \item \texttt{signal\_history}: one row per \((date, asset)\) with columns
+    \[
+    \{\texttt{date}, \texttt{asset}, \texttt{signal}, \texttt{target\_weight}\}.
+    \]
+    \item \texttt{liquidity\_panel}: one row per \((date, asset)\) with columns
+    \[
+    \{\texttt{date}, \texttt{asset}, \texttt{adv\_dollar}, \texttt{spread\_bps}, \texttt{volatility}\}.
+    \]
+\end{itemize}
+
+\subsection{Outputs}
+
+For each date \(t\), the module produces one row with:
+
+\[
+\{\texttt{n\_names}, \texttt{hhi}, \texttt{top\_5\_share}, \texttt{top\_10\_share}, \texttt{liquidity\_pressure},
+\texttt{signal\_overlap}, \texttt{crowding\_score}, \texttt{alert}\}.
+\]
+
+The output must be written to a point-in-time safe parquet file such as
+
+\[
+\texttt{research/capacity\_analysis/artifacts/crowding\_scores.parquet}.
+\]
+
+\section{Mathematical Definitions}
+
+Let \(\mathcal{U}_t\) denote the set of active names on date \(t\), and let \(x_{i,t}\) be the dollar position of asset \(i\). Define absolute gross-normalized portfolio weights by
+
+\begin{equation}
+w_{i,t} = \frac{|x_{i,t}|}{\sum_{j \in \mathcal{U}_t} |x_{j,t}| + \varepsilon},
+\qquad \sum_{i \in \mathcal{U}_t} w_{i,t} = 1.
+\end{equation}
+
+Absolute weights are used here because crowding is a concentration phenomenon; long and short exposures both consume capacity.
+
+\subsection{Concentration: Herfindahl--Hirschman Index}
+
+\begin{equation}
+HHI_t = \sum_{i \in \mathcal{U}_t} w_{i,t}^2.
+\end{equation}
+
+\(HHI_t\) lies in \([1/N_t,1]\), where \(N_t = |\mathcal{U}_t|\). A rising \(HHI_t\) indicates that gross exposure is collapsing into fewer names.
+
+\subsection{Top-\(k\) Share}
+
+For \(k \in \{5,10\}\), define
+
+\begin{equation}
+TS_{k,t} = \sum_{i \in \text{Top-}k(w_t)} w_{i,t},
+\end{equation}
+
+where \(\text{Top-}k(w_t)\) is the set of the \(k\) largest absolute weights. This is easier to interpret operationally than \(HHI_t\): it tells us what fraction of gross exposure is concentrated in the dominant names.
+
+\subsection{Liquidity Pressure}
+
+Let \(ADV_{i,t}\) denote average daily dollar volume. Define name-level liquidity usage by
+
+\begin{equation}
+\ell_{i,t} = \frac{|x_{i,t}|}{ADV_{i,t} + \varepsilon}.
+\end{equation}
+
+We then aggregate to a portfolio-level liquidity pressure statistic:
+
+\begin{equation}
+LP_t = \sum_{i \in \mathcal{U}_t} w_{i,t}\,\ell_{i,t}.
+\end{equation}
+
+This quantity is dimensionless and rises when the book is not only concentrated, but concentrated in names where gross participation is large relative to tradable volume. This is preferable to an ad hoc ``liquidity-adjusted HHI'' written as an inverse factor, because \(LP_t\) preserves clear monotonicity: higher means worse.
+
+\subsection{Signal-to-Book Overlap}
+
+To measure whether the live book is excessively aligned with the strongest current signals, define robustly standardized signal and portfolio vectors:
+
+\begin{equation}
+\tilde{s}_{i,t} =
+\frac{s_{i,t} - \mathrm{median}(s_t)}
+{\mathrm{MAD}(s_t) + \varepsilon},
+\qquad
+\tilde{w}_{i,t} =
+\frac{w_{i,t} - \mathrm{median}(w_t)}
+{\mathrm{MAD}(w_t) + \varepsilon}.
+\end{equation}
+
+Then define cosine overlap by
+
+\begin{equation}
+\rho_t =
+\frac{\sum_{i \in \mathcal{U}_t} \tilde{s}_{i,t}\tilde{w}_{i,t}}
+{\left(\sum_i \tilde{s}_{i,t}^2\right)^{1/2}
+ \left(\sum_i \tilde{w}_{i,t}^2\right)^{1/2} + \varepsilon}.
+\end{equation}
+
+A high positive \(\rho_t\) indicates that the current book is strongly concentrated in the same names that currently dominate the signal cross-section, which may amplify common-position risk and slippage during rebalances.
+
+\subsection{Composite Crowding Score}
+
+Each raw metric is normalized using only trailing information. For any metric \(m_t\), define
+
+\begin{equation}
+z_t(m) =
+\frac{m_t - \mu_{t-1}^{(L)}(m)}
+{\sigma_{t-1}^{(L)}(m) + \varepsilon},
+\end{equation}
+
+where \(\mu_{t-1}^{(L)}\) and \(\sigma_{t-1}^{(L)}\) are the rolling mean and standard deviation over the previous \(L\) trading days, computed strictly out-of-sample.
+
+The default crowding score is
+
+\begin{equation}
+C_t =
+\frac{1}{4}\Big(
+z_t(HHI) + z_t(TS_{10}) + z_t(LP) + z_t(\max\{0,\rho_t\})
+\Big).
+\end{equation}
+
+Equal weights are the default because they are transparent and robust. A supervised weighting scheme may be added later, but only if it is estimated on training data and validated out-of-sample.
+
+\subsection{Alert Policy}
+
+Fixed universal thresholds such as \(HHI > 0.25\) are not appropriate across universes. Instead, thresholds must be calibrated from the training sample:
+
+\begin{equation}
+\texttt{warn}_t \iff C_t > Q_{0.90}^{\mathrm{train}}(C),
+\qquad
+\texttt{hard}_t \iff C_t > Q_{0.97}^{\mathrm{train}}(C).
+\end{equation}
+
+The module therefore emits one of
+
+\[
+\texttt{alert} \in \{\texttt{ok}, \texttt{warn}, \texttt{hard}\}.
+\]
+
+\section{Implementation Logic}
+
 \begin{lstlisting}
-import pandas as pd
 import numpy as np
-from numba import jit  # Optimización
+import pandas as pd
 
-@jit(nopython=True)
-def compute_hhi(weights: np.ndarray) -> float:
-    return np.sum(weights**2)
+EPS = 1e-12
 
-# Carga
+def normalize_abs_weights(dollar_pos: np.ndarray) -> np.ndarray:
+    gross = np.abs(dollar_pos).sum()
+    if gross <= EPS:
+        return np.zeros_like(dollar_pos, dtype=float)
+    return np.abs(dollar_pos) / gross
+
+def hhi(weights: np.ndarray) -> float:
+    return float(np.sum(weights ** 2))
+
+def top_k_share(weights: np.ndarray, k: int) -> float:
+    if len(weights) == 0:
+        return np.nan
+    k = min(k, len(weights))
+    return float(np.sort(weights)[-k:].sum())
+
+def robust_z(x: np.ndarray) -> np.ndarray:
+    med = np.median(x)
+    mad = np.median(np.abs(x - med))
+    return (x - med) / (mad + EPS)
+
+def cosine_overlap(a: np.ndarray, b: np.ndarray) -> float:
+    na = np.linalg.norm(a)
+    nb = np.linalg.norm(b)
+    if na <= EPS or nb <= EPS:
+        return np.nan
+    return float(np.dot(a, b) / (na * nb + EPS))
+
+def crowding_metrics(day_df: pd.DataFrame) -> pd.Series:
+    w = normalize_abs_weights(day_df["dollar_position"].to_numpy())
+    adv = day_df["adv_dollar"].to_numpy()
+    sig = day_df["signal"].to_numpy()
+
+    liq_use = np.abs(day_df["dollar_position"].to_numpy()) / (adv + EPS)
+    lp = float(np.sum(w * liq_use))
+
+    sig_z = robust_z(sig)
+    w_z = robust_z(w)
+    overlap = cosine_overlap(sig_z, w_z)
+
+    return pd.Series({
+        "n_names": int(len(day_df)),
+        "hhi": hhi(w),
+        "top_5_share": top_k_share(w, 5),
+        "top_10_share": top_k_share(w, 10),
+        "liquidity_pressure": lp,
+        "signal_overlap": overlap,
+    })
+
 positions = pd.read_parquet(positions_history_path)
 signals = pd.read_parquet(signal_history_path)
+liq = pd.read_parquet(liquidity_panel_path)
 
-# Por fecha
-def crowding_metrics(group):
-    w = group['weight'].values
-    hhi = compute_hhi(w)
-    top_share = np.sum(np.sort(w)[-10:])  # Top 10
-    # Overlap con signals
-    return pd.Series({'hhi': hhi, 'top_share': top_share})
+df = (
+    positions
+    .merge(signals[["date", "asset", "signal"]], on=["date", "asset"], how="left")
+    .merge(liq[["date", "asset", "adv_dollar"]], on=["date", "asset"], how="left")
+)
 
-scores = positions.groupby('date').apply(crowding_metrics)
-# Alertas
-scores['alert'] = np.where(scores['hhi'] > 0.25, 'warn', 'ok')
-scores.to_parquet(f"crowding_scores.parquet")
+daily = (
+    df.groupby("date", group_keys=False)
+      .apply(crowding_metrics)
+      .sort_index()
+)
+
+lookback = 252
+for col in ["hhi", "top_10_share", "liquidity_pressure", "signal_overlap"]:
+    mu = daily[col].rolling(lookback, min_periods=63).mean().shift(1)
+    sd = daily[col].rolling(lookback, min_periods=63).std().shift(1)
+    daily[f"z_{col}"] = (daily[col] - mu) / (sd + EPS)
+
+daily["crowding_score"] = 0.25 * (
+    daily["z_hhi"].fillna(0.0)
+    + daily["z_top_10_share"].fillna(0.0)
+    + daily["z_liquidity_pressure"].fillna(0.0)
+    + daily["z_signal_overlap"].clip(lower=0.0).fillna(0.0)
+)
+
+q_warn = daily.loc[train_mask, "crowding_score"].quantile(0.90)
+q_hard = daily.loc[train_mask, "crowding_score"].quantile(0.97)
+
+daily["alert"] = "ok"
+daily.loc[daily["crowding_score"] > q_warn, "alert"] = "warn"
+daily.loc[daily["crowding_score"] > q_hard, "alert"] = "hard"
+
+daily.to_parquet(output_path)
 \end{lstlisting}
 
-\section{Estado del Arte y Optimizaciones Industriales}
-- \textbf{ML Gate}: Entrena QuantileRegression (LightGBM) sobre históricos para P(unwind | crowding) > 0.7 $\to$ fail.
-- \textbf{Risk Parity}: Ajusta posiciones $pos_i \propto 1 / \sigma_i \cdot crowding_i^{-1}$.
-- \textbf{Backtest Avanzado}: Monte Carlo con $10^4$ paths, Calmar = Sharpe / MaxDD.
-Ref: Chan (2020) ``Quantitative Trading'' Ch. 7; López de Prado (2018) ``Advances in FML''.
+\section{Calibration Requirements}
 
-\section{Backtest de Referencia (Ejemplo Rentable)}
-Simulación: Sin crowding filter, Sharpe=1.2, MaxDD=25\%; Con filter, Sharpe=2.1, MaxDD=12\% (decay reducido 40\%).
+The module is only useful if its alerts correlate with future degradation in tradability or alpha retention. Therefore, calibration must be tied to concrete downstream variables rather than arbitrary thresholds.
 
-\bibliographystyle{plain}
+Let \(h\) be the forward horizon used by the rebalance engine, typically \(h \in \{1,3,5\}\) trading days. Define one or more forward targets, for example:
+
+\begin{equation}
+Y_t^{(1)} = \text{future implementation shortfall over } [t,t+h],
+\end{equation}
+
+\begin{equation}
+Y_t^{(2)} = \text{future realized alpha decay over } [t,t+h],
+\end{equation}
+
+\begin{equation}
+Y_t^{(3)} = \text{future tail loss or drawdown event indicator}.
+\end{equation}
+
+A valid calibration should show that larger \(C_t\) predicts worse future execution quality and/or weaker realized alpha retention. If not, the score is not economically useful and must not be promoted into production gating.
+
+\section{Validation Protocol}
+
+Validation must be performed with strict train/validation/test splits and with all rolling statistics shifted to avoid look-ahead bias.
+
+The module should be accepted only if most of the following hold out-of-sample:
+
+\begin{enumerate}[label=\arabic*.]
+    \item Monotonicity: higher deciles of \(C_t\) correspond to worse future slippage and/or weaker forward alpha retention.
+    \item Stability: the relationship holds across major liquidity regimes and subperiods.
+    \item Actionability: applying a crowding-aware throttle improves implementation quality without destroying too much gross alpha.
+    \item Incrementality: the score adds information beyond simple concentration proxies such as \(HHI_t\) alone.
+\end{enumerate}
+
+Useful summary diagnostics include decile tables, Spearman rank correlations, conditional means of forward shortfall, and regime-by-regime breakdowns.
+
+\section{Integration With the Rest of the System}
+
+This module must integrate explicitly with the rest of the stack:
+
+\begin{itemize}
+    \item \textbf{portfolio}: use \texttt{alert} to cap max name weight, reduce concentration, or reallocate across less crowded names.
+    \item \textbf{rebalance}: use \texttt{crowding\_score} to throttle target changes when the portfolio is already capacity-stressed.
+    \item \textbf{execution / impact\_model}: condition impact coefficients or participation limits on current crowding conditions.
+    \item \textbf{capacity\_analysis}: combine crowding diagnostics with AUM scaling studies and turnover-cost curves.
+    \item \textbf{validation}: verify that any crowding-aware intervention improves net performance after realistic costs rather than merely reducing gross exposure.
+\end{itemize}
+
+\section{Edge Cases and Failure Modes}
+
+The implementation must handle the following cases explicitly:
+
+\begin{enumerate}[label=\arabic*.]
+    \item \textbf{Too few names}: if \(N_t\) is very small, \(HHI_t\) is mechanically high; interpret relative to historical percentiles, not in isolation.
+    \item \textbf{Missing ADV}: if \(ADV_{i,t}\) is unavailable or stale, the name must be excluded from liquidity-pressure calculations or imputed conservatively.
+    \item \textbf{Near-zero gross}: if total gross exposure is near zero, all concentration metrics should be set to missing rather than forced.
+    \item \textbf{Corporate events / price jumps}: extreme one-day moves can distort dollar weights; optional winsorization may be used, but only before score construction and with auditability.
+    \item \textbf{Universe drift}: thresholds must be recalibrated when the tradable universe or book construction logic changes materially.
+\end{enumerate}
+
+\section{What This Module Is Not}
+
+This module should not contain unsupported claims about Sharpe uplift, return improvement, or ``ultra-profitable'' outcomes. Those belong to downstream empirical validation. The responsibility of \texttt{crowding\_detector.py} is narrower and more important: to measure concentration and liquidity stress in a way that is statistically defensible, operationally interpretable, and directly usable by portfolio and execution layers.
+
+\section{References}
+
 \begin{thebibliography}{9}
-\bibitem{greenwood2020} Greenwood et al., ``Crowded Trades and Tail Risk'', JF 2020.
-\bibitem{lopez2025} López de Prado, ``AFML 2nd Ed.'', 2025.
+
+\bibitem{greenwood}
+Greenwood, R. and Thesmar, D.
+\textit{Stock Price Fragility}.
+Journal of Financial Economics, 102(3), 2011.
+
+\bibitem{grinold}
+Grinold, R. C. and Kahn, R. N.
+\textit{Active Portfolio Management}.
+2nd ed., McGraw--Hill, 2000.
+
+\bibitem{almgren}
+Almgren, R. and Chriss, N.
+\textit{Optimal Execution of Portfolio Transactions}.
+Journal of Risk, 3(2), 2001.
+
 \end{thebibliography}
 
 \end{document}

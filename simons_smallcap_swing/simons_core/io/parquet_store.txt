@@ -3,152 +3,485 @@
 \usepackage[T1]{fontenc}
 \usepackage[spanish]{babel}
 \usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
 \usepackage{geometry}
 \usepackage{listings}
 \usepackage{hyperref}
 \usepackage{booktabs}
 \usepackage{xcolor}
-\usepackage{siunitx} % Para unidades
+\usepackage{enumitem}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{siunitx}
 
-\geometry{margin=2cm}
+\geometry{margin=2.2cm}
 \hypersetup{colorlinks=true, urlcolor=blue}
 
-% Código Python + DataFrame styling
 \lstset{
     language=Python,
     basicstyle=\ttfamily\small,
     keywordstyle=\color{blue}\bfseries,
-    commentstyle=\color{green!60!black},
-    stringstyle=\color{red},
+    commentstyle=\color{green!50!black},
+    stringstyle=\color{red!70!black},
     frame=single,
     breaklines=true,
+    showstringspaces=false,
     numbers=left,
     numberstyle=\tiny\color{gray}
 }
 
-\title{\textbf{JimSimons Core: Parquet Store para Swing Trading Industrial}}
-\author{Research-Level Specification \\ simons\_core/io/parquet\_store.py}
+\title{\textbf{Especificación de Almacenamiento Parquet Determinista}\\
+\large \texttt{simons\_core/io/parquet\_store.py}}
+\author{Research Engineering Specification}
 \date{Marzo 2026}
 
 \begin{document}
 \maketitle
 
-\section{Objetivo Matemático}
-Proveer I/O columnar optimizado para datasets trading:
-\begin{equation}
-\text{I/O Saved} = S_{\text{raw}} \cdot (1 - CR) \cdot (1 - \text{Selectivity})
-\end{equation}
-donde $CR \approx 10x$ compression ratio Parquet, Selectivity $\approx 0.08$ monthly filters.
+\section{Propósito}
 
-\section{Alcance Production-Grade}
-\begin{itemize}
-    \item \textbf{write\_parquet()} versioned snapshots con manifest
-    \item \textbf{read\_parquet()} column projection + pushdown filters
-    \item Schema contracts + checksum validation
-    \item Partitioning: date/symbol (pruning $\approx 92\%$ I/O)
+Este módulo define una capa de persistencia columnar para datasets de investigación y producción en un sistema de \emph{small-cap swing trading}. Su misión es proporcionar lectura y escritura reproducibles, eficientes y auditables sobre artefactos tabulares de gran volumen, con semántica explícita de esquema, particionado y versionado.
+
+El objetivo del módulo es infraestructural: reducir I/O innecesario, estabilizar tiempos de acceso, mejorar interoperabilidad analítica y formalizar contratos de almacenamiento. No se atribuyen a este componente mejoras directas de Sharpe, CAGR, hit rate o drawdown, pues dichas métricas pertenecen al dominio del modelo, los datos y la ejecución, no al del formato de persistencia.
+
+\section{Ámbito}
+
+El módulo cubre:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item escritura de tablas en formato Parquet;
+    \item lectura selectiva con proyección de columnas y filtros;
+    \item validación de esquema antes y después de escritura;
+    \item particionado físico por claves de acceso frecuentes;
+    \item manifiestos y metadatos de snapshot;
+    \item detección de corrupción y aislamiento de particiones inválidas;
+    \item observabilidad operativa de volumen, latencia y cobertura de lectura.
 \end{itemize}
 
-\section{API Industrial}
+Quedan fuera de alcance:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item transacciones ACID multiobjeto al estilo \emph{table formats} avanzados;
+    \item control distribuido de concurrencia fuerte;
+    \item evolución automática de esquema sin validación explícita;
+    \item gobierno integral de data lake.
+\end{itemize}
+
+\section{Motivación formal}
+
+Sea una tabla lógica $T \in \mathbb{R}^{N \times d}$ con $N$ filas y $d$ columnas. Si una consulta requiere sólo un subconjunto $C \subseteq \{1,\dots,d\}$ y un predicado $P$ que activa poda de particiones o \emph{row-group pruning}, el coste de I/O efectivo puede aproximarse por
+
+\[
+\mathrm{IO}_{\mathrm{eff}}
+\approx
+S_{\mathrm{phys}} \cdot \rho_C \cdot \rho_P,
+\]
+
+donde:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item $S_{\mathrm{phys}}$ es el tamaño físico almacenado;
+    \item $\rho_C \in (0,1]$ es la fracción de columnas materializadas;
+    \item $\rho_P \in (0,1]$ es la fracción de datos no descartada por poda.
+\end{itemize}
+
+Frente a formatos fila-a-fila o serializaciones monolíticas, Parquet permite explotar dos propiedades estructurales útiles para pipelines cuantitativos:
+
+\begin{enumerate}[leftmargin=1.7em]
+    \item \textbf{proyección columnar}, que evita cargar columnas no requeridas;
+    \item \textbf{pruning físico}, que evita leer particiones o grupos irrelevantes.
+\end{enumerate}
+
+La mejora buscada, por tanto, es operacional: menor latencia y menor volumen leído/escrito bajo consultas parciales.
+
+\section{Principios de diseño}
+
+\begin{enumerate}[label=\textbf{P\arabic*.},leftmargin=1.7em]
+    \item \textbf{Contrato explícito de esquema.} Ninguna tabla se persiste sin validar estructura y tipos.
+    \item \textbf{Persistencia reproducible.} Una misma tabla lógica y una misma configuración de escritura deben generar un artefacto compatible y auditable.
+    \item \textbf{Separación entre snapshot lógico y layout físico.} El consumidor razona sobre datasets y versiones, no sobre rutas ad hoc.
+    \item \textbf{Atomicidad a nivel de publicación.} Un snapshot sólo es visible cuando su publicación queda completada.
+    \item \textbf{Lectura sobria.} El lector debe poder proyectar columnas, aplicar filtros y validar metadatos sin acoplarse a detalles accidentales del layout.
+    \item \textbf{Fallo recuperable.} Una partición corrupta no debe invalidar el dataset completo salvo decisión explícita.
+\end{enumerate}
+
+\section{Modelo de datos y snapshot}
+
+El store debe tratar cada escritura como una publicación de snapshot. Un snapshot está compuesto por:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item uno o varios ficheros Parquet;
+    \item un manifiesto de snapshot;
+    \item metadatos de esquema;
+    \item estadísticas resumidas de publicación.
+\end{itemize}
+
+Definimos un snapshot como la tupla
+\[
+\mathcal{S} = (\Pi, \Sigma, M, \tau),
+\]
+donde:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item $\Pi$ es el conjunto de paths físicos publicados;
+    \item $\Sigma$ es el esquema lógico validado;
+    \item $M$ es el manifiesto con hashes, conteos y particiones;
+    \item $\tau$ es el instante de publicación.
+\end{itemize}
+
+La unidad visible para el consumidor es $\mathcal{S}$, no cada fichero individual.
+
+\section{Invariantes}
+
+El módulo debe respetar, como mínimo, los siguientes invariantes:
+
+\begin{enumerate}[label=\textbf{I\arabic*.},leftmargin=1.7em]
+    \item Todo snapshot visible tiene manifiesto íntegro.
+    \item Todo snapshot visible referencia un esquema compatible con \texttt{schema\_ref}.
+    \item Ningún fichero temporal se considera parte del dataset publicado.
+    \item Una lectura versionada nunca mezcla particiones de snapshots distintos.
+    \item Toda discrepancia entre esquema esperado y esquema observado produce error explícito o política controlada de rechazo.
+    \item La corrupción de una partición se aísla y registra; no se sirve silenciosamente.
+\end{enumerate}
+
+\section{Esquema y contratos}
+
+Cada dataset debe estar asociado a una referencia de esquema \texttt{schema\_ref}. El contrato mínimo debe definir:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item nombres de columnas;
+    \item tipos;
+    \item nulabilidad;
+    \item columnas de partición;
+    \item claves lógicas o restricciones esperadas;
+    \item versión del contrato.
+\end{itemize}
+
+La validación debe separar dos niveles:
+
+\subsection{Validación estructural}
+Comprueba que las columnas requeridas existen y que los tipos son compatibles con el contrato esperado.
+
+\subsection{Validación semántica ligera}
+Comprueba propiedades de bajo coste que evitan errores gruesos antes de persistir, por ejemplo:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item ausencia de duplicados en clave lógica esperada;
+    \item no negatividad en columnas de volumen si así procede;
+    \item monotonicidad temporal por partición si el dataset lo exige.
+\end{itemize}
+
+El módulo no debe fingir validaciones más fuertes de las que realmente ejecuta.
+
+\section{Estrategia de particionado}
+
+El particionado debe obedecer patrones de acceso y no meras intuiciones estéticas. En datasets de mercado, una política razonable de partida es:
+
+\begin{center}
+\texttt{partition\_cols = ['date', 'symbol']}
+\end{center}
+
+pero sólo cuando:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item las consultas filtran con frecuencia por fecha y/o símbolo;
+    \item la cardinalidad no produce explosión patológica de ficheros pequeños;
+    \item el tamaño medio de partición permanece operativo.
+\end{itemize}
+
+Por ello, la decisión de particionado debe evaluarse con tres tensiones:
+
+\[
+\text{granularidad} \;\leftrightarrow\; \text{pruning} \;\leftrightarrow\; \text{small-file overhead}.
+\]
+
+El documento de implementación debe dejar claro que particionar demasiado puede degradar el rendimiento aunque mejore la poda teórica.
+
+\section{API propuesta}
+
 \begin{lstlisting}
-def write_parquet(df: pd.DataFrame, 
-                  path: str, 
-                  schema_ref: str,
-                  partition_cols: List[str] = ['date', 'symbol'],
-                  write_mode: str = 'fail_if_exists') -> Dict:
+from __future__ import annotations
+from typing import Any, Dict, Iterable, List, Optional, Sequence
+import pandas as pd
+
+def write_parquet(
+    df: pd.DataFrame,
+    path: str,
+    schema_ref: str,
+    partition_cols: Optional[Sequence[str]] = None,
+    write_mode: str = "fail_if_exists",
+    dataset_version: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
-    Atomic write con schema validation + manifest
-    Returns: {'row_count': N, 'schema_hash': SHA256, 'checksum': MD5}
+    Publica un snapshot Parquet con validacion de esquema y manifiesto.
     """
-    manifest = generate_manifest(df, partition_cols)
-    pq.write_to_dataset(df, path, ...)
+
+def read_parquet(
+    path: str,
+    columns: Optional[Sequence[str]] = None,
+    filters: Optional[Iterable[tuple]] = None,
+    schema_ref: Optional[str] = None,
+    dataset_version: Optional[str] = None,
+    strict_schema: bool = True,
+) -> pd.DataFrame:
+    """
+    Lee un snapshot o dataset aplicando proyeccion de columnas y filtros.
+    """
+
+def validate_dataset(
+    path: str,
+    schema_ref: str,
+    dataset_version: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Valida integridad basica, esquema y metadatos del dataset.
+    """
+\end{lstlisting}
+
+\section{Modos de escritura}
+
+Se proponen tres modos mínimos, con semántica estricta:
+
+\subsection{\texttt{fail\_if\_exists}}
+Falla si el destino lógico ya existe. Es el modo correcto cuando el dataset se considera inmutable para una versión dada.
+
+\subsection{\texttt{overwrite\_partition}}
+Reemplaza sólo las particiones afectadas por la nueva publicación. Debe dejar constancia explícita de qué particiones se sustituyeron y bajo qué snapshot quedan vigentes.
+
+\subsection{\texttt{append\_versioned}}
+Publica un nuevo snapshot versionado sin destruir snapshots previos. Es el modo más limpio para auditoría, reproducibilidad y backtesting trazable.
+
+\bigskip
+En los tres casos, la publicación debe apoyarse en un manifiesto visible sólo al final del proceso. La atomicidad real depende del backend subyacente; por tanto, el contrato debe distinguir claramente entre:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \textbf{atomicidad de fichero local vía rename,} que suele ser fuerte;
+    \item \textbf{publicación lógica por manifiesto,} que es la técnica portable;
+    \item \textbf{backend object store,} donde la semántica de renombrado puede no ser realmente atómica.
+\end{itemize}
+
+\section{Protocolo de escritura}
+
+Una implementación seria debe seguir, de forma aproximada, el siguiente protocolo:
+
+\begin{enumerate}[leftmargin=1.7em]
+    \item validar esquema de \texttt{df} frente a \texttt{schema\_ref};
+    \item validar reglas semánticas ligeras;
+    \item materializar escritura en staging temporal;
+    \item recopilar metadatos físicos y hashes de salida;
+    \item construir manifiesto del snapshot;
+    \item publicar el snapshot haciéndolo visible sólo al final;
+    \item registrar métricas y trazas.
+\end{enumerate}
+
+El pseudocódigo conceptual sería:
+
+\begin{lstlisting}
+def write_parquet(...):
+    schema = resolve_schema(schema_ref)
+    validate_schema(df, schema)
+    validate_business_constraints(df, schema)
+
+    staging_path = allocate_staging_area(path)
+    materialize_parquet(df, staging_path, partition_cols)
+
+    manifest = build_manifest(
+        staging_path=staging_path,
+        schema=schema,
+        dataset_version=dataset_version,
+        metadata=metadata,
+    )
+
+    publish_snapshot(staging_path, path, manifest, write_mode)
     return manifest
 \end{lstlisting}
 
-\section{Reglas de Escritura Robustas}
-\begin{enumerate}
-    \item \textbf{Schema Pre-validation}: PyArrow Schema.equals()
-    \item \textbf{Deduplication}: PK hash collisions $P < 10^{-9}$
-    \item \textbf{Write Modes}:
-    \begin{itemize}
-        \item \texttt{fail\_if\_exists}: Zero-downtime validation
-        \item \texttt{overwrite\_partition}: Date-granular updates
-        \item \texttt{append\_versioned}: Audit trail completo
-    \end{itemize}
-\end{enumerate}
+\section{Lectura columnar}
 
-\section{Optimización Lectura Columnar}
+La lectura debe poder restringir columnas y filtros sin cargar material innecesario. Un uso típico sería:
+
 \begin{lstlisting}
-# Predicate pushdown: 92% I/O reduction
 df = read_parquet(
-    "s3://trading/ohlcv/",
-    columns=['close', 'volume', 'rsi_14'],  # 15/120 cols = 12.5%
-    filters=[('date', '>=', '2026-01-01')]
+    path="s3://trading/ohlcv/",
+    columns=["close", "volume", "rsi_14"],
+    filters=[("date", ">=", "2026-01-01"), ("symbol", "in", ["AAPL", "NVDA"])],
+    schema_ref="features_v2"
 )
 \end{lstlisting}
 
-\section{Manejo de Errores Production}
-\begin{itemize}
-    \item \textbf{Schema Mismatch} $\rightarrow$ \texttt{Raise SchemaValidationError}
-    \item \textbf{Corrupt Partition} $\rightarrow$ \texttt{.isolate\_and\_log()}
-    \item \textbf{Path Injection} $\rightarrow$ \texttt{PathValidator.reject()}
+La eficiencia real de esta operación dependerá de:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item alineación entre filtros y columnas de partición;
+    \item metadatos de row groups;
+    \item granularidad de ficheros;
+    \item backend físico.
 \end{itemize}
 
-\section{Observabilidad Real-Time}
-\begin{table}[h]
-\centering
-\sisetup{group-separator={,}, group-minimum-digits=4}
-\begin{tabular}{l S[table-format=5.0] S[table-format=2.1] S[table-format=3.1]}
+Por tanto, la documentación debe hablar de \emph{habilitar} poda y proyección, no de prometer reducciones de I/O fijas en todo escenario.
+
+\section{Manifiesto}
+
+Cada snapshot debe llevar un manifiesto con información suficiente para trazabilidad y validación. Campos mínimos recomendados:
+
+\begin{longtable}{>{\ttfamily}p{4cm}p{9.5cm}}
 \toprule
-{Métrica} & {Valor} & {Target} & {p95} \\
+Campo & Significado \\
 \midrule
-rows\_written & 12543000 & {-} & {-} \\
-bytes\_written & 2.4 & 10.0 & 8.7 \\
-write\_latency & 7.2 & {5.0} & {12.1} \\
-rows\_read & 847000 & {-} & {-} \\
-bytes\_read & 184.3 & 2.4 & 1.9 \\
+dataset\_version & versión lógica del snapshot \\
+schema\_ref & referencia del contrato de esquema \\
+schema\_hash & hash del esquema resuelto \\
+created\_at & instante de publicación \\
+row\_count & número total de filas \\
+file\_count & número de ficheros publicados \\
+partition\_cols & columnas de partición \\
+partitions & particiones incluidas o afectadas \\
+checksums & hashes por fichero o bloque lógico \\
+writer\_version & versión del escritor \\
+metadata & metadatos opcionales de ejecución \\
+\bottomrule
+\end{longtable}
+
+El manifiesto es la pieza que permite distinguir entre ``ficheros presentes'' y ``snapshot válido''.
+
+\section{Errores y tratamiento de fallos}
+
+El módulo debe fallar de forma explícita y tipada. Como mínimo:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{SchemaValidationError}: esquema incompatible;
+    \item \texttt{ManifestError}: manifiesto ausente o inconsistente;
+    \item \texttt{DatasetNotFoundError}: dataset o versión inexistente;
+    \item \texttt{CorruptPartitionError}: partición ilegible o checksum inválido;
+    \item \texttt{InvalidPathError}: path rechazado por validación;
+    \item \texttt{WriteConflictError}: conflicto con el modo de escritura elegido.
+\end{itemize}
+
+Una partición corrupta debe seguir la política:
+
+\begin{enumerate}[leftmargin=1.7em]
+    \item detectar;
+    \item aislar;
+    \item registrar;
+    \item excluir del conjunto válido;
+    \item decidir si la lectura total debe abortar o continuar según modo estricto o tolerante.
+\end{enumerate}
+
+\section{Hardening de rutas}
+
+El escritor y el lector deben validar rutas de entrada y salida para evitar:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item traversal no permitido;
+    \item mezcla accidental de entornos;
+    \item escritura fuera de raíces autorizadas;
+    \item colisiones de nombres entre datasets lógicos.
+\end{itemize}
+
+La validación de rutas no es un detalle cosmético: es parte del contrato de integridad operacional.
+
+\section{Observabilidad}
+
+El módulo debe exponer métricas que permitan entender coste y salud operativa, por ejemplo:
+
+\begin{center}
+\begin{tabular}{>{\ttfamily}p{5cm}p{8.5cm}}
+\toprule
+Métrica & Interpretación \\
+\midrule
+rows\_written & filas publicadas por snapshot \\
+bytes\_written & volumen físico escrito \\
+write\_latency\_sec & latencia total de publicación \\
+rows\_read & filas materializadas por lectura \\
+bytes\_read & volumen físico realmente leído \\
+projected\_columns & número de columnas solicitadas \\
+pruned\_partitions & particiones descartadas por filtros \\
+schema\_validation\_failures & fallos de contrato \\
+corrupt\_partitions & incidencias de integridad detectadas \\
 \bottomrule
 \end{tabular}
-\caption{Métricas Parquet Store (GB, segundos)}
-\end{table}
+\end{center}
 
-\section{Backtest Impacto Cuantitativo}
-\begin{table}[h]
-\centering
-\begin{tabular}{lcccc}
-\toprule
-Escenario & {Raw CSV} & {Parquet} & {Speedup} & {Compresión} \\
-\midrule
-10k símbolos × 10yr & 47h & 2h18m & 20.4x & 11.2x \\
-Monthly Backtest & 14m & 42s & 20x & 10.8x \\
-OOS Sharpe 2020-26 & 2.1 & 2.6 & +23.8\% & - \\
-Max DD & 12.1\% & 7.4\% & -38.8\% & - \\
-\bottomrule
-\end{tabular}
-\caption{Performance vs Raw CSV en Swing Trading}
-\end{table}
+Estas métricas sí son pertinentes para un módulo Parquet. No lo es reportar, como mérito del store, mejoras directas de performance financiera.
 
-\section{CLI Validation}
+\section{CLI sugerida}
+
 \begin{lstlisting}[language=bash]
-$ python -m simons_core.io.parquet_store --validate s3://trading/ohlcv/ \
+python -m simons_core.io.parquet_store validate \
+    --path s3://trading/ohlcv/ \
     --schema features_v2
-✓ Schema OK | Rows: 12.5M | Size: 2.4GB | Checksum: e3b0c442...
+
+python -m simons_core.io.parquet_store inspect \
+    --path s3://trading/ohlcv/ \
+    --version 2026-03-01
+
+python -m simons_core.io.parquet_store read \
+    --path s3://trading/ohlcv/ \
+    --columns close volume rsi_14 \
+    --filter "date>=2026-01-01"
 \end{lstlisting}
 
-\section{Definition of Done (DoD)}
-\begin{itemize}
-    \item \textbf{100\% idempotente} con manifest validation
-    \item \textbf{Schema contracts} zero-drift garantizado
-    \item \textbf{20x speedup} vs CSV en backtests
-    \item \textbf{Zero data loss} con checksums + isolation
+\section{Criterios de aceptación}
+
+El módulo no debe considerarse listo sin pasar, al menos, estas pruebas:
+
+\begin{enumerate}[leftmargin=1.7em]
+    \item escritura válida produce snapshot visible con manifiesto íntegro;
+    \item esquema incompatible produce error antes de publicación;
+    \item modo \texttt{fail\_if\_exists} rechaza colisión de destino;
+    \item modo \texttt{overwrite\_partition} sustituye sólo particiones objetivo;
+    \item lectura versionada no mezcla snapshots;
+    \item lectura con proyección devuelve exactamente las columnas pedidas;
+    \item lectura con filtros poda correctamente particiones cuando aplica;
+    \item partición corrupta se detecta y aísla;
+    \item validación de ruta rechaza destinos no autorizados;
+    \item métricas operativas quedan registradas tras lectura y escritura.
+\end{enumerate}
+
+\section{Definition of Done}
+
+La \emph{Definition of Done} realista para este módulo es:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item snapshots publicados con manifiesto y esquema validado;
+    \item semántica de escritura definida y testeada por modo;
+    \item lectura con proyección y filtros operativa;
+    \item trazabilidad de versión, filas, ficheros y checksums;
+    \item detección y aislamiento de corrupción;
+    \item documentación explícita de garantías y límites del backend.
 \end{itemize}
 
-\section{Referencias Research-Level}
+No forman parte de la DoD afirmaciones absolutas como ``zero data loss'' o ``100\% idempotente'' sin especificación formal exhaustiva del entorno, concurrencia y backend.
+
+\section{Notas de arquitectura}
+
+Parquet debe verse aquí como una capa de persistencia analítica bien adaptada a workloads cuantitativos tabulares. Su valor está en:
+
+\begin{itemize}[leftmargin=1.5em]
+    \item eficiencia en lecturas parciales;
+    \item compresión razonable;
+    \item integración amplia con tooling analítico;
+    \item facilidad para construir pipelines reproducibles.
+\end{itemize}
+
+Si en el futuro el sistema necesita garantías ACID más fuertes, evolución de esquema compleja o control transaccional sobre catálogos, entonces podrá evaluarse la adopción de formatos de tabla superiores. Pero ese es otro nivel del stack y no debe confundirse con el contrato actual de \texttt{parquet\_store.py}.
+
+\section{Resumen}
+
+\texttt{simons\_core/io/parquet\_store.py} debe implementar un store Parquet determinista, versionable y auditable, con publicación por snapshots, validación de esquema, particionado razonado, lectura selectiva y tratamiento sobrio de fallos. La calidad del módulo no proviene de promesas grandilocuentes, sino de la precisión con la que formaliza persistencia tabular para investigación y producción cuantitativa.
+
+\section{Referencias conceptuales}
+
 \begin{description}
-\item[\href{https://www.databricks.com/blog/2019/09/24/diving-into-delta-lake-schema-enforcement-enrichment.html}{Delta Lake (2019)}]
-    Schema evolution + ACID guarantees
-\item[\href{https://duckdb.org/why_duckdb}{DuckDB (2021)}] Columnar analytics SOTA
-\item[\href{https://www.amazon.com/Advances-Financial-Machine-Learning-Marcos/dp/1119482089}{López de Prado (2018)}]
-    Reproducible pipelines para quant research
+    \item[\href{https://www.databricks.com/blog/2019/09/24/diving-into-delta-lake-schema-enforcement-enrichment.html}{Delta Lake}]
+    Referencia útil para pensar enforcement de esquema y publicación de datasets, sin implicar que este módulo implemente sus garantías completas.
+
+    \item[\href{https://duckdb.org/why_duckdb}{DuckDB}]
+    Referencia útil para workloads analíticos columnares y acceso eficiente a datos tabulares.
+
+    \item[\href{https://www.amazon.com/Advances-Financial-Machine-Learning-Marcos/dp/1119482089}{López de Prado}]
+    Referencia metodológica sobre pipelines reproducibles en investigación cuantitativa.
 \end{description}
 
 \end{document}

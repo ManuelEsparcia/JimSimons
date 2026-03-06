@@ -1,255 +1,642 @@
 \section{Módulo: \texttt{data/universe/corporate\_actions.py}}
 \label{sec:corporate_actions}
 
-\subsection{Objetivo y filosofía de diseño}
+\subsection{Objetivo, alcance y principio rector}
 \label{sec:corporate_actions:objective}
 
-El módulo \texttt{corporate\_actions.py} construye un \textbf{dataset PIT de acciones corporativas} para:
+El módulo \texttt{corporate\_actions.py} construye la \textbf{capa canónica point-in-time (PIT) de acciones corporativas} del sistema. Su misión no es únicamente recopilar eventos desde proveedores externos, sino \textbf{transformar un flujo heterogéneo, ambiguo y potencialmente conflictivo de corporate actions en una representación única, determinista y auditable de la evolución económica de cada instrumento}.
+
+Esta capa cumple tres funciones fundacionales:
+
+\begin{enumerate}
+    \item \textbf{Ajuste correcto de series de precios y volumen}, de forma consistente con \texttt{adjust\_prices.py}.
+    \item \textbf{Preservación de la continuidad histórica de identidad} frente a ticker changes, splits, mergers, spin-offs, relistings y demás eventos de lifecycle.
+    \item \textbf{Soporte institucional de auditoría, versionado y reproducibilidad}, de modo que cualquier ajuste aplicado a una serie o a un universo pueda trazarse hasta un evento corporativo concreto, una fuente concreta y una política concreta de resolución.
+\end{enumerate}
+
+En un stack cuantitativo serio, las corporate actions no son un detalle operativo de postprocesado: son una \textbf{capa semántica de verdad histórica}. Si esta capa falla, entonces quedan contaminados el universo, los retornos históricos, la attribution, el cálculo de liquidez y la inferencia de capacidad.
+
+\paragraph{Principio rector}
+\label{par:corporate_actions:principle}
+
+El módulo debe representar \textbf{hechos económicos efectivos sobre instrumentos identificados de forma estable}, no meros cambios textuales de ticker o anotaciones de proveedor. Por ello, la entidad primaria de modelado no es \texttt{symbol}, sino \texttt{instrument\_id}; el ticker es solo una etiqueta observacional versionada en el tiempo.
+
+\subsection{Convención temporal PIT obligatoria}
+\label{sec:corporate_actions:timing}
+
+La semántica temporal de corporate actions debe quedar fijada sin ambigüedad.
+
+\paragraph{Tres tiempos distintos}
+\label{par:corporate_actions:three_times}
+
+Para cada evento \( a \), el sistema distingue, como mínimo:
 
 \begin{itemize}
-  \item \textbf{Ajustar precios} (splits, dividendos) de forma consistente con el tratamiento de índices institucionales (\textit{e.g.} MSCI, FTSE Russell) \cite{msci2023, lseg2024}.
-  \item \textbf{Garantizar continuidad histórica} del universo frente a cambios de ticker, \textit{mergers} y \textit{spin‑offs}.
-  \item \textbf{Soportar versionado} por \texttt{run\_id} y auditoría de eventos faltantes o conflictivos.
+    \item \(\mathtt{announcement\_ts}(a)\): instante en que el evento se hizo público o fue conocido por mercado/proveedor;
+    \item \(\mathtt{ex\_date}(a)\): fecha a partir de la cual el instrumento negocia ex-evento;
+    \item \(\mathtt{effective\_date}(a)\): fecha efectiva operativa del cambio en identidad, estructura o elegibilidad, si difiere de \(\mathtt{ex\_date}\).
 \end{itemize}
 
-La filosofía de diseño sigue estándares de \textit{corporate actions} en data providers institucionales (Bloomberg, LSEG, Optiver, etc.) \cite{databento2025, lseg2025, optiver2024, eulerpool2025}. En particular:
+\paragraph{Regla PIT}
+\label{par:corporate_actions:pit_rule}
 
-\begin{itemize}
-  \item \textbf{Schema canónico}: todos los proveedores se mapean a un \texttt{schema} común comprensible por \texttt{adjust\_prices} y \texttt{build\_universe}.
-  \item \textbf{Deduplicación robusta}: evita ajustes múltiples por el mismo evento.
-  \item \textbf{Timestamp PIT}: fechas de \texttt{ex\_date} y \texttt{effective\_date} se usan únicamente con información disponible hasta esa fecha.
-\end{itemize}
+Un evento solo puede influir en datasets etiquetados en fecha \( t \) si:
 
-\subsection{Definición formal del conjunto de acciones corporativas}
+\[
+\mathtt{known\_asof}(a,t)=1
+\]
+
+donde, por defecto:
+
+\[
+\mathtt{known\_asof}(a,t)=
+\mathbb{I}\big(\mathtt{announcement\_ts}(a) \le \texttt{decision\_cutoff}(t)\big)
+\]
+
+Esto impide incorporar retroactivamente información de eventos cuya fecha efectiva histórica sea anterior, pero cuyo conocimiento por el sistema o el mercado sea posterior.
+
+\paragraph{Regla operativa por defecto}
+\label{par:corporate_actions:default_timing}
+
+Salvo configuración contraria, la política estándar será:
+
+\[
+\texttt{decision\_cutoff}(t)=\texttt{close}(t-1)
+\]
+
+Por tanto, un evento con \(\mathtt{ex\_date}=t\) solo puede afectar a los artefactos construidos para \( t \) si era conocido como muy tarde al cierre de \( t-1 \).
+
+\subsection{Modelo formal del conjunto de corporate actions}
 \label{sec:corporate_actions:formal}
 
-Sea \(\mathcal{E}_{\text{ca}}\) el conjunto de eventos corporativos sobre \(\mathcal{T}\) (ticker universe) en el periodo \(\mathcal{D} = [t_0, t_1]\).
+Sea \(\mathcal{I}\) el conjunto de instrumentos económicamente identificables y \(\mathcal{D}=[t_0,t_1]\) el horizonte temporal del run. El módulo construye un conjunto canónico:
+
+\[
+\mathcal{A}^{\star}
+=
+\{a_1,\dots,a_n\}
+\]
+
+donde cada \(a \in \mathcal{A}^{\star}\) representa un evento económico normalizado, PIT y resoluble por el resto del sistema.
 
 \paragraph{Entradas}
 \label{par:corporate_actions:inputs}
+
 \begin{itemize}
-  \item \(\mathcal{D} = [t_0, t_1]\): rango de fechas de sesión.
-  \item \(\mathcal{A}_{\text{raw}}\): set de eventos corporativos \textit{raw} desde uno o varios proveedores (\texttt{provider\_events\_path} o API).
-  \item \(\mathcal{M}_{\text{ticker}}\): mapping \texttt{old\_symbol} \(\leftrightarrow\) \texttt{new\_symbol} estable por \texttt{FIGI/CIK}.
-  \item \texttt{config\_path}: reglas de normalización, mapeo de tipos de evento y políticas de conflicto same‑day.
-  \item \texttt{run\_id}: versión de ejecución.
+    \item \(\mathcal{A}_{\mathrm{raw}}^{(1)}, \dots, \mathcal{A}_{\mathrm{raw}}^{(m)}\): feeds raw de uno o varios proveedores.
+    \item \(\mathcal{M}_{\mathrm{id}}\): tablas de identidad PIT (\texttt{instrument\_id}, \texttt{issuer\_id}, FIGI, CUSIP, CIK, vendor IDs, ticker history).
+    \item \(\mathcal{R}_{\mathrm{ca}}\): configuración versionada de normalización, deduplicación y resolución de conflictos.
+    \item \(\mathcal{D}\): rango temporal solicitado.
+    \item \(\texttt{run\_id}\), \(\texttt{config\_hash}\), \(\texttt{code\_version}\): metadatos de reproducibilidad.
 \end{itemize}
 
-\paragraph{Tipos de evento}
-\label{par:corporate_actions:types}
-Cada evento \(a \in \mathcal{A}_{\text{raw}}\) se categoriza en un \texttt{event\_type} canónico:
-\begin{itemize}
-  \item \texttt{split}: \texttt{split\_from}, \texttt{split\_to} (\textit{e.g.} 2:1, 1:10).
-  \item \texttt{dividend\_cash}: \texttt{dividend\_cash} (USD por share).
-  \item \texttt{ticker\_change}: \texttt{old\_symbol}, \texttt{new\_symbol}.
-  \item \texttt{merger}, \texttt{spinoff}, \texttt{rights\_issue}, etc.\ (extensible).
-\end{itemize}
+\paragraph{Representación canónica}
+\label{par:corporate_actions:canonical}
 
-\paragraph{Schema canónico}
-\label{par:corporate_actions:schema}
-Tras normalización, cada evento \(a\) cumple:
+Cada evento normalizado \( a \in \mathcal{A}^{\star} \) debe contener, como mínimo:
+
 \[
-  a \in \mathcal{A}_{\text{ca}}
-  := \{(a_{\text{id}}, \mathtt{symbol}, \mathtt{event\_type}, \mathtt{ex\_date}, \mathtt{effective\_date}, \dots, \mathtt{source}, \mathtt{run\_id}, \mathtt{ingest\_ts\_utc})\}
+a =
+(
+\mathtt{event\_id},
+\mathtt{instrument\_id},
+\mathtt{issuer\_id},
+\mathtt{symbol},
+\mathtt{event\_type},
+\mathtt{announcement\_ts},
+\mathtt{ex\_date},
+\mathtt{effective\_date},
+\mathtt{status},
+\mathtt{source\_provider},
+\mathtt{source\_priority},
+\mathtt{confidence\_score},
+\mathtt{raw\_event\_refs},
+\dots
+)
 \]
-Donde:
+
+donde:
+
 \begin{itemize}
-  \item \texttt{event\_type} \(\in \Omega_{\text{ca}}\): enum de tipos de acción corporativa soportados.
-  \item \texttt{ex\_date}: fecha de registro para \textit{split} o \textit{dividend}.
-  \item \texttt{effective\_date} (si aplica): fecha en que el ajuste se aplica.
-  \item \texttt{split\_from}, \texttt{split\_to} para \texttt{split}.
-  \item \texttt{dividend\_cash} para \texttt{dividend\_cash}.
-  \item \texttt{old\_symbol}, \texttt{new\_symbol} para \texttt{ticker\_change}.
+    \item \(\mathtt{event\_id}\) es un identificador estable y determinista;
+    \item \(\mathtt{instrument\_id}\) es la clave primaria del evento;
+    \item \(\mathtt{status}\in\{\texttt{pending},\texttt{confirmed},\texttt{cancelled},\texttt{superseded}\}\);
+    \item \(\mathtt{raw\_event\_refs}\) referencia los registros raw que originaron el evento canónico.
 \end{itemize}
 
-\subsection{Transformaciones matemáticas clave para ajuste de precios}
-\label{sec:corporate_actions:pricing}
+\subsection{Taxonomía canónica de eventos}
+\label{sec:corporate_actions:taxonomy}
 
-\paragraph{Split de acciones}
-\label{par:corporate_actions:split}
-Sea un split \(s\) con:
-\begin{itemize}
-  \item \texttt{split\_from} = \(A\),
-  \item \texttt{split\_to} = \(B\).
-\end{itemize}
-El \textbf{split factor}:
+El sistema no debe depender de taxonomías arbitrarias de proveedores. Todos los eventos se proyectan sobre un conjunto canónico:
+
 \[
-  f_{\text{split}} = \frac{B}{A}
+\Omega_{\mathrm{ca}}=
+\{
+\texttt{split},
+\texttt{reverse\_split},
+\texttt{stock\_dividend},
+\texttt{cash\_dividend},
+\texttt{special\_cash\_dividend},
+\texttt{ticker\_change},
+\texttt{name\_change},
+\texttt{share\_class\_change},
+\texttt{exchange\_change},
+\texttt{merger},
+\texttt{acquisition},
+\texttt{spinoff},
+\texttt{rights\_issue},
+\texttt{tender\_offer},
+\texttt{delisting},
+\texttt{relisting},
+\texttt{bankruptcy\_reorg},
+\texttt{identifier\_maintenance}
+\}
 \]
-\begin{itemize}
-  \item \textbf{Precio ajustado} antes de \(t_{\text{split}}\):
-  \[
-    p_{t}^{\text{adj}} = p_{t}^{\text{raw}} \cdot f_{\text{split}}
-  \]
-  \item \textbf{Volumen ajustado} antes de \(t_{\text{split}}\):
-  \[
-    v_{t}^{\text{adj}} = v_{t}^{\text{raw}} \cdot \frac{1}{f_{\text{split}}}
-  \]
-\end{itemize}
-Este enfoque es consistente con el usado en metodologías de índices de mercado cap‑weighted \cite{msci2023, lseg2024}.
 
-\paragraph{Dividendos en efectivo}
-\label{par:corporate_actions:dividend}
-Sea un dividendo \(d\) con:
+\paragraph{Separación conceptual crítica}
+\label{par:corporate_actions:semantic_split}
+
+No todos los eventos tienen la misma semántica:
+
 \begin{itemize}
-  \item \texttt{dividend\_cash} = \(d_{\text{cash}}\).
+    \item \textbf{Eventos de ajuste mecánico}: splits, stock dividends, cash dividends.
+    \item \textbf{Eventos de identidad}: ticker changes, identifier maintenance, exchange changes sin ruptura económica.
+    \item \textbf{Eventos de transformación económica}: mergers, acquisitions, spinoffs, reorganizaciones.
+    \item \textbf{Eventos terminales o cuasi-terminales}: delistings, liquidations, bankruptcy reorg con discontinuidad material.
 \end{itemize}
-El \textbf{factor de ajuste} de precio:
+
+Esta separación es esencial porque distintos módulos downstream consumen diferentes subconjuntos semánticos del dataset.
+
+\subsection{Modelo de identidad y continuidad económica}
+\label{sec:corporate_actions:identity}
+
+El principal error de un sistema débil de corporate actions es tratar cambios de ticker como si fueran cambios de activo. Este módulo prohíbe esa simplificación.
+
+\paragraph{Regla básica}
+\label{par:corporate_actions:identity_rule}
+
+La continuidad histórica se modela a nivel de \texttt{instrument\_id}. Por tanto:
+
 \[
-  f_{\text{div}} = 1 - \frac{d_{\text{cash}}}{p_{t_{\text{ex}}-1}}
+\mathtt{symbol}(i,t)
+=
+\text{etiqueta observable del instrumento } i \text{ en } t
 \]
-\begin{itemize}
-  \item \textbf{Precio ajustado} para \(t \leq t_{\text{ex}}\):
-  \[
-    p_{t}^{\text{adj}} =
-    \begin{cases}
-      p_{t}^{\text{raw}} \cdot f_{\text{div}}^{-1} & \text{si } t \leq t_{\text{ex}} \\
-      p_{t}^{\text{raw}}                          & \text{si } t > t_{\text{ex}}
-    \end{cases}
-  \]
-\end{itemize}
-En índices de capitalización de mercado, se ajusta el price divisor y el número de shares para mantener el \textit{market cap} inalterado \cite{msci2023, lseg2024}.
 
-\paragraph{Cambio de ticker / Mergers}
-\label{par:corporate_actions:ticker_merger}
-Para \texttt{ticker\_change} o \texttt{merger}, se usa un \texttt{FIGI} o \texttt{CIK} estable \(i\) como identificador de instrumento:
+pero el historial económico y de pertenencia al universo debe seguir a \(i\), no al texto del símbolo.
+
+\paragraph{Ticker changes}
+\label{par:corporate_actions:ticker_change}
+
+Para un evento \texttt{ticker\_change} sobre \(i\):
+
 \[
-  \mathtt{symbol}(i,t) :=
-  \begin{cases}
-    \mathtt{old\_symbol} & \text{si } t < t_{\text{change}} \\
-    \mathtt{new\_symbol} & \text{si } t \geq t_{\text{change}}
-  \end{cases}
+\mathtt{symbol}(i,t)=
+\begin{cases}
+\mathtt{old\_symbol} & t < t_{\mathrm{eff}} \\
+\mathtt{new\_symbol} & t \ge t_{\mathrm{eff}}
+\end{cases}
 \]
-De forma que el historial de precios se “pega” por \texttt{FIGI} y el universo \(\mathcal{U}_t\) mantiene trazabilidad de la continuidad.
 
-\subsection{Ingesta y normalización de eventos}
-\label{sec:corporate_actions:ingest}
+sin que ello genere discontinuidad económica, falso turnover o pseudo-entrada/salida en el universo.
 
-\paragraph{Flujo de procesamiento}
-\label{par:corporate_actions:flow}
+\paragraph{Relistings}
+\label{par:corporate_actions:relistings}
+
+Un relisting puede significar:
+
 \begin{enumerate}
-  \item \textbf{Cargar eventos fuente}:
-  \[
-    \mathcal{A}_{\text{raw}} \leftarrow \text{source}( \texttt{source\_path} \text{ o } \texttt{API}, \mathcal{D} )
-  \]
-  \item \textbf{Normalizar a schema canónico}:
-  \[
-    \mathcal{A}_{\text{raw}} \stackrel{\phi}{\longrightarrow} \mathcal{A}_{\text{ca}}
-  \]
-  donde \(\phi\) aplica:
-  \begin{itemize}
-    \item mapeo de tipo de evento,
-    \item conversión de campos específicos de proveedor,
-    \item reglas de tratamiento de fechas y valores nulos.
-  \end{itemize}
-  \item \textbf{Enriquecer con mappings}:
-  \[
-    \mathcal{A}_{\text{ca}} \leftarrow \mathcal{A}_{\text{ca}} 
-    \text{ join } \mathcal{M}_{\text{ticker}} \text{ on } \text{old\_symbol} / \text{new\_symbol}
-  \]
-  \item \textbf{Validar y deduplicar}:
-  \[
-    \mathcal{A}_{\text{clean}} := \texttt{dedup\_by\_key}(\mathcal{A}_{\text{ca}}, \texttt{event\_id\_key})
-  \]
-  donde \texttt{event\_id\_key} puede ser \((\mathtt{symbol}, \mathtt{event\_type}, \mathtt{ex\_date}, \texttt{extra\_fields})\).
-  \item \textbf{Detectar conflictos same‑day}:
-  \[
-    a, a' \in \mathcal{A}_{\text{clean}}:
-    \mathtt{symbol}(a) = \mathtt{symbol}(a'), \mathtt{ex\_date}(a) = \mathtt{ex\_date}(a'), \mathtt{event\_type}(a) = \mathtt{event\_type}(a')
-    \Rightarrow \texttt{flag\_conflict}(a,a')
-  \]
-  \item \textbf{Persistir salidas}:
-  \[
-    \texttt{history.parquet}, \texttt{current.parquet}, \texttt{manifest\_*.json}, \texttt{failures\_*.parquet}
-  \]
+    \item continuidad económica del mismo instrumento;
+    \item creación efectiva de una nueva entidad invertible.
 \end{enumerate}
 
-\subsection{Validaciones y controles de calidad}
+La política por defecto será conservadora:
+
+\[
+\texttt{relisting\_resolution}=
+\texttt{new\_instrument\_unless\_proven\_continuous}
+\]
+
+salvo evidencia fuerte en \(\mathcal{M}_{\mathrm{id}}\) o en reglas explícitas de proveedor.
+
+\subsection{Transformaciones matemáticas para ajuste de precios}
+\label{sec:corporate_actions:pricing}
+
+El módulo no necesariamente aplica los ajustes finales, pero sí debe producir los factores canónicos que permitan a \texttt{adjust\_prices.py} hacerlo de forma consistente.
+
+\paragraph{Split y reverse split}
+\label{par:corporate_actions:split}
+
+Sea un evento con razón \(A:B\), donde una acción previa pasa a representar \(B/A\) acciones posteriores. Definimos:
+
+\[
+f_{\mathrm{split}}=\frac{B}{A}
+\]
+
+Entonces, para fechas históricas anteriores al evento:
+
+\[
+p_{u}^{\mathrm{adj}} = p_{u}^{\mathrm{raw}} \cdot f_{\mathrm{split}}
+\qquad \forall u < t_{\mathrm{eff}}
+\]
+
+\[
+v_{u}^{\mathrm{adj}} = v_{u}^{\mathrm{raw}} \cdot f_{\mathrm{split}}^{-1}
+\qquad \forall u < t_{\mathrm{eff}}
+\]
+
+\[
+\text{shares}^{\mathrm{adj}}_u = \text{shares}^{\mathrm{raw}}_u \cdot f_{\mathrm{split}}^{-1}
+\qquad \forall u < t_{\mathrm{eff}}
+\]
+
+\paragraph{Cash dividends}
+\label{par:corporate_actions:cash_dividend}
+
+Sea un dividendo ordinario \(d_{\mathrm{cash}}\) con ex-date \(t_{\mathrm{ex}}\). El factor de ajuste backward se define como:
+
+\[
+f_{\mathrm{div}}=
+1-\frac{d_{\mathrm{cash}}}{p_{t_{\mathrm{ex}}-1}^{\mathrm{raw}}}
+\]
+
+siempre que:
+
+\[
+0 < d_{\mathrm{cash}} < p_{t_{\mathrm{ex}}-1}^{\mathrm{raw}}
+\]
+
+En otro caso, el evento debe marcarse como anómalo o clasificarse como \texttt{special\_cash\_dividend}. Para fechas \(u < t_{\mathrm{ex}}\), el factor acumulado incluirá \(f_{\mathrm{div}}\) según la convención de ajuste elegida.
+
+\paragraph{Special dividends}
+\label{par:corporate_actions:special_div}
+
+Los dividendos extraordinarios no deben mezclarse ciegamente con dividendos ordinarios. Si su magnitud supera un umbral configurado \(\theta_{\mathrm{special}}\), se reclasifican como:
+
+\[
+\texttt{special\_cash\_dividend}
+\]
+
+y requieren política explícita de tratamiento, ya que pueden alterar materialmente la comparabilidad de retornos y market cap.
+
+\paragraph{Mergers y conversions}
+\label{par:corporate_actions:mergers}
+
+En una merger con ratio de conversión \(\rho\), efectivo \(c\) y/o combinación mixta, el módulo debe persistir la estructura económica del evento:
+
+\[
+\text{consideration}(a)=
+(\rho, c, \texttt{stock\_cash\_mix}, \texttt{survivor\_instrument\_id})
+\]
+
+No se permite representar una merger compleja únicamente como \texttt{ticker\_change}, porque eso destruye semántica económica relevante.
+
+\paragraph{Spin-offs}
+\label{par:corporate_actions:spinoff}
+
+Un \texttt{spinoff} debe modelarse como relación padre-hijo entre instrumentos:
+
+\[
+a_{\mathrm{spinoff}}=
+(
+i_{\mathrm{parent}},
+i_{\mathrm{child}},
+\alpha,
+t_{\mathrm{ex}}
+)
+\]
+
+donde \(\alpha\) representa la asignación de títulos del hijo por título del padre. La política de ajuste debe quedar explícita: o bien se genera factor económico equivalente para series históricas del parent, o bien se delega a un módulo posterior que consuma la estructura del evento.
+
+\subsection{Pipeline de ingestión, normalización y canonización}
+\label{sec:corporate_actions:pipeline}
+
+El pipeline debe ser estrictamente determinista.
+
+\paragraph{Paso 1: ingestión raw}
+\label{par:corporate_actions:step1}
+
+\[
+\mathcal{A}_{\mathrm{raw}}
+=
+\bigcup_{j=1}^{m}
+\mathcal{A}_{\mathrm{raw}}^{(j)}
+\]
+
+Cada registro raw debe conservar:
+
+\begin{itemize}
+    \item \texttt{provider\_name},
+    \item \texttt{provider\_event\_id},
+    \item payload original normalizado a JSON o estructura equivalente,
+    \item timestamp de ingesta.
+\end{itemize}
+
+\paragraph{Paso 2: normalización semántica}
+\label{par:corporate_actions:step2}
+
+Se aplica una función de normalización:
+
+\[
+\phi: \mathcal{A}_{\mathrm{raw}} \to \widetilde{\mathcal{A}}
+\]
+
+que:
+\begin{itemize}
+    \item mapea taxonomías de proveedor a \(\Omega_{\mathrm{ca}}\),
+    \item estandariza fechas y zonas horarias,
+    \item homogeneiza unidades monetarias y ratios,
+    \item identifica campos críticos faltantes,
+    \item genera flags de calidad por evento.
+\end{itemize}
+
+\paragraph{Paso 3: resolución de identidad}
+\label{par:corporate_actions:step3}
+
+Cada evento se enlaza con \(\mathtt{instrument\_id}\) y \(\mathtt{issuer\_id}\) mediante una función PIT de linkage:
+
+\[
+\psi: \widetilde{\mathcal{A}} \to \widehat{\mathcal{A}}
+\]
+
+La precedencia de matching debe ser:
+
+\begin{enumerate}
+    \item identificador estable explícito (FIGI, vendor security ID, CUSIP, etc.);
+    \item mapping histórico PIT de ticker + exchange + share class;
+    \item rules-based linkage con score de confianza;
+    \item si no resuelve, evento enviado a \texttt{failures}.
+\end{enumerate}
+
+\paragraph{Paso 4: deduplicación intra- e inter-provider}
+\label{par:corporate_actions:step4}
+
+Dos registros raw \(a,b\) representan el mismo evento económico si cumplen una relación de equivalencia:
+
+\[
+a \sim b
+\]
+
+determinada por:
+\begin{itemize}
+    \item mismo \texttt{instrument\_id},
+    \item mismo \texttt{event\_type} canónico,
+    \item proximidad temporal compatible,
+    \item parámetros económicos equivalentes dentro de tolerancia,
+    \item ausencia de contradicción material.
+\end{itemize}
+
+Cada clase de equivalencia colapsa en un único evento canónico \(a^\star\).
+
+\paragraph{Paso 5: resolución de conflictos}
+\label{par:corporate_actions:step5}
+
+Cuando múltiples proveedores discrepan sobre el mismo evento, el módulo debe aplicar una política cerrada de arbitraje, nunca heurística implícita.
+
+\subsection{Política formal de source-of-truth y precedencia}
+\label{sec:corporate_actions:source_of_truth}
+
+Este era uno de los puntos débiles más claros del texto original: la necesidad de cerrar una política formal de resolución cuando dos proveedores no coinciden.
+
+\paragraph{Ranking de fuentes}
+\label{par:corporate_actions:source_rank}
+
+La configuración debe fijar una relación total de prioridad:
+
+\[
+\Pi:
+\texttt{provider} \mapsto \{1,2,\dots,m\}
+\]
+
+donde menor valor implica mayor prioridad.
+
+\paragraph{Regla de resolución}
+\label{par:corporate_actions:source_rule}
+
+Para una clase de eventos equivalentes \([a]\), el valor canónico de cada campo material \(x\) se decide como:
+
+\[
+x^{\star}=
+\operatorname*{arg\,min}_{x(a_j)}
+\Pi(\mathtt{provider}(a_j))
+\]
+
+salvo que exista inconsistencia económica grave. En tal caso:
+
+\begin{itemize}
+    \item el evento se marca \texttt{CONFLICT\_MATERIAL},
+    \item no se promociona automáticamente a \texttt{confirmed},
+    \item puede bloquear downstream si afecta ajustes o identidad.
+\end{itemize}
+
+\paragraph{Campos críticos}
+\label{par:corporate_actions:critical_fields}
+
+Se consideran críticos, al menos:
+
+\[
+\{
+\mathtt{event\_type},
+\mathtt{instrument\_id},
+\mathtt{ex\_date},
+\mathtt{effective\_date},
+\mathtt{split\_ratio},
+\mathtt{cash\_amount},
+\mathtt{survivor\_instrument\_id}
+\}
+\]
+
+Una discrepancia material en cualquiera de ellos no puede resolverse silenciosamente.
+
+\subsection{Eventos concurrentes y precedencia same-day}
+\label{sec:corporate_actions:sameday}
+
+Cuando múltiples eventos afectan al mismo instrumento y misma fecha, el orden importa. El sistema debe fijar una precedencia formal.
+
+\paragraph{Precedencia operativa por defecto}
+\label{par:corporate_actions:sameday_precedence}
+
+Para el mismo \((\mathtt{instrument\_id}, t)\), el orden de aplicación por defecto será:
+
+\begin{enumerate}
+    \item \texttt{identifier\_maintenance} / \texttt{name\_change}
+    \item \texttt{ticker\_change}
+    \item \texttt{exchange\_change}
+    \item \texttt{split} / \texttt{reverse\_split}
+    \item \texttt{stock\_dividend}
+    \item \texttt{cash\_dividend}
+    \item \texttt{special\_cash\_dividend}
+    \item \texttt{rights\_issue}
+    \item \texttt{spinoff}
+    \item \texttt{merger} / \texttt{acquisition}
+    \item \texttt{delisting}
+    \item \texttt{relisting}
+\end{enumerate}
+
+\paragraph{Motivación}
+\label{par:corporate_actions:sameday_motivation}
+
+Esta precedencia refleja que:
+\begin{itemize}
+    \item primero se resuelve la identidad textual y venue;
+    \item después los ajustes mecánicos sobre capital structure;
+    \item después los eventos distributivos;
+    \item finalmente los transformacionales o terminales.
+\end{itemize}
+
+\paragraph{Eventos compuestos}
+\label{par:corporate_actions:compound}
+
+Si un proveedor reporta un evento compuesto, por ejemplo split + ticker change + exchange move, el sistema debe descomponerlo en una secuencia ordenada de subeventos canónicos, enlazados por un \texttt{compound\_event\_id}. Esto permite downstream reproducible y evita lógica opaca.
+
+\subsection{Validaciones, invariantes y criterios de aceptación}
 \label{sec:corporate_actions:checks}
 
-\paragraph{Checks obligatorios}
-\label{par:corporate_actions:checks}
+\paragraph{Invariantes duros}
+\label{par:corporate_actions:hard_checks}
+
+Un run válido debe satisfacer:
+
+\begin{enumerate}
+    \item \textbf{Unicidad canónica}
+    \[
+    \nexists a \neq b \in \mathcal{A}^{\star}
+    :
+    \mathtt{event\_id}(a)=\mathtt{event\_id}(b)
+    \]
+    \item \textbf{Integridad temporal}
+    \[
+    \mathtt{ex\_date}, \mathtt{effective\_date}
+    \text{ parseables y coherentes}
+    \]
+    \item \textbf{Identidad resuelta}
+    \[
+    \mathtt{instrument\_id}(a) \neq \varnothing
+    \quad \forall a \in \mathcal{A}^{\star}_{\mathrm{confirmed}}
+    \]
+    \item \textbf{Split ratio válido}
+    \[
+    A>0,\; B>0
+    \quad \text{para todo split } A:B
+    \]
+    \item \textbf{Dividend cash no negativo}
+    \[
+    d_{\mathrm{cash}} \ge 0
+    \]
+    \item \textbf{No duplicidad económica no resuelta}
+    ninguna clase de equivalencia puede promocionarse a confirmada con conflicto material abierto.
+\end{enumerate}
+
+\paragraph{Checks blandos}
+\label{par:corporate_actions:soft_checks}
+
+Se monitorizan como \texttt{WARN} o \texttt{FAIL} según umbral:
+
 \begin{itemize}
-  \item \textbf{Fechas parseables y en rango}:
-  \[
-    \forall a \in \mathcal{A}_{\text{clean}}: \mathtt{ex\_date}(a) \in \mathcal{D}
-  \]
-  \item \textbf{Deduplicación por clave de evento}:
-  \[
-    \text{no duplicados en } \texttt{event\_id\_key} := (\mathtt{symbol}, \mathtt{event\_type}, \mathtt{ex\_date})
-  \]
-  \item \textbf{Eventos conflictivos mismo día}:
-  \[
-    \{a,a'\} \text{ same } \mathtt{symbol}, \mathtt{event\_type}, \mathtt{ex\_date} \Rightarrow \texttt{flag} = 1 \text{ en ambos}
-  \]
-  \item \textbf{Mapping de ticker coherente}:
-  \[
-    \text{Si } \mathtt{old\_symbol}(a) \text{ mapea a } \mathtt{new\_symbol}(a) \text{ mediante } i = \mathtt{FIGI},
-    \text{ entonces } \mathtt{symbol}(i) \text{ es estable.}
-  \]
+    \item tasa de eventos no resueltos \(>\gamma_{\mathrm{fail}}\),
+    \item caída abrupta de cobertura por tipo de evento,
+    \item aumento anómalo de conflictos inter-provider,
+    \item concentración excesiva en un único proveedor,
+    \item número inusual de special dividends o relistings.
 \end{itemize}
 
-\paragraph{Calidad de cobertura}
-\label{par:corporate_actions:coverage}
-Finalizadas las validaciones, se genera un \texttt{manifest} que reporta:
+\paragraph{Severidad global}
+\label{par:corporate_actions:severity}
+
+Cada check produce:
+
+\[
+\texttt{PASS} < \texttt{WARN} < \texttt{FAIL}
+\]
+
+y:
+
+\[
+\texttt{run\_status}=
+\max(\texttt{severity of all checks})
+\]
+
+Si \(\texttt{run\_status}=\texttt{FAIL}\), el output no debe alimentar módulos downstream críticos sin override explícito y logueado.
+
+\subsection{Outputs canónicos y artefactos de auditoría}
+\label{sec:corporate_actions:outputs}
+
+\paragraph{Dataset histórico}
+\label{par:corporate_actions:history}
+
+\[
+\texttt{data/universe/corporate\_actions/history.parquet}
+\]
+
+contiene \(\mathcal{A}^{\star}\) completo con schema canónico y lineage.
+
+\paragraph{Snapshot vigente}
+\label{par:corporate_actions:current}
+
+\[
+\texttt{data/universe/corporate\_actions/current.parquet}
+\]
+
+contiene la vista activa o más reciente según política de snapshot.
+
+\paragraph{Eventos fallidos}
+\label{par:corporate_actions:failures}
+
+\[
+\texttt{failures\_\{run\_id\}.parquet}
+\]
+
+incluye eventos no normalizados, no enlazados o materialmente conflictivos, con código de fallo estable.
+
+\paragraph{Manifest}
+\label{par:corporate_actions:manifest}
+
+\[
+\texttt{manifest\_\{run\_id\}.json}
+\]
+
+debe incluir, como mínimo:
+
 \begin{itemize}
-  \item conteo de eventos por \texttt{event\_type},
-  \item porcentaje de eventos resueltos vs faltantes,
-  \item \texttt{run\_duration\_sec}, \texttt{run\_id}, \texttt{config\_hash}.
+    \item \texttt{run\_id}, \texttt{config\_hash}, \texttt{code\_version},
+    \item hashes de inputs,
+    \item conteos por \texttt{event\_type},
+    \item cobertura por proveedor,
+    \item número de conflictos y no resueltos,
+    \item checks ejecutados y severidad final,
+    \item timestamps de inicio y fin.
 \end{itemize}
 
-\subsection{Interfaz de ejecución y salida de archivos}
-\label{sec:corporate_actions:cli}
+\subsection{Contrato con módulos aguas abajo}
+\label{sec:corporate_actions:contracts}
 
-\paragraph{CLI}
-\label{par:corporate_actions:cli}
-\begin{verbatim}
-python -m data.universe.corporate_actions ^
-  --source-path data/universe/source/corp_actions.parquet ^
-  --mapping-path data/universe/source/ticker_map.parquet ^
-  --config-path configs/data/corporate_actions.yaml ^
-  --run-id corp_actions_20260305_001
-\end{verbatim}
+\texttt{corporate\_actions.py} expone un contrato estable a otros componentes:
 
-\paragraph{Outputs}
-\label{par:corporate_actions:outputs}
 \begin{itemize}
-  \item \texttt{data/universe/corporate\_actions/history.parquet}:
-  \[
-    \mathcal{A}_{\text{clean}} \text{ con historial completo}
-  \]
-  \item \texttt{data/universe/corporate\_actions/current.parquet}:
-  \[
-    \mathcal{A}_{\text{current}} := \{(a \in \mathcal{A}_{\text{clean}} \mid t \leq t_{\max})\}
-  \]
-  \item \texttt{data/universe/corporate\_actions/manifest\_\{run\_id\}.json}:
-  \[
-    \{(\texttt{event\_type}, \texttt{count}), \texttt{success\_rate}, \texttt{run\_duration\_sec}\}
-  \]
-  \item \texttt{data/universe/corporate\_actions/failures\_\{run\_id\}.parquet}:
-  \[
-    \texttt{a} \in \mathcal{A}_{\text{raw}} \text{ que no se pudieron normalizar}
-  \]
+    \item \texttt{adjust\_prices.py}: consume factores de ajuste mecánico y estructura temporal correcta.
+    \item \texttt{build\_universe.py}: consume continuidad de identidad, delistings, relistings, exchange changes y transformaciones materiales.
+    \item \texttt{survivorship.py}: consume eventos terminales y mappings de continuidad para no confundir ticker death con economic death.
+    \item validación y attribution: consumen el lineage completo del evento.
 \end{itemize}
 
-\subsection{Definition of Done y alineación con el sistema}
+Queda prohibido que módulos downstream reinterpreten raw feeds de corporate actions por su cuenta, ya que eso rompería la unicidad semántica del sistema.
+
+\subsection{Definition of Done}
 \label{sec:corporate_actions:dod}
 
-El módulo cumple su \textbf{Definition of Done} cuando:
-\begin{itemize}
-  \item El dataset \texttt{history.parquet} es:
-  \[
-    \text{PIT, deduplicado y con mapeo estable por \texttt{FIGI/CIK}.}
-  \]
-  \item Es directamente usable por:
-  \begin{itemize}
-    \item \texttt{data/price/adjust\_prices.py} para ajustar \texttt{split} y \texttt{dividend\_cash}.
-    \item \texttt{data/universe/build\_universe.py} para mantener continuidad de \texttt{symbol} ante \texttt{ticker\_change} y \texttt{merger}.
-  \end{itemize}
-  \item Existe \texttt{manifest} y \texttt{failures} que permiten:
-  \[
-    \text{auditoría de cobertura y errores en el pipeline de datos.}
-  \]
-\end{itemize}
+El módulo alcanza su \textbf{Definition of Done} cuando:
 
-Esto lo convierte en un \textbf{pilar de bajo nivel** del sistema de trading industrial, reduciendo el riesgo de \textit{look‑ahead} y rupturas de continuidad de ticker en el backtest \cite{quantjourney2025, atlasquant2025}.
+\begin{enumerate}
+    \item produce un dataset \textbf{PIT, canónico, deduplicado y resoluble por identidad económica};
+    \item fija una \textbf{política determinista de source-of-truth y de precedencia same-day};
+    \item representa de forma explícita \textbf{eventos compuestos, eventos terminales y transformaciones económicas};
+    \item entrega \textbf{lineage completo} desde el evento canónico hasta los registros raw de origen;
+    \item expone artefactos suficientes para auditoría, bloqueo y reproducción exacta del run.
+\end{enumerate}
+
+\subsection{Resumen ejecutivo}
+\label{sec:corporate_actions:summary}
+
+\texttt{corporate\_actions.py} no es un parser de eventos; es el \textbf{motor de canonización histórica} del sistema. Su responsabilidad es convertir feeds heterogéneos de corporate actions en una capa única de verdad PIT que preserve continuidad económica, ajuste correctamente precios y volumen, resuelva conflictos de proveedor con reglas cerradas y mantenga trazabilidad institucional de todas las decisiones.
+
+Sin esta capa, los ajustes de precios, la continuidad del universo, la medición de retornos y la inferencia de supervivencia quedarían expuestos a errores silenciosos de enorme coste cuantitativo.

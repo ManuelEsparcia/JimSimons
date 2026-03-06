@@ -1,74 +1,510 @@
-% Copiar y pegar en LaTeX (guarda como .txt)
+% Copiar y pegar en LaTeX (guardar como .txt)
 \documentclass{article}
 \usepackage[utf8]{inputenc}
-\usepackage{amsmath,amssymb}
-\usepackage{hyperref}
-\usepackage{booktabs}
+\usepackage[T1]{fontenc}
 \usepackage[spanish]{babel}
-\title{Explicaci\'on SOTA: validation/synthetic\_shocks.py}
-\author{Perplexity Stress Testing Research}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\title{Especificaci\'on Cuantitativa: validation/synthetic\_shocks.py}
+\author{JimSimons Small Cap Swing --- Validation Research Note}
 \date{Marzo 2026}
+
 \begin{document}
 \maketitle
 
-\section{Resumen Ejecutivo}
-25+ shocks sint\'eticos reproducibles eval\'uan fragilidad swing trading:
-liq -80\%, vol +300\%, gaps $\pm$15\%. 73\% estrategias FALLAN 
-``Liq Crash + Vol Spike''. Survivors mantienen Sharpe$>$1.8. 
-Robustez score: 0.62$\to$0.91 post-hardening.
+\section{Prop\'osito del m\'odulo}
 
-\section{Shocks Matem\'aticos}
+El objetivo de \texttt{synthetic\_shocks.py} no es producir un relato dram\'atico de crisis ni
+mostrar cu\'antas estrategias ``sobreviven'' a un conjunto vistoso de escenarios. Su funci\'on
+es m\'as precisa: someter una estrategia ya especificada a perturbaciones sint\'eticas
+controladas sobre liquidez, volatilidad, gaps, spreads, correlaci\'on y costes de ejecuci\'on
+para medir su fragilidad operativa y econ\'omica fuera del r\'egimen base.
 
-\subsection{Impacto Din\'amico Stress}
-\begin{equation}
-\text{Slippage}_{\text{stress}} = \lambda_0 \sqrt{\frac{\sigma_{\text{stress}}^2}{\sigma_{\text{base}}^2}} \frac{Q}{\text{ADV}_{\text{down}}}
-\end{equation}
+La pregunta formal del m\'odulo es:
 
-\subsection{Drawdown Cascading Gaps}
-\begin{equation}
-\text{DD}_{\text{cascade}} = \max_t \sum_i \text{gap}_i \cdot w_{i,t}
-\end{equation}
+\begin{quote}
+\emph{Si el entorno de mercado deja de parecerse al utilizado para calibrar el backtest base,
+\`en qu\'e dimensiones falla primero la estrategia: rentabilidad neta, drawdown, capacidad de
+ejecuci\'on, concentraci\'on de riesgo o estabilidad de inventario?}
+\end{quote}
 
-\subsection{Robustez Score}
-\begin{equation}
-R = \alpha\frac{\text{Sharpe}_{\min}}{\text{Sharpe}_{\text{base}}} + (1-\alpha)\left(1-\frac{\text{DD}_{\max}}{\text{DD}_{\text{tol}}}\right)
-\end{equation}
+Este m\'odulo, por tanto, no estima probabilidad real de crisis. Construye \textbf{escenarios
+contrafactuales reproducibles} para evaluar sensibilidad del sistema a perturbaciones plausibles
+o deliberadamente adversas.
 
-\section{Backtest 25 Escenarios}
-\begin{table}[h]
-\centering
-\tiny
-\begin{tabular}{lccccc}
-\toprule
-Escenario & Intensidad & $\Delta$Sharpe & $\Delta$DD & $\Delta$R & Breach \\
-\midrule
-\textbf{Liq Crash} & ADV -80\% & -1.2 & +14\% & -22\% & S\'{\i} \\
-\textbf{Vol Spike} & $\sigma$+300\% & -0.8 & +9\% & -17\% & S\'{\i} \\
-\textbf{Gap Down} & -12\% jump & -0.5 & +11\% & -15\% & S\'{\i} \\
-\textbf{Cost x3} & Fees$\times$3 & -0.3 & +3\% & -9\% & No \\
-\textbf{Crisis Combo} & Liq+Vol+Gap & -2.1 & +28\% & -41\% & S\'{\i} \\
-\textbf{Baseline} & 0 & 0 & 0 & 0 & No \\
-\bottomrule
-\end{tabular}
-\caption{Robustez bajo Shocks Sint\'eticos}
-\end{table}
+\section{Principio de dise\~no}
 
-\section{Implementaci\'on Stress Engine}
+El test de shocks sint\'eticos solo es interpretable si mantiene fija la estrategia y cambia
+el entorno. Deben permanecer invariantes:
+
+\begin{itemize}[leftmargin=2em]
+    \item las se\~nales de entrada y salida;
+    \item las reglas de construcci\'on de cartera;
+    \item la frecuencia de rebalanceo;
+    \item la l\'ogica de sizing;
+    \item la gobernanza de riesgo interna;
+    \item la definici\'on del universo, salvo que el propio shock act\'ue sobre su liquidez efectiva.
+\end{itemize}
+
+Si durante el shock se reoptimiza la estrategia, ya no se est\'a midiendo robustez del dise\~no
+original, sino la capacidad de un dise\~no nuevo para adaptarse al escenario.
+
+\section{Marco matem\'atico}
+
+Sea
+\[
+Z_t = \big(r_t,\sigma_t,\mathrm{ADV}_t,s_t,\Sigma_t,g_t\big)
+\]
+el estado de mercado agregado en la fecha $t$, donde:
+\begin{itemize}[leftmargin=2em]
+    \item $r_t$ representa retornos o innovaciones de precio;
+    \item $\sigma_t$ volatilidad;
+    \item $\mathrm{ADV}_t$ liquidez observada o efectiva;
+    \item $s_t$ spread bid-ask;
+    \item $\Sigma_t$ estructura de covarianzas o correlaciones cross-sectional;
+    \item $g_t$ vector de gaps o saltos discretos relevantes.
+\end{itemize}
+
+Un shock sint\'etico $k$ es una transformaci\'on
+\[
+\mathcal{T}_k : Z_t \mapsto Z_t^{(k)}
+\]
+que altera una o varias componentes del estado:
+\[
+Z_t^{(k)} =
+\mathcal{T}_k(Z_t; \xi_k),
+\]
+donde $\xi_k$ contiene la severidad del escenario.
+
+La estrategia genera holdings $h_t$ y \'ordenes $\Delta h_t$ seg\'un el pipeline base ya fijado.
+Bajo el escenario $k$, el PnL neto debe recomputarse como:
+\[
+\mathrm{PnL}^{(k)}_t
+=
+h_{t-1}^{\top} r_t^{(k)}
+-
+\mathrm{TC}^{(k)}_t(\Delta h_t, Z_t^{(k)}),
+\]
+con costes de ejecuci\'on y fricciones consistentes con el entorno perturbado.
+
+\section{Familias de shocks}
+
+El m\'odulo debe organizar la librer\'ia de shocks por familias econ\'omicamente interpretables.
+
+\subsection{Compresi\'on de liquidez}
+
+En small caps, una de las fragilidades principales no es el retorno bruto, sino la capacidad
+de ejecutar tama\~nos razonables cuando el volumen disponible se contrae. El shock de liquidez
+debe actuar sobre el volumen efectivo:
+\[
+\mathrm{ADV}^{(k)}_{i,t} = \kappa^{(k)}_{\mathrm{liq},i,t}\,\mathrm{ADV}_{i,t},
+\qquad
+0 < \kappa^{(k)}_{\mathrm{liq},i,t} \le 1.
+\]
+
+La severidad puede ser uniforme o cross-sectional. En escenarios m\'as realistas, los nombres
+menos l\'iquidos deben deteriorarse m\'as:
+\[
+\kappa^{(k)}_{\mathrm{liq},i,t}
+=
+\kappa_0^{(k)} \cdot \psi_i,
+\]
+donde $\psi_i$ penaliza microcaps o activos con historial de volumen inestable.
+
+\subsection{Ampliaci\'on de spread}
+
+La liquidez rara vez colapsa sola. En estr\'es severo, el spread y el impacto suelen crecer.
+El shock de spread puede definirse como:
+\[
+s^{(k)}_{i,t} = \kappa^{(k)}_{\mathrm{spr},i,t}\, s_{i,t},
+\qquad \kappa^{(k)}_{\mathrm{spr},i,t} \ge 1.
+\]
+
+No conviene tratar spread y liquidez como shocks totalmente independientes si el objetivo es
+simular deterioro microestructural coherente. En escenarios compuestos deben poder acoplarse.
+
+\subsection{Amplificaci\'on de volatilidad}
+
+La volatilidad puede escalarse de forma multiplicativa:
+\[
+\sigma^{(k)}_{i,t} = \kappa^{(k)}_{\sigma,i,t}\, \sigma_{i,t},
+\qquad \kappa^{(k)}_{\sigma,i,t} \ge 1.
+\]
+
+Si el motor necesita perturbar tambi\'en retornos, una forma parsimoniosa es:
+\[
+r^{(k)}_{i,t}
+=
+\mu_{i,t}
++
+\kappa^{(k)}_{\sigma,i,t}\big(r_{i,t} - \mu_{i,t}\big),
+\]
+donde $\mu_{i,t}$ es un centro local o drift estimado. Esta transformaci\'on preserva signo
+y orden temporal, pero magnifica la dispersi\'on.
+
+\subsection{Gaps y jumps discretos}
+
+El riesgo de swing trading en small caps est\'a muy expuesto a gaps overnight, noticias idiosincr\'aticas,
+halts y movimientos discontinuos. El shock de jumps debe introducir saltos discretos:
+\[
+r^{(k)}_{i,t}
+=
+r_{i,t}
++
+J^{(k)}_{i,t},
+\]
+donde
+\[
+J^{(k)}_{i,t}
+=
+\sum_{\ell=1}^{N^{(k)}_{i,t}} Y^{(k)}_{i,t,\ell}.
+\]
+
+Aqu\'i $N^{(k)}_{i,t}$ representa el n\'umero de eventos de gap en una ventana y $Y^{(k)}$ su
+magnitud. Para validaci\'on operativa no hace falta modelar una ley sofisticada; basta con
+especificar escenarios reproducibles como:
+\begin{itemize}[leftmargin=2em]
+    \item gap down uninominal;
+    \item gap sincronizado por factor de mercado;
+    \item cascada de gaps sobre posiciones concentradas;
+    \item gap adverso en el top decil de pesos.
+\end{itemize}
+
+\subsection{Concentraci\'on de correlaciones}
+
+Muchos backtests parecen diversificados hasta que las correlaciones aumentan simult\'aneamente.
+Para un shock de dependencia, puede perturbarse la matriz de covarianza:
+\[
+\Sigma_t^{(k)} = D_t \, C_t^{(k)} \, D_t,
+\]
+donde $D_t$ contiene volatilidades marginales y $C_t^{(k)}$ es una matriz de correlaci\'on
+estresada, por ejemplo m\'as cercana a una estructura de factor \'unico o m\'as homog\'enea
+en off-diagonals.
+
+Este tipo de shock es especialmente relevante si la estrategia concentra nombres en subuniversos
+parecidos aunque el n\'umero bruto de posiciones parezca elevado.
+
+\subsection{Impacto y costes de ejecuci\'on}
+
+El coste total en estr\'es no debe limitarse a comisiones multiplicadas por una constante.
+Una formulaci\'on suficientemente general es:
+\[
+c^{(k)}_{i,t}
+=
+c^{\mathrm{fees}}_{i,t}
++
+\frac{1}{2}s^{(k)}_{i,t}
++
+\lambda^{(k)}_{i,t}
+\left(
+\frac{|Q_{i,t}|}{\mathrm{ADV}^{(k)}_{i,t}}
+\right)^{\beta},
+\qquad \beta \in [1,2].
+\]
+
+Obs\'ervese que liquidez, spread y coste de impacto quedan acoplados de forma natural. Esto es
+preferible a multiplicar el coste por un factor fijo arbitrario sin relaci\'on con el resto del
+escenario.
+
+\section{Escenarios simples y escenarios compuestos}
+
+La librer\'ia debe distinguir entre:
+
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{shocks simples}, que perturban una sola dimensi\'on;
+    \item \textbf{shocks compuestos}, que combinan varias perturbaciones coherentes;
+    \item \textbf{stress paths}, que aplican el shock durante una ventana temporal consecutiva y
+    no solo en una fecha aislada.
+\end{itemize}
+
+Ejemplos de escenarios compuestos razonables:
+\begin{itemize}[leftmargin=2em]
+    \item liquidez abajo + spread arriba;
+    \item liquidez abajo + volatilidad arriba + gaps adversos;
+    \item correlaci\'on arriba + gap de mercado + impacto elevado;
+    \item deterioro progresivo en varios d\'ias de ejecuci\'on.
+\end{itemize}
+
+No debe explotarse combinatoriamente la librer\'ia hasta producir cientos de escenarios poco
+interpretables. Es preferible una familia reducida, bien documentada y econ\'omicamente coherente.
+
+\section{Calibraci\'on de severidades}
+
+La severidad del shock no debe fijarse con frases del tipo ``ADV -80\%'' o ``vol +300\%'' sin
+anclaje metodol\'ogico. El m\'odulo debe permitir tres modos de calibraci\'on:
+
+\subsection{Calibraci\'on emp\'irica}
+Basada en cuantiles hist\'oricos del propio universo:
+\[
+\kappa_{\mathrm{liq}} \in Q_{0.01}\left(\frac{\mathrm{ADV}_{t+1}}{\mathrm{ADV}_t}\right),
+\qquad
+\kappa_{\sigma} \in Q_{0.99}\left(\frac{\sigma_{t+1}}{\sigma_t}\right),
+\]
+o an\'alogos robustos.
+
+\subsection{Calibraci\'on hist\'orico-epis\'odica}
+Basada en ventanas reales de tensi\'on de mercado o nombres individuales representativos,
+reaplicadas como plantillas sobre el pipeline.
+
+\subsection{Calibraci\'on adversarial}
+No pretende probabilidad realista, sino testar puntos de ruptura deliberadamente severos
+para descubrir d\'onde la estrategia deja de ser operacionalmente aceptable.
+
+Es importante etiquetar claramente cu\'al de estos modos se usa en cada escenario.
+
+\section{M\'etricas que debe devolver el m\'odulo}
+
+El test no debe resumirse en un ``robustness score'' \'unico como criterio principal. Debe
+devolver una bater\'ia de m\'etricas diagn\'osticas, al menos:
+
+\begin{itemize}[leftmargin=2em]
+    \item retorno anualizado neto bajo shock;
+    \item Sharpe neto bajo shock;
+    \item drawdown m\'aximo bajo shock;
+    \item turnover y coste total bajo shock;
+    \item participaci\'on en volumen y d\'ias para liquidar bajo shock;
+    \item peor d\'ia, peor semana o peor ventana relevante;
+    \item fracci\'on de escenarios con breach de l\'imites duros;
+    \item restricci\'on vinculante por escenario.
+\end{itemize}
+
+Adem\'as, para comparar frente al baseline:
+\[
+\Delta U_k = U^{(k)} - U^{(0)},
+\]
+donde $U$ puede ser una utilidad interna definida ex ante (por ejemplo Sharpe neto penalizado
+por drawdown y costes), siempre que no se cambie tras ver los resultados.
+
+\section{Governance: PASS, WARN y FAIL}
+
+La l\'ogica de gobernanza no debe permitir que un gran promedio oculte un fallo cr\'itico en
+un escenario relevante. Es preferible una jerarqu\'ia de restricciones duras y blandas.
+
+\subsection{Restricciones duras}
+
+Para cada escenario cr\'itico $k \in \mathcal{K}_{\mathrm{crit}}$ deben definirse l\'imites como:
+\[
+\mathrm{DD}^{(k)} \le \mathrm{DD}_{\max},
+\qquad
+\mathrm{TC}^{(k)} \le \mathrm{TC}_{\max},
+\qquad
+Q_{0.95}\big(\pi^{(k)}\big) \le \pi_{\max},
+\qquad
+Q_{0.95}\big(\mathrm{DTL}^{(k)}\big) \le \mathrm{DTL}_{\max}.
+\]
+
+Si cualquiera de estas restricciones falla en un escenario cr\'itico, el resultado debe ser
+\texttt{FAIL} independientemente del comportamiento medio del resto.
+
+\subsection{Restricciones blandas}
+
+Sobre escenarios no cr\'iticos o degradaciones moderadas, puede definirse un conjunto de alerts:
+\[
+\Delta \mathrm{Sharpe}^{(k)} < -\delta_S,
+\qquad
+\Delta \mathrm{DD}^{(k)} > \delta_{DD},
+\qquad
+\mathrm{Retention}^{(k)} < r_{\min}.
+\]
+
+Estas restricciones elevan severidad a \texttt{WARN} cuando la fragilidad es visible, aunque no
+haya ruptura operacional total.
+
+\subsection{Decisi\'on global}
+
+Una gobernanza simple y auditable es:
+\[
+\texttt{FAIL}
+\iff
+\exists k \in \mathcal{K}_{\mathrm{crit}}
+\text{ tal que se viola una restricci\'on dura},
+\]
+\[
+\texttt{WARN}
+\iff
+\text{no hay FAIL pero existe degradaci\'on material repetida},
+\]
+\[
+\texttt{PASS}
+\iff
+\text{todos los escenarios cr\'iticos son absorbibles y la degradaci\'on agregada es aceptable}.
+\]
+
+\section{Sobre los scores agregados}
+
+Puede ser \'util construir un score auxiliar para ordenar estrategias, pero nunca debe ser el
+criterio decisorio primario. Si se define un score de robustez, debe ser secundario y transparente,
+por ejemplo:
+\[
+R_k = \varphi\!\left(
+\frac{U^{(k)}}{U^{(0)}},
+\frac{\mathrm{DD}^{(k)}}{\mathrm{DD}_{\max}},
+\frac{\mathrm{TC}^{(k)}}{\mathrm{TC}_{\max}}
+\right),
+\]
+con $\varphi$ fijada ex ante.
+
+La raz\'on es clara: cualquier score agregado puede compensar un drawdown intolerable con una
+m\'etrica favorable en otra dimensi\'on. Esa compensaci\'on es inaceptable si el objetivo del
+m\'odulo es validaci\'on seria.
+
+\section{Casos l\'imite y errores frecuentes}
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Doblar el mismo riesgo dos veces.} Un shock de volatilidad y un shock de gap
+    mal dise\~nados pueden duplicar la misma fuente de estr\'es.
+    \item \textbf{ADV nulo o casi nulo.} El m\'odulo debe saturar o marcar como il\'iquida la
+    observaci\'on en vez de producir divisiones num\'ericamente inestables.
+    \item \textbf{Ignorar halts o sesiones discontinuas.} En small caps esto no es un detalle.
+    \item \textbf{Reoptimizar pesos en cada shock.} Eso destruye la interpretaci\'on del test.
+    \item \textbf{Confundir severidad con probabilidad.} Un escenario adversarial puede ser muy
+    \'util sin pretender ser frecuente.
+    \item \textbf{Promediar escenarios incompatibles.} Un promedio simple puede ocultar que la
+    estrategia es inviable en un subconjunto peque\~no pero cr\'itico de shocks.
+\end{enumerate}
+
+\section{Invariantes de implementaci\'on}
+
+El motor debe respetar al menos estos invariantes:
+
+\begin{itemize}[leftmargin=2em]
+    \item toda perturbaci\'on debe ser reproducible a partir de una semilla o especificaci\'on fija;
+    \item la estrategia base no debe cambiar entre escenarios;
+    \item los costes deben ser no decrecientes en escenarios de deterioro de liquidez o spread;
+    \item los escenarios compuestos deben declarar expl\'icitamente sus componentes;
+    \item el reporte debe identificar la restricci\'on vinculante de cada breach;
+    \item el resultado final debe distinguir entre shocks emp\'iricos, hist\'oricos y adversariales.
+\end{itemize}
+
+\section{Salida recomendada del m\'odulo}
+
+La salida debe ser granular y auditable, por ejemplo:
+
 \begin{verbatim}
-def liquidity_shock(adv, intensity=-0.8):
-    return adv * (1 + intensity)
-
-def gap_cascade_dd(pos, gaps):
-    return np.max(np.cumsum(gaps @ pos.T))
-
-shocks = {'liq_crash': {'adv': 0.2}, 'vol_spike': {'vol': 4.0}}
+{
+  "baseline_metrics": {...},
+  "scenario_reports": [
+    {
+      "scenario_id": "...",
+      "scenario_type": "empirical|historical|adversarial",
+      "components": ["liquidity", "spread", "gap"],
+      "severity": {...},
+      "metrics": {...},
+      "hard_breaches": [...],
+      "soft_flags": [...],
+      "binding_constraint": "..."
+    }
+  ],
+  "global_gate": "PASS|WARN|FAIL",
+  "critical_failures": [...],
+  "worst_scenarios": [...],
+  "notes": [...]
+}
 \end{verbatim}
 
-\section{Referencias}
-\begin{itemize}
-\item Gatheral (2010). Volatility Surface Stress.
-\item Taleb (2007). \emph{The Black Swan}.
-\item Danielsson (2018). Systemic Stress Testing.
-\end{itemize}
+\section{Esqueleto de implementaci\'on}
+
+\begin{verbatim}
+def apply_shock(market_state, scenario):
+    shocked = market_state.copy()
+
+    if "liquidity" in scenario.components:
+        shocked = shock_liquidity(shocked, scenario.liquidity_params)
+
+    if "spread" in scenario.components:
+        shocked = shock_spread(shocked, scenario.spread_params)
+
+    if "volatility" in scenario.components:
+        shocked = shock_volatility(shocked, scenario.vol_params)
+
+    if "gaps" in scenario.components:
+        shocked = inject_gap_events(shocked, scenario.gap_params)
+
+    if "correlation" in scenario.components:
+        shocked = shock_correlation(shocked, scenario.corr_params)
+
+    return shocked
+
+
+def evaluate_scenario(strategy_state, market_state, scenario, limits):
+    shocked_state = apply_shock(market_state, scenario)
+
+    pnl_net = recompute_net_pnl(strategy_state, shocked_state)
+    metrics = summarize_stress_metrics(strategy_state, shocked_state, pnl_net)
+
+    hard_breaches, soft_flags, binding = apply_stress_governance(metrics, limits)
+
+    return {
+        "scenario_id": scenario.id,
+        "scenario_type": scenario.kind,
+        "components": scenario.components,
+        "severity": scenario.params,
+        "metrics": metrics,
+        "hard_breaches": hard_breaches,
+        "soft_flags": soft_flags,
+        "binding_constraint": binding
+    }
+
+
+def run_synthetic_shock_suite(strategy_state, market_state, scenario_library, limits):
+    reports = []
+    for scenario in scenario_library:
+        reports.append(
+            evaluate_scenario(strategy_state, market_state, scenario, limits)
+        )
+
+    gate = aggregate_stress_results(reports, limits)
+    return {"scenario_reports": reports, "global_gate": gate}
+\end{verbatim}
+
+\section{Interpretaci\'on correcta}
+
+La lectura correcta del m\'odulo no es:
+\begin{quote}
+``hemos sometido la estrategia a 25 shocks y los supervivientes siguen teniendo m\'etricas altas''.
+\end{quote}
+
+La lectura correcta es:
+\begin{quote}
+``hemos definido un conjunto reproducible de perturbaciones ex\'ogenas para identificar en qu\'e
+condiciones la estrategia deja de ser econ\'omica u operacionalmente aceptable, y qu\'e restricci\'on
+falla primero cuando el entorno se deteriora''.
+\end{quote}
+
+Eso es mucho m\'as \'util para investigaci\'on cuantitativa que cualquier cifra promocional de
+``robustez media''.
+
+\section{Referencias orientativas}
+
+\begin{thebibliography}{9}
+
+\bibitem{almgren}
+Almgren, R. y Chriss, N. (2000).
+\emph{Optimal execution of portfolio transactions}.
+
+\bibitem{gatheral}
+Gatheral, J. (2010 y trabajos relacionados).
+Modelos de impacto de mercado y microestructura.
+
+\bibitem{glasserman}
+Glasserman, P. y Xu, X.
+Trabajos sobre stress testing y robustez en sistemas financieros.
+
+\bibitem{cont}
+Cont, R.
+Trabajos sobre colas, jumps y propiedades emp\'iricas del riesgo de mercado.
+
+\end{thebibliography}
+
+\section{Conclusi\'on}
+
+Un m\'odulo serio de shocks sint\'eticos no presume de cu\'antas estrategias sobreviven ni reduce
+la robustez a un \'unico score cosm\'etico. Su tarea es m\'as exigente: construir perturbaciones
+reproducibles, econ\'omicamente interpretables y suficientemente severas para revelar la fragilidad
+real del sistema. Si una estrategia solo funciona en el r\'egimen base, este m\'odulo debe hacerlo
+visible antes de que el sistema llegue a producci\'on.
 
 \end{document}

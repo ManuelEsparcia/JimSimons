@@ -1,315 +1,541 @@
 \section{Módulo: execution/impact\_model.py}
 
-\subsection{Objetivo y contexto de market impact}
+\subsection{Objetivo económico y rol dentro de la arquitectura}
 \label{sec:impact-model-objective}
 
-El objetivo de \texttt{execution/impact\_model.py} es \textbf{estimar el impacto de mercado esperado} de órdenes sobre pequeñas capitalizaciones (\textit{small caps}), descomponiendo el efecto en:
-\begin{itemize}
-    \item \textbf{Impacto temporal (temporary impact)}.
-    \item \textbf{Impacto permanente (permanent impact, opcional)}.
-\end{itemize}
-Este modelo alimenta el \texttt{cost\_model} y el \texttt{fills\_simulator} con estimaciones de \texttt{impact\_bps} por orden, mejorando el realismo de los retornos netos en backtest. El diseño está inspirado en la literatura de \textit{non‑linear market impact} (Almgren et al., 2005; Donier et al., 2015) y prácticas de trading de \textit{quantitative execution} en entornos de \textit{equity} estrictamente regulados.\footnote{%
-    Almgren, R., et al. (2005). “Optimal Execution of Portfolio Transactions.”\\
-    Donier, J., et al. (2015). “A fully consistent, minimal model for non-linear market impact.”\\
-    De Prado, M. (2018). “ADVANCED RISK AND PORTFOLIO MANAGEMENT.”}
+El propósito de \texttt{execution/impact\_model.py} es estimar, de manera estructurada y auditable, el \textbf{coste de market impact esperado} asociado a la implementación de órdenes en el universo de \textit{small caps}. En un stack cuantitativo serio, este módulo no debe entenderse como un corrector cosmético de slippage, sino como la capa que cuantifica la degradación endógena del precio causada por el propio tamaño de la orden relativo a la liquidez disponible.
 
-\subsection{Alcance y límites del módulo}
+Su función es transformar una orden admitida por el motor de cartera en una estimación explícita de:
+
+\begin{itemize}
+    \item \textbf{impacto temporal} (\textit{temporary impact}),
+    \item \textbf{impacto permanente} (\textit{permanent impact}, opcional),
+    \item \textbf{impacto total en bps},
+    \item y \textbf{coste monetario de impacto}.
+\end{itemize}
+
+Estas magnitudes deben ser consumibles por \texttt{execution/cost\_model} y, de forma controlada, por \texttt{execution/fills\_simulator}, con una semántica suficientemente rígida como para evitar dos errores clásicos:
+
+\begin{enumerate}
+    \item subestimar sistemáticamente la erosión de alpha en nombres ilíquidos;
+    \item contar dos veces el mismo deterioro económico bajo etiquetas distintas (\textit{impact}, \textit{slippage}, \textit{spread crossing}).
+\end{enumerate}
+
+En consecuencia, este módulo existe para responder a una pregunta central de implementabilidad:
+
+\begin{quote}
+\textit{¿qué fracción del retorno bruto esperado sobrevive una vez que el propio acto de ejecutar la orden desplaza adversamente el precio?}
+\end{quote}
+
+\subsection{Principio rector}
+\label{sec:impact-model-principle}
+
+La filosofía del módulo es la siguiente:
+
+\begin{quote}
+\textit{el impacto debe crecer con el tamaño relativo de la orden, debe ser sensible al régimen de liquidez, y debe imputarse exactamente una vez en la capa correcta del sistema.}
+\end{quote}
+
+De esta filosofía se derivan cuatro reglas no negociables:
+
+\begin{enumerate}
+    \item El impacto se estima sobre \textbf{órdenes o intentos de ejecución económicamente definidos}, no sobre señales abstractas.
+    \item La dependencia del impacto con el tamaño relativo debe ser \textbf{no lineal} y \textbf{bucketizada} por régimen de liquidez.
+    \item El impacto temporal y el spread crossing no son sinónimos: el primero captura deterioro adicional inducido por tamaño; el segundo captura cruce mecánico del bid--ask.
+    \item Si el \texttt{fills\_simulator} ya incorpora el impacto en el \texttt{fill\_price}, el \texttt{cost\_model} no puede volver a cargar ese mismo componente como impacto independiente.
+\end{enumerate}
+
+\subsection{Alcance del módulo}
 \label{sec:impact-model-scope}
 
-\subsubsection{Funcionalidades incluidas}
-
+\subsubsection{Incluido}
 \begin{itemize}
-    \item \textbf{Modelado de impacto en \texttt{bps} por orden}:
-        \begin{itemize}
-            \item \texttt{impact\_temp\_bps} (impacto temporal).
-            \item \texttt{impact\_perm\_bps} (opcional, impacto permanente).
-        \end{itemize}
-    \item \textbf{Dependencia de factores de mercado}:
-        \begin{itemize}
-            \item \texttt{participation\_rate}.
-            \item \texttt{ADV}, \texttt{volatilidad} y \texttt{spread\_proxy\_bps}.
-        \end{itemize}
-    \item \textbf{Calibración bucketizada}:
-        \begin{itemize}
-            \item Coeficientes \texttt{a, b, c} por bucket de liquidez o \texttt{market cap}.
-        \end{itemize}
-    \item \textbf{Escenarios de sensibilidad}:
-        \begin{itemize}
-            \item \texttt{base}, \texttt{high}, \texttt{stress} vot bps.
-        \end{itemize}
+    \item Estimación de \texttt{impact\_temp\_bps} por orden o por intento de ejecución.
+    \item Estimación opcional de \texttt{impact\_perm\_bps}.
+    \item Bucketización por liquidez, tamaño o \texttt{market cap}.
+    \item Escenarios de sensibilidad y estrés.
+    \item Señalización de órdenes con \texttt{participation\_rate} excesiva.
+    \item Producción de artefactos auditables para módulos downstream.
 \end{itemize}
 
-\subsubsection{Funcionalidades no incluidas}
-
+\subsubsection{Explícitamente no incluido}
 \begin{itemize}
-    \item Simulación completa de \texttt{fills} (capa \texttt{fills\_simulator}).
-    \item Optimización de \textit{scheduling} intradía avanzada (\textit{intraday optimizer}).
+    \item Simulación completa del proceso de fills intradía.
+    \item Scheduling óptimo de child orders.
+    \item Enrutamiento multi-venue.
+    \item Negociación de liquidez o acceso a dark pools.
 \end{itemize}
 
-Esto permite que el módulo se enfoque exclusivamente en la \textbf{estimación de impacto} y no en la ejecución dinámica de órdenes.
+Este diseño es deliberado: el módulo debe concentrarse en estimar la penalización económica de impacto, no en reconstruir toda la microestructura de ejecución.
 
-\subsection{Dependencias upstream y downstream}
-\label{sec:impact-model-deps}
+\subsection{Relación con el resto del sistema}
+\label{sec:impact-model-relations}
 
-\textbf{Upstream:}
+\subsubsection{Inputs upstream}
 \begin{itemize}
-    \item \texttt{portfolio/rebalance}:
-        \begin{itemize}
-            \item \texttt{rebalance\_orders.parquet} con órdenes de rebalance.
-        \end{itemize}
-    \item \texttt{data/price/liquidity}:
-        \begin{itemize}
-            \item \texttt{ADV}, \texttt{vol\_20d}, \texttt{spread\_proxy\_bps} por símbolo y fecha.
-        \end{itemize}
-    \item \texttt{configs/execution/impact\_model}:
-        \begin{itemize}
-            \item \texttt{coeff\_a}, \texttt{coeff\_b}, \texttt{coeff\_c}, \texttt{vol\_scale\_mode}, etc.
-        \end{itemize}
+    \item \texttt{portfolio/rebalance}: órdenes objetivo o intentos de ejecución.
+    \item \texttt{data/price/liquidity}: \texttt{ADV}, volatilidad, spread proxy, precio de referencia y buckets de liquidez.
+    \item \texttt{config/execution/impact\_model}: coeficientes, política de clipping, escenarios y versión semántica.
 \end{itemize}
 
-\textbf{Downstream:}
+\subsubsection{Outputs downstream}
 \begin{itemize}
-    \item \texttt{execution/cost\_model}:
-        \begin{itemize}
-            \item Usa \texttt{impact\_per\_order.parquet} para calcular \texttt{impact\_cost} y \texttt{total\_cost\_bps}.
-        \end{itemize}
-    \item \texttt{execution/fills\_simulator}:
-        \begin{itemize}
-            \item Incorpora \texttt{impact\_bps} en el cálculo de \texttt{fill\_price}.
-        \end{itemize}
-    \item \texttt{backtest/engine}:
-        \begin{itemize}
-            \item Consume \texttt{impact\_bps} para refinar el \texttt{net\_pnl} según escenarios de costes de impacto.
-        \end{itemize}
+    \item \texttt{execution/fills\_simulator}: puede usar \texttt{impact\_bps} para deteriorar el precio de fill.
+    \item \texttt{execution/cost\_model}: puede traducir \texttt{impact\_bps} a coste monetario si el fill price no lo absorbió ya.
+    \item \texttt{backtest/engine}: puede usar los outputs para stress de capacidad, attribution y análisis de net alpha.
+    \item \texttt{validation}: verifica estabilidad, no doble conteo y coherencia de magnitudes.
 \end{itemize}
+
+\subsection{Semántica económica obligatoria}
+\label{sec:impact-model-semantics}
+
+Para evitar ambigüedad, el módulo debe distinguir entre tres unidades posibles de imputación:
+
+\begin{itemize}
+    \item \textbf{Order-level impact:} impacto estimado sobre la orden completa deseada.
+    \item \textbf{Attempt-level impact:} impacto estimado sobre la parte realmente intentada en una fecha concreta.
+    \item \textbf{Fill-level impact:} impacto finalmente absorbido por un fill específico.
+\end{itemize}
+
+La política por defecto recomendada es:
+
+\begin{quote}
+\textit{calcular impacto al nivel del intento de ejecución, no al nivel de la orden global multiday.}
+\end{quote}
+
+La razón es que una orden repartida en varios días no enfrenta la misma participation cada día. Si se calculase un único impacto sobre la orden total, se distorsionaría tanto el coste diario como la reconciliación posterior con fills y P\&L.
+
+Por tanto:
+
+\[
+\text{order impact}
+\neq
+\text{attempt impact}
+\neq
+\text{fill impact absorbed}.
+\]
+
+La especificación debe hacer explícito cuál de estas tres magnitudes genera el módulo. En esta versión, el estándar recomendado es producir \textbf{impacto por intento de ejecución}, con agregación posterior si se necesita reporting a nivel orden.
 
 \subsection{Contrato de entrada}
 \label{sec:impact-model-inputs}
 
-\subsubsection{Entradas mínimas}
-
+\subsubsection{Rutas mínimas}
 \begin{itemize}
-    \item \texttt{orders\_path}:
-        \begin{itemize}
-            \item \texttt{rebalance\_orders.parquet} con campos mínimos:
-                \begin{itemize}
-                    \item \texttt{date, symbol, order\_id}.
-                    \item \texttt{order\_notional} o \texttt{order\_shares}.
-                    \item \texttt{side} (long/short).
-                \end{itemize}
-        \end{itemize}
-    \item \texttt{market\_context\_path}:
-        \begin{itemize}
-            \item \texttt{liquidity/latest.parquet} con \texttt{adv\_usd}, \texttt{vol\_20d}, \texttt{spread\_proxy\_bps}.
-        \end{itemize}
-    \item \texttt{impact\_config\_path}:
-        \begin{itemize}
-            \item YAML con parámetros de impacto y buckets de liquidez.
-        \end{itemize}
-    \item \texttt{run\_id}:
-        \begin{itemize}
-            \item Identificador del run de backtest.
-        \end{itemize}
+    \item \texttt{orders\_path}
+    \item \texttt{market\_context\_path}
+    \item \texttt{impact\_config\_path}
+    \item \texttt{run\_id}
 \end{itemize}
 
-\subsubsection{Campos mínimos por orden}
-
+\subsubsection{Campos mínimos de órdenes}
 \begin{itemize}
-    \item \texttt{date, symbol}.
-    \item \texttt{order\_notional} / \texttt{order\_shares}.
-    \item \texttt{side}.
-    \item \texttt{adv\_usd} (valor medio de ADV en USD para el día).
-    \item \texttt{vol\_20d} (volatilidad anualizada de 20 días).
-    \item \texttt{spread\_proxy\_bps}.
+    \item \texttt{date}
+    \item \texttt{symbol}
+    \item \texttt{order\_id}
+    \item \texttt{side}
+    \item \texttt{order\_shares} o \texttt{order\_notional}
+    \item \texttt{reference\_price} si \texttt{order\_shares} es la unidad primaria
+\end{itemize}
+
+\subsubsection{Campos mínimos de contexto de mercado}
+\begin{itemize}
+    \item \texttt{date}
+    \item \texttt{symbol}
+    \item \texttt{adv\_usd}
+    \item \texttt{vol\_20d}
+    \item \texttt{spread\_proxy\_bps}
+    \item \texttt{liquidity\_bucket}
+    \item \texttt{data\_quality\_flag}
+\end{itemize}
+
+\subsubsection{Invariantes de entrada}
+\begin{itemize}
+    \item \texttt{adv\_usd > 0} para toda orden costable bajo la ruta estándar.
+    \item \texttt{vol\_20d >= 0}.
+    \item \texttt{spread\_proxy\_bps >= 0}.
+    \item \texttt{abs(order\_notional) > 0} o, equivalentemente, \texttt{abs(order\_shares) > 0}.
+    \item La clave \texttt{(date, symbol, order\_id)} debe ser única.
 \end{itemize}
 
 \subsection{Contrato de salida}
 \label{sec:impact-model-outputs}
 
-\textbf{Archivos generados por \texttt{run\_id}:}
+Para cada \texttt{run\_id}, el módulo debe producir:
+
 \begin{itemize}
-    \item \texttt{execution/impact/\{run\_id\}/impact\_per\_order.parquet}:
-        \begin{itemize}
-            \item \texttt{date, symbol, order\_id}.
-            \item \texttt{participation\_rate}.
-            \item \texttt{impact\_temp\_bps}.
-            \item \texttt{impact\_perm\_bps} (opcional).
-            \item \texttt{impact\_total\_bps}.
-            \item \texttt{impact\_cost\_usd}.
-        \end{itemize}
-    \item \texttt{execution/impact/\{run\_id\}/impact\_summary.json}:
-        \begin{itemize}
-            \item Métricas agregadas: \texttt{avg\_impact\_bps}, \texttt{p95\_impact\_bps}, \texttt{total\_impact\_usd}, \texttt{pct\_orders\_above\_participation\_cap}.
-        \end{itemize}
-    \item \texttt{execution/impact/\{run\_id\}/manifest.json}:
-        \begin{itemize}
-            \item Metadatos de ejecución y trazabilidad de inputs/outputs.
-        \end{itemize}
+    \item \texttt{execution/impact/\{run\_id\}/impact\_per\_attempt.parquet}
+    \item \texttt{execution/impact/\{run\_id\}/impact\_summary.json}
+    \item \texttt{execution/impact/\{run\_id\}/manifest.json}
 \end{itemize}
 
-\subsection{Modelo matemático de impacto}
-\label{sec:impact-model-math}
-
-Sea:
+\subsubsection{Campos mínimos de \texttt{impact\_per\_attempt.parquet}}
 \begin{itemize}
-    \item \( t \in \{1,\dots,T\} \): tiempo (días de backtest).
-    \item \( i \in \{1,\dots,N\} \): símbolos (con foco en \textit{small caps}).
-    \item \( j \in \{1,\dots,M\} \): órdenes.
-    \item \( q_{jit}^{\text{order}} \): \texttt{order\_shares} de la orden \( j \) del símbolo \( i \) en el día \( t \).
-    \item \( V_{it}^{\text{ADV}} \): \texttt{adv\_usd} del símbolo \( i \) en el día \( t \).
-    \item \( \rho_{jit} = \frac{\lvert q_{jit}^{\text{order}} \rvert \cdot p_{it}}{V_{it}^{\text{ADV}}} \): \texttt{participation\_rate} (en términos de USD).
-    \item \( \nu_{it}^{\text{vol}} \): \texttt{vol\_20d} del símbolo \( i \).
-    \item \( s_{it}^{\text{proxy}} \): \texttt{spread\_proxy\_bps} del símbolo \( i \).
+    \item \texttt{date}
+    \item \texttt{symbol}
+    \item \texttt{order\_id}
+    \item \texttt{attempt\_id} si existe segmentación multiday
+    \item \texttt{attempt\_notional\_usd}
+    \item \texttt{participation\_rate}
+    \item \texttt{impact\_temp\_bps}
+    \item \texttt{impact\_perm\_bps}
+    \item \texttt{impact\_total\_bps}
+    \item \texttt{impact\_cost\_usd}
+    \item \texttt{liquidity\_bucket}
+    \item \texttt{scenario}
+    \item \texttt{participation\_cap\_flag}
+    \item \texttt{fallback\_flag}
+    \item \texttt{policy\_version}
 \end{itemize}
 
-\subsubsection{Forma funcional de impacto sugerida}
-\label{sec:impact-functional-form}
+\subsection{Definiciones formales}
+\label{sec:impact-model-definitions}
 
-Una forma funcional estándar para el impacto temporal es:
+Sea \( j \) un intento de ejecución sobre el símbolo \( i \) en la fecha \( t \). Definimos:
+
+\begin{itemize}
+    \item \( N_{jit}^{\mathrm{attempt}} \): nocional absoluto intentado.
+    \item \( V_{it}^{\mathrm{ADV}} \): volumen medio diario en USD.
+    \item \( \rho_{jit} = \frac{N_{jit}^{\mathrm{attempt}}}{V_{it}^{\mathrm{ADV}}} \): \texttt{participation\_rate}.
+    \item \( \nu_{it} \): volatilidad del símbolo en el horizonte definido por configuración.
+    \item \( s_{it} \): spread proxy en bps.
+    \item \( b(it) \): bucket de liquidez del símbolo.
+\end{itemize}
+
+\subsection{Forma funcional preferida}
+\label{sec:impact-model-functional-form}
+
+Para eliminar ambigüedad, este módulo adopta como \textbf{familia preferida} una función separable y bucketizada del tipo:
 
 \begin{equation}
-    \texttt{impact\_temp\_bps}_{jit} 
-    = 
-    \alpha_{it}
-    \cdot
-    \rho_{jit}^{\beta_{it}}
-    +
-    \gamma_{it}
-    \cdot
-    s_{it}^{\text{proxy}},
+\texttt{impact\_temp\_bps}_{jit}
+=
+\alpha_{b(it)}
+\cdot
+\rho_{jit}^{\beta_{b(it)}}
+\cdot
+g(\nu_{it})
++
+\gamma_{b(it)} \cdot s_{it},
 \end{equation}
+
 donde:
-\begin{itemize}
-    \item \(\alpha_{it}, \beta_{it}, \gamma_{it}\) son parámetros de impacto por \textit{bucket} de liquidez.
-    \item \(\beta_{it} > 1\) para capturar concavidad típica de impacto en \textit{small caps}.\footnote{%
-        Donier, J., et al. (2015). “A fully consistent, minimal model for non-linear market impact.”}
-\end{itemize}
-
-\subsubsection{Bucketización por liquidez / market cap}
-\label{sec:impact-buckets}
-
-Los símbolos se agrupan en \textit{buckets} según \texttt{ADV} o \texttt{market cap}:
 
 \begin{itemize}
-    \item \texttt{bucket\_A} (alta liquidez).
-    \item \texttt{bucket\_B} (media).
-    \item \texttt{bucket\_C} (baja, \textit{small caps}).
+    \item \(\alpha_{b(it)} > 0\) controla la escala de impacto del bucket,
+    \item \(\beta_{b(it)} > 0\) controla la curvatura,
+    \item \(g(\nu_{it})\) introduce la modulación por volatilidad,
+    \item \(\gamma_{b(it)} \ge 0\) pondera el efecto estructural del spread.
 \end{itemize}
 
-Cada bucket tiene coeficientes \((\alpha_b, \beta_b, \gamma_b)\) distintos, calibrados a partir de historias de ejecución o datos de \textit{implementation shortfall}.
-
-\subsubsection{Impacto permanente opcional}
-\label{sec:impact-permanent}
-
-Cuando \texttt{use\_permanent\_impact = True}, se incorpora una componente adicional:
+\paragraph{Elección recomendada para \(g(\nu)\).}
+Salvo que exista una calibración empírica superior, la política recomendada es:
 
 \begin{equation}
-    \texttt{impact\_perm\_bps}_{jit} 
-    = 
-    \eta_{it}
-    \cdot
-    \rho_{jit},
+g(\nu_{it}) = \left(\frac{\nu_{it}}{\nu_{\mathrm{ref},b(it)}}\right)^{\delta},
+\qquad \delta \in [0,1].
 \end{equation}
-con \(\eta_{it} \ll \alpha_{it}\) (coeficiente de permanencia más pequeño que el de impacto temporal). Esto aproxima el efecto de \textit{price pressure} persistente observado en \textit{small caps} altamente concentrados.\footnote{%
-    De Prado, M. (2018). “ADVANCED RISK AND PORTFOLIO MANAGEMENT.”}
 
-El impacto total en bps es:
+Esta forma mantiene interpretabilidad, estabilidad y compatibilidad con calibración bucketizada.
+
+\paragraph{Preferencia frente a otras familias.}
+La especificación permite que el fichero de configuración soporte modelos alternativos, pero la versión semántica por defecto debe ser esta familia. No se debe dejar a la implementación la libertad implícita de elegir entre lineal, raíz cuadrada o potencia arbitraria sin registrar un \texttt{model\_family} explícito en el manifiesto.
+
+\subsection{Condición sobre la curvatura}
+\label{sec:impact-model-curvature}
+
+Para universos de \textit{small caps}, una especificación robusta no debe dejar la curvatura abierta sin restricciones. La recomendación institucional es:
 
 \begin{equation}
-    \texttt{impact\_total\_bps}_{jit} 
-    = 
-    \texttt{impact\_temp\_bps}_{jit} 
-    + 
-    \texttt{impact\_perm\_bps}_{jit}.
+\beta_{b(it)} \in [0.5, 1.5],
 \end{equation}
 
-El coste de impacto en USD es:
+con calibración por bucket. Una \(\beta\) estrictamente mayor que uno implica convexidad; una menor que uno, concavidad. El punto importante no es imponer una doctrina única, sino evitar que la implementación introduzca una curvatura arbitraria sin control ni trazabilidad.
+
+\paragraph{Regla operativa.}
+El manifiesto del run debe persistir:
+\begin{itemize}
+    \item \texttt{model\_family},
+    \item \texttt{alpha\_by\_bucket},
+    \item \texttt{beta\_by\_bucket},
+    \item \texttt{gamma\_by\_bucket},
+    \item \texttt{vol\_scale\_mode},
+    \item \texttt{delta}.
+\end{itemize}
+
+\subsection{Impacto permanente opcional}
+\label{sec:impact-model-permanent}
+
+Si \texttt{use\_permanent\_impact = True}, se añade:
 
 \begin{equation}
-    \texttt{impact\_cost\_usd}_{jit} 
-    = 
-    \texttt{impact\_total\_bps}_{jit} 
-    \cdot 
-    10^{-4}
-    \cdot
-    \lvert \texttt{order\_notional}_{jit} \rvert.
+\texttt{impact\_perm\_bps}_{jit}
+=
+\eta_{b(it)} \cdot \rho_{jit},
 \end{equation}
 
-\subsection{Parametrización y escenarios de sensibilidad}
-\label{sec:impact-params}
+con \(\eta_{b(it)} \ge 0\) y típicamente menor que la escala del impacto temporal.
 
-\subsubsection{Parámetros clave}
+El impacto total será:
+
+\begin{equation}
+\texttt{impact\_total\_bps}_{jit}
+=
+\texttt{impact\_temp\_bps}_{jit}
++
+\texttt{impact\_perm\_bps}_{jit}.
+\end{equation}
+
+Y el coste monetario:
+
+\begin{equation}
+\texttt{impact\_cost\_usd}_{jit}
+=
+\texttt{impact\_total\_bps}_{jit}
+\cdot 10^{-4}
+\cdot N_{jit}^{\mathrm{attempt}}.
+\end{equation}
+
+\paragraph{Regla de interpretación.}
+El impacto permanente no debe usarse simultáneamente como:
+\begin{itemize}
+    \item deterioro inmediato del fill price, y
+    \item desplazamiento adicional del mark-to-market posterior,
+\end{itemize}
+salvo que la contabilidad de P\&L esté explícitamente diseñada para ello. En la mayoría de arquitecturas de research, el permanente debe tratarse como componente informativo o como penalización adicional controlada, no como licencia para duplicar costes.
+
+\subsection{Precedencia semántica frente a spread y slippage}
+\label{sec:impact-model-precedence}
+
+Para evitar doble conteo, este módulo debe imponer la siguiente separación conceptual:
 
 \begin{itemize}
-    \item \texttt{coeff\_a}, \texttt{coeff\_b}, \texttt{coeff\_c} (por bucket de liquidez).
-    \item \texttt{participation\_cap}: umbral máximo de participación usado para \textit{flagging} y manejo de órdenes grandes.
-    \item \texttt{vol\_scale\_mode}: forma de escalar \(\nu_{it}^{\text{vol}}\) en la función de impacto.
-    \item \texttt{use\_permanent\_impact}: booleano que activa/desactiva \texttt{impact\_perm\_bps}.
-    \item \texttt{permanent\_multiplier}: factor de escala de \texttt{impact\_perm\_bps}.
-    \item \texttt{scenario\_multipliers}: factores de multiplicación para \texttt{base}, \texttt{high}, \texttt{stress} vot bps.
+    \item \textbf{Spread crossing:} coste mecánico de cruzar el bid--ask.
+    \item \textbf{Impact:} deterioro no lineal inducido por el tamaño relativo de la orden.
+    \item \textbf{Slippage residual:} residuo de ejecución no explicado por spread ni impacto.
 \end{itemize}
 
-\subsubsection{Escenarios de impacto}
-
-\begin{itemize}
-    \item \texttt{base}: impacto nominal con parámetros de referencia.
-    \item \texttt{high}: impactos multiplicados por \(\sim 1.25\).
-    \item \texttt{stress} vot bps: \(\times 1.5\) o configuración custom.
-\end{itemize}
-
-Para cada escenario se persiste una versión del \texttt{impact\_per\_order.parquet} lo que permite estudiar cómo el P\&L neto cambia ante condiciones de liquidez adversas.
-
-\subsection{Flujo del proceso}
-\label{sec:impact-flow}
+Por tanto:
 
 \begin{enumerate}
-    \item \textbf{Cargar órdenes y contexto de mercado}: \texttt{orders.parquet} y \texttt{liquidity/latest.parquet}.
-    \item \textbf{Calcular participación por orden}:
-        \begin{equation}
-            \rho_{jit} 
-            = 
-            \frac{\lvert \texttt{order\_notional}_{jit} \rvert}{V_{it}^{\text{ADV}}}.
-        \end{equation}
-    \item \textbf{Aplicar forma funcional y coeficientes}:
-        \begin{itemize}
-            \item Determinar \textit{bucket} de liquidez.
-            \item Computar \texttt{impact\_temp\_bps} y \texttt{impact\_perm\_bps} (si aplica).
-        \end{itemize}
-    \item \textbf{Calcular bps y coste USD}:
-        \begin{itemize}
-            \item \texttt{impact\_total\_bps} y \texttt{impact\_cost\_usd}.
-        \end{itemize}
-    \item \textbf{Ejecutar escenarios de sensibilidad}:
-        \begin{itemize}
-            \item Generar versiones de \texttt{impact\_per\_order} bajo \texttt{base}, \texttt{high}, \texttt{stress} vot bps.
-        \end{itemize}
-    \item \textbf{Persistir outputs}:
-        \begin{itemize}
-            \item \texttt{impact\_per\_order.parquet}, \texttt{impact\_summary.json}, \texttt{manifest.json}.
-        \end{itemize}
+    \item el término \(\gamma_{b(it)} s_{it}\) solo es admisible si se interpreta como modulador estructural del impacto en entornos de spread amplio, no como recarga completa del spread crossing;
+    \item el \texttt{cost\_model} debe seguir tratando el spread crossing como componente separado;
+    \item si el \texttt{fills\_simulator} ya usa \texttt{impact\_total\_bps} para construir \texttt{fill\_price}, el \texttt{cost\_model} no puede volver a sumar \texttt{impact\_cost\_usd} como coste independiente.
 \end{enumerate}
 
-\subsection{Manejo de casos especiales}
-\label{sec:impact-special-cases}
+\paragraph{Regla obligatoria.}
+El manifiesto debe incluir un campo:
 
-\subsubsection{Falta de \texttt{ADV}}
+\begin{verbatim}
+impact_application_mode: [to_fill_price | to_cost_model | informational_only]
+\end{verbatim}
 
-\begin{itemize}
-    \item Si \texttt{adv\_usd} falta, se aplica \textit{fallback} a un bucket de liquidez conservador (por ejemplo, \textit{small cap} bajo).
-    \item Se registra \texttt{WARNING} en el log.
-\end{itemize}
+Sin este campo, el run debe considerarse semánticamente incompleto.
 
-\subsubsection{Orden muy pequeña}
+\subsection{Bucketización y régimen de liquidez}
+\label{sec:impact-model-buckets}
 
-\begin{itemize}
-    \item Se aplica un \texttt{impact\_bps\_floor} configurable para evitar impacto cero en tamaños de orden irrelevantes.
-\end{itemize}
-
-\subsubsection{Orden excesiva}
+Los símbolos deben clasificarse, como mínimo, por bucket de liquidez. La granularidad mínima aceptable es:
 
 \begin{itemize}
-    \item Si \(\rho_{jit} > \texttt{participation\_cap}\), el impacto se puede \textit{clip} o imponer una penalización \textit{superlineal} para forzar reducción de tamaño de orden en el diseño de estrategias.\footnote{%
-        De Prado, M. (2018). “ADVANCED RISK AND PORTFOLIO MANAGEMENT.”}
+    \item \texttt{bucket\_A}: alta liquidez,
+    \item \texttt{bucket\_B}: liquidez media,
+    \item \texttt{bucket\_C}: baja liquidez / \textit{small caps},
+    \item \texttt{bucket\_D}: micro-liquidez o régimen extremo, si el universo lo requiere.
 \end{itemize}
 
-\subsection{
+\paragraph{Política recomendada.}
+La asignación de bucket debe derivarse de \texttt{adv\_usd} y, opcionalmente, de \texttt{market cap}. Sin embargo, la prioridad debe ser la liquidez transable, no la capitalización nominal.
+
+\paragraph{Régimen de liquidez extrema.}
+Si un símbolo cae en régimen de liquidez extrema o muestra una \texttt{participation\_rate} implícita incompatible con ejecución razonable, el módulo no debe limitarse a emitir un número muy grande. Debe activar política explícita:
+
+\begin{itemize}
+    \item \texttt{flag\_only}
+    \item \texttt{superlinear\_penalty}
+    \item \texttt{clip\_participation}
+    \item \texttt{reject\_for\_execution\_review}
+\end{itemize}
+
+\subsection{Participation extrema y política de saturación}
+\label{sec:impact-model-participation-extreme}
+
+Sea \(\rho_{jit}\) la participación implícita. Definimos un umbral \(\rho^{\max}_{b(it)}\). Si:
+
+\begin{equation}
+\rho_{jit} > \rho^{\max}_{b(it)},
+\end{equation}
+
+el módulo debe activar una política explícita de saturación. La opción recomendada para research conservador es:
+
+\begin{equation}
+\texttt{impact\_temp\_bps}_{jit}
+=
+\alpha_{b(it)}
+\cdot
+\left(\rho^{\max}_{b(it)}\right)^{\beta_{b(it)}}
+\cdot
+g(\nu_{it})
++
+\gamma_{b(it)} s_{it}
++
+\kappa_{b(it)}\left(\rho_{jit}-\rho^{\max}_{b(it)}\right)^{\zeta},
+\end{equation}
+
+con \(\kappa_{b(it)} > 0\) y \(\zeta > 1\), para imponer una penalización superlineal más allá del umbral.
+
+Esto es preferible a un simple \textit{clip} silencioso, porque preserva información sobre órdenes operacionalmente inverosímiles.
+
+\subsection{Políticas de calibración}
+\label{sec:impact-model-calibration}
+
+La calibración debe seguir la siguiente jerarquía:
+
+\begin{enumerate}
+    \item \textbf{Histórico real de ejecución} o implementation shortfall interno, si existe.
+    \item \textbf{Calibración empírica interna} por bucket usando fills históricos simulados o semi-reales.
+    \item \textbf{Heurísticos conservadores} si no hay datos suficientes.
+\end{enumerate}
+
+\paragraph{Regla fuerte.}
+No basta con declarar “coeficientes por bucket”. El manifiesto debe fijar:
+
+\begin{itemize}
+    \item fecha y versión de calibración,
+    \item fuente de datos,
+    \item tamaño de muestra por bucket,
+    \item política de fallback cuando un bucket no tenga masa estadística suficiente.
+\end{itemize}
+
+\subsection{Escenarios de sensibilidad}
+\label{sec:impact-model-scenarios}
+
+El módulo debe soportar como mínimo:
+
+\begin{itemize}
+    \item \texttt{base}
+    \item \texttt{high}
+    \item \texttt{stress}
+\end{itemize}
+
+Pero estos escenarios no deben ser simples multiplicadores ciegos sobre \texttt{impact\_total\_bps}. Una especificación madura debe permitir alterar selectivamente:
+
+\begin{itemize}
+    \item \(\alpha\) por bucket,
+    \item \(\beta\) por bucket,
+    \item \(\eta\) del componente permanente,
+    \item umbrales de participation,
+    \item modulación por volatilidad.
+\end{itemize}
+
+Esto es importante porque, en estrés de liquidez, no solo crece la escala del impacto; también puede cambiar su curvatura efectiva y el régimen de saturación.
+
+\subsection{Casos frontera obligatorios}
+\label{sec:impact-model-edge-cases}
+
+\begin{enumerate}
+    \item \textbf{ADV ausente.}  
+    La política por defecto recomendada es \texttt{fail-closed} para cálculo estándar y fallback a bucket conservador solo si el config lo permite explícitamente.
+
+    \item \textbf{Orden muy pequeña.}  
+    Puede aplicarse un \texttt{impact\_bps\_floor}, pero este no debe confundirse con spread crossing mínimo.
+
+    \item \textbf{Volatilidad nula o anómalamente baja.}  
+    Debe aplicarse un suelo de volatilidad o una referencia de bucket para evitar que el impacto colapse artificialmente a cero.
+
+    \item \textbf{Spread proxy extremo.}  
+    Debe marcarse con flag de calidad y limitar su contribución si amenaza con contaminar todo el término de impacto estructural.
+
+    \item \textbf{Participation absurda.}  
+    Debe activar flag y política de saturación, nunca pasar silenciosamente por la fórmula base.
+\end{enumerate}
+
+\subsection{Invariantes de salida}
+\label{sec:impact-model-invariants}
+
+Deben cumplirse siempre:
+
+\begin{equation}
+\texttt{impact\_temp\_bps} \ge 0,
+\end{equation}
+
+\begin{equation}
+\texttt{impact\_perm\_bps} \ge 0,
+\end{equation}
+
+\begin{equation}
+\texttt{impact\_total\_bps}
+=
+\texttt{impact\_temp\_bps}
++
+\texttt{impact\_perm\_bps},
+\end{equation}
+
+\begin{equation}
+\texttt{impact\_cost\_usd}
+=
+\texttt{impact\_total\_bps}\cdot 10^{-4}\cdot \texttt{attempt\_notional\_usd}.
+\end{equation}
+
+Además:
+
+\begin{itemize}
+    \item toda observación con fallback debe quedar marcada,
+    \item toda observación que supere el cap de participation debe quedar marcada,
+    \item toda observación debe registrar el \texttt{liquidity\_bucket} usado.
+\end{itemize}
+
+\subsection{Algoritmo operativo recomendado}
+\label{sec:impact-model-algorithm}
+
+\begin{enumerate}
+    \item Cargar órdenes o intentos de ejecución y contexto de mercado.
+    \item Validar unicidad y calidad de claves.
+    \item Convertir toda orden a \texttt{attempt\_notional\_usd}.
+    \item Calcular \(\rho_{jit}\).
+    \item Asignar bucket de liquidez.
+    \item Obtener parámetros \((\alpha,\beta,\gamma,\eta,\delta)\) del bucket y escenario.
+    \item Aplicar política de fallback si faltan inputs.
+    \item Aplicar política de saturación si \(\rho_{jit}\) excede el cap.
+    \item Calcular \texttt{impact\_temp\_bps}, \texttt{impact\_perm\_bps}, \texttt{impact\_total\_bps} y \texttt{impact\_cost\_usd}.
+    \item Persistir outputs y manifiesto con semántica completa.
+\end{enumerate}
+
+\subsection{Tests de aceptación obligatorios}
+\label{sec:impact-model-tests}
+
+\subsubsection{Test A: monotonicidad en tamaño}
+A igualdad de bucket, volatilidad y spread, una orden con mayor \(\rho\) no puede producir menor \texttt{impact\_temp\_bps}.
+
+\subsubsection{Test B: régimen bucketizado}
+Una misma \(\rho\) debe producir, en promedio, mayor impacto en el bucket menos líquido que en el más líquido, salvo calibración contraria explícita.
+
+\subsubsection{Test C: no doble conteo}
+Si \texttt{impact_application_mode = to\_fill\_price}, el \texttt{cost\_model} no debe volver a sumar \texttt{impact\_cost\_usd} como componente independiente.
+
+\subsubsection{Test D: participation extrema}
+Toda observación con \(\rho > \rho^{\max}\) debe quedar marcada y seguir la política de saturación definida.
+
+\subsubsection{Test E: fallback por datos ausentes}
+Si falta \texttt{adv\_usd}, el cálculo estándar no puede continuar silenciosamente sin registrar \texttt{fallback\_flag = True} o sin rechazar la observación.
+
+\subsubsection{Test F: consistencia monetaria}
+La relación entre \texttt{impact\_total\_bps} e \texttt{impact\_cost\_usd} debe cumplirse exactamente dentro de tolerancia numérica.
+
+\subsection{CLI sugerida}
+\label{sec:impact-model-cli}
+
+\begin{verbatim}
+python -m execution.impact_model \
+  --orders-path portfolio/rebalance/run_latest/rebalance_orders.parquet \
+  --market-context-path data/liquidity/latest.parquet \
+  --impact-config-path config/execution/impact_model.yaml \
+  --run-id simons_smallcap_swing_2026_03_06
+\end{verbatim}
+
+\subsection{Conclusión}
+\label{sec:impact-model-conclusion}
+
+\texttt{execution/impact\_model.py} no debe verse como un módulo auxiliar de “slippage avanzado”, sino como la capa que cuantifica el coste endógeno de convertir señal en posición bajo liquidez finita. Su valor reside en imponer una estructura coherente: forma funcional explícita, bucketización por régimen de liquidez, política clara ante participation extrema, separación semántica frente a spread y slippage, y trazabilidad suficiente para que \texttt{fills\_simulator} y \texttt{cost\_model} no entren en conflicto.
+
+En un sistema institucional, la calidad de este módulo no se mide solo por citar literatura de impacto no lineal, sino por impedir que la implementación deje zonas grises sobre qué fenómeno económico se está cobrando, cuándo se cobra y en qué capa del stack se reconoce. Ese cierre semántico es precisamente lo que convierte una buena intuición de execution en una especificación realmente robusta.

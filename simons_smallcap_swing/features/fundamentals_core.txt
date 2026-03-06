@@ -1,188 +1,532 @@
 \section{Módulo: \texttt{features/fundamentals\_core.py}}
 
 \paragraph{Objetivo general}
-Este módulo construye un conjunto de \textbf{features fundamentales base} (value, quality, profitability, leverage, turnover/growth) a partir de fundamentales PIT normalizados extraídos de EDGAR, produciendo ratios estandarizables por fecha y listos para ser integrados en un sistema de factoring de small caps con \textit{swing trading} multi‑factor. El objetivo es transformar datos contables complejos en señales robustas, comparables entre activos y coherentes con el marco de Fama–French, Carhart, y literatura de factores de valor calidad.
+Este módulo construye la \textbf{capa fundamental core point-in-time (PIT)} del sistema de señales, transformando datos contables brutos, asincrónicos y potencialmente irregulares en un conjunto de ratios económicos comparables entre activos y utilizables dentro de un pipeline multifactor de \textit{small caps swing trading}.
 
-\subsection{Marco teórico y notación}
-
-Sea \( \mathcal{S} \) el conjunto de símbolos y \( \mathcal{T} \) el rango de fechas. El módulo trabaja sobre:
+Su propósito no es simplemente “calcular ratios contables”, sino imponer una representación fundamental que sea simultáneamente:
 \begin{itemize}
-    \item \texttt{fundamentals\_pit}: vector de métricas contables \( \mathbf{F}^{(s,\texttt{asof})} \) con \texttt{asof\_date} \(\leq t\).
-    \item \texttt{prices}: precio ajustado \( p_{t}^{(s)} \) y \texttt{share\_count} para convertir valores contables en ratios de valoración y mercado.
+    \item \textbf{PIT-correcta}: solo usa información verdaderamente observable en la fecha de decisión;
+    \item \textbf{económicamente interpretable}: cada ratio conserva una semántica financiera clara;
+    \item \textbf{robusta a rarezas contables}: denominadores degenerados, equity negativo, ingresos casi nulos, restatements y frecuencia irregular de reporting;
+    \item \textbf{estable para modelado}: apta para transformación cross-sectional y validación estadística;
+    \item \textbf{trazable}: cada observación puede auditarse hasta su fuente, fecha efectiva y política de tratamiento.
 \end{itemize}
 
-La \textbf{feature matrix} resultante es:
+En términos estratégicos, este módulo constituye la principal traducción de la dimensión \textbf{value--quality--profitability--balance-sheet discipline} al lenguaje operativo del sistema. En un universo de \textit{small caps}, donde la información fundamental es más ruidosa, menos homogénea y frecuentemente más stale que en universos mega-cap, esta capa debe estar más blindada que en un pipeline cuantitativo convencional.
+
+\subsection{Rol dentro de la arquitectura}
+
+Este módulo se sitúa aguas abajo de:
+\begin{itemize}
+    \item ingestión PIT de EDGAR y normalización contable,
+    \item precios ajustados y series de capitalización de mercado,
+    \item reglas de universo histórico y calendario de decisión,
+\end{itemize}
+y aguas arriba de:
+\begin{itemize}
+    \item \texttt{features/build\_features.py},
+    \item \texttt{features/cross\_sectional.py},
+    \item \texttt{features/feature\_qc.py},
+    \item modelos multifactor y backtests \textit{walk-forward}.
+\end{itemize}
+
+Su función arquitectónica consiste en producir un bloque de \textbf{features fundamentales canónicas}, separadas de:
+\begin{itemize}
+    \item deltas o aceleraciones contables,
+    \item interacciones con liquidez o microestructura,
+    \item y transformaciones cross-sectional posteriores.
+\end{itemize}
+
+Esta separación es importante: el módulo debe construir \textbf{niveles económicos fundamentales PIT}, no mezclar en una sola capa semántica el ratio base, su variación temporal y su representación estadística final.
+
+\subsection{Marco teórico y contexto cuantitativo}
+
+La motivación del módulo conecta con varias líneas de evidencia empírica:
+
+\begin{itemize}
+    \item La literatura de \textit{asset pricing} basada en características documenta que variables de valoración relativa, profitability, calidad de balance y eficiencia operativa contienen estructura explicativa en el \textit{cross-section} de retornos.
+    \item Las versiones empíricas de \textit{value} no dependen solo de una ratio concreta, sino de una construcción PIT disciplinada que evite contaminación temporal y errores de comparabilidad.
+    \item La evidencia en \textit{quality} y profitability sugiere que la rentabilidad contable y la disciplina de balance suelen ser más robustas cuando el dato subyacente se limpia adecuadamente de anomalías de escala y reporting.
+    \item En \textit{small caps}, la dimensión fundamental no puede tratarse con ingenuidad porque abundan:
+    \begin{itemize}
+        \item cobertura contable incompleta,
+        \item retrasos irregulares de filing,
+        \item equity negativo,
+        \item ingresos erráticos,
+        \item cambios de \textit{share count},
+        \item y discontinuidades por restatements o corporate actions.
+    \end{itemize}
+\end{itemize}
+
+Por tanto, la dificultad real del módulo no es definir un ratio bonito en papel, sino especificar de forma inequívoca:
+\begin{enumerate}
+    \item qué versión PIT del dato se usa,
+    \item qué denominadores son económicamente válidos,
+    \item cuándo un ratio debe convertirse en \texttt{null},
+    \item y cuándo puede conservarse, winsorizarse o degradarse a observación no confiable.
+\end{enumerate}
+
+\subsection{Marco formal y notación}
+
+Sea \( \mathcal{T} \) el conjunto de fechas de trading y \( \mathcal{S}_t \) el universo PIT elegible en fecha \( t \). Para cada símbolo \( s \in \mathcal{S}_t \), el módulo dispone de:
+
+\begin{itemize}
+    \item \( p_t^{(s)} \): precio ajustado de cierre en fecha \( t \);
+    \item \( sh_t^{(s)} \): \textit{shares outstanding} o proxy PIT de conteo de acciones;
+    \item \( mc_t^{(s)} = p_t^{(s)} \cdot sh_t^{(s)} \): capitalización de mercado PIT;
+    \item \( F_{k,\tau}^{(s)} \): valor PIT del campo fundamental \( k \) disponible en fecha efectiva \( \tau \);
+    \item \( a_{k,\tau}^{(s)} \): \textit{as-of date} o fecha máxima de disponibilidad del dato contable utilizado.
+\end{itemize}
+
+La feature fundamental \( f \) construida en la fecha \( t \) para el símbolo \( s \) viene dada por:
 \[
-X_{t}^{(f)}(s) = \phi^{(f)} \big( \texttt{fundamentals\_pit}(s, \tau \leq t), p_{t}^{(s)} \big),
+X_t^{(f)}(s) = \phi_f\Big(\mathcal{F}_{\le t-\delta}^{(s)}, p_t^{(s)}, sh_t^{(s)}\Big),
 \]
-donde \( \phi^{(f)} \) es una función de ratio fundamental específica.
-
-\subsection{Features fundamentales core}
-
-\paragraph{Value / earnings yield}
+donde:
 \begin{itemize}
-    \item \texttt{fund\_pe\_proxy} o \texttt{earnings\_yield}:
-        \[
-        \text{EY}_t^{(s)} = \frac{\text{Earnings}_{\text{ttm}}^{(s)}}{\text{Market Cap}_t^{(s)}}
-        = \frac{\text{Net Income}_{\text{ttm}}^{(s)}}{p_{t}^{(s)} \cdot \text{SharesOut}_{t}^{(s)}},
-        \]
-        donde \texttt{ttm} indica “trailing twelve months” PIT, usando \texttt{asof\_date} válido.
+    \item \( \mathcal{F}_{\le t-\delta}^{(s)} \) es el conjunto de fundamentales observables hasta \( t-\delta \),
+    \item \( \delta = \texttt{decision\_lag\_days} \in \{0,1\} \),
+    \item \( \phi_f \) es la regla económica del ratio,
+    \item y toda evaluación debe respetar restricciones de staleness y validez económica.
 \end{itemize}
 
-\paragraph{Value / book–to–market}
+\paragraph{Condición PIT fundamental}
+Para cualquier campo contable usado en \( X_t^{(f)}(s) \), debe cumplirse:
+\[
+a_{k,\tau}^{(s)} \le t-\delta.
+\]
+Si esta condición no se cumple, el dato no es elegible para construcción de la feature.
+
+\paragraph{Staleness}
+Sea \( \tau_k^{(s,t)} \) la fecha efectiva del último valor observable del campo \( k \) usado en \( t \). Entonces:
+\[
+\mathrm{staleness}_{k,t}^{(s)} = t - \tau_k^{(s,t)}.
+\]
+Si
+\[
+\mathrm{staleness}_{k,t}^{(s)} > H_k^{\max},
+\]
+el dato debe considerarse stale más allá de tolerancia y no podrá usarse salvo política explícita documentada.
+
+\subsection{Principios de diseño}
+
+\paragraph{1. PIT estricto por campo, no por bloque agregado}
+No basta con que el dataset “parezca histórico”. Cada numerador y denominador debe satisfacer su propia condición de observabilidad.
+
+\paragraph{2. Validez económica antes que conveniencia estadística}
+Un ratio contable con denominador casi nulo, equity negativo o revenue irrelevante no debe forzarse a existir solo para aumentar cobertura.
+
+\paragraph{3. Forward-fill limitado y gobernado}
+El \textit{forward fill} solo está permitido dentro de horizontes de staleness por campo, nunca de forma indefinida.
+
+\paragraph{4. Separación entre missing estructural y ratio inválido}
+No es lo mismo no disponer aún del dato que disponer de él pero obtener un ratio económicamente no interpretable.
+
+\paragraph{5. Determinismo}
+El tratamiento de casos frontera debe ser fijo y reproducible: la misma observación debe resolverse igual en cualquier ejecución con la misma configuración.
+
+\subsection{Universo de métricas fundamentales core}
+
+El módulo debe construir una familia canónica de ratios base agrupada en cinco bloques: \textbf{valuation}, \textbf{profitability}, \textbf{quality proxy}, \textbf{leverage} y \textbf{efficiency}. Cada ratio debe venir acompañado de:
 \begin{itemize}
-    \item \texttt{fund\_book\_to\_market}:
-        \[
-        \text{BtM}_t^{(s)} = \frac{\text{Book Value}_{\text{latest}}^{(s)}}{\text{Market Cap}_t^{(s)}}
-        = \frac{\text{Total Equity}_{\text{latest}}^{(s)}}{p_{t}^{(s)} \cdot \text{SharesOut}_{t}^{(s)}},
-        \]
-        con \texttt{Total Equity} ajustado por data PIT, dejando fuera quiebras o anomalias de capital contable.
+    \item fórmula,
+    \item numerador y denominador explícitos,
+    \item condiciones de validez,
+    \item política ante denominadores degenerados,
+    \item política de staleness,
+    \item y metadata de lineage.
 \end{itemize}
 
-\paragraph{Profitability / quality}
+\subsubsection{Value / earnings yield}
+
+\paragraph{\texttt{fund\_earnings\_yield}}
+\[
+\mathrm{EY}_t^{(s)} =
+\frac{\mathrm{NetIncome}_{\mathrm{ttm}}^{(s)}}{mc_t^{(s)}}.
+\]
+
+donde:
 \begin{itemize}
-    \item \texttt{fund\_profit\_margin}:
-        \[
-        \text{PM}_t^{(s)} = \frac{\text{Net Income}_{\text{ttm}}^{(s)}}{\text{Revenue}_{\text{ttm}}^{(s)}},
-        \]
-        captura calidad de ganancias y disciplina de costes.
-    \item \texttt{fund\_roa} (Return on Assets):
-        \[
-        \text{ROA}_t^{(s)} = \frac{\text{Net Income}_{\text{ttm}}^{(s)}}{\text{Total Assets}_{\text{latest}}^{(s)}}.
-        \]
-    \item \texttt{fund\_roe\_proxy}:
-        \[
-        \text{ROE}_t^{(s)} \approx \frac{\text{Net Income}_{\text{ttm}}^{(s)}}{\text{Average Equity}_{\text{window}}},
-        \]
-        estimado con media de equity en ventana PIT-compatible.
+    \item \( \mathrm{NetIncome}_{\mathrm{ttm}}^{(s)} \) es el beneficio neto trailing-twelve-months PIT;
+    \item \( mc_t^{(s)} = p_t^{(s)} \cdot sh_t^{(s)} \) es la capitalización de mercado PIT;
+    \item el uso de TTM debe respetar la disponibilidad efectiva de todos los reportes que lo componen.
 \end{itemize}
 
-\paragraph{Leverage}
+\paragraph{Condiciones de validez}
 \begin{itemize}
-    \item \texttt{fund\_leverage\_ratio}:
-        \[
-        \text{Leverage}_t^{(s)} = \frac{\text{Total Debt}_{\text{latest}}^{(s)}}{\text{Total Assets}_{\text{latest}}^{(s)}},
-        \]
-        midiendo exposición de balance a riesgo de crédito y volatilidad de estructura de capital.
+    \item \( mc_t^{(s)} > 0 \) es obligatorio;
+    \item \( sh_t^{(s)} \) debe proceder de una fuente PIT-consistente o de una política documentada de reconstrucción;
+    \item si \( sh_t^{(s)} \) es inconsistente con split-adjustment o presenta saltos incompatibles con corporate actions conocidas, el ratio debe marcarse con flag de baja confianza o invalidarse.
 \end{itemize}
 
-\paragraph{Asset turnover / growth}
+\paragraph{Observación económica}
+Este ratio admite valores negativos; un beneficio negativo no invalida la métrica. Lo que invalida la métrica es una capitalización mal definida o una inconsistencia severa de \textit{share count}.
+
+\subsubsection{Value / book-to-market}
+
+\paragraph{\texttt{fund\_book\_to\_market}}
+\[
+\mathrm{BtM}_t^{(s)} =
+\frac{\mathrm{TotalEquity}_{\mathrm{latest}}^{(s)}}{mc_t^{(s)}}.
+\]
+
+\paragraph{Condiciones de validez}
 \begin{itemize}
-    \item \texttt{fund\_asset\_turnover}:
-        \[
-        \text{Turnover}_t^{(s)} = \frac{\text{Revenue}_{\text{ttm}}^{(s)}}{\text{Total Assets}_{\text{latest}}^{(s)}},
-        \]
-        asociado a eficiencia de capital y potencial de crecimiento orgánico.
+    \item \( mc_t^{(s)} > 0 \) obligatorio;
+    \item \( \mathrm{TotalEquity}_{\mathrm{latest}}^{(s)} \) debe ser observable PIT;
+    \item si equity es exactamente cero, el ratio es inválido;
+    \item si equity es negativo, la política debe decidir explícitamente entre:
+    \begin{itemize}
+        \item \texttt{return\_null},
+        \item \texttt{keep\_signed\_value},
+        \item o \texttt{flag\_negative\_equity\_and\_exclude\_from\_canonical}.
+    \end{itemize}
 \end{itemize}
 
-\subsection{Reglas PIT y control de staleness}
-
-\paragraph{Disponibilidad PIT}
+\paragraph{Política recomendada}
+Para la build canónica, el tratamiento más robusto suele ser:
 \begin{itemize}
-    \item Solo se usan métricas con \texttt{asof\_date} \(\leq t\), respetando el calendario de reporting de small caps y el \texttt{decision\_lag} configurado.
-    \item Para cada fecha \( t \), se asigna a cada símbolo \( s \) el \texttt{asof} más reciente disponible.
+    \item excluir equity negativo de la versión canónica de BtM,
+    \item mantener un flag auxiliar \texttt{fund\_negative\_equity\_flag},
+    \item y permitir uso experimental en research separado si se desea.
 \end{itemize}
 
-\paragraph{Forward–fill limitado}
+La razón es económica: un \textit{book-to-market} negativo no conserva la semántica clásica de \textit{value}.
+
+\subsubsection{Profitability / quality}
+
+\paragraph{\texttt{fund\_profit\_margin}}
+\[
+\mathrm{PM}_t^{(s)} =
+\frac{\mathrm{NetIncome}_{\mathrm{ttm}}^{(s)}}{\mathrm{Revenue}_{\mathrm{ttm}}^{(s)}}.
+\]
+
+\paragraph{Condiciones de validez}
 \begin{itemize}
-    \item Si una métrica fundamental no está disponible en \( t \), se usa forward–fill por máximo \texttt{max\_staleness} (por ejemplo, 90–180 días).
-    \item Tras exceder \texttt{max\_staleness}, se considera \texttt{stale\_severely} y se fuerza a \texttt{null} o se excluye según política.
+    \item \( \mathrm{Revenue}_{\mathrm{ttm}}^{(s)} > \tau_{\mathrm{rev,min}} \);
+    \item si ingresos son positivos pero cercanos a cero, el ratio no debe dejarse explotar numéricamente sin control;
+    \item si ingresos son cero o negativos, el ratio debe invalidarse para la build canónica.
 \end{itemize}
 
-\paragraph{Política de tratamiento}
+\paragraph{Motivación}
+La principal fragilidad aquí no es el numerador, sino el denominador: ingresos casi nulos generan márgenes absurdamente grandes que no representan calidad económica, sino inestabilidad de escala.
+
+\paragraph{\texttt{fund\_roa}}
+\[
+\mathrm{ROA}_t^{(s)} =
+\frac{\mathrm{NetIncome}_{\mathrm{ttm}}^{(s)}}{\mathrm{TotalAssets}_{\mathrm{latest}}^{(s)}}.
+\]
+
+\paragraph{Condiciones de validez}
 \begin{itemize}
-    \item \texttt{normative\_policy}: advertir pero no imputar si se viola \texttt{max\_staleness} de métricas críticas.
-    \item \texttt{fallback\_policy}: para denominadores críticos, usar valores anteriores no nulos o imputación cross‑sectional si permitido.
+    \item \( \mathrm{TotalAssets}_{\mathrm{latest}}^{(s)} > \tau_{\mathrm{assets,min}} \);
+    \item activos cero o negativos invalidan el ratio;
+    \item activos extremadamente pequeños requieren flag de baja confianza aunque el ratio sea computable.
 \end{itemize}
 
-\subsection{Validaciones y rangos de sanidad}
+\paragraph{\texttt{fund\_roe\_proxy}}
+\[
+\mathrm{ROE}_t^{(s)} \approx
+\frac{\mathrm{NetIncome}_{\mathrm{ttm}}^{(s)}}{\mathrm{AvgEquity}_{\mathrm{PIT}}^{(s)}}.
+\]
 
-\paragraph{Reglas de validación}
+donde:
+\[
+\mathrm{AvgEquity}_{\mathrm{PIT}}^{(s)}
+=
+\frac{1}{m}\sum_{j=1}^{m}\mathrm{Equity}_{\tau_j}^{(s)},
+\]
+con fechas \( \tau_j \) observables PIT y comparables dentro de la ventana definida.
+
+\paragraph{Condiciones de validez}
 \begin{itemize}
-    \item \textbf{Denominadores no nulos}:
-        \[
-        \text{Denominator}^{(s)} \neq 0 \quad \text{o} \quad \text{fallback\_value} \text{ configurado}.
-        \]
-    \item \textbf{Rangos de ratios plausibles}:
-        \begin{itemize}
-            \item \texttt{Profit margin} > \(-100\%\) y < \(100\%\) típicamente, salvo casos excepcionales (excluidos).
-            \item \texttt{ROA} y \texttt{ROE} limitados por zonas de outliers.
-        \end{itemize}
-    \item \textbf{Cobertura mínima por métrica}:
-        \[
-        \rho_{\text{cov}}^{(f)} = \frac{1}{|\mathcal{T}|} \sum_{t \in \mathcal{T}} \rho_{\text{cov}}^{(f,t)} \geq \texttt{min\_coverage\_pct},
-        \]
-        donde cada \(\rho_{\text{cov}}^{(f,t)}\) es el porcentaje de símbolos con observación.
+    \item la ventana de averaging debe estar completamente definida en términos PIT;
+    \item si alguna observación de equity requerida no existe o viola staleness, debe aplicarse una política explícita;
+    \item si el promedio de equity es no positivo, la versión canónica del ROE debe invalidarse o salir del catálogo principal.
 \end{itemize}
+
+\paragraph{Nota metodológica}
+ROE es especialmente frágil en small caps por equity volátil, recompras, pérdidas acumuladas y cambios bruscos de balance. Debe tratarse como proxy supervisada, no como ratio inocua.
+
+\subsubsection{Leverage}
+
+\paragraph{\texttt{fund\_leverage\_ratio}}
+\[
+\mathrm{Leverage}_t^{(s)} =
+\frac{\mathrm{TotalDebt}_{\mathrm{latest}}^{(s)}}{\mathrm{TotalAssets}_{\mathrm{latest}}^{(s)}}.
+\]
+
+\paragraph{Condiciones de validez}
+\begin{itemize}
+    \item \( \mathrm{TotalAssets}_{\mathrm{latest}}^{(s)} > \tau_{\mathrm{assets,min}} \);
+    \item deuda negativa o activos no positivos deben activar invalidación o revisión según caso;
+    \item la definición exacta de \textit{TotalDebt} debe quedar fijada en el diccionario de features.
+\end{itemize}
+
+\paragraph{Observación}
+Este ratio sí conserva sentido económico incluso en firmas débiles, pero su estabilidad depende críticamente de una definición consistente de deuda y activos.
+
+\subsubsection{Efficiency / asset turnover}
+
+\paragraph{\texttt{fund\_asset\_turnover}}
+\[
+\mathrm{Turnover}_t^{(s)} =
+\frac{\mathrm{Revenue}_{\mathrm{ttm}}^{(s)}}{\mathrm{TotalAssets}_{\mathrm{latest}}^{(s)}}.
+\]
+
+\paragraph{Condiciones de validez}
+\begin{itemize}
+    \item ingresos TTM observables PIT;
+    \item activos positivos y por encima de umbral mínimo;
+    \item no mezclar periodicidades incompatibles sin ajuste explícito.
+\end{itemize}
+
+\paragraph{Interpretación}
+Esta feature captura eficiencia operativa y velocidad de rotación del capital invertido. En small caps puede ser útil, pero también muy inestable en compañías con activos pequeños o modelos de negocio discontinuos; por ello necesita filtros de escala claros.
+
+\subsection{Construcción PIT y política de staleness}
+
+\subsubsection{Disponibilidad PIT}
+
+Para cada fecha \( t \) y símbolo \( s \), el módulo debe seleccionar el último dato contable disponible tal que:
+\[
+a_{k,\tau}^{(s)} \le t-\delta.
+\]
+No se permite utilizar fechas de filing, aceptación o publicación que excedan el \textit{decision cut} efectivo.
+
+\subsubsection{Forward-fill limitado}
+
+Sea \( H_k^{\max} \) el máximo horizonte de staleness permitido para el campo \( k \). Entonces un valor puede mantenerse activo solo si:
+\[
+t - \tau_k^{(s,t)} \le H_k^{\max}.
+\]
+
+\paragraph{Gobernanza}
+Los umbrales \( H_k^{\max} \) no deben ser únicos para todo el módulo. Deben poder definirse:
+\begin{itemize}
+    \item por campo contable,
+    \item por familia de ratios,
+    \item o, si se desea, por frecuencia esperada de reporting.
+\end{itemize}
+
+\paragraph{Regla recomendada}
+Los fundamentales de balance pueden tolerar una staleness distinta a los de flujo. El módulo debe permitir esta separación explícita.
+
+\subsubsection{Restatements y revisiones}
+
+Cuando existan restatements:
+\begin{itemize}
+    \item la versión válida es la que era observable en la fecha de decisión, no la versión retrospectivamente corregida si aún no estaba disponible;
+    \item el sistema debe preservar, en la medida de lo posible, la cronología PIT del dato revisado;
+    \item si la fuente no permite distinguirlo, debe documentarse la limitación.
+\end{itemize}
+
+\subsection{Jerarquía de validación}
+
+La resolución de una observación debe seguir este orden obligatorio:
+
+\begin{enumerate}
+    \item verificar observabilidad PIT de todos los componentes;
+    \item verificar staleness por campo;
+    \item verificar integridad numérica básica;
+    \item verificar validez económica de numerador y denominador;
+    \item aplicar flags de rareza contable;
+    \item solo después calcular el ratio;
+    \item y únicamente al final decidir winsorización o invalidación por extremo.
+\end{enumerate}
+
+Esta jerarquía evita que una winsorización silenciosa o una imputación temprana escondan un problema contable estructural.
+
+\subsection{Políticas para casos frontera}
+
+\subsubsection{Equity negativo}
+
+El módulo debe tratarlo explícitamente, no de forma incidental. Para ratios de valor y ROE:
+\begin{itemize}
+    \item \textbf{canónico}: invalidar y registrar flag;
+    \item \textbf{experimental}: permitir variante signed o bucket especial bajo nombre distinto.
+\end{itemize}
+
+\subsubsection{Revenue casi nulo}
+
+Si
+\[
+0 < \mathrm{Revenue}_{\mathrm{ttm}}^{(s)} \le \tau_{\mathrm{rev,min}},
+\]
+la observación no debe pasar como margen ordinario. Debe:
+\begin{itemize}
+    \item invalidarse,
+    \item o quedar marcada como ratio de baja fiabilidad si la política lo permite.
+\end{itemize}
+
+\subsubsection{Share count inconsistente}
+
+Si \( sh_t^{(s)} \) presenta discontinuidades incompatibles con ajustes corporativos conocidos:
+\begin{itemize}
+    \item las métricas de market-cap dependent deben marcarse como sospechosas;
+    \item si no puede reconstruirse un share count fiable, deben invalidarse EY y BtM en esa fecha.
+\end{itemize}
+
+\subsubsection{Ratios extremos pero válidos}
+
+No todo valor extremo implica error. El módulo debe distinguir entre:
+\begin{itemize}
+    \item \textbf{extremo válido}: caso económico raro pero posible;
+    \item \textbf{extremo inválido}: resultado de denominador degenerado, corrupción o rareza no interpretable.
+\end{itemize}
+
+La build canónica puede winsorizar extremos válidos, pero no debe rescatar extremos inválidos.
+
+\subsection{Controles de sanidad y calidad}
+
+\paragraph{Validaciones mínimas}
+\begin{itemize}
+    \item denominadores no nulos y por encima de mínimos económicos;
+    \item ausencia de \texttt{inf} y \texttt{-inf};
+    \item cobertura mínima por feature y por fecha;
+    \item tasa de invalidación por razón económica;
+    \item distribución de staleness por campo y por ratio;
+    \item flags de negative equity, near-zero revenue, suspect share count.
+\end{itemize}
+
+\paragraph{Cobertura}
+Para cada feature \( f \), deben calcularse:
+\[
+\rho_{\mathrm{cov}}^{(f)},
+\qquad
+Q_{0.05}\big(\rho_{\mathrm{cov}}^{(f,t)}\big),
+\qquad
+\text{breach rate de cobertura}.
+\]
+No basta la media global: una feature con colapsos repetidos en fechas relevantes no es canónica aunque su media sea aceptable.
+
+\paragraph{Rangos plausibles}
+Los rangos plausibles pueden servir como \textbf{soft checks}, pero no deben sustituir la validación económica del denominador. Un margen del 400\% puede ser un error o un caso extraordinario; el QC debe apoyarse en la causa, no solo en el valor observado.
 
 \subsection{Flujo de procesamiento}
 
-\paragraph{Alto nivel}
-1. \texttt{load\_fundamentals\_pit(fundamentals\_pit\_path, prices\_path, cfg)}:
-    - Carga datos de EDGAR PIT y precios ajustados.
-2. \texttt{compute\_core\_ratios(...)}:
-    - Calcula \texttt{fund\_pe\_proxy}, \texttt{fund\_book\_to\_market}, \texttt{fund\_profit\_margin}, \texttt{fund\_roa}, \texttt{fund\_roe\_proxy}, \texttt{fund\_leverage\_ratio}, \texttt{fund\_asset\_turnover}.
-3. \texttt{apply\_staleness\_controls(...)}:
-    - Aplica reglas de \texttt{max\_staleness} y exclusiones severas.
-4. \texttt{apply\_outlier\_filters(...)}:
-    - Winsorización o corte de ratios extremos.
-5. \texttt{persist\_outputs(...)}:
-    - Guarda la matriz de features, \texttt{summary\_run\_id.json}, \texttt{manifest\_run\_id.json}.
+\paragraph{Secuencia de alto nivel}
+\begin{enumerate}
+    \item Cargar fundamentales PIT, precios ajustados y series de \textit{share count}.
+    \item Resolver observabilidad PIT por campo y fecha.
+    \item Construir TTM y métricas latest de forma PIT-compatible.
+    \item Verificar staleness por campo.
+    \item Calcular ratios core con validación económica previa.
+    \item Aplicar flags de rarezas contables y sanitarias.
+    \item Aplicar política de clipping o winsorización solo sobre ratios válidos.
+    \item Persistir outputs y metadatos.
+\end{enumerate}
 
-\subsection{Salidas y estructura de almacenamiento}
-
-\paragraph{Outputs principales}
+\paragraph{Descomposición funcional sugerida}
 \begin{itemize}
-    \item \texttt{features/fundamentals\_core/date={yyyy-mm-dd}/part-*.parquet}:
-        \begin{itemize}
-            \item Columnas base: \texttt{date}, \texttt{symbol}, \texttt{run\_id}.
-            \item Features de fundamentales:
-                \begin{itemize}
-                    \item \texttt{fund\_pe\_proxy}, \texttt{fund\_book\_to\_market},
-                    \texttt{fund\_profit\_margin\_core}, \texttt{fund\_roa}, \texttt{fund\_roe\_proxy},
-                    \texttt{fund\_leverage\_ratio}, \texttt{fund\_asset\_turnover}.
-                \end{itemize}
-        \end{itemize}
-    \item \texttt{features/fundamentals\_core/summary\_\{run\_id\}.json}:
-        \begin{itemize}
-            \item \texttt{coverage\_rate}, \texttt{mean}, \texttt{p50}, \texttt{p99}, \texttt{n\_stale\_exclusions}.
-        \end{itemize}
-    \item \texttt{features/fundamentals\_core/manifest\_\{run\_id\}.json}:
-        \begin{itemize}
-            \item \texttt{run\_id}, \texttt{config\_hash}, \texttt{fundamentals\_pit\_hash}, \texttt{prices\_path}.
-        \end{itemize}
+    \item \texttt{load\_fundamentals\_pit()}
+    \item \texttt{load\_prices\_and\_shares()}
+    \item \texttt{resolve\_pit\_latest\_and\_ttm()}
+    \item \texttt{compute\_market\_cap\_series()}
+    \item \texttt{validate\_fundamental\_components()}
+    \item \texttt{compute\_value\_ratios()}
+    \item \texttt{compute\_profitability\_ratios()}
+    \item \texttt{compute\_leverage\_ratios()}
+    \item \texttt{compute\_efficiency\_ratios()}
+    \item \texttt{apply\_fundamental\_sanity\_flags()}
+    \item \texttt{apply\_staleness\_policy()}
+    \item \texttt{persist\_outputs()}
+    \item \texttt{main()}
 \end{itemize}
 
-\subsection{CLI y uso en el pipeline global}
+\subsection{Salidas y contrato de persistencia}
 
-\paragraph{CLI recomendada}
+\paragraph{Dataset principal}
+\begin{verbatim}
+features/fundamentals_core/
+  run_id=<RUN_ID>/
+    date=YYYY-MM-DD/part-*.parquet
+\end{verbatim}
+
+\paragraph{Columnas mínimas}
+\begin{itemize}
+    \item \texttt{date}, \texttt{symbol}, \texttt{run\_id}
+    \item \texttt{fund\_earnings\_yield}
+    \item \texttt{fund\_book\_to\_market}
+    \item \texttt{fund\_profit\_margin}
+    \item \texttt{fund\_roa}
+    \item \texttt{fund\_roe\_proxy}
+    \item \texttt{fund\_leverage\_ratio}
+    \item \texttt{fund\_asset\_turnover}
+    \item flags auxiliares:
+    \begin{itemize}
+        \item \texttt{negative\_equity\_flag}
+        \item \texttt{near\_zero\_revenue\_flag}
+        \item \texttt{suspect\_share\_count\_flag}
+        \item \texttt{stale\_fundamental\_flag}
+    \end{itemize}
+\end{itemize}
+
+\paragraph{Metadatos}
+El \texttt{manifest} debe incluir:
+\begin{itemize}
+    \item \texttt{run\_id},
+    \item \texttt{config\_hash},
+    \item \texttt{fundamentals\_pit\_hash},
+    \item \texttt{prices\_hash},
+    \item \texttt{shares\_source\_hash},
+    \item \texttt{staleness\_policy\_hash},
+    \item \texttt{lineage\_hash}.
+    \end{itemize}
+
+\paragraph{Summary recomendado}
+\begin{itemize}
+    \item cobertura por ratio;
+    \item distribución de staleness;
+    \item número de exclusiones por invalidación económica;
+    \item número de flags por tipo;
+    \item percentiles de ratios válidos;
+    \item número de observaciones winsorizadas.
+\end{itemize}
+
+\subsection{CLI recomendada}
+
 \begin{verbatim}
 python -m features.fundamentals_core ^
   --fundamentals-pit-path data/edgar/pit ^
   --prices-path data/price/adjusted/mode=dual_output ^
+  --shares-path data/reference/shares_outstanding ^
   --config-path configs/features/fundamentals_core.yaml ^
   --run-id fundamentals_core_20260305_001
 \end{verbatim}
 
-\paragraph{Uso downstream}
+\subsection{Uso downstream}
+
 \begin{itemize}
-    \item \texttt{features/build\_features.py}: integra ratios \texttt{fund\_*} como componentes de familias de features fundamentales.
-    \item \texttt{models/*/train\_*.py}: construye factores de value–quality–leverage.
-    \item \texttt{backtest/run\_walkforward.py}: exploita rankings de value/quality para construir long–short portfolios de small caps.
+    \item \texttt{features/build\_features.py} integra estas métricas como bloque fundamental canónico.
+    \item \texttt{features/cross\_sectional.py} transforma estos ratios en representación comparable por fecha.
+    \item \texttt{features/feature\_qc.py} evalúa cobertura, drift, leakage y degeneraciones.
+    \item \texttt{fundamentals\_deltas.py} construye cambios QoQ/YoY sobre esta base ya validada.
 \end{itemize}
 
 \subsection{Definition of Done}
 
+\paragraph{El módulo se considera terminado únicamente si:}
+\begin{enumerate}
+    \item todas las ratios se construyen con observabilidad PIT verificable;
+    \item la política de staleness está definida por campo o familia, no de forma difusa;
+    \item equity negativo, ingresos casi nulos y share count inconsistente tienen tratamiento explícito;
+    \item la build canónica distingue ratios válidos de ratios solo computables;
+    \item el output es reproducible y trazable por \texttt{run\_id}, hashes y lineage;
+    \item las salidas pueden entrar en \texttt{cross\_sectional.py} y \texttt{feature\_qc.py} sin reinterpretación manual.
+\end{enumerate}
+
+\subsection{Casos de prueba mínimos}
+
 \begin{itemize}
-    \item Conjunto de \textbf{features fundamentales PIT} listo para estandarización cross‑sectional y modelado.
-    \item Ratios bien definidos matemáticamente, con tratamiento de staleness controlado.
-    \item Salidas almacenadas de forma versionada, con metadata completa y cobertura adecuada para seguir el pipeline de \texttt{feature\_qc} y \texttt{cross\_sectional}.
+    \item Verificación de que un filing posterior al \textit{decision cut} no entra en la fecha anterior.
+    \item Invalidación correcta de BtM con equity negativo.
+    \item Invalidación correcta de profit margin con revenue casi nulo.
+    \item Detección de inconsistencia de \textit{share count} que invalida ratios dependientes de market cap.
+    \item Verificación de forward-fill solo dentro del horizonte de staleness permitido.
+    \item Confirmación de que un ratio extremo válido se winsoriza, pero uno inválido se descarta.
+    \item Reproducibilidad exacta dada la misma configuración e inputs.
 \end{itemize}
 
-\subsection{Referencias de referencia}
-
-\begin{itemize}
-    \item Fama, E. F. y French, K. R. (1992, 2015). \textit{The Cross‑Section of Expected Stock Returns} y \textit{Choosing Factors}. \cite{fama1992, fama2015}
-    \item Novy‑Marx, R. (2013). \textit{The Other Side of Value: The Gross Profitability Premium}. \cite{novy2013}
-    \item Estudios de \textit{value–quality} en small caps (S&P Global, Robeco, et al.). \cite{spglobal_pit, robeco2025}
-\end{itemize}
+\paragraph{Síntesis final}
+\texttt{features/fundamentals\_core.py} no debe verse como un módulo auxiliar de ratios contables, sino como el traductor oficial entre contabilidad PIT imperfecta y representación económica utilizable por el stack cuantitativo. En un universo de \textit{small caps}, esta traducción exige mucha más disciplina que en datasets académicos limpios: la dificultad real está en decidir cuándo un ratio sigue siendo informativo y cuándo deja de ser interpretable. Si el módulo está mal especificado, la capa fundamental se convierte en una mezcla opaca de ruido contable, stale data y falsos extremos. Si está bien blindado, el sistema gana una base de \textit{value}, \textit{quality}, profitability y leverage que puede sobrevivir al paso de research a producción.

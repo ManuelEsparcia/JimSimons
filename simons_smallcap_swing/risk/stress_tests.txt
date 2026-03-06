@@ -1,14 +1,18 @@
 \documentclass{article}
 \usepackage[utf8]{inputenc}
-\usepackage{amsmath,amssymb,amsfonts}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,mathtools}
 \usepackage{booktabs}
-\usepackage{listings}
-\usepackage{hyperref}
+\usepackage{array}
+\usepackage{enumitem}
 \usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
 \geometry{margin=1in}
 
-\title{Explicación SOTA: risk/stress\_tests.py \\ Escenarios Adversos Resilientes (JPM/GS Tail Risk)}
-\author{Análisis Research Industrial}
+\title{\textbf{Especificación Técnica: \texttt{risk/stress\_tests.py}}}
+\author{Quant Research Infrastructure}
 \date{Marzo 2026}
 
 \begin{document}
@@ -17,80 +21,616 @@
 \tableofcontents
 \newpage
 
-\section{Objetivo y Alcance}
-Evalúa resiliencia bajo históricos (GFC/COVID), paramétricos (vol x1.5, corr 0.8), operativos (liq/2). Outputs: stressed DD/ES, breaches $[web:25]$.
+\section{Propósito del módulo}
 
-\section{Teoría Matemática}
-Stressed PnL: Perturba \( r \to r + \Delta \), cov \(\Sigma \to (1+\kappa) \Sigma + \Delta\rho\).
+Este módulo evalúa la resiliencia del portafolio y de la estrategia frente a escenarios adversos de mercado, liquidez y dependencia transversal. Su función es responder, de forma cuantitativa y reproducible, a una pregunta simple: \emph{qué ocurre con el portafolio si las condiciones relevantes empeoran de forma material, aunque plausible}.
 
-ES:
-\[
-ES_\alpha = -\E[r | r \le q_\alpha], \quad q_\alpha = \inf \{ q: P(r \le q) \ge \alpha \}
-\]
+El módulo no existe para producir una tabla vistosa de escenarios extremos ni para introducir terminología sofisticada desconectada de decisiones operativas. Su objetivo es transformar una cartera, una matriz de riesgo y un conjunto de hipótesis de shock en métricas comparables de deterioro: pérdidas, drawdown, expected shortfall, concentración de pérdidas, degradación de liquidez y violaciones de límites.
 
-Copula shock: \( C(u_1,...,u_n) \) para joint tails (Clayton para lower).
-
-Liquidity impact: \( \text{Price}_t = P_0 + \lambda \cdot \frac{V_t}{\sqrt{ADV_t}} \).
-
-\section{Papers Seminales}
+En una estrategia \emph{swing} sobre small caps, esta capa es necesaria porque los mayores fallos del sistema no suelen provenir de un error medio de predicción, sino de combinaciones adversas de:
 \begin{itemize}
-\item \href{https://www.math.ethz.ch/~embrecht/ftp/copulas.pdf}{Embrechts (2002)}: Copulas tails.
-\item McNeil (2009): EVT/ES computation.
-\item \href{https://arxiv.org/abs/1201.4594}{Glasserman (2012)}: MC stress.
-\item Danielsson (2018): Endogenous liquidity risk.
+    \item caídas de mercado,
+    \item aumento de correlaciones,
+    \item compresión de liquidez,
+    \item ampliación de spreads,
+    \item y deterioro simultáneo de múltiples posiciones aparentemente diversificadas.
 \end{itemize}
 
-\section{Libros Industriales}
-\begin{itemize}
-\item McNeil et al. (2015): \textit{Quantitative Risk Mgmt.} -- EVT/ES.
-\item Patterson (2010): \textit{The Quants} -- 2008 quant crisis.
-\item Chan (2020): \textit{QT} -- Backtest stress.
-\item Taleb (2007): \textit{Black Swan} -- Fat tails.
-\end{itemize}
+\section{Objetivo operativo}
 
-\section{Análisis del Flujo}
-\begin{enumerate}
-\item Load backtest/positions/cov.
-\item Scenarios: Histórico replay, param (vol*1.5), op (slippage*2).
-\item Recompute PnL/DD/ES/Sharpe stressed.
-\item Breaches vs config limits.
-\item Persist results/breaches/summary.
+El módulo debe cumplir cinco funciones:
+
+\begin{enumerate}[label=\arabic*.]
+    \item Definir un conjunto mínimo y estable de escenarios de estrés.
+    \item Revaluar el portafolio bajo cada escenario con una semántica consistente.
+    \item Calcular métricas de daño comparables entre escenarios.
+    \item Clasificar cada escenario como \texttt{pass}, \texttt{warn} o \texttt{fail}.
+    \item Producir salidas utilizables por monitoreo, gobernanza y \emph{gating} de portfolio.
 \end{enumerate}
 
-PIT: No future leak.
+El módulo no debe limitarse a ``simular shocks''. Debe convertir esos shocks en un diagnóstico operativo.
 
-\section{Optimizaciones SOTA}
-- Vine copula para asymmetric tails.
-- GARCH regime shocks.
-Snippet copula:
-\begin{lstlisting}[language=Python]
-from copulae import ClaytonCopula
-shock = clayton.copula_sample(1, n_samples)
+\section{Entradas, salidas y contrato del módulo}
+
+\subsection{Entradas mínimas}
+
+El módulo requiere:
+
+\begin{itemize}
+    \item cartera o posiciones vigentes a la fecha \(t\);
+    \item retornos históricos por activo;
+    \item covarianza base del sistema;
+    \item opcionalmente matriz factorial y exposiciones;
+    \item métricas de liquidez por activo;
+    \item configuración de escenarios;
+    \item política de límites y umbrales de severidad.
+\end{itemize}
+
+En notación compacta:
+
+\begin{itemize}
+    \item pesos o notionals del portafolio:
+    \[
+    w_t \in \mathbb{R}^N;
+    \]
+    \item matriz de retornos históricos:
+    \[
+    R \in \mathbb{R}^{T \times N};
+    \]
+    \item covarianza base:
+    \[
+    \Sigma_t \in \mathbb{R}^{N \times N};
+    \]
+    \item ADV, spreads u otras variables de capacidad.
+\end{itemize}
+
+\subsection{Salidas obligatorias}
+
+El módulo debe persistir:
+
+\begin{itemize}
+    \item \texttt{scenario\_results.parquet}: métricas por escenario;
+    \item \texttt{breaches.parquet}: violaciones específicas de límites;
+    \item \texttt{summary.json}: diagnóstico agregado;
+    \item \texttt{scenario\_definitions.json}: definición exacta y parametrización de cada escenario.
+\end{itemize}
+
+\subsection{Campos mínimos de \texttt{scenario\_results.parquet}}
+
+Cada escenario debe reportar, al menos:
+
+\begin{itemize}
+    \item identificador del escenario;
+    \item tipo de escenario;
+    \item severidad parametrizada;
+    \item stressed return o stressed PnL;
+    \item stressed volatility;
+    \item stressed drawdown;
+    \item stressed expected shortfall;
+    \item gross y net exposure post-shock, si aplica;
+    \item liquidity-adjusted PnL, si aplica;
+    \item clasificación final: \texttt{pass}, \texttt{warn}, \texttt{fail}.
+\end{itemize}
+
+\subsection{Campos mínimos de \texttt{summary.json}}
+
+\begin{itemize}
+    \item fecha de evaluación;
+    \item número total de escenarios ejecutados;
+    \item peor escenario por PnL;
+    \item peor escenario por drawdown;
+    \item peor escenario por expected shortfall;
+    \item número de \texttt{warn};
+    \item número de \texttt{fail};
+    \item decisión agregada;
+    \item metadatos de inputs usados;
+    \item si se activó algún \emph{fallback}.
+\end{itemize}
+
+\section{Taxonomía de escenarios}
+
+La versión canónica del módulo debe distinguir tres familias de escenarios:
+
+\begin{enumerate}[label=\arabic*.]
+    \item \textbf{Históricos}: replay de episodios observados.
+    \item \textbf{Paramétricos}: shocks definidos sobre volatilidad, correlación, factores o precios.
+    \item \textbf{Operativos / de liquidez}: perturbaciones en capacidad de ejecución, spreads, slippage y ADV.
+\end{enumerate}
+
+Esta taxonomía debe ser fija en el núcleo del módulo. Extensiones como copulas, EVT o Monte Carlo avanzado pueden existir después, pero no deben sustituir a estos bloques mínimos.
+
+\section{Escenarios obligatorios del núcleo canónico}
+
+\subsection{Escenarios históricos}
+
+La versión base debe incluir un pequeño conjunto de ventanas históricas relevantes para el universo operado. No es necesario que todas correspondan a crisis globales; deben ser episodios que representen tipos distintos de daño:
+
+\begin{itemize}
+    \item shock de mercado amplio;
+    \item episodio de correlación elevada;
+    \item episodio de deterioro de liquidez;
+    \item episodio de venta agresiva en small caps;
+    \item episodio de reversión violenta o \emph{short squeeze}, si el sistema mantiene cortos.
+\end{itemize}
+
+La implementación no debe fijar nombres de crisis como decoración, sino ventanas temporales concretas y persistidas en \texttt{scenario\_definitions.json}.
+
+\subsection{Escenarios paramétricos mínimos}
+
+La versión canónica debe incluir, como mínimo:
+
+\begin{enumerate}[label=\arabic*.]
+    \item \textbf{Shock de volatilidad}: multiplicar la covarianza por un factor \(1+\kappa\), con \(\kappa > 0\).
+    \item \textbf{Shock de correlación}: desplazar correlaciones hacia un nivel más alto.
+    \item \textbf{Shock direccional}: caída del factor de mercado o del benchmark relevante.
+    \item \textbf{Shock factorial}: movimientos adversos en factores a los que el libro esté expuesto.
+\end{enumerate}
+
+\subsection{Escenarios operativos mínimos}
+
+La versión canónica debe incluir:
+
+\begin{itemize}
+    \item caída del ADV utilizable;
+    \item aumento de slippage;
+    \item ampliación de spread;
+    \item limitación de participación máxima;
+    \item retraso de liquidación o reducción de capacidad de salida.
+\end{itemize}
+
+Estos escenarios son especialmente importantes en small caps y no deben tratarse como apéndice opcional.
+
+\section{Formulación matemática base}
+
+\subsection{PnL bajo shock de retornos}
+
+Sea \(w \in \mathbb{R}^N\) el vector de pesos o notionals normalizados y sea \(\Delta r \in \mathbb{R}^N\) el vector de shocks de retorno. El PnL de primer orden es:
+
+\[
+PnL_{\text{stress}} = w^\top \Delta r.
+\]
+
+Si el portafolio está expresado en notionals monetarios, la misma fórmula se interpreta en unidades monetarias.
+
+\subsection{Shock paramétrico sobre covarianza}
+
+Un shock simple de volatilidad puede representarse como:
+
+\[
+\Sigma^{\text{stress}} = (1+\kappa)\Sigma,
+\qquad \kappa > 0.
+\]
+
+Un shock de correlación puede construirse desde la descomposición
+\[
+\Sigma = D_\sigma \, \rho \, D_\sigma,
+\]
+donde \(D_\sigma = \operatorname{diag}(\sigma_1,\dots,\sigma_N)\), y luego perturbando la matriz de correlación:
+
+\[
+\rho^{\text{stress}}_{ij} =
+\begin{cases}
+1, & i=j,\\
+\min\{1,\rho_{ij}+\Delta \rho\}, & i\neq j.
+\end{cases}
+\]
+
+Finalmente,
+
+\[
+\Sigma^{\text{stress}} = D_\sigma \rho^{\text{stress}} D_\sigma.
+\]
+
+La matriz resultante debe ser simétrica y PSD tras corrección si fuera necesario.
+
+\subsection{Expected Shortfall}
+
+Para una distribución de retornos o pérdidas bajo escenario, el expected shortfall a nivel \(\alpha\) se define como:
+
+\[
+ES_\alpha = - \mathbb{E}[r \mid r \le q_\alpha],
+\]
+donde \(q_\alpha\) es el cuantil \(\alpha\) de la distribución:
+
+\[
+q_\alpha = \inf\{q : \mathbb{P}(r \le q) \ge \alpha\}.
+\]
+
+La convención de signos debe quedar fija en todo el sistema. Si se trabaja con pérdidas \(L=-r\), entonces:
+
+\[
+ES_\alpha = \mathbb{E}[L \mid L \ge VaR_\alpha].
+\]
+
+El módulo no debe alternar ambas convenciones sin documentarlo.
+
+\subsection{Drawdown bajo escenario}
+
+Si el escenario se aplica sobre una trayectoria de PnL o retornos acumulados, el drawdown estresado se define de forma estándar:
+
+\[
+HWM_t^{\text{stress}} = \max_{s \le t} NAV_s^{\text{stress}},
+\]
+\[
+DD_t^{\text{stress}} = \frac{NAV_t^{\text{stress}} - HWM_t^{\text{stress}}}{HWM_t^{\text{stress}}}.
+\]
+
+El resumen de escenario debe incluir:
+
+\[
+MDD^{\text{stress}} = \min_t DD_t^{\text{stress}}.
+\]
+
+\subsection{Impacto de liquidez}
+
+Para no sobrediseñar el núcleo, la versión canónica debe usar una forma simple y auditable de coste de liquidez. Por ejemplo, si \(Q_i\) es el notional de salida de la posición \(i\) y \(ADV_i\) el volumen monetario medio diario:
+
+\[
+PR_i = \frac{|Q_i|}{ADV_i},
+\]
+
+y el coste adicional de liquidez puede modelarse de forma conservadora como:
+
+\[
+Cost_i^{\text{liq}} = c_1 \, PR_i + c_2 \, PR_i^2,
+\qquad c_1,c_2 \ge 0.
+\]
+
+Entonces,
+
+\[
+PnL_{\text{stress,liq}} = PnL_{\text{stress}} - \sum_{i=1}^N Cost_i^{\text{liq}}.
+\]
+
+Esta forma es operativamente más útil que introducir de entrada modelos microestructurales sofisticados no integrados con ejecución.
+
+\section{Severidad y comparabilidad entre escenarios}
+
+Uno de los problemas más comunes de los \emph{stress tests} es mezclar escenarios de magnitud arbitraria, haciendo imposible comparar resultados. La versión base debe asignar a cada escenario un parámetro explícito de severidad.
+
+\subsection{Ejemplos de parametrización}
+
+\begin{itemize}
+    \item volatilidad:
+    \[
+    \kappa \in \{0.25, 0.50, 1.00\};
+    \]
+    \item correlación:
+    \[
+    \Delta \rho \in \{0.10, 0.20, 0.30\};
+    \]
+    \item ADV:
+    \[
+    ADV^{\text{stress}} = \eta \cdot ADV,
+    \qquad \eta \in \{0.75, 0.50, 0.25\};
+    \]
+    \item shock direccional de mercado:
+    \[
+    \Delta f_{\text{mkt}} \in \{-1\sigma, -2\sigma, -3\sigma\}.
+    \]
+\end{itemize}
+
+Cada escenario debe persistir su severidad exacta. No deben existir escenarios llamados ``extremo'' o ``severo'' sin definición numérica.
+
+\section{Reglas de decisión: pass, warn, fail}
+
+El módulo debe traducir resultados numéricos a una clasificación operativa. Una política base razonable puede usar umbrales configurables sobre:
+
+\begin{itemize}
+    \item stressed PnL;
+    \item stressed drawdown;
+    \item stressed expected shortfall;
+    \item breach de liquidez;
+    \item breach de concentración o capacidad.
+\end{itemize}
+
+\subsection{Ejemplo de política}
+
+Sea \(L_{pnl}\) el límite máximo de pérdida tolerada, \(L_{dd}\) el drawdown máximo tolerado y \(L_{es}\) el ES máximo tolerado. Entonces:
+
+\[
+\texttt{fail}
+\quad \text{si} \quad
+PnL_{\text{stress}} < -L_{pnl}
+\;\;\text{o}\;\;
+MDD^{\text{stress}} < -L_{dd}
+\;\;\text{o}\;\;
+ES_\alpha > L_{es}.
+\]
+
+\[
+\texttt{warn}
+\quad \text{si no hay fail pero alguna métrica entra en zona de alerta}.
+\]
+
+\[
+\texttt{pass}
+\quad \text{si ninguna métrica excede sus umbrales}.
+\]
+
+\subsection{Decisión agregada del módulo}
+
+La decisión agregada debe seguir la regla:
+
+\[
+\texttt{fail} \;>\; \texttt{warn} \;>\; \texttt{pass}.
+\]
+
+Si existe al menos un escenario en \texttt{fail}, la salida global del módulo no puede ser \texttt{pass}.
+
+\section{Escenarios históricos: implementación correcta}
+
+\subsection{Replay histórico}
+
+En un escenario histórico, el módulo debe extraer una ventana observada de retornos o shocks y aplicarla a la cartera actual. Esto puede hacerse de dos formas, según política:
+
+\begin{enumerate}[label=\arabic*.]
+    \item \textbf{Replay directo}: aplicar a los pesos actuales los retornos de una ventana histórica seleccionada.
+    \item \textbf{Replay reescalado}: aplicar la misma estructura relativa del episodio histórico pero ajustada al nivel actual de volatilidad o liquidez.
+\end{enumerate}
+
+La política usada debe quedar fijada por configuración.
+
+\subsection{Evitar confusiones temporales}
+
+El replay histórico no debe confundirse con \emph{backtesting}. No se está preguntando qué habría ocurrido si la estrategia hubiera existido entonces con pesos históricos, sino qué ocurriría al libro actual si se reprodujera hoy un patrón adverso análogo.
+
+\section{Escenarios factoriales}
+
+Si el sistema dispone de \texttt{factor\_model.py}, el módulo debe poder aplicar shocks sobre factores en lugar de, o además de, shocks directos por activo.
+
+Sea \(B\) la matriz de exposiciones y \(\Delta f\) un vector de shocks factoriales. Entonces:
+
+\[
+\Delta r = B \Delta f,
+\]
+y el PnL de primer orden queda:
+
+\[
+PnL_{\text{stress}} = w^\top B \Delta f.
+\]
+
+Este enfoque es especialmente útil para:
+
+\begin{itemize}
+    \item shock de mercado;
+    \item shock de tamaño;
+    \item shock de liquidez;
+    \item shock sectorial;
+    \item combinaciones adversas coherentes con las exposiciones reales del libro.
+\end{itemize}
+
+\section{Escenarios de liquidez y capacidad}
+
+\subsection{Principio}
+
+En small caps, un stress test que ignore liquidez es incompleto aunque la matriz de riesgo sea impecable. El módulo debe medir no solo la pérdida mark-to-market bajo shock, sino también la pérdida ajustada por deterioro de salida.
+
+\subsection{Controles mínimos}
+
+Cada escenario operativo debe poder reportar:
+
+\begin{itemize}
+    \item participación máxima por orden;
+    \item días teóricos para liquidación:
+    \[
+    DTL_i = \frac{|PositionNotional_i|}{\phi \cdot ADV_i};
+    \]
+    \item slippage adicional agregado;
+    \item número de posiciones que se vuelven no ejecutables bajo el escenario.
+\end{itemize}
+
+\subsection{Breach operativo}
+
+Debe marcarse al menos \texttt{warn} si una fracción material del portafolio requiere una participación o un horizonte de liquidación incompatibles con la política del sistema.
+
+\section{Interacción con otros módulos}
+
+\subsection{Con \texttt{risk/factor\_model.py}}
+
+El modelo factorial proporciona exposiciones y covarianza estructurada para shocks coherentes por factores. Este módulo no debe reconstruir factores localmente salvo en contingencia documentada.
+
+\subsection{Con \texttt{risk/cov\_shrinkage.py}}
+
+La covarianza base consumida por el stress test debe provenir de una fuente PSD y auditada. Si la matriz base no es válida, los resultados del stress test no deben tratarse como fiables.
+
+\subsection{Con \texttt{risk/drawdown\_control.py}}
+
+Los escenarios deben informar si los thresholds de drawdown activan transiciones a \texttt{warning}, \texttt{derisk} o \texttt{kill}. Esta conexión es necesaria para que el stress testing tenga consecuencia operativa real.
+
+\subsection{Con \texttt{portfolio/optimizer.py}}
+
+Si el resultado agregado del módulo es \texttt{fail}, el optimizador o la capa de governance pueden:
+\begin{itemize}
+    \item rechazar la cartera propuesta;
+    \item pedir reducción de exposición;
+    \item o lanzar una reoptimización bajo restricciones más duras.
+\end{itemize}
+
+\section{Política de fallbacks}
+
+Los \emph{fallbacks} deben ser pocos y explícitos.
+
+\subsection{Casos típicos}
+
+\begin{itemize}
+    \item falta de covarianza válida;
+    \item cobertura insuficiente de retornos;
+    \item ADV faltante en posiciones materiales;
+    \item escenarios mal definidos o no calibrados;
+    \item resultados no finitos tras aplicar shocks.
+\end{itemize}
+
+\subsection{Comportamiento correcto}
+
+En caso de \emph{fallback}, el módulo debe:
+
+\begin{enumerate}[label=\arabic*.]
+    \item registrar el motivo;
+    \item degradar a una versión conservadora del escenario, si existe;
+    \item o fallar de forma controlada si no puede producir resultados auditables.
+\end{enumerate}
+
+No debe rellenar silenciosamente datos críticos ni emitir \texttt{pass} con inputs incompletos.
+
+\section{Algoritmo operativo}
+
+\begin{enumerate}[label=\arabic*.]
+    \item Cargar cartera, retornos, covarianza base y datos de liquidez.
+    \item Validar consistencia de dimensiones, cobertura y finitud.
+    \item Construir el conjunto de escenarios obligatorios.
+    \item Para cada escenario:
+    \begin{enumerate}[label*=\arabic*.]
+        \item aplicar shock a retornos, factores, covarianza o liquidez;
+        \item recalcular PnL, volatilidad, drawdown y expected shortfall;
+        \item calcular métricas operativas de capacidad si aplica;
+        \item evaluar breaches;
+        \item asignar \texttt{pass}/\texttt{warn}/\texttt{fail}.
+    \end{enumerate}
+    \item Agregar resultados a nivel de módulo.
+    \item Persistir resultados, definiciones y resumen.
+\end{enumerate}
+
+\section{Pseudocódigo de referencia}
+
+\begin{lstlisting}[language=Python,basicstyle=\ttfamily\small,breaklines=true]
+positions = load_positions()
+returns = load_returns()
+cov = load_covariance()
+liq = load_liquidity_metrics()
+scenarios = build_scenarios(config)
+
+results = []
+
+for sc in scenarios:
+    shocked = apply_scenario(
+        scenario=sc,
+        positions=positions,
+        returns=returns,
+        covariance=cov,
+        liquidity=liq,
+    )
+
+    pnl = compute_stressed_pnl(shocked)
+    vol = compute_stressed_vol(shocked)
+    dd = compute_stressed_drawdown(shocked)
+    es = compute_stressed_es(shocked, alpha=0.95)
+    liq_metrics = compute_liquidity_stress(shocked)
+
+    breaches = evaluate_limits(
+        pnl=pnl,
+        drawdown=dd,
+        es=es,
+        liquidity_metrics=liq_metrics,
+        limits=config["limits"],
+    )
+
+    decision = aggregate_decision(breaches)
+
+    results.append({
+        "scenario_id": sc.id,
+        "scenario_type": sc.type,
+        "severity": sc.severity,
+        "pnl_stress": pnl,
+        "vol_stress": vol,
+        "dd_stress": dd,
+        "es_stress": es,
+        "decision": decision,
+    })
+
+save_results(results)
+save_summary(results)
 \end{lstlisting}
 
-\section{Backtest Élite Swing}
-Rebalance 10d equities:
+\section{Métricas diagnósticas obligatorias}
 
-\begin{table}[h]
-\centering
-\begin{tabular}{llcc}
-\toprule
-Escenario & Baseline DD (\%) & Stressed DD (\%) & Breach \\
-\midrule
-GFC 2008 & -18 & -28 & No \\
-Vol x2 & -12 & -22 & No \\
-Corr 0.9 & -15 & -25 & Warn \\
-Liq /2 & -10 & -18 & No \\
-ES 95\% & -8 & -14 & Pass \\
-\bottomrule
-\end{tabular}
-\caption{Monte Carlo 10k paths, 2015-2026 $[web:42]$.}
-\end{table}
+Además de los outputs principales, el módulo debe reportar:
 
-\section{Integración}
-Post factor_model, pre monitoring. Filters fragil strategies.
+\begin{itemize}
+    \item peor pérdida por escenario;
+    \item peor drawdown por escenario;
+    \item peor ES por escenario;
+    \item número de posiciones ilíquidas bajo cada shock;
+    \item fracción del libro afectada por breaches de capacidad;
+    \item sensibilidad agregada a shocks factoriales;
+    \item cobertura efectiva de inputs por escenario.
+\end{itemize}
 
-\section{Próximos Pasos}
-Reverse stress: Find max shock tolerable.
+Estas métricas son diagnósticas, no marketing. Deben servir para entender \emph{por qué} el portafolio falla o resiste.
+
+\section{Pruebas mínimas de aceptación}
+
+\subsection{Test 1: trazabilidad de escenarios}
+
+Cada escenario ejecutado debe tener definición persistida, con parámetros numéricos exactos. No puede existir un escenario sin metadatos completos.
+
+\subsection{Test 2: consistencia dimensional}
+
+Las dimensiones de cartera, retornos, covarianza y shocks deben ser compatibles en todos los escenarios.
+
+\subsection{Test 3: PSD}
+
+Toda covarianza estresada debe ser simétrica y PSD tras la política de corrección.
+
+\subsection{Test 4: monotonicidad de severidad}
+
+Si dos escenarios son idénticos salvo porque uno tiene mayor severidad parametrizada, el daño esperado no debe mejorar sistemáticamente en el escenario más severo salvo por efectos explícitos del modelo.
+
+\subsection{Test 5: liquidity stress}
+
+Reducir \(ADV\) o aumentar slippage no debe mejorar el PnL ajustado por liquidez.
+
+\subsection{Test 6: aggregate decision}
+
+Si existe al menos un escenario en \texttt{fail}, la decisión global del módulo no puede ser \texttt{pass}.
+
+\subsection{Test 7: deterministic replay}
+
+Con los mismos inputs y la misma configuración, el módulo debe producir exactamente los mismos resultados.
+
+\section{Qué no debe hacer este módulo}
+
+La versión canónica no debe:
+
+\begin{itemize}
+    \item apoyarse en nombres de crisis o referencias bibliográficas como sustituto de especificación;
+    \item introducir copulas, EVT o Monte Carlo 10k paths como decoración si no forman parte del contrato operativo;
+    \item mezclar stress testing con backtest promocional;
+    \item usar términos como ``severo'' o ``extremo'' sin definición paramétrica;
+    \item presentar resultados sintéticos como evidencia suficiente de robustez real.
+\end{itemize}
+
+\section{Extensiones futuras razonables}
+
+Una vez estabilizado el módulo base, pueden estudiarse como extensiones:
+
+\begin{itemize}
+    \item reverse stress testing;
+    \item shocks dependientes de régimen;
+    \item escenarios conjuntos por copulas o EVT;
+    \item Monte Carlo con dependencia factorial;
+    \item liquidez endógena y ejecución multi-día;
+    \item escenarios condicionados por crowding o correlación de señales.
+\end{itemize}
+
+Estas extensiones deben vivir detrás de flags experimentales o en \texttt{research}, no dentro del contrato mínimo del módulo.
+
+\section{Resumen ejecutivo}
+
+\texttt{risk/stress\_tests.py} debe ser una pieza de gobernanza cuantitativa, no un escaparate de conceptos. Su misión es forzar al sistema a responder de forma explícita a escenarios adversos relevantes y convertir esa respuesta en decisiones comparables y auditables.
+
+La prioridad correcta de diseño es:
+
+\[
+\text{definición clara de escenarios}
+\;\rightarrow\;
+\text{métricas comparables}
+\;\rightarrow\;
+\text{reglas de pass/warn/fail}
+\;\rightarrow\;
+\text{consecuencia operativa}.
+\]
+
+Si el módulo cumple ese orden, deja de ser un mini whitepaper de tail risk y pasa a ser una especificación seria de resiliencia para infraestructura cuantitativa.
 
 \end{document}

@@ -1,159 +1,469 @@
 \section{Módulo: \texttt{features/microstructure.py}}
 
 \paragraph{Objetivo general}
-Este módulo construye \textbf{features de microestructura} a nivel de small cap, generando proxies de \textit{spread implícito}, \textit{gap overnight}, \textit{rango intradía} y \textit{amihud‑like liquidity} a partir de datos OHLCV diarios. El objetivo es cuantificar la \textit{fricción de trading} y la \textit{dinámica de precio de corto plazo}, para modular señales de momentum y reversión de swing trading y ajustar la exposición de risk de tamaño/microestructura.
+Este módulo construye la \textbf{capa de microestructura diaria} del sistema de señales, generando proxies PIT de \textit{fricción de trading}, \textit{estrés de liquidez}, \textit{dinámica intradía}, \textit{gap risk} y \textit{presión transitoria de flujo} a partir de datos \texttt{OHLCV} ajustados. Su propósito no es simplemente derivar indicadores técnicos de corto plazo, sino traducir la información contenida en la sesión diaria en una representación cuantitativa útil para:
 
-\subsection{Marco teórico y notación}
-
-Sea \( \mathcal{S} \) el conjunto de símbolos y \( \mathcal{T} \) el rango de fechas de trading. Para cada símbolo \( s \in \mathcal{S} \) y fecha \( t \in \mathcal{T} \), se tienen:
 \begin{itemize}
-    \item \texttt{open\_adj}_t^{(s)}, \texttt{high\_adj}_t^{(s)}, \texttt{low\_adj}_t^{(s)}, \texttt{close\_adj}_t^{(s)}.
-    \item \texttt{volume\_adj}_t^{(s)}.
-    \item \( r_{t}^{(s)} = \log p_{t}^{(s)} - \log p_{t-1}^{(s)} \), retorno logarítmico diario.
+    \item modular señales de momentum y reversión,
+    \item penalizar nombres con ejecución frágil,
+    \item capturar estrés microestructural relevante en small caps,
+    \item y mejorar la disciplina de selección cuando liquidez, rango y gap interactúan con el alpha.
 \end{itemize}
 
-Las features de microestructura capturan:
+En un universo de \textit{small caps swing trading}, la microestructura no es un detalle cosmético. La misma señal fundamental o de precio puede tener una calidad económica muy distinta según el coste implícito de ejecución, la inestabilidad intradía, la frecuencia de gaps o la profundidad efectiva del nombre. Por ello, \texttt{features/microstructure.py} debe entenderse como una \textbf{capa de representación de fricción y ejecutabilidad}, no como una colección de indicadores accesorios.
+
+La dificultad principal del módulo es conceptual: a frecuencia diaria, las verdaderas variables microestructurales ---spread efectivo, profundidad del libro, market impact, order imbalance, resiliencia--- no se observan directamente. Lo que se construye aquí son \textbf{proxies diarias disciplinadas}, útiles si se tratan como aproximaciones parciales y peligrosas si se presentan como estimadores exactos del objeto económico.
+
+\subsection{Rol dentro de la arquitectura}
+
+Este módulo se sitúa aguas abajo de:
 \begin{itemize}
-    \item \textit{Coste de liquidez} (spread proxy, \texttt{amihud}).
-    \item \textit{Impacto de gap} y \textit{volatilidad intradía}.
-    \item \textit{Shocks de volumen} y \textit{reversión de corto plazo}.
+    \item series de precios ajustados \texttt{OHLCV},
+    \item calendario de trading y universo PIT,
+    \item reglas de integridad y ajuste corporativo del bloque de datos de mercado;
+\end{itemize}
+y aguas arriba de:
+\begin{itemize}
+    \item \texttt{features/build\_features.py},
+    \item \texttt{features/cross\_sectional.py},
+    \item \texttt{features/feature\_qc.py},
+    \item modelos multifactor, validación y backtests walk-forward.
 \end{itemize}
 
-\subsection{Features de microestructura sugeridas}
-
-\subsubsection{Microspread proxy}
+Su función arquitectónica es producir una familia de features de microestructura diarias separada de:
 \begin{itemize}
-    \item \texttt{micro\_spread\_proxy}:
-        \[
-        \text{Spread}_t^{(s)} = \frac{\text{high\_adj}_t^{(s)} - \text{low\_adj}_t^{(s)}}{\text{close\_adj}_t^{(s)}},
-        \]
-        proxy relativo del rango intradía, relacionado con el spread implícito (Roll, 1984). \cite{roll1984}
+    \item retornos y momentum de horizonte múltiple,
+    \item volatilidad histórica agregada,
+    \item señales fundamentales,
+    \item e interacciones de segundo orden.
 \end{itemize}
 
-\subsubsection{Gap de apertura}
+Esta separación es importante porque evita mezclar en una misma capa semántica:
 \begin{itemize}
-    \item \texttt{micro\_gap\_open}:
-        \[
-        \text{Gap}_t^{(s)} = \frac{\text{open\_adj}_t^{(s)} - \text{close\_adj}_{t-1}^{(s)}}{\text{close\_adj}_{t-1}^{(s)}},
-        \]
-        mide \textit{overnight news impact} y posible \textit{gap risk} en small caps.
+    \item \textbf{movimiento direccional},
+    \item \textbf{fricción de ejecución},
+    \item \textbf{rango intradía},
+    \item y \textbf{liquidez por volumen negociado}.
 \end{itemize}
 
-\subsubsection{Rango de sesión (\texttt{HL\_range})}
+\subsection{Marco teórico y contexto cuantitativo}
+
+La intuición económica del módulo descansa sobre varias ideas robustas:
+
 \begin{itemize}
-    \item \texttt{micro\_hl\_range}:
-        \[
-        \text{Range}_t^{(s)} = \log \Big( \frac{\text{high\_adj}_t^{(s)}}{\text{low\_adj}_t^{(s)}} \Big),
-        \]
-        mide la volatilidad intradía como medida de \textit{price discovery} diario.
+    \item Los activos menos líquidos presentan mayor fricción, mayor sensibilidad a shocks de flujo y mayor inestabilidad de precio por unidad de volumen.
+    \item Los gaps overnight contienen información sobre incorporación discontinua de noticias y sobre riesgo de ejecución fuera del control del operador.
+    \item El rango intradía puede reflejar tanto descubrimiento de precios como fragilidad del nombre, pero no es equivalente al spread efectivo.
+    \item El impacto precio-volumen, capturado de forma imperfecta por proxies tipo Amihud, es particularmente relevante en universos small cap donde la liquidez es escasa y heterogénea.
+\end{itemize}
+
+A nivel metodológico, esto implica una distinción central:
+
+\begin{itemize}
+    \item \textbf{spread proxy} \(\neq\) \textbf{spread real},
+    \item \textbf{intraday range} \(\neq\) \textbf{coste de ejecución},
+    \item \textbf{daily illiquidity proxy} \(\neq\) \textbf{market impact estructural exacto}.
+\end{itemize}
+
+El módulo debe preservar esta honestidad semántica. Su objetivo no es estimar con precisión microestructura de alta frecuencia, sino extraer variables diarias suficientemente informativas para penalizar fragilidad y describir condiciones de trading relativas.
+
+\subsection{Marco formal y notación}
+
+Sea \( \mathcal{T} \) el conjunto de fechas de trading y \( \mathcal{S}_t \) el universo PIT elegible en fecha \( t \). Para cada símbolo \( s \in \mathcal{S}_t \) y fecha \( t \in \mathcal{T} \), se dispone de:
+
+\begin{itemize}
+    \item \( o_t^{(s)}, h_t^{(s)}, l_t^{(s)}, c_t^{(s)} \): precios ajustados \texttt{open/high/low/close};
+    \item \( v_t^{(s)} \): volumen ajustado;
+    \item \( dv_t^{(s)} = c_t^{(s)} \cdot v_t^{(s)} \): \textit{dollar volume} diario aproximado;
+    \item \( r_t^{(s)} = \log c_t^{(s)} - \log c_{t-1}^{(s)} \): retorno logarítmico de cierre a cierre.
+\end{itemize}
+
+La familia de micro-features construida por el módulo es:
+\[
+M_t^{(g)}(s) = \psi_g\big(o_t^{(s)}, h_t^{(s)}, l_t^{(s)}, c_t^{(s)}, v_t^{(s)}, \mathcal{H}_{\le t}^{(s)}\big),
+\]
+donde \( g \) indexa cada proxy de microestructura y \( \mathcal{H}_{\le t}^{(s)} \) representa el historial observable hasta la fecha \( t \).
+
+\paragraph{Restricción PIT}
+Toda feature debe satisfacer:
+\[
+M_t^{(g)}(s)
+=
+\psi_g\big(\mathcal{I}_{\le t}^{(s)}\big),
+\]
+sin utilizar ninguna información de \( t+1 \) ni ventanas futuras.
+
+\subsection{Principios de diseño}
+
+\paragraph{1. Proxies, no estimadores exactos}
+Las variables construidas deben nombrarse y documentarse como proxies diarias. Llamar “spread” a un rango relativo intradía puede inducir a error económico si no se aclara su naturaleza aproximada.
+
+\paragraph{2. Integridad de OHLCV antes que cálculo de feature}
+No se debe calcular ninguna proxy sobre observaciones con:
+\begin{itemize}
+    \item precios no positivos,
+    \item \( h_t < l_t \),
+    \item \( o_t \) o \( c_t \) incompatibles con \([l_t,h_t]\) salvo tolerancia explícita,
+    \item volumen negativo,
+    \item o ajustes corporativos evidentemente rotos.
+\end{itemize}
+
+\paragraph{3. Separación entre rango, spread proxy e iliquidez}
+El módulo debe mantener semántica diferenciada entre:
+\begin{itemize}
+    \item rango intradía,
+    \item gap overnight,
+    \item illiquidity proxy,
+    \item shock de volumen,
+    \item y reversión transitoria.
+\end{itemize}
+No deben presentarse como si midieran lo mismo.
+
+\paragraph{4. Robustez en nombres ilíquidos}
+En small caps, muchos problemas aparecen precisamente donde la señal interesa más: precios discontinuos, volumen mínimo, barras degeneradas y gaps extremos. El módulo debe tratarlos explícitamente.
+
+\paragraph{5. Determinismo}
+La validación, clipping, winsorización e invalidación deben seguir una jerarquía fija y reproducible.
+
+\subsection{Catálogo canónico de micro-features}
+
+\subsubsection{Proxy de spread intradía}
+
+\paragraph{\texttt{micro\_spread\_proxy}}
+Se define:
+\[
+\mathrm{SpreadProxy}_t^{(s)}
+=
+\frac{h_t^{(s)} - l_t^{(s)}}{c_t^{(s)}}.
+\]
+
+\paragraph{Interpretación}
+Esta variable no debe interpretarse como spread bid-ask real, sino como \textbf{proxy relativa de amplitud intradía} potencialmente relacionada con fricción, incertidumbre de precio o falta de profundidad. Su valor económico está en captar nombres con sesión ancha en relación con su precio, no en estimar un spread efectivo en sentido microestructural estricto.
+
+\paragraph{Condiciones de validez}
+\begin{itemize}
+    \item \( c_t^{(s)} > \tau_{\mathrm{price,min}} \);
+    \item \( h_t^{(s)} \ge l_t^{(s)} > 0 \);
+    \item si \( h_t^{(s)} = l_t^{(s)} \), la observación es válida pero informativamente degenerada;
+    \item si el rango resulta de una barra probablemente mal ajustada por corporate action, la observación debe invalidarse o flaggearse.
+\end{itemize}
+
+\paragraph{Nota metodológica}
+Dado que esta proxy y el \texttt{HL\_range} comparten información, el módulo debe evitar tratarlas como señales completamente independientes en el control de redundancia downstream.
+
+\subsubsection{Gap overnight}
+
+\paragraph{\texttt{micro\_gap\_open}}
+\[
+\mathrm{GapOpen}_t^{(s)}
+=
+\frac{o_t^{(s)} - c_{t-1}^{(s)}}{c_{t-1}^{(s)}}.
+\]
+
+\paragraph{Interpretación}
+Mide incorporación overnight de noticias, discontinuidad de precio entre sesiones y potencial \textit{gap risk}. En small caps, esta variable es especialmente relevante porque muchos shocks se incorporan fuera de la sesión líquida y pueden invalidar entradas aparentemente atractivas a cierre.
+
+\paragraph{Condiciones de validez}
+\begin{itemize}
+    \item \( c_{t-1}^{(s)} > \tau_{\mathrm{price,min}} \);
+    \item debe existir sesión previa válida;
+    \item si entre \( t-1 \) y \( t \) existe ajuste corporativo mal resuelto que genera salto artificial, el gap debe invalidarse.
+\end{itemize}
+
+\subsubsection{Rango de sesión logarítmico}
+
+\paragraph{\texttt{micro\_hl\_range}}
+\[
+\mathrm{HLRange}_t^{(s)}
+=
+\log\!\left(\frac{h_t^{(s)}}{l_t^{(s)}}\right).
+\]
+
+\paragraph{Interpretación}
+Esta métrica captura amplitud intradía en escala logarítmica y funciona como proxy de descubrimiento de precios y fragilidad intradía. A diferencia del \texttt{SpreadProxy}, aquí el foco está en la amplitud relativa de la sesión, no en su lectura como fricción de ejecución.
+
+\paragraph{Condiciones de validez}
+\begin{itemize}
+    \item \( h_t^{(s)} \ge l_t^{(s)} > 0 \);
+    \item barras con \( h_t/l_t \) implausiblemente altas para un nombre ajustado deben investigarse antes de conservarse como válidas;
+    \item la política de clipping debe actuar solo después de validar integridad.
 \end{itemize}
 
 \subsubsection{Proxy de Amihud}
+
+\paragraph{\texttt{micro\_amihud\_proxy}}
+\[
+\mathrm{AmihudProxy}_t^{(s)}
+=
+\frac{|r_t^{(s)}|}{dv_t^{(s)} + \epsilon},
+\qquad
+dv_t^{(s)} = c_t^{(s)} \cdot v_t^{(s)}.
+\]
+
+\paragraph{Interpretación}
+Este proxy aproxima \textbf{movimiento de precio por unidad de volumen negociado en valor}, y debe leerse como medida diaria de iliquidez relativa. Es especialmente útil en small caps para distinguir retornos “limpios” de retornos generados con escasa profundidad o baja participación.
+
+\paragraph{Condiciones de validez}
 \begin{itemize}
-    \item \texttt{micro\_amihud\_proxy}:
-        \[
-        \text{Amihud}_t^{(s)} = \frac{|r_{t}^{(s)}|}{\text{volume\_adj}_t^{(s)} \cdot p_{t}^{(s)} + \epsilon},
-        \]
-        donde:
-        \begin{itemize}
-            \item numerador: magnitud de retorno diario.
-            \item denominador: volumen en valor nominal (USD).
-        \end{itemize}
-        Este proxy capta \textit{precio por unidad de volumen} o \textit{illiquidity} (Amihud, 2002). \cite{amihud2002}
+    \item \( c_t^{(s)} > \tau_{\mathrm{price,min}} \);
+    \item \( v_t^{(s)} \ge 0 \);
+    \item si \( dv_t^{(s)} \le \tau_{\mathrm{dollarvol,min}} \), la observación canónica debe invalidarse o marcarse como de muy baja confianza;
+    \item \( \epsilon \) solo puede actuar como protección numérica, no como mecanismo para “fabricar” liquidez donde no la hay.
 \end{itemize}
+
+\paragraph{Nota crítica}
+Una barra con retorno apreciable y volumen casi nulo no debe traducirse automáticamente en un valor extremo “útil”. En muchos casos refleja observación microestructural demasiado frágil para una build canónica.
 
 \subsubsection{Shock de volumen}
+
+\paragraph{\texttt{micro\_volume\_shock}}
+Sea una ventana histórica PIT \( W \) definida por configuración. Entonces:
+\[
+\mathrm{VolShock}_t^{(s)}
+=
+\frac{v_t^{(s)} - \mu_{t-1,W}^{(v,s)}}{\sigma_{t-1,W}^{(v,s)} + \epsilon_\sigma},
+\]
+donde:
+\[
+\mu_{t-1,W}^{(v,s)}
+=
+\frac{1}{W}\sum_{i=1}^{W} v_{t-i}^{(s)},
+\qquad
+\sigma_{t-1,W}^{(v,s)}
+=
+\mathrm{std}\big(v_{t-W}^{(s)},\dots,v_{t-1}^{(s)}\big).
+\]
+
+\paragraph{Interpretación}
+Captura anomalía relativa de volumen frente a su propio historial reciente. Puede reflejar:
 \begin{itemize}
-    \item \texttt{micro\_volume\_shock}:
-        \[
-        \text{VolShock}_t^{(s)} = \frac{v_{t}^{(s)} - \mu_{t,\text{window}}^{(v,s)}}{\sigma_{t,\text{window}}^{(v,s)}},
-        \]
-        donde \(\mu_{t,\text{window}}^{(v,s)}\) y \(\sigma_{t,\text{window}}^{(v,s)}\) son media y volatilidad del volumen en una ventana histórica PIT segura.
+    \item entrada de flujo informacional,
+    \item presión temporal de negociación,
+    \item o episodios de atención anómala.
 \end{itemize}
 
-\subsubsection{Reversión de retorno de 1 día}
+\paragraph{Condiciones de validez}
 \begin{itemize}
-    \item \texttt{micro\_return\_reversal\_1d}:
-        \[
-        \text{Reversal}_t^{(s)} = - r_{t}^{(s)},
-        \]
-        captura reversión de corto plazo asociada a fricción de mercado y market impact.
+    \item la ventana debe usar solo información \(\le t-1\);
+    \item si la ventana contiene demasiados ceros o la desviación estándar colapsa, la observación debe invalidarse, degradarse a percentile-rank o marcarse como degenerada;
+    \item no se permite estandarizar contra una ventana contaminada por faltantes operativos sin tratarlos explícitamente.
 \end{itemize}
 
-\subsection{Reglas PIT y fiabilidad temporal}
+\subsubsection{Reversión de retorno 1 día}
 
-\paragraph{Uso de información histórica}
+\paragraph{\texttt{micro\_return\_reversal\_1d}}
+\[
+\mathrm{Reversal1D}_t^{(s)} = - r_t^{(s)}.
+\]
+
+\paragraph{Interpretación}
+Esta señal captura reversión de muy corto plazo potencialmente asociada a presión transitoria de orden, sobresalto de microliquidez o sobre-reacción táctica. Aunque aritméticamente simple, semánticamente pertenece al bloque microestructural cuando se usa como proxy de fricción transitoria y no como reversión genérica multi-horizonte.
+
+\paragraph{Condiciones de validez}
 \begin{itemize}
-    \item Todas las métricas de microestructura se construyen usando \textbf{la sesión diaria actual} y el \textbf{historial de fechas anteriores}.
-    \item No se usa ningún precio futuro (cierre de \( t+1 \)) o \texttt{future\_window} en las fórmulas.
+    \item requiere \( c_t^{(s)} > 0 \) y \( c_{t-1}^{(s)} > 0 \);
+    \item shocks claramente artificiales por malas correcciones corporativas deben invalidarse.
 \end{itemize}
 
-\paragraph{Ejemplo de ventana de volumen}
+\subsection{Features opcionales permitidas}
+
+El módulo puede permitir, bajo configuración explícita, un bloque opcional no canónico:
+
 \begin{itemize}
-    \item \texttt{micro\_volume\_shock} se calcula sobre \texttt{volumen ajustado} solo \(\leq t-1\), con \texttt{window} controlada por configuración.
+    \item rolling mean de \texttt{AmihudProxy},
+    \item rolling median de \texttt{HLRange},
+    \item frecuencia de gaps grandes en ventana histórica,
+    \item indicador de sesiones de volumen cero o casi cero,
+    \item y measure de discontinuidad tipo \texttt{gap / hl\_range}.
 \end{itemize}
+
+Estas extensiones deben quedar fuera de la build canónica por defecto salvo evidencia clara de utilidad incremental.
+
+\subsection{Jerarquía de validez y reglas PIT}
+
+La resolución de una observación debe seguir este orden obligatorio:
+
+\begin{enumerate}
+    \item verificar integridad de OHLCV ajustado;
+    \item verificar consistencia de sesión (\(h \ge l\), precios positivos, volumen no negativo);
+    \item verificar compatibilidad con ajustes corporativos y ausencia de saltos artificiales evidentes;
+    \item verificar requisitos mínimos del denominador o ventana histórica;
+    \item construir la feature;
+    \item aplicar flags de rareza o degeneración;
+    \item y solo al final aplicar clipping o winsorización sobre observaciones válidas.
+\end{enumerate}
+
+\paragraph{Prohibición}
+No se permite “rescatar” observaciones estructuralmente inválidas mediante clipping o añadiendo constantes arbitrarias a denominadores problemáticos.
+
+\subsection{Tratamiento de sesiones anómalas}
+
+El módulo debe detectar y tratar explícitamente:
+
+\begin{itemize}
+    \item sesiones con \( h_t < l_t \);
+    \item sesiones con \( o_t, c_t \notin [l_t, h_t] \) salvo tolerancia operacional documentada;
+    \item volumen cero persistente;
+    \item precios no positivos;
+    \item barras extremadamente anchas debidas a split/dividend adjustment defectuoso;
+    \item gaps descomunales incompatibles con historia ajustada razonable.
+\end{itemize}
+
+\paragraph{Política recomendada}
+Estas observaciones deben clasificarse como:
+\begin{itemize}
+    \item \texttt{invalid\_session},
+    \item \texttt{suspect\_corporate\_action},
+    \item \texttt{low\_liquidity\_degenerate},
+    \item o \texttt{extreme\_but\_valid}.
+\end{itemize}
+
+La distinción es importante:
+\begin{itemize}
+    \item \textbf{extreme but valid} puede winsorizarse;
+    \item \textbf{invalid session} debe descartarse;
+    \item \textbf{suspect corporate action} debe invalidarse o pasar a revisión;
+    \item \textbf{low liquidity degenerate} puede excluirse de la build canónica.
+\end{itemize}
+
+\subsection{Coordinación con ajustes de precios}
+
+Dado que varias métricas dependen críticamente de continuidad temporal, el módulo debe explicitar:
+
+\begin{itemize}
+    \item si trabaja sobre precios totalmente ajustados o parcialmente ajustados;
+    \item si el volumen está split-adjusted;
+    \item y cómo se interpreta un gap cuando hay corporate actions entre \( t-1 \) y \( t \).
+\end{itemize}
+
+\paragraph{Regla obligatoria}
+El \texttt{manifest} del módulo debe dejar trazable el \texttt{adjustment mode} de precios y volumen. Sin esa información, varias micro-features pierden interpretabilidad económica.
 
 \subsection{Flujo de procesamiento}
 
-\paragraph{Alto nivel}
-1. \texttt{load\_prices\_adjusted(prices\_path, config)}:
-    - Carga \texttt{OHLCV} ajustado por \texttt{date} y \texttt{symbol}.
-2. \texttt{compute\_micro\_features(...)}:
-    - Calcula \texttt{micro\_spread\_proxy}, \texttt{micro\_gap\_open}, \texttt{micro\_hl\_range}, \texttt{micro\_amihud\_proxy}, \texttt{micro\_volume\_shock}, \texttt{micro\_return\_reversal\_1d} por símbolo/fecha.
-3. \texttt{apply\_clipping\_winsor(...)}:
-    - Aplica clipping o winsorización a percentiles \([p_{\min}, p_{\max}]\) configurables para outliers.
-4. \texttt{persist\_micro\_features(...)}:
-    - Guarda \texttt{features/microstructure/date=...} junto con \texttt{summary\_run\_id.json} y \texttt{manifest\_run\_id.json}.
+\paragraph{Secuencia de alto nivel}
+\begin{enumerate}
+    \item Cargar \texttt{OHLCV} ajustado y universo PIT.
+    \item Validar integridad básica de barras por fecha y símbolo.
+    \item Construir retornos y \textit{dollar volume}.
+    \item Calcular \texttt{micro\_spread\_proxy}, \texttt{micro\_gap\_open}, \texttt{micro\_hl\_range}, \texttt{micro\_amihud\_proxy}, \texttt{micro\_volume\_shock}, \texttt{micro\_return\_reversal\_1d}.
+    \item Aplicar flags de sesión anómala, degeneración de volumen y corporate action sospechosa.
+    \item Aplicar clipping o winsorización solo a observaciones válidas.
+    \item Persistir outputs, summary y manifest.
+\end{enumerate}
+
+\paragraph{Descomposición funcional sugerida}
+\begin{itemize}
+    \item \texttt{load\_prices\_adjusted()}
+    \item \texttt{validate\_ohlcv\_integrity()}
+    \item \texttt{compute\_returns\_and\_dollar\_volume()}
+    \item \texttt{compute\_spread\_proxy()}
+    \item \texttt{compute\_gap\_open()}
+    \item \texttt{compute\_hl\_range()}
+    \item \texttt{compute\_amihud\_proxy()}
+    \item \texttt{compute\_volume\_shock()}
+    \item \texttt{compute\_return\_reversal\_1d()}
+    \item \texttt{apply\_microstructure\_sanity\_flags()}
+    \item \texttt{apply\_clipping\_winsor()}
+    \item \texttt{persist\_micro\_features()}
+    \item \texttt{main()}
+\end{itemize}
 
 \subsection{Validaciones de sanidad y consistencia}
 
-\paragraph{Valores finitos}
+\paragraph{Integridad numérica}
 \begin{itemize}
-    \item \texttt{No inf, -inf} en \texttt{micro\_amihud\_proxy} o \texttt{micro\_volume\_shock}.
-    \item Comprobación de división por cero mediante \(\epsilon\) o denominadores razonables.
+    \item ausencia de \texttt{inf}, \texttt{-inf};
+    \item control explícito de divisiones por denominadores degenerados;
+    \item coherencia de tipos y no negatividad donde aplique.
 \end{itemize}
+
+\paragraph{Cobertura}
+Para cada feature \( f_{\mathrm{micro}} \):
+\[
+\rho_{\mathrm{cov}}^{(f_{\mathrm{micro}})} \ge \texttt{min\_coverage\_pct},
+\]
+pero además deben calcularse:
+\[
+Q_{0.05}\big(\rho_{\mathrm{cov}}^{(f,t)}\big),
+\qquad
+\text{breach rate de cobertura}.
+\]
+No basta una media global aceptable.
+
+\paragraph{Redundancia interna}
+Debe medirse la dependencia entre:
+\begin{itemize}
+    \item \texttt{micro\_spread\_proxy} y \texttt{micro\_hl\_range},
+    \item \texttt{micro\_amihud\_proxy} y shocks de volumen/extremos de retorno,
+    \item \texttt{micro\_return\_reversal\_1d} y reversión de precio de otras familias.
+\end{itemize}
+El objetivo no es prohibir coexistencia, sino evitar que el bloque microestructural se llene de casi-duplicados sin control.
 
 \paragraph{Rangos plausibles}
+Los rangos plausibles deben usarse como \textit{soft checks}, no como criterio único de validez. Un valor extremo puede ser real en small caps; lo importante es distinguir si procede de:
 \begin{itemize}
-    \item \texttt{micro\_spread\_proxy} típico en \([0.001, 0.2]\) para small caps líquidos.
-    \item \texttt{micro\_amihud\_proxy} limitado por cotas empíricas de \textit{illiquidity}.
-\end{itemize}
-
-\paragraph{Cobertura mínima}
-\begin{itemize}
-    \item \texttt{coverage\_rate} por feature:
-        \[
-        \rho_{\text{cov}}^{(f_{\text{micro}})} \geq \texttt{min\_coverage\_pct}.
-        \]
+    \item sesión válida y rara,
+    \item baja liquidez degenerada,
+    \item o error de ajuste/fuente.
 \end{itemize}
 
 \subsection{Salidas y estructura de almacenamiento}
 
 \paragraph{Outputs principales}
+\begin{verbatim}
+features/microstructure/
+  run_id=<RUN_ID>/
+    date=YYYY-MM-DD/part-*.parquet
+    _meta/
+      summary.json
+      manifest.json
+      dictionary.json
+\end{verbatim}
+
+\paragraph{Columnas mínimas}
 \begin{itemize}
-    \item \texttt{features/microstructure/date=\{yyyy-mm-dd\}/part-*.parquet}:
-        \begin{itemize}
-            \item \texttt{date}, \texttt{symbol}, \texttt{run\_id}.
-            \item Columnas de microestructura:
-                \begin{itemize}
-                    \item \texttt{micro\_spread\_proxy}, \texttt{micro\_gap\_open},
-                    \texttt{micro\_hl\_range}, \texttt{micro\_amihud\_proxy},
-                    \texttt{micro\_volume\_shock}, \texttt{micro\_return\_reversal\_1d}.
-                \end{itemize}
-        \end{itemize}
-    \item \texttt{features/microstructure/summary\_\{run\_id\}.json}:
-        \begin{itemize}
-            \item \texttt{mean}, \texttt{p50}, \texttt{p99}, \texttt{coverage\_rate} por feature.
-        \end{itemize}
-    \item \texttt{features/microstructure/manifest\_\{run\_id\}.json}:
-        \begin{itemize}
-            \item \texttt{run\_id}, \texttt{microstructure\_config\_hash}, \texttt{prices\_path\_hash}.
-        \end{itemize}
+    \item \texttt{date}, \texttt{symbol}, \texttt{run\_id}
+    \item \texttt{micro\_spread\_proxy}
+    \item \texttt{micro\_gap\_open}
+    \item \texttt{micro\_hl\_range}
+    \item \texttt{micro\_amihud\_proxy}
+    \item \texttt{micro\_volume\_shock}
+    \item \texttt{micro\_return\_reversal\_1d}
+    \item flags auxiliares:
+    \begin{itemize}
+        \item \texttt{invalid\_session\_flag}
+        \item \texttt{suspect\_corporate\_action\_flag}
+        \item \texttt{low\_liquidity\_degenerate\_flag}
+        \item \texttt{extreme\_but\_valid\_flag}
+    \end{itemize}
 \end{itemize}
 
-\subsection{CLI y uso en el pipeline global}
+\paragraph{Manifest}
+El \texttt{manifest.json} debe incluir:
+\begin{itemize}
+    \item \texttt{run\_id},
+    \item \texttt{microstructure\_config\_hash},
+    \item \texttt{prices\_path\_hash},
+    \item \texttt{adjustment\_mode},
+    \item \texttt{lineage\_hash},
+    \item \texttt{n\_rows},
+    \item \texttt{n\_symbols},
+    \item \texttt{n\_dates}.
+\end{itemize}
 
-\paragraph{CLI recomendada}
+\paragraph{Summary recomendado}
+\begin{itemize}
+    \item \texttt{mean}, \texttt{p50}, \texttt{p95}, \texttt{p99} por feature;
+    \item cobertura por feature;
+    \item número de sesiones inválidas;
+    \item número de observaciones degeneradas por volumen;
+    \item número de flags por corporate action sospechosa;
+    \item número de observaciones winsorizadas.
+\end{itemize}
+
+\subsection{CLI recomendada}
+
 \begin{verbatim}
 python -m features.microstructure ^
   --prices-path data/price/adjusted/mode=dual_output ^
@@ -161,25 +471,37 @@ python -m features.microstructure ^
   --run-id microstructure_20260305_001
 \end{verbatim}
 
-\paragraph{Uso downstream}
+\subsection{Uso downstream}
+
 \begin{itemize}
-    \item \texttt{features/build\_features.py}: integra \texttt{micro\_spread\_proxy}, \texttt{micro\_amihud\_proxy} y \texttt{micro\_gap\_open} como factores de \textit{liquidez} y \textit{risk de microestructura}.
-    \item \texttt{feature\_qc.py}: valida cobertura y drift de features de microestructura.
-    \item \texttt{backtest/run\_walkforward.py}: explora \textit{take‑profit} y \textit{stop} adaptados a volatilidad intradía y \textit{gap risk}.
+    \item \texttt{features/build\_features.py} integra estas variables como bloque de fricción y ejecutabilidad.
+    \item \texttt{features/cross\_sectional.py} transforma estas proxies en escala comparable por fecha.
+    \item \texttt{features/feature\_qc.py} evalúa cobertura, drift y redundancia del bloque microestructural.
+    \item \texttt{backtest/run\_walkforward.py} puede usarlas para filtrar nombres con gap risk, baja liquidez o fricción intradía elevada.
 \end{itemize}
 
 \subsection{Definition of Done}
 
+\paragraph{El módulo se considera terminado únicamente si:}
+\begin{enumerate}
+    \item todas las micro-features son PIT-correctas y usan exclusivamente sesión actual e historia pasada;
+    \item las observaciones con OHLCV estructuralmente inválido o mal ajustado se detectan antes del cálculo final;
+    \item spread proxy, rango intradía e iliquidez se mantienen conceptualmente separados;
+    \item el tratamiento de volumen casi nulo y sesiones degeneradas está explícitamente gobernado;
+    \item el output es reproducible, trazable y apto para integrarse sin reinterpretación manual en \texttt{build\_features.py} y \texttt{feature\_qc.py}.
+\end{enumerate}
+
+\subsection{Casos de prueba mínimos}
+
 \begin{itemize}
-    \item Conjunto de \textbf{micro‑features} PIT listos para estandarización y análisis de calidad.
-    \item Diseño sin leakage temporal y con chequeo de sanidad numérica.
-    \item Integración limpia con \texttt{feature\_qc} y \texttt{build\_features} como familia de señales líquidas y de fricción.
+    \item Verificación de invalidación cuando \( h_t < l_t \).
+    \item Verificación de invalidación o flag cuando el gap está contaminado por corporate action mal ajustada.
+    \item Confirmación de que \texttt{micro\_volume\_shock} usa solo ventana \(\le t-1\).
+    \item Confirmación de que \texttt{micro\_amihud\_proxy} no produce valores canónicos sobre \textit{dollar volume} degenerado.
+    \item Detección de sesiones con volumen cero persistente.
+    \item Verificación de que una barra extrema válida se winsoriza, pero una inválida se descarta.
+    \item Reproducibilidad exacta dada la misma configuración, precios y \texttt{run\_id}.
 \end{itemize}
 
-\subsection{Referencias de referencia}
-
-\begin{itemize}
-    \item Roll, R. (1984). \textit{A Simple Measure of Bid–Ask Spread}. \cite{roll1984}
-    \item Amihud, Y. (2002). \textit{Illiquidity and Stock Returns: Cross–Section and Time–Series Effects}. \cite{amihud2002}
-    \item Estudios de \textit{microstructure risk} en small caps (e.g., Edwards, Harris y Piwowar, 2007). \cite{edwards2007}
-\end{itemize}
+\paragraph{Síntesis final}
+\texttt{features/microstructure.py} no debe verse como un módulo de indicadores rápidos, sino como la capa que traduce la sesión diaria en variables de fricción, discontinuidad y ejecutabilidad relevantes para un sistema small cap. Su valor no está en fingir acceso a la verdadera microestructura de alta frecuencia, sino en construir proxies diarias honestas, disciplinadas y útiles para distinguir señales explotables de señales que solo parecen atractivas sobre papel pero son demasiado costosas o frágiles para sobrevivir a producción.

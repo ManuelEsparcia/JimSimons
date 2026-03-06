@@ -1,95 +1,469 @@
 \documentclass{article}
 \usepackage[utf8]{inputenc}
 \usepackage[spanish]{babel}
-\usepackage{amsmath,amsfonts,amssymb}
+\usepackage{amsmath,amssymb,amsfonts}
 \usepackage{booktabs}
 \usepackage{graphicx}
 \usepackage{listings}
 \usepackage{xcolor}
 \usepackage{hyperref}
+\usepackage[margin=2.5cm]{geometry}
 
 \lstset{
   language=Python,
   basicstyle=\ttfamily\small,
   keywordstyle=\color{blue},
-  commentstyle=\color{green},
+  commentstyle=\color{teal},
   stringstyle=\color{red},
   breaklines=true,
-  frame=single
+  frame=single,
+  showstringspaces=false
 }
 
-\title{Explicación Industrial: tests/test\_data\_pit.py \\ Validación Point-In-Time (PIT) Anti-Leakage para Backtests Swing Elite}
-\author{Perplexity Research -- Nivel RenTech}
+\title{Especificación Técnica: \texttt{tests/test\_data\_pit.py}\\
+Validación Point-in-Time y Control Estricto de Look-Ahead}
+\author{Rewrite Quant PhD Level}
 \date{Marzo 2026}
 
 \begin{document}
 \maketitle
 
-\section{Objetivo Estratégico}
-Verificar capas PIT evitan informaci\'on futura (look-ahead bias), respetando \texttt{asof}/\texttt{filing}/\texttt{availability} timing. Cr\'itico para swing trading: previene inflado artificial de IC $IC = \corr(\pred_t, r_{t+1:t+h})$, asegurando OOS Sharpe realista $>2.8$. Estándar en RenTech/DE Shaw.[web:54][web:56]
+\section{Propósito del Módulo}
 
-\section{Casos Mínimos y Assertions Temporales}
+El objetivo de \texttt{tests/test\_data\_pit.py} es verificar que toda la capa de datos respeta semántica \emph{point-in-time} (PIT) y que ninguna observación utilizada por el backtest, el cálculo de features o la construcción de universo incorpora información que no estaba disponible en el instante de decisión.
+
+Este módulo no evalúa la capacidad predictiva de la estrategia. Su función es más fundamental: impedir contaminación temporal del dataset. Si esta capa falla, el sistema puede producir métricas aparentemente plausibles con información imposible de conocer ex ante. En ese caso, todo resultado posterior queda invalidado aunque el código de modelado, ejecución o reporting sea correcto.
+
+La pregunta que debe contestar esta suite es precisa:
+
+\begin{quote}
+\emph{Para cada timestamp de decisión, ¿todos los datos consumidos por el sistema eran efectivamente observables y elegibles en ese instante?}
+\end{quote}
+
+\section{Principios de Diseño}
+
+El módulo debe construirse sobre cinco principios:
+
+\begin{enumerate}
+    \item \textbf{Temporalidad explícita}: toda tabla relevante debe distinguir entre fecha económica, fecha de publicación, fecha de disponibilidad y fecha de decisión cuando aplique.
+    \item \textbf{Join PIT verificable}: ninguna fila de salida puede depender de una fila fuente con timestamp posterior al \texttt{asof} o \texttt{decision\_ts}.
+    \item \textbf{Universo histórico correcto}: la elegibilidad de un símbolo debe respetar estrictamente su ventana histórica real.
+    \item \textbf{Fallos binarios e informativos}: la suite debe fallar con claridad al detectar una sola violación temporal.
+    \item \textbf{Fixtures mínimas y canónicas}: los escenarios deben ser pequeños, deterministas y fáciles de recomputar a mano.
+\end{enumerate}
+
+\section{Modelo Temporal Canónico}
+
+Para que un sistema PIT sea auditable, conviene fijar una nomenclatura temporal estable. Una descomposición útil es:
+
 \begin{itemize}
-\item \texttt{test\_no\_future\_dates\_in\_prices}: $\price.date \leq \asof.date$.
-\item \texttt{test\_edgar\_acceptance\_before\_asof}: $\acceptance\_ts \leq \asof$.
-\item \texttt{test\_universe\_membership\_respects\_list\_delist\_window}: Membership solo en ventana $[list\_date, delist\_date)$.
-\item \texttt{test\_no\_universe\_current\_leakage\_into\_history}: No universos futuros en historia.
+    \item \(\mathrm{event\_ts}\): instante económico al que pertenece el dato.
+    \item \(\mathrm{publish\_ts}\): instante en que el dato fue publicado por la fuente.
+    \item \(\mathrm{available\_ts}\): instante en que el dato estuvo efectivamente disponible para el sistema.
+    \item \(\mathrm{decision\_ts}\): instante en que la estrategia decide.
+    \item \(\mathrm{asof\_ts}\): corte temporal usado por la consulta PIT.
 \end{itemize}
-Assertions: $\max(\src\_ts - \decision\_ts) \leq 0$, joins preservan $|LHS| \times |RHS|$, flags leakage$=0$.
 
-\section{Matemáticas Avanzadas: PIT y Bias Purging}
-PIT join: Para cada $\asof_t$, datos con $\src\_ts \leq \asof_t$. Leakage medido como $Leak = \P(\src\_ts > \asof_t)$. Purged CV (López de Prado): Embargo $T_{emb} = h + m$, $h$=hold period (5 días swing). Universe leakage: $U_t = \{s \in S | list_s \leq t < delist_s \}$. SOTA: Combinar con survivorship bias correction via Heckman model $\Prob(survive) = \Phi(X\beta)$.[web:54][web:45]
+La restricción esencial es:
 
-Para EDGAR: $filing\_delay = \acceptance - quarter\_end \sim \mathcal{N}(40,10)$ días, filtrar delays $>90\%$ percentile.
+\[
+\mathrm{available\_ts} \le \mathrm{decision\_ts}
+\]
 
-\section{Papers SOTA y Libros Industria}
+y, en una implementación basada en \texttt{asof}:
+
+\[
+\mathrm{src\_ts} \le \mathrm{asof\_ts}
+\]
+
+donde \(\mathrm{src\_ts}\) representa el timestamp efectivo que gobierna la elegibilidad temporal de la fila fuente.
+
+\section{Contrato PIT General}
+
+Sea \(L\) una tabla izquierda indexada por decisiones y \(R\) una tabla fuente con observaciones históricas. Un join PIT correcto debe satisfacer:
+
+\[
+R^\star(t,s) = \arg\max_{u \le t} \{u : (u,s) \in R\}
+\]
+
+siempre que exista observación válida previa. Es decir, para cada símbolo \(s\) y tiempo \(t\), solo puede utilizarse la observación más reciente \emph{no posterior} a \(t\).
+
+La suite debe prohibir explícitamente:
+
 \begin{itemize}
-\item ``Advances in Financial Machine Learning'' (López de Prado, cap. 12: PurgedKFold, embargo para ML en finanzas).[web:54]
-\item \href{https://arxiv.org/abs/2401.06139}{STL Swing Trading} (PIT en features multitimeframe).[web:45]
-\item ``Quantitative Momentum'' (Gray/K Carlson): Universe construction PIT-safe.
-\item Backtrader/Backtesting.py: PIT fixtures integradas.[web:56]
+    \item joins con observaciones futuras,
+    \item forward fills que crucen el punto de decisión indebidamente,
+    \item reutilización de universos actuales en historia,
+    \item mezclas entre fecha de evento y fecha de disponibilidad,
+    \item resolución ambigua de múltiples filas elegibles sin regla determinista.
 \end{itemize}
 
-\section{Fixtures Optimizadas para Leakage Testing}
+\section{Invariantes que Deben Verificarse}
+
+\subsection{No uso de fechas futuras en precios}
+
+Para cualquier precio consumido por el sistema en un instante de decisión \(t\):
+
+\[
+\mathrm{price\_ts} \le t
+\]
+
+Si el motor usa cierre del día \(t\) para decidir en apertura del mismo día, el test debe fallar. La semántica de decisión debe estar fijada con precisión: cierre para decidir mañana, apertura para decidir hoy, o cualquier otra convención explícita.
+
+\subsection{Disponibilidad efectiva en datos fundamentales}
+
+En datasets con filings o fundamentales, no basta con exigir:
+
+\[
+\mathrm{period\_end} \le t
+\]
+
+Lo correcto es exigir disponibilidad efectiva:
+
+\[
+\mathrm{acceptance\_ts} \le t
+\quad\text{o más estrictamente}\quad
+\mathrm{available\_ts} \le t
+\]
+
+según la convención del sistema. El periodo económico de referencia nunca debe confundirse con el momento en que la información pudo ser observada.
+
+\subsection{Ventana histórica de pertenencia al universo}
+
+Si un símbolo tiene:
+\[
+\mathrm{list\_date}=a, \qquad \mathrm{delist\_date}=b
+\]
+entonces su pertenencia histórica debe satisfacer:
+
+\[
+s \in U_t \iff a \le t < b
+\]
+
+o la variante exacta que defina el negocio. Lo importante es que la frontera sea única y testeada. El módulo debe impedir que símbolos actualmente vivos aparezcan en fechas previas a su listado o sobrevivan artificialmente tras su exclusión histórica.
+
+\subsection{Ausencia de leakage del universo actual hacia el pasado}
+
+Una de las fugas más dañinas consiste en construir historia usando el universo actual. Formalmente, para un conjunto \(U_t\) de símbolos elegibles en \(t\), debe cumplirse:
+
+\[
+U_t \neq U_T \quad \text{en general para } t < T
+\]
+
+y el sistema no debe imponer:
+\[
+U_t := U_{\text{hoy}}
+\]
+
+salvo que esa restricción sea deliberada y reconocida como no PIT.
+
+\subsection{Monotonicidad temporal de la fuente elegida}
+
+En joins PIT por símbolo, la secuencia de timestamps fuente seleccionados no debe adelantarse indebidamente respecto al tiempo de decisión. Si \(u_t\) es el \texttt{src\_ts} usado en \(t\), entonces:
+
+\[
+u_t \le t
+\]
+
+para todo \(t\), y cualquier violación debe detectarse fila a fila, no solo por agregados.
+
+\section{Casos Mínimos del Módulo}
+
+\subsection{\texttt{test\_no\_future\_dates\_in\_prices}}
+
+Verifica que la tabla de precios consumida por el pipeline no contiene observaciones posteriores al \texttt{asof} o \texttt{decision\_ts}.
+
+\paragraph{Qué protege}
+\begin{itemize}
+    \item look-ahead directo en precios,
+    \item uso de cierre no disponible aún,
+    \item joins mal ordenados por fecha,
+    \item forward fills ilegítimos.
+\end{itemize}
+
+\paragraph{Assertion base}
 \begin{lstlisting}
+assert (joined["price_ts"] <= joined["decision_ts"]).all()
+\end{lstlisting}
+
+\subsection{\texttt{test\_edgar\_acceptance\_before\_asof}}
+
+Verifica que un filing solo entra en el dataset si su timestamp de aceptación o disponibilidad no excede el instante de decisión.
+
+\paragraph{Assertion base}
+\begin{lstlisting}
+assert (fundamentals["acceptance_ts"] <= fundamentals["decision_ts"]).all()
+\end{lstlisting}
+
+\paragraph{Qué protege}
+\begin{itemize}
+    \item uso de fundamentales antes de su publicación,
+    \item confusión entre \texttt{period\_end} y \texttt{acceptance\_ts},
+    \item fuga temporal silenciosa en merges fundamentales.
+\end{itemize}
+
+\subsection{\texttt{test\_universe\_membership\_respects\_list\_delist\_window}}
+
+Verifica que la pertenencia de cada símbolo al universo respeta su ventana histórica real.
+
+\paragraph{Assertion base}
+\begin{lstlisting}
+mask = (
+    (universe["list_date"] <= universe["date"]) &
+    (universe["date"] < universe["delist_date"])
+)
+assert universe["is_member"].equals(mask)
+\end{lstlisting}
+
+\subsection{\texttt{test\_no\_universe\_current\_leakage\_into\_history}}
+
+Comprueba que la historia no se reconstruye con el universo vigente hoy.
+
+\paragraph{Qué protege}
+\begin{itemize}
+    \item survivorship implícito,
+    \item sesgo de selección retrospectivo,
+    \item desaparición artificial de símbolos quebrados o excluidos.
+\end{itemize}
+
+\paragraph{Idea de test}
+Construir un ejemplo donde un símbolo exista hoy pero no en la primera mitad de la historia. Si el universo histórico lo incluye retroactivamente, el test debe fallar.
+
+\section{Reglas de Fallo de los Joins PIT}
+
+Un buen test PIT no debe limitarse a decir que ``hay leakage''. Debe fijar reglas exactas.
+
+\subsection{Fila inválida por fuente futura}
+
+Si una fila izquierda \((t,s)\) se casa con una fila derecha cuyo timestamp fuente satisface:
+
+\[
+\mathrm{src\_ts} > t
+\]
+
+esa fila debe considerarse inválida y el test debe fallar.
+
+\subsection{Join ambiguo}
+
+Si para una misma clave \((t,s)\) existen varias filas elegibles y el sistema no define una regla determinista de desempate, el test debe fallar. Una regla válida puede ser ``usar la mayor \texttt{src\_ts} elegible''; lo que no es aceptable es una selección implícita dependiente del orden físico de la tabla.
+
+\subsection{Join sin observación previa}
+
+Cuando no existe observación elegible previa, el contrato debe explicitar una de estas conductas:
+
+\begin{itemize}
+    \item devolver \texttt{NaN},
+    \item excluir la fila,
+    \item marcarla como \texttt{missing\_pit}.
+\end{itemize}
+
+La suite debe verificar la política escogida. Nunca debe tolerar silenciosamente un forward fill desde el futuro para ``rellenar'' huecos.
+
+\section{Fixtures Recomendadas}
+
+Las fixtures PIT deben ser pequeñas y construidas para forzar los casos correctos y los incorrectos.
+
+\subsection{Precios mínimos PIT}
+
+\begin{lstlisting}
+import pandas as pd
+import pytest
+
 @pytest.fixture
 def synthetic_price_panel():
-    dates = pd.date_range('2020', periods=5000)
-    panel = pd.DataFrame({'price': 100 + np.cumsum(np.random.normal(0,1,5000))}, index=dates)
-    panel['asof'] = panel.index
-    return panel
+    return pd.DataFrame([
+        {"symbol": "AAA", "price_ts": "2024-01-01", "price": 100.0},
+        {"symbol": "AAA", "price_ts": "2024-01-02", "price": 101.0},
+        {"symbol": "AAA", "price_ts": "2024-01-03", "price": 103.0},
+        {"symbol": "BBB", "price_ts": "2024-01-01", "price": 50.0},
+        {"symbol": "BBB", "price_ts": "2024-01-03", "price": 51.0},
+    ]).assign(
+        price_ts=lambda df: pd.to_datetime(df["price_ts"])
+    )
+\end{lstlisting}
 
+\subsection{Decisiones mínimas}
+
+\begin{lstlisting}
+@pytest.fixture
+def decision_table():
+    return pd.DataFrame([
+        {"symbol": "AAA", "decision_ts": "2024-01-02"},
+        {"symbol": "AAA", "decision_ts": "2024-01-03"},
+        {"symbol": "BBB", "decision_ts": "2024-01-02"},
+    ]).assign(
+        decision_ts=lambda df: pd.to_datetime(df["decision_ts"])
+    )
+\end{lstlisting}
+
+\subsection{Fundamentales con timestamp de disponibilidad}
+
+\begin{lstlisting}
+@pytest.fixture
+def synthetic_fundamentals():
+    return pd.DataFrame([
+        {
+            "symbol": "AAA",
+            "period_end": "2023-12-31",
+            "acceptance_ts": "2024-02-10 18:00:00",
+            "value": 1.23,
+        },
+        {
+            "symbol": "AAA",
+            "period_end": "2024-03-31",
+            "acceptance_ts": "2024-05-09 18:00:00",
+            "value": 1.40,
+        },
+    ]).assign(
+        period_end=lambda df: pd.to_datetime(df["period_end"]),
+        acceptance_ts=lambda df: pd.to_datetime(df["acceptance_ts"]),
+    )
+\end{lstlisting}
+
+\subsection{Historia de universo}
+
+\begin{lstlisting}
 @pytest.fixture
 def synthetic_universe_history():
-    # Induce leakage sintético para tests negativos
-    return pd.DataFrame({'symbol': 'AAPL', 'list_date': '2020-01', 'delist_date': '2025'})
+    return pd.DataFrame([
+        {"symbol": "AAA", "list_date": "2020-01-01", "delist_date": "2099-12-31"},
+        {"symbol": "BBB", "list_date": "2024-01-03", "delist_date": "2099-12-31"},
+        {"symbol": "CCC", "list_date": "2020-01-01", "delist_date": "2024-01-02"},
+    ]).assign(
+        list_date=lambda df: pd.to_datetime(df["list_date"]),
+        delist_date=lambda df: pd.to_datetime(df["delist_date"]),
+    )
 \end{lstlisting}
-\texttt{synthetic\_edgar\_pit}: Filings con delays realistas.
 
-\section{Implementación: Detección Automática de Leakage}
-Flag: $\texttt{leakage} = (\src\_ts > \asof).any()$. Test inducido: Shift precios +1 día, assert falla.
+\section{Ejemplo Sobrio de Join PIT}
 
-\section{Backtest Ejemplo: Impacto Leakage en Swing}
-Tabla con/ sin PIT:
+\begin{lstlisting}
+def pit_join_prices(decision_table, price_panel):
+    left = decision_table.sort_values(["symbol", "decision_ts"])
+    right = price_panel.sort_values(["symbol", "price_ts"])
 
-\begin{table}[h]
-\centering
-\begin{tabular}{lcccc}
-\toprule
-Métrica & IS Sharpe & OOS Sharpe & IS IC & OOS IC \\
-\midrule
-No PIT (Leak) & 4.2 & 0.8 & 0.35 & 0.05 \\
-PIT Correcto & 2.9 & 2.7 & 0.22 & 0.20 \\
-\bottomrule
-\end{tabular}
-\caption{Validación PIT: Drop 30\% IS pero OOS robusto.}
-\end{table}
+    out = pd.merge_asof(
+        left,
+        right,
+        left_on="decision_ts",
+        right_on="price_ts",
+        by="symbol",
+        direction="backward",
+        allow_exact_matches=True,
+    )
+    return out
+\end{lstlisting}
 
-DoD: Tests verdes normales, detectan leakage inducido 100\%, CI/CD safe.
+El contrato de este join es correcto solo si:
+\begin{itemize}
+    \item la tabla derecha está ordenada,
+    \item la dirección es \texttt{backward},
+    \item la clave temporal de la derecha representa disponibilidad efectiva,
+    \item los asserts posteriores verifican \texttt{price\_ts <= decision\_ts}.
+\end{itemize}
 
-\section{Optimizaciones SOTA para Rentabilidad Máxima}
-- AutoML PIT via Ray + Optuna.
-- Dynamic embargo $T_{emb} = f(\sigma_t)$ GARCH.
-- Integrar con Zipline para PIT nativo en +1000 líneas simulación.
+\section{Ejemplo de Test Correcto}
+
+\begin{lstlisting}
+def test_no_future_dates_in_prices(decision_table, synthetic_price_panel):
+    joined = pit_join_prices(decision_table, synthetic_price_panel)
+    assert (joined["price_ts"] <= joined["decision_ts"]).all()
+\end{lstlisting}
+
+Este test es bueno porque:
+\begin{itemize}
+    \item verifica directamente la restricción temporal,
+    \item no depende de métricas indirectas,
+    \item falla exactamente cuando aparece una observación futura.
+\end{itemize}
+
+\section{Casos Borde que Deben Añadirse}
+
+Para que el módulo sea realmente fuerte, debe cubrir además:
+
+\subsection{Huecos de calendario por símbolo}
+
+Un símbolo puede no cotizar en una fecha intermedia. El join PIT debe usar la última observación previa válida o devolver ausencia según contrato, pero nunca tomar la siguiente.
+
+\subsection{Duplicados temporales en la fuente}
+
+Si existen dos filas con igual \texttt{src\_ts} para el mismo símbolo, el sistema debe:
+\begin{itemize}
+    \item prohibir el caso,
+    \item o definir una política determinista de selección.
+\end{itemize}
+
+La suite debe verificar esa política.
+
+\subsection{Timestamps intradía}
+
+Cuando la decisión y la disponibilidad ocurren el mismo día, la hora importa. Debe distinguirse entre:
+\[
+2024\text{-}02\text{-}10\,09{:}00 \quad \text{y} \quad 2024\text{-}02\text{-}10\,18{:}00
+\]
+No basta con comparar solo fechas si la estrategia opera intradía o a apertura.
+
+\subsection{Filas sin observación histórica elegible}
+
+Si un símbolo no tiene dato previo en el instante de decisión, el sistema no debe imputar una observación futura para rellenar. El test debe exigir \texttt{NaN}, exclusión o flag explícito.
+
+\subsection{Cambio de universo dentro del horizonte}
+
+Debe probarse que un símbolo listado a mitad del histórico entra solo a partir de su fecha de elegibilidad y que uno deslistado desaparece cuando corresponde.
+
+\section{Métrica de Leakage para Depuración, no como Sustituto del Test}
+
+Puede ser útil definir una métrica diagnóstica:
+
+\[
+\mathrm{LeakRate}
+=
+\frac{1}{N}
+\sum_{j=1}^{N}
+\mathbf{1}\{\mathrm{src\_ts}^{(j)} > \mathrm{decision\_ts}^{(j)}\}
+\]
+
+pero esta métrica no sustituye los asserts fila a fila. Un módulo PIT fuerte no debe conformarse con ``leakage bajo''; debe imponer:
+
+\[
+\mathrm{LeakRate} = 0
+\]
+
+en los tests donde el contrato temporal exige cero violaciones.
+
+\section{Qué No Debe Hacer Este Módulo}
+
+Para mantener nivel alto, \texttt{test\_data\_pit.py} no debe:
+
+\begin{itemize}
+    \item justificar PIT con promesas de Sharpe o IC,
+    \item mezclar corrección PIT con calibración de modelos,
+    \item introducir correcciones econométricas que no formen parte del contrato base del test,
+    \item usar datasets sintéticos enormes cuando bastan ejemplos pequeños y auditables,
+    \item medir éxito del módulo por performance del backtest.
+\end{itemize}
+
+El lenguaje correcto aquí es el de disponibilidad temporal, semántica de joins y validez histórica, no el de rentabilidad.
+
+\section{Definition of Done}
+
+El módulo puede considerarse bien especificado si cumple simultáneamente lo siguiente:
+
+\begin{enumerate}
+    \item Verifica que no se usan precios futuros respecto al instante de decisión.
+    \item Verifica que datos fundamentales respetan su timestamp de disponibilidad.
+    \item Verifica que la pertenencia al universo respeta ventanas históricas reales.
+    \item Verifica que no se reutiliza el universo actual en historia.
+    \item Verifica comportamiento correcto cuando no existe observación previa elegible.
+    \item Verifica que los joins PIT son deterministas y no ambiguos.
+    \item Cubre al menos un caso intradía y un caso con huecos de calendario.
+    \item Falla con mensajes que identifiquen la violación temporal exacta.
+\end{enumerate}
+
+\section{Conclusión}
+
+\texttt{tests/test\_data\_pit.py} debe entenderse como una barrera metodológica contra la contaminación temporal del stack. Su misión no es adornar el pipeline con lenguaje de robustez; es imponer una disciplina exacta sobre qué información existía, cuándo existía y cuándo podía usarse.
+
+En un sistema cuantitativo serio, la corrección PIT no es una mejora opcional: es una condición de validez experimental. Por eso este módulo debe redactarse como una especificación de semántica temporal y no como una narrativa de performance. Lo que importa aquí es una sola cosa: que ninguna fila del pasado haya sido construida con conocimiento del futuro.
 
 \end{document}

@@ -1,267 +1,547 @@
 \section{Módulo \texttt{models/inference/model\_registry.py}}
 
 \subsection{Objetivo}
-El módulo \texttt{models/inference/model\_registry.py} tiene como objetivo gestionar un \textbf{registro central de modelos} que almacene:
+
+El módulo \texttt{models/inference/model\_registry.py} implementa el \textbf{registro canónico de modelos}
+del sistema. Su función no es únicamente almacenar versiones, sino actuar como
+\textbf{fuente única de verdad operacional} para responder, de forma determinista y auditable, a la pregunta:
+
+\begin{quote}
+\textit{¿Qué modelo exacto está autorizado para ser usado en inferencia, bajo qué condiciones,
+con qué trazabilidad y con qué historia de decisiones?}
+\end{quote}
+
+En un sistema cuantitativo serio, esta pregunta no es administrativa; es una cuestión de
+\textbf{control de riesgo de modelo}. El registro debe garantizar que toda predicción en producción
+pueda enlazarse sin ambigüedad con:
+
 \begin{itemize}
-    \item \textbf{Metadatos}: \texttt{model\_id}, \texttt{task\_type}, \texttt{algo\_family}, \texttt{stage}, etc.
-    \item \textbf{Artefactos versionados}: rutas \texttt{artifact\_uri} inmutables.
-    \item \textbf{Versiones y etapas}: \texttt{candidate}, \texttt{staging}, \texttt{production}, \texttt{archived}.
-    \item \textbf{Historial de promociones y rollbacks}: trazabilidad de decisiones de despliegue.
+    \item la versión exacta del modelo desplegado;
+    \item el \texttt{training\_run\_id} que generó esa versión;
+    \item el \texttt{training\_data\_hash} y el \texttt{feature\_set\_hash};
+    \item la configuración de entrenamiento e inferencia;
+    \item el \texttt{code\_commit} del código que produjo el artefacto;
+    \item la decisión formal de validación y el historial de promociones, overrides y rollbacks.
 \end{itemize}
 
-Este sistema garantiza:
+Por tanto, el módulo debe resolver simultáneamente cuatro funciones:
+
+\begin{enumerate}
+    \item \textbf{Registro}: alta de nuevas versiones con metadatos completos e invariantes de integridad.
+    \item \textbf{Gobernanza}: control de estados, promociones y restricciones de despliegue.
+    \item \textbf{Resolución}: mapeo determinista de referencias lógicas (\texttt{production}, \texttt{staging}, alias, versión)
+    a una versión única y ejecutable.
+    \item \textbf{Auditoría}: preservación \textit{append-only} de la historia de decisiones y cambios de estado.
+\end{enumerate}
+
+\subsection{Principio de diseño}
+
+El diseño del registro sigue un principio conservador:
+
+\begin{quote}
+\textit{El registry no es un catálogo descriptivo de modelos, sino un sistema de control transaccional sobre el ciclo
+de vida de los artefactos predictivos.}
+\end{quote}
+
+De este principio se derivan tres consecuencias:
+
 \begin{itemize}
-    \item \textbf{Reproducibilidad plena}: trazabilidad de \texttt{model\_version} \(\leftrightarrow\) \texttt{training\_run\_id} \(\leftrightarrow\) \texttt{data\_hash} \(\leftrightarrow\) \texttt{code\_commit}.
-    \item \textbf{Gobernanza de riesgo}: sólo modelos con validación aprobada pueden ascender a producción, con políticas de \textit{override} auditado.
-    \item \textbf{Despliegue seguro}: resolución determinista de la versión activa para inferencia (\texttt{resolve\_model}).
+    \item el registro no debe aceptar estados ambiguos;
+    \item la resolución de la versión activa debe ser determinista incluso bajo concurrencia, fallos parciales o múltiples promociones;
+    \item la historia nunca se reescribe: toda mutación operacional debe representarse como un evento auditable.
 \end{itemize}
 
-Este diseño se alinea con estándares industriales de \textbf{model registry} como \texttt{MLflow Model Registry} \cite{mlflow2020modelregistry}, \texttt{Vertex AI Model Registry} \cite{google2025modelregistry} y guías de MLOps para entornos de trading cuantitativo \cite{mlinproduction2020registries}.
+\subsection{Contexto en Trading Cuantitativo}
 
-\subsection{Contexto de Model Registry en Trading Cuantitativo}
-En estrategias de \textit{swing trading} de alta rotación, la gestión de modelos debe ser tan rigurosa como la gestión de carteras. El registro de modelos permite:
+En estrategias de \textit{small-cap swing trading}, la gestión de versiones de modelo debe tratarse con el mismo rigor
+que la gestión de órdenes o la gestión de riesgo. No basta con “guardar un \texttt{.pkl}” o etiquetar una versión como
+\texttt{prod}. El verdadero problema es garantizar que:
+
 \begin{itemize}
-    \item \textbf{Separación clara} entre entrenamiento (\texttt{training}) e inferencia (\texttt{predict}).
-    \item \textbf{Iteración controlada} de versiones, evitando despliegues caóticos.
-    \item \textbf{Auditoría regulatoria}: qué modelo, qué dataset, qué código, en qué fecha.
+    \item el modelo activo es exactamente el que se cree que está activo;
+    \item una promoción no puede dejar el sistema en un estado incoherente;
+    \item un rollback puede ejecutarse rápidamente sin destruir la trazabilidad histórica;
+    \item la evidencia de validación que justificó el despliegue permanece enlazada a la versión servida.
 \end{itemize}
 
-El uso de \textit{append-only} de eventos de promoción/rollback, junto con alias inmutables (\texttt{production}, \texttt{staging}), es un patrón recomendado en guías de MLOps \cite{modelregistry2025bestpractices}.
+Esto es especialmente importante cuando conviven múltiples iteraciones del mismo modelo, varios pipelines de entrenamiento
+o distintos entornos de validación y producción. El registry debe, por tanto, operar como una capa de
+\textbf{gobernanza formal del riesgo de modelo}.
 
 \subsection{Alcance Funcional}
 
 \subsubsection{Incluye}
+
 \begin{itemize}
-    \item \textbf{Alta de nuevas versiones}:
-    \begin{itemize}
-        \item Registro de \texttt{model\_version} con metadatos, métricas y hashes de datos/features.
-    \end{itemize}
-    \item \textbf{Consulta por alias/etapa}:
-    \begin{itemize}
-        \item \texttt{latest\_candidate}, \texttt{staging}, \texttt{production}, \texttt{archived}.
-    \end{itemize}
-    \item \textbf{Resolución de modelo activo}:
-    \begin{itemize}
-        \item Operación \texttt{resolve\_model(ref)} que devuelve la versión actualmente activa para inferencia.
-    \end{itemize}
-    \item \textbf{Versionado de artefactos y dependencias}:
-    \begin{itemize}
-        \item \texttt{feature\_set\_hash}, \texttt{config\_hash}, \texttt{code\_commit}.
-    \end{itemize}
-    \item \textbf{Trazabilidad de decisiones}:
-    \begin{itemize}
-        \item Historial de promociones y rollbacks, con motivo y aprobador.
-    \end{itemize}
+    \item alta de nuevas versiones de modelo;
+    \item persistencia de metadatos, hashes, métricas y referencias a artefactos;
+    \item definición de etapas de ciclo de vida;
+    \item resolución de alias y referencias lógicas a una versión concreta;
+    \item promociones y rollbacks auditables;
+    \item consulta de historial y estado actual;
+    \item validaciones de integridad previas a toda transición crítica.
 \end{itemize}
 
 \subsubsection{No incluye}
+
 \begin{itemize}
-    \item \textbf{Entrenamiento de modelos}: el módulo asume completitud de \texttt{training\_run} y \texttt{validation\_suite}.
-    \item \textbf{Almacenamiento binario pesado}: solo gestiona \texttt{paths} hacia artefactos externos (S3, GCS, etc.).
+    \item entrenamiento de modelos;
+    \item almacenamiento binario pesado del artefacto en sí;
+    \item scoring o inferencia;
+    \item evaluación de mercado o sizing;
+    \item decisión automática de promoción basada únicamente en una métrica aislada.
 \end{itemize}
 
 \subsection{Dependencias}
 
 \subsubsection{Upstream}
+
 \begin{itemize}
-    \item \textbf{Outputs de \texttt{training}}:
-    \begin{itemize}
-        \item Métricas, artefactos, manifests generados por el pipeline de entrenamiento.
-    \end{itemize}
-    \item \textbf{Decisiones de \texttt{validation\_suite}}:
-    \begin{itemize}
-        \item \texttt{validation\_decision} (pass/fail/override) que determina si una versión puede ascender a \texttt{production}.
-    \end{itemize}
+    \item \textbf{Training pipeline}:
+    produce el artefacto, \texttt{training\_run\_id}, hashes, métricas y manifiesto de entrenamiento.
+    \item \textbf{Validation suite}:
+    determina si la versión tiene estatus \texttt{pass}, \texttt{fail} o \texttt{override}.
+    \item \textbf{Artifact store}:
+    almacena el artefacto serializado y sus manifiestos asociados.
 \end{itemize}
 
 \subsubsection{Downstream}
+
 \begin{itemize}
-    \item \texttt{models/inference/predict}: consulta el modelo resuelto para realizar inferencia en tiempo real.
-    \item \texttt{backtest/run\_walkforward}: selecciona versiones de modelo para backtesting y walk‑forward testing.
-    \item \texttt{ops/monitoring}: obtiene el modelo activo para monitorear su comportamiento en producción.
+    \item \texttt{models/inference/predict}: resuelve el modelo exacto que debe usarse para inferencia;
+    \item \texttt{models/inference/explain}: vincula explicaciones a una versión registrada;
+    \item \texttt{backtest/run\_walkforward}: recupera versiones históricas por fecha, alias o versión fija;
+    \item \texttt{ops/monitoring}: supervisa el modelo activo y sus cambios de etapa;
+    \item \texttt{audit/compliance}: reconstruye la historia de decisiones y despliegues.
 \end{itemize}
 
-\subsection{Entidades Clave}
+\subsection{Entidades Fundamentales}
 
-\subsubsection{Model}
+\subsubsection{Modelo lógico}
+
+El objeto \texttt{Model} representa una familia estable de predictor, identificada por:
+
 \begin{itemize}
-    \item \texttt{model\_id} (estable, único a nivel de problema).
-    \item \texttt{task\_type} (e.g.\ \texttt{regression\_returns}, \texttt{binary\_signal}).
-    \item \texttt{algo\_family} (e.g.\ \texttt{gbdt}, \texttt{nn}, \texttt{ensemble}).
+    \item \texttt{model\_id}: identificador lógico único;
+    \item \texttt{task\_type}: tipo de problema (\texttt{regression\_returns}, \texttt{binary\_signal}, etc.);
+    \item \texttt{algo\_family}: familia algorítmica (\texttt{gbdt}, \texttt{linear}, \texttt{nn}, \texttt{ensemble});
+    \item \texttt{owner} u origen opcional del pipeline;
+    \item \texttt{status}: activo/inactivo a nivel lógico, independiente de las versiones.
 \end{itemize}
 
-\subsubsection{Version}
-Para cada versión de modelo \((m, v)\) se almacena:
-\begin{itemize}
-    \item \texttt{model\_version} (semver \texttt{v1.2.3} o timestamp \texttt{2026.03.05.1}).
-    \item \texttt{artifact\_uri}: ruta inmutable al artefacto serializado (Weights, \texttt{joblib}, \texttt{pmml}, etc.).
-    \item \texttt{training\_run\_id}: referencia al \texttt{run} de entrenamiento en el sistema de experimentación.
-    \item \texttt{training\_data\_hash}: huella del dataset de entrenamiento (SHA‑256 o hash de partición).
-    \item \texttt{feature\_set\_hash}: hash del conjunto de features utilizadas.
-    \item \texttt{config\_hash}: hash de la configuración de entrenamiento (\texttt{hyperparams}).
-    \item \texttt{code\_commit}: SHA del commit de código fuente.
-    \item \texttt{metrics\_snapshot}: métricas principales (e.g.\ \texttt{sharpe}, \texttt{accuracy}, \texttt{AUC}).
-    \item \texttt{validation\_decision}: \texttt{pass}, \texttt{fail}, \texttt{override}.
-    \item \texttt{stage}: \texttt{candidate}, \texttt{staging}, \texttt{production}, \texttt{archived}.
-\end{itemize}
+\subsubsection{Versión}
 
-Estos campos siguen el patrón de metadatos recomendado por MLflow \cite{mlflow2020modelregistry} y guías de MLOps \cite{modelregistry2025bestpractices}.
+Cada versión \((m,v)\) representa un artefacto entrenado e inmutable. Para cada una se almacena al menos:
 
-\subsubsection{Alias}
-\begin{itemize}
-    \item \texttt{latest\_candidate}: versión más reciente aprobada por \texttt{validation\_suite}.
-    \item \texttt{staging}: versión en prueba para entornos de \texttt{staging}.
-    \item \texttt{production}: versión activa en producción.
-\end{itemize}
-
-\subsection{Contrato de Entrada}
-
-\subsubsection{Operaciones mínimas}
-\begin{itemize}
-    \item \texttt{register\_model\_version(payload)}: registra una nueva versión candidata.
-    \item \texttt{promote\_model(model\_id, version, stage)}: promueve una versión a nueva etapa.
-    \item \texttt{rollback\_model(model\_id, to\_version)}: revierte el alias \texttt{production} a una versión previa.
-    \item \texttt{resolve\_model(ref)}: resuelve el modelo activo dado un \texttt{ref} (alias, stage, versión).
-    \item \texttt{list\_models(filters)}: consulta el catálogo de modelos.
-\end{itemize}
-
-\subsubsection{Payload mínimo de registro}
 \begin{itemize}
     \item \texttt{model\_id}
     \item \texttt{model\_version}
     \item \texttt{artifact\_uri}
+    \item \texttt{artifact\_hash}
     \item \texttt{training\_run\_id}
-    \item \texttt{metrics\_summary} (representación serializada de métricas clave).
+    \item \texttt{training\_data\_hash}
+    \item \texttt{feature\_set\_hash}
+    \item \texttt{config\_hash}
+    \item \texttt{code\_commit}
+    \item \texttt{metrics\_snapshot}
     \item \texttt{validation\_decision}
-    \item \texttt{created\_ts}
+    \item \texttt{stage}
+    \item \texttt{created\_ts\_utc}
+    \item \texttt{registered\_by}
 \end{itemize}
 
-Estos campos forman el núcleo de trazabilidad necesaria para un \textit{model card} minimalista \cite{modelcards2019}.
+\subsubsection{Alias}
+
+Los alias son referencias lógicas a versiones activas:
+
+\begin{itemize}
+    \item \texttt{latest\_candidate}
+    \item \texttt{staging}
+    \item \texttt{production}
+\end{itemize}
+
+Un alias nunca es una versión en sí misma; es una \textbf{asignación mutable y auditable} que apunta a una versión concreta.
+La historia de esa asignación debe mantenerse como eventos.
+
+\subsubsection{Evento de lifecycle}
+
+Toda mutación relevante del registry se modela como un evento \textit{append-only}, por ejemplo:
+
+\begin{itemize}
+    \item \texttt{REGISTER\_VERSION}
+    \item \texttt{PROMOTE\_TO\_STAGING}
+    \item \texttt{PROMOTE\_TO\_PRODUCTION}
+    \item \texttt{ROLLBACK\_PRODUCTION}
+    \item \texttt{ARCHIVE\_VERSION}
+    \item \texttt{OVERRIDE\_PROMOTION}
+\end{itemize}
+
+Cada evento debe llevar:
+
+\begin{itemize}
+    \item \texttt{event\_id}
+    \item \texttt{event\_ts\_utc}
+    \item \texttt{event\_type}
+    \item \texttt{model\_id}
+    \item \texttt{from\_version} y/o \texttt{to\_version}
+    \item \texttt{actor}
+    \item \texttt{reason}
+    \item \texttt{approval\_ref} opcional
+    \item \texttt{event\_payload\_hash}
+\end{itemize}
+
+\subsection{Invariantes Formales del Registry}
+
+Para que el sistema sea operacionalmente seguro, el registry debe mantener siempre los siguientes invariantes:
+
+\begin{enumerate}
+    \item \textbf{Unicidad de versión}: no pueden existir dos registros con la misma clave
+    \[
+    (\texttt{model\_id},\ \texttt{model\_version}).
+    \]
+
+    \item \textbf{Inmutabilidad de artefacto}: una vez registrada una versión, los campos
+    \texttt{artifact\_uri}, \texttt{artifact\_hash}, \texttt{training\_run\_id},
+    \texttt{training\_data\_hash}, \texttt{feature\_set\_hash}, \texttt{config\_hash} y \texttt{code\_commit}
+    no pueden modificarse.
+
+    \item \textbf{Unicidad de alias activo por modelo}: para cada \texttt{model\_id} y para cada alias lógico
+    crítico (\texttt{production}, \texttt{staging}) debe existir como máximo una versión activa.
+
+    \item \textbf{Consistencia entre validación y promoción}: ninguna versión con
+    \texttt{validation\_decision=fail} puede ocupar \texttt{production} salvo evento explícito de override.
+
+    \item \textbf{Historial no reescribible}: el estado actual puede derivarse de los eventos, pero los eventos
+    nunca deben editarse retroactivamente.
+
+    \item \textbf{Resolución determinista}: toda llamada a \texttt{resolve\_model(ref)} debe devolver
+    exactamente una versión o fallar de forma explícita; nunca debe devolver múltiples candidatas ni elegir
+    implícitamente por heurística no registrada.
+\end{enumerate}
+
+\subsection{Modelo de Estados}
+
+La etapa \texttt{stage} de una versión pertenece al conjunto:
+
+\[
+\{\texttt{candidate},\ \texttt{staging},\ \texttt{production},\ \texttt{archived}\}.
+\]
+
+Estas etapas deben interpretarse así:
+
+\begin{itemize}
+    \item \texttt{candidate}: versión registrada pero no necesariamente desplegable;
+    \item \texttt{staging}: versión autorizada para pruebas de preproducción;
+    \item \texttt{production}: versión actualmente servida por el sistema de inferencia;
+    \item \texttt{archived}: versión preservada solo con fines de reproducibilidad o análisis histórico.
+\end{itemize}
+
+La transición entre estados no es libre. La política recomendada es:
+
+\[
+\texttt{candidate} \rightarrow \texttt{staging} \rightarrow \texttt{production} \rightarrow \texttt{archived},
+\]
+
+permitiendo rollback a una versión anterior ya conocida. Las transiciones inválidas deben fallar.
+
+\subsection{Semántica Operativa de Alias}
+
+La semántica de alias debe quedar cerrada:
+
+\begin{itemize}
+    \item \texttt{latest\_candidate} no significa “la última versión registrada”, sino
+    \textbf{la última versión candidata elegible bajo la política vigente}.
+    \item \texttt{staging} apunta a una única versión activa de prueba.
+    \item \texttt{production} apunta a una única versión activa y servible.
+\end{itemize}
+
+En caso de múltiples versiones candidatas aprobadas, el registry no debe resolver por fecha sin más.
+La política de desempate debe estar fijada, por ejemplo:
+
+\begin{enumerate}
+    \item prioridad por \texttt{validation\_decision};
+    \item después, prioridad por \texttt{promotion\_score} o criterio explícito de validación;
+    \item después, \texttt{created\_ts\_utc};
+    \item después, fallo explícito si persiste la ambigüedad.
+\end{enumerate}
+
+\subsection{Contrato de Entrada}
+
+\subsubsection{Operaciones mínimas}
+
+\begin{itemize}
+    \item \texttt{register\_model\_version(payload)}
+    \item \texttt{promote\_model(model\_id, version, target\_alias)}
+    \item \texttt{rollback\_model(model\_id, to\_version)}
+    \item \texttt{resolve\_model(ref)}
+    \item \texttt{list\_models(filters)}
+    \item \texttt{get\_history(model\_id)}
+\end{itemize}
+
+\subsubsection{Payload mínimo de registro}
+
+\begin{itemize}
+    \item \texttt{model\_id}
+    \item \texttt{model\_version}
+    \item \texttt{artifact\_uri}
+    \item \texttt{artifact\_hash}
+    \item \texttt{training\_run\_id}
+    \item \texttt{training\_data\_hash}
+    \item \texttt{feature\_set\_hash}
+    \item \texttt{config\_hash}
+    \item \texttt{code\_commit}
+    \item \texttt{metrics\_snapshot}
+    \item \texttt{validation\_decision}
+    \item \texttt{created\_ts\_utc}
+    \item \texttt{registered\_by}
+\end{itemize}
 
 \subsection{Contrato de Salida}
 
-\subsubsection{Persistencia}
+\subsubsection{Persistencia recomendada}
+
 \begin{itemize}
-    \item \texttt{models/registry/registry.parquet} (o base de datos ligera \texttt{sqlite}/\texttt{jsonl}):
-    \begin{itemize}
-        \item Tabla principal de \texttt{model\_version} con todos sus metadatos.
-    \end{itemize}
-    \item \texttt{models/registry/history/\{date\}/events.parquet}:
-    \begin{itemize}
-        \item Log de eventos \textit{append-only} (registrar, promover, rollback).
-    \end{itemize}
+    \item \texttt{models/registry/versions.parquet}:
+    tabla materializada con el estado actual por versión;
+    \item \texttt{models/registry/aliases.parquet}:
+    asignación actual de alias;
+    \item \texttt{models/registry/history/events.parquet}:
+    historial \textit{append-only};
     \item \texttt{models/registry/model\_cards/\{model\_id\}\_\{version\}.json}:
-    \begin{itemize}
-        \item \textit{Model Card} por versión con métricas y metadatos de uso.
-    \end{itemize}
+    documentación por versión;
+    \item \texttt{models/registry/manifests/\{model\_id\}\_\{version\}.json}:
+    metadatos completos de reproducibilidad.
 \end{itemize}
 
-\subsubsection{Respuestas API internas}
-\begin{itemize}
-    \item \texttt{resolved\_model\_metadata}: conjunto completo de metadatos de la versión resuelta.
-    \item \texttt{promotion\_history}: historial de transiciones de etapa.
-    \item \texttt{current\_status\_by\_alias}: estado actual de cada alias.
-\end{itemize}
+\subsubsection{Respuesta de \texttt{resolve\_model}}
 
-\subsection{Reglas de Gobernanza}
+La operación \texttt{resolve\_model(ref)} debe devolver un objeto completo y ejecutable, por ejemplo:
 
 \begin{itemize}
-    \item \textbf{Sólo versiones con \texttt{validation\_suite=pass} pueden ir a producción} (salvo override auditado explicitamente registrado).
-    \item \textbf{Promotion y rollback son eventos auditables}: cada cambio de \texttt{stage} genera un evento persistido.
-    \item \textbf{No se reescribe historia}: el registro de eventos es \textit{append-only}; se mantiene la trazabilidad completa.
-    \item \textbf{Cada versión apunta a artefacto inmutable}: el \texttt{artifact\_uri} no debe ser modificado después del registro.
+    \item \texttt{model\_id}
+    \item \texttt{model\_version}
+    \item \texttt{artifact\_uri}
+    \item \texttt{artifact\_hash}
+    \item \texttt{feature\_set\_hash}
+    \item \texttt{config\_hash}
+    \item \texttt{code\_commit}
+    \item \texttt{validation\_decision}
+    \item \texttt{resolved\_from\_ref}
+    \item \texttt{resolved\_ts\_utc}
 \end{itemize}
 
-Estas reglas responden a recomendaciones de gobernanza de ML en entornos de trading de alta frecuencia \cite{mlops2023trading}.
+\subsection{Resolución Determinista}
 
-\subsection{Flujo de Registro y Promoción}
+La función \texttt{resolve\_model(ref)} es el corazón operativo del módulo. Debe aceptar referencias como:
+
+\begin{itemize}
+    \item alias (\texttt{production}, \texttt{staging}, \texttt{latest\_candidate});
+    \item versión exacta;
+    \item combinación \texttt{model\_id + alias};
+    \item referencia histórica por fecha, si se soporta.
+\end{itemize}
+
+La resolución sigue el siguiente orden:
 
 \begin{enumerate}
-    \item \textbf{Registrar versión candidata} tras el entrenamiento:
-    \begin{itemize}
-        \item \texttt{register\_model\_version} con métricas y hashes.
-    \end{itemize}
-    \item \textbf{Adjuntar métricas y hashes de reproducibilidad}:
-    \begin{itemize}
-        \item \texttt{training\_data\_hash}, \texttt{feature\_set\_hash}, \texttt{config\_hash}, \texttt{code\_commit}.
-    \end{itemize}
-    \item \textbf{Evaluar \texttt{validation\_decision}}:
-    \begin{itemize}
-        \item \texttt{pass} \(\rightarrow\) candidatura a \texttt{staging}/\texttt{production}.
-        \item \texttt{fail} \(\rightarrow\) versión bloqueada a salvo de overrides.
-    \end{itemize}
-    \item \textbf{Promover a etapa según política}:
-    \begin{itemize}
-        \item \texttt{promote\_model(model\_id, version, stage)}.
-    \end{itemize}
-    \item \textbf{Registrar evento y actualizar alias}:
-    \begin{itemize}
-        \item Actualización atómica de \texttt{production}/\texttt{staging} y escritura de evento.
-    \end{itemize}
+    \item validar sintaxis del \texttt{ref};
+    \item expandir a una consulta explícita;
+    \item recuperar el candidato o candidatos elegibles;
+    \item aplicar política de unicidad;
+    \item verificar integridad del artefacto;
+    \item devolver una única versión;
+    \item si no existe una única respuesta válida, fallar.
 \end{enumerate}
 
-Este flujo sigue el patrón de \textit{lifecycle stages} descrito en \cite{mlflow2020modelregistry} y \cite{modelregistry2025bestpractices}.
+Bajo ningún caso debe usarse una política del tipo “devolver la primera fila encontrada”.
+La resolución debe ser estable, reproducible y registrable en logs.
+
+\subsection{Atomicidad de Promociones}
+
+Uno de los puntos más críticos del registry es la promoción a \texttt{staging} o \texttt{production}.
+La promoción debe ser \textbf{atómica}. Conceptualmente, una promoción contiene tres subpasos:
+
+\begin{enumerate}
+    \item verificación previa de elegibilidad e integridad;
+    \item actualización de alias;
+    \item escritura del evento de promoción.
+\end{enumerate}
+
+Estos tres pasos deben ejecutarse como una única transacción lógica. Si cualquiera falla, el sistema debe quedar
+en el estado anterior. Nunca debe ocurrir una situación donde el alias cambie pero el evento no se registre,
+o donde el evento exista pero el alias no refleje ese cambio.
+
+La política correcta es:
+
+\begin{itemize}
+    \item \textbf{precheck} completo;
+    \item \textbf{compare-and-swap} o mecanismo equivalente bajo lock/txn;
+    \item escritura de estado y evento en compromiso único;
+    \item confirmación final de lectura tras escritura.
+\end{itemize}
+
+\subsection{Validación de Artefactos}
+
+Antes de permitir registro o promoción, el registry debe verificar:
+
+\begin{itemize}
+    \item existencia física de \texttt{artifact\_uri};
+    \item legibilidad del artefacto;
+    \item coincidencia entre \texttt{artifact\_hash} almacenado y hash calculado;
+    \item presencia del manifiesto asociado;
+    \item compatibilidad mínima con la clase de modelo declarada.
+\end{itemize}
+
+Si el artefacto falta, está corrupto o el hash no coincide, la versión debe marcarse como no servible y
+no puede resolverse como \texttt{production}. Esto es especialmente importante porque un artefacto “registrado”
+pero ilegible destruye la utilidad operativa del registry.
+
+\subsection{Política de Promoción}
+
+La promoción de una versión a \texttt{production} solo debe permitirse si:
+
+\begin{itemize}
+    \item la versión existe;
+    \item el artefacto es íntegro y accesible;
+    \item el \texttt{validation\_decision} es \texttt{pass}, o bien existe override auditado;
+    \item la versión es compatible con el contrato de inferencia vigente;
+    \item la transición solicitada es válida según la máquina de estados.
+\end{itemize}
+
+Cuando varias versiones compiten por promoción, el registry no decide por una sola métrica aislada.
+La decisión debe venir ya resuelta por \texttt{validation\_suite} o por un \texttt{promotion\_decision} explícito.
+El registry registra la decisión; no inventa la preferencia.
+
+\subsection{Semántica Precisa de Rollback}
+
+El rollback no debe entenderse como “deshacer historia”, sino como
+\textbf{crear un nuevo evento que reasigna el alias \texttt{production} a una versión anterior conocida y servible}.
+
+Formalmente, si en el instante \(t\) el alias \texttt{production} apunta a \(v_t\), un rollback a \(v_k\) con \(k<t\)
+debe cumplir:
+
+\begin{itemize}
+    \item \(v_k\) sigue existiendo en el registry;
+    \item \(v_k\) conserva integridad de artefacto;
+    \item la historia de promociones previas no se borra;
+    \item se registra un nuevo evento \texttt{ROLLBACK\_PRODUCTION}.
+\end{itemize}
+
+Además, el rollback debe capturar:
+
+\begin{itemize}
+    \item \texttt{from\_version}
+    \item \texttt{to\_version}
+    \item motivo del rollback
+    \item actor y aprobador
+    \item snapshot del estado de alias antes y después
+\end{itemize}
+
+Si el alias \texttt{production} ha cambiado múltiples veces, el rollback nunca debe inferirse como “volver al estado anterior”
+sin especificar \texttt{to\_version}; eso sería ambiguo. Debe indicarse explícitamente la versión destino o una política muy
+formal de “última versión estable conocida”.
+
+\subsection{Failover y Fallback Policy}
+
+El módulo debe especificar qué hacer si \texttt{production} no puede resolverse:
+
+\begin{itemize}
+    \item si el alias no existe, fallar;
+    \item si la versión existe pero el artefacto está corrupto, fallar;
+    \item solo si existe una política explícita de \texttt{fallback\_to\_previous\_production}, podrá intentarse un fallback;
+    \item todo fallback debe registrarse como evento operativo.
+\end{itemize}
+
+La política por defecto debe ser \textbf{fail-closed}, no “servir cualquier cosa razonable”.
+
+\subsection{Flujo Operativo}
+
+\begin{enumerate}
+    \item \textbf{Registro}
+    \begin{itemize}
+        \item validar campos obligatorios;
+        \item verificar unicidad de \((\texttt{model\_id},\texttt{model\_version})\);
+        \item validar artefacto y hashes;
+        \item registrar versión como \texttt{candidate};
+        \item persistir evento \texttt{REGISTER\_VERSION}.
+    \end{itemize}
+
+    \item \textbf{Promoción}
+    \begin{itemize}
+        \item verificar elegibilidad;
+        \item adquirir lock/transacción;
+        \item actualizar alias objetivo;
+        \item registrar evento de promoción;
+        \item confirmar consistencia post-escritura.
+    \end{itemize}
+
+    \item \textbf{Resolución}
+    \begin{itemize}
+        \item recibir referencia;
+        \item expandir y desambiguar;
+        \item verificar servibilidad;
+        \item devolver versión única.
+    \end{itemize}
+
+    \item \textbf{Rollback}
+    \begin{itemize}
+        \item validar versión destino;
+        \item tomar snapshot del estado actual;
+        \item reasignar alias \texttt{production};
+        \item registrar evento de rollback.
+    \end{itemize}
+\end{enumerate}
 
 \subsection{Validaciones Mínimas}
 
 \begin{itemize}
-    \item \textbf{Unicidad} \texttt{(model\_id, model\_version)}:
-    \begin{itemize}
-        \item Evitar versiones duplicadas para el mismo modelo.
-    \end{itemize}
-    \item \textbf{Accesibilidad de \texttt{artifact\_uri}}:
-    \begin{itemize}
-        \item Verificar que el artefacto existe y es legible (p.ej.\ \texttt{HEAD} HTTP o similar).
-    \end{itemize}
-    \item \textbf{Campos obligatorios no nulos}.
-    \item \textbf{Stage válido} (perteneciente al conjunto predefinido).
-    \item \textbf{Coherencia entre \texttt{validation\_decision} y \texttt{stage} target}:
-    \begin{itemize}
-        \item No se permite promover a \texttt{production} una versión con \texttt{validation\_decision=fail} salvo \texttt{override} auditado.
-    \end{itemize}
+    \item unicidad de \((\texttt{model\_id}, \texttt{model\_version})\);
+    \item no nulidad de campos obligatorios;
+    \item validez del \texttt{stage};
+    \item accesibilidad y hash correcto de \texttt{artifact\_uri};
+    \item coherencia entre \texttt{validation\_decision} y promoción solicitada;
+    \item integridad de alias activos;
+    \item resolución unívoca de referencias;
+    \item rechazo explícito de estados ambiguos.
 \end{itemize}
-
-\subsection{Manejo de Rollback}
-
-\begin{itemize}
-    \item \textbf{Rollback rápido por alias}:
-    \begin{itemize}
-        \item Operación \texttt{rollback\_model(model\_id, to\_version)} que actualiza el alias \texttt{production} a una versión anterior estable.
-    \end{itemize}
-    \item \textbf{Snapshot de estado de alias}:
-    \begin{itemize}
-        \item Guardar el estado de los alias antes y después del rollback para análisis forense.
-    \end{itemize}
-    \item \textbf{Registro de motivo y aprobador}:
-    \begin{itemize}
-        \item Persistir metadatos de operación (¿por qué se retrocedió?, ¿quién lo aprobó?).
-    \end{itemize}
-\end{itemize}
-
-Esta estrategia de rollback es recomendada en guías de MLOps para entornos de alta frecuencia \cite{modelregistry2025rollback}.
 
 \subsection{Observabilidad}
 
 \subsubsection{Logging}
+
 \begin{itemize}
-    \item \texttt{INFO}: registros de alta de versiones, promociones exitosas.
-    \item \texttt{WARNING}: promociones forzadas con \texttt{override} o rollback no planificado.
-    \item \texttt{ERROR}: conflictos de versión, artefacto inexistente, fallo de \texttt{resolve\_model}.
+    \item \texttt{INFO}: registro exitoso, promoción válida, resolución correcta;
+    \item \texttt{WARNING}: override auditado, fallback explícito, rollback no planificado;
+    \item \texttt{ERROR}: artefacto faltante, hash inconsistente, conflicto de alias, resolución ambigua, fallo transaccional.
 \end{itemize}
 
 \subsubsection{Métricas}
+
 \begin{itemize}
-    \item \texttt{n\_models\_total}: número total de modelos registrados.
-    \item \texttt{n\_versions\_total}: número total de versiones registradas.
-    \item \texttt{n\_promotions\_prod}: cuántas promociones a \texttt{production} se han realizado.
-    \item \texttt{n\_rollbacks}: número de rollback a versiones anteriores.
-    \item \texttt{avg\_time\_candidate\_to\_prod}: tiempo medio desde \texttt{latest\_candidate} hasta \texttt{production}.
+    \item \texttt{n\_models\_total}
+    \item \texttt{n\_versions\_total}
+    \item \texttt{n\_promotions\_production}
+    \item \texttt{n\_rollbacks}
+    \item \texttt{n\_override\_promotions}
+    \item \texttt{resolve\_failures}
+    \item \texttt{artifact\_integrity\_failures}
+    \item \texttt{avg\_candidate\_to\_production\_latency}
 \end{itemize}
 
-\subsection{CLI Sugerida}
+\subsection{Resumen}
 
-\begin{verbatim}
-python -m models.inference.model_registry register \
-  --model-id lgbm_main \
-  --version 2026.03.05.1 \
-  --artifact-uri models/artifacts/lgb
+\texttt{models/inference/model\_registry.py} debe entenderse como una pieza de infraestructura crítica,
+no como un simple índice de modelos. Su responsabilidad real es imponer estructura y disciplina al ciclo de vida
+de los artefactos predictivos. Un registry de nivel institucional debe:
+
+\begin{itemize}
+    \item garantizar trazabilidad completa;
+    \item imponer invariantes fuertes;
+    \item resolver versiones sin ambigüedad;
+    \item ejecutar promociones de forma atómica;
+    \item tratar rollback como evento auditable y no como borrado de historia;
+    \item fallar de forma conservadora ante corrupción, ambigüedad o inconsistencia.
+\end{itemize}
+
+Este enfoque es el adecuado para una plataforma cuantitativa seria: el registry no solo recuerda qué modelos existen,
+sino que determina, con reglas formales y auditablemente, cuáles pueden vivir de verdad en producción.
