@@ -1,355 +1,471 @@
-\documentclass{article}
-\usepackage{amsmath,amssymb}
-\usepackage{parskip}
-\usepackage{enumitem}
-\usepackage{hyperref}
-\usepackage{listings}
-\lstset{language=Python, basicstyle=\ttfamily\small, columns=fullflexible, showstringspaces=false}
+Módulo: risk/capacity/crowding_detector.py
 
-\begin{document}
+1. Objetivo del módulo
 
-\title{crowding\_detector.py --- Crowding Diagnostics and Capacity Risk Control}
-\author{}
-\date{}
-\maketitle
+El objetivo de crowding_detector.py es medir, para cada fecha, si el libro de la
+estrategia se está concentrando excesivamente en pocos nombres y si esa concentración
+es grande en relación con la liquidez disponible del universo operado.
 
-\section{Purpose}
+Este módulo no es una fuente de alpha ni un optimizador de ejecución por sí mismo.
+Su función correcta es de diagnóstico de riesgo de capacidad y control preventivo:
+producir métricas diarias de concentración, presión de liquidez y alineación entre
+libro y señal, sintetizarlas en un crowding score normalizado y emitir un estado
+discreto de alerta que pueda ser consumido por portfolio, rebalance, execution y
+capacity research.
 
-The goal of \texttt{crowding\_detector.py} is to quantify whether the strategy is becoming too concentrated in a small subset of names and whether that concentration is large relative to available liquidity. This is a \emph{diagnostic and risk-control} module, not a stand-alone alpha source. Its job is to produce daily crowding diagnostics that can be consumed by portfolio construction, rebalance throttling, execution, and capacity research.
+La pregunta operativa que debe responder no es “si el portfolio está simplemente
+concentrado”, sino algo más útil:
 
-The module must answer four operational questions:
+- si la concentración actual es anómala respecto a su propia historia;
+- si esa concentración está cargada en nombres con liquidez limitada;
+- si el libro se está solapando demasiado con las señales dominantes;
+- y si esas condiciones anticipan empeoramiento futuro de shortfall, alpha retention
+  o eventos de cola.
 
-\begin{enumerate}[label=\arabic*.]
-    \item Is the book becoming excessively concentrated in a small number of names?
-    \item Is the concentration large relative to the liquidity of the traded universe?
-    \item Is the live book too aligned with the strongest cross-sectional signals, increasing the probability of common-position risk and forced overlap?
-    \item Are crowding conditions deteriorating fast enough to require an alert, a position cap, or a rebalance reduction?
-\end{enumerate}
+2. Qué hace y qué no hace
 
-Accordingly, the module outputs a daily panel of crowding metrics, a normalized crowding score, and a discrete alert state.
+2.1 Qué hace
+- calcula métricas diarias de concentración del libro;
+- calcula métricas de presión de liquidez relativas a ADV;
+- mide solapamiento entre composición del libro y jerarquía actual de señales;
+- normaliza todas las métricas con estadísticos rolling estrictamente históricos;
+- construye un crowding score compuesto interpretable;
+- calibra estados discretos de alerta: ok / warn / hard;
+- persiste tanto score agregado como componentes subyacentes;
+- y exige validación posterior contra targets futuros de degradación de ejecución
+  o retención de alpha.
 
-\section{Module Contract}
+2.2 Qué no hace
+- no estima impacto de mercado estructural completo;
+- no reemplaza impact_model.py;
+- no optimiza sizing ni rebalance por sí solo;
+- no usa información futura para calibrar score o alertas;
+- no pretende inferir crowding de otros gestores externos;
+- no justifica por sí mismo cambios de producción sin validación downstream.
 
-\subsection{Required Inputs}
+3. Rol dentro del stack
 
-At minimum, the module consumes the following daily inputs after all point-in-time alignment has already been enforced upstream:
+Secuencia conceptual correcta:
 
-\begin{itemize}
-    \item \texttt{positions\_history}: one row per \((date, asset)\) with columns
-    \[
-    \{\texttt{date}, \texttt{asset}, \texttt{shares}, \texttt{close}, \texttt{dollar\_position}, \texttt{side}, \texttt{gross\_weight}\}.
-    \]
-    \item \texttt{signal\_history}: one row per \((date, asset)\) with columns
-    \[
-    \{\texttt{date}, \texttt{asset}, \texttt{signal}, \texttt{target\_weight}\}.
-    \]
-    \item \texttt{liquidity\_panel}: one row per \((date, asset)\) with columns
-    \[
-    \{\texttt{date}, \texttt{asset}, \texttt{adv\_dollar}, \texttt{spread\_bps}, \texttt{volatility}\}.
-    \]
-\end{itemize}
+    positions_history + signal_history + liquidity_panel
+    -> crowding_detector.py
+    -> portfolio / rebalance / execution / capacity_analysis
+    -> posibles caps, throttles o revisiones de capacidad
 
-\subsection{Outputs}
+Interpretación correcta:
+- crowding_detector.py no decide alpha;
+- no decide por sí solo qué nombres comprar o vender;
+- sí informa si el estado actual del libro es peligrosamente concentrado o frágil
+  respecto a liquidez y solapamiento de señal;
+- y aporta una señal de condición del sistema que puede gatillar restricciones
+  blandas o duras aguas abajo.
 
-For each date \(t\), the module produces one row with:
+4. Preguntas operativas que debe responder
 
-\[
-\{\texttt{n\_names}, \texttt{hhi}, \texttt{top\_5\_share}, \texttt{top\_10\_share}, \texttt{liquidity\_pressure},
-\texttt{signal\_overlap}, \texttt{crowding\_score}, \texttt{alert}\}.
-\]
+El módulo debe responder, de forma diaria y auditable, al menos a estas preguntas:
 
-The output must be written to a point-in-time safe parquet file such as
+- ¿se está concentrando el gross en muy pocos nombres?
+- ¿esos nombres son suficientemente líquidos para soportar el tamaño actual?
+- ¿el libro está excesivamente alineado con la parte dominante del signal cross-section?
+- ¿el estado actual es normal respecto al historial o está entrando en zona de crowding?
+- ¿cuando el score sube, empeoran después la ejecución, la retención de alpha o la cola de pérdidas?
 
-\[
-\texttt{research/capacity\_analysis/artifacts/crowding\_scores.parquet}.
-\]
+Si no puede responder razonablemente a la última, el score puede ser descriptivo,
+pero todavía no es un score operativo listo para gating.
 
-\section{Mathematical Definitions}
+5. Inputs requeridos
 
-Let \(\mathcal{U}_t\) denote the set of active names on date \(t\), and let \(x_{i,t}\) be the dollar position of asset \(i\). Define absolute gross-normalized portfolio weights by
+El módulo debe consumir, con alineación PIT ya garantizada upstream, al menos:
 
-\begin{equation}
-w_{i,t} = \frac{|x_{i,t}|}{\sum_{j \in \mathcal{U}_t} |x_{j,t}| + \varepsilon},
-\qquad \sum_{i \in \mathcal{U}_t} w_{i,t} = 1.
-\end{equation}
+- positions_history:
+  una fila por (date, asset) con variables como shares, close, dollar_position,
+  side y gross_weight o equivalentes reconstruibles.
 
-Absolute weights are used here because crowding is a concentration phenomenon; long and short exposures both consume capacity.
+- signal_history:
+  una fila por (date, asset) con al menos signal y, si existe, target_weight.
 
-\subsection{Concentration: Herfindahl--Hirschman Index}
+- liquidity_panel:
+  una fila por (date, asset) con al menos adv_dollar y, opcionalmente, spread_bps
+  y volatility para diagnósticos futuros.
 
-\begin{equation}
-HHI_t = \sum_{i \in \mathcal{U}_t} w_{i,t}^2.
-\end{equation}
+Todas las uniones deben ser point-in-time safe.
+Ningún dato de liquidez o señal puede mirar más allá de la fecha t al construir
+las métricas de crowding en t.
 
-\(HHI_t\) lies in \([1/N_t,1]\), where \(N_t = |\mathcal{U}_t|\). A rising \(HHI_t\) indicates that gross exposure is collapsing into fewer names.
+6. Pesos base del libro
 
-\subsection{Top-\(k\) Share}
+Sea U_t el conjunto de nombres activos en la fecha t y x_i,t la posición monetaria
+en dólares del activo i.
 
-For \(k \in \{5,10\}\), define
+Los pesos del libro para este módulo deben definirse sobre gross absoluto:
 
-\begin{equation}
-TS_{k,t} = \sum_{i \in \text{Top-}k(w_t)} w_{i,t},
-\end{equation}
+    w_i,t = |x_i,t| / (sum_j in U_t |x_j,t| + eps)
 
-where \(\text{Top-}k(w_t)\) is the set of the \(k\) largest absolute weights. This is easier to interpret operationally than \(HHI_t\): it tells us what fraction of gross exposure is concentrated in the dominant names.
+de modo que:
 
-\subsection{Liquidity Pressure}
+    sum_i w_i,t = 1
 
-Let \(ADV_{i,t}\) denote average daily dollar volume. Define name-level liquidity usage by
+La razón es directa:
+el crowding es un fenómeno de concentración de uso de capacidad, no de dirección neta.
+Tanto largos como cortos consumen capacidad, liquidez y atención operativa.
 
-\begin{equation}
-\ell_{i,t} = \frac{|x_{i,t}|}{ADV_{i,t} + \varepsilon}.
-\end{equation}
+7. Métricas de concentración
 
-We then aggregate to a portfolio-level liquidity pressure statistic:
+7.1 Herfindahl-Hirschman Index
+La métrica base de concentración es:
 
-\begin{equation}
-LP_t = \sum_{i \in \mathcal{U}_t} w_{i,t}\,\ell_{i,t}.
-\end{equation}
+    HHI_t = sum_i w_i,t^2
 
-This quantity is dimensionless and rises when the book is not only concentrated, but concentrated in names where gross participation is large relative to tradable volume. This is preferable to an ad hoc ``liquidity-adjusted HHI'' written as an inverse factor, because \(LP_t\) preserves clear monotonicity: higher means worse.
+Interpretación:
+- cuanto mayor es HHI_t, más colapsado está el gross en pocos nombres;
+- el rango mecánico depende del número de nombres activos;
+- por tanto, HHI no debe interpretarse en bruto, sino respecto a su propia historia.
 
-\subsection{Signal-to-Book Overlap}
+7.2 Top-k share
+Para k en {5, 10}, definimos:
 
-To measure whether the live book is excessively aligned with the strongest current signals, define robustly standardized signal and portfolio vectors:
+    TS_k,t = sum_{i in Top-k(w_t)} w_i,t
 
-\begin{equation}
-\tilde{s}_{i,t} =
-\frac{s_{i,t} - \mathrm{median}(s_t)}
-{\mathrm{MAD}(s_t) + \varepsilon},
-\qquad
-\tilde{w}_{i,t} =
-\frac{w_{i,t} - \mathrm{median}(w_t)}
-{\mathrm{MAD}(w_t) + \varepsilon}.
-\end{equation}
+Esta métrica es especialmente útil porque:
+- es operativamente muy interpretable;
+- responde a la pregunta “qué parte del gross vive en los nombres dominantes”;
+- y suele ser más fácil de comunicar que HHI a portfolio y execution.
 
-Then define cosine overlap by
+8. Métrica de presión de liquidez
 
-\begin{equation}
-\rho_t =
-\frac{\sum_{i \in \mathcal{U}_t} \tilde{s}_{i,t}\tilde{w}_{i,t}}
-{\left(\sum_i \tilde{s}_{i,t}^2\right)^{1/2}
- \left(\sum_i \tilde{w}_{i,t}^2\right)^{1/2} + \varepsilon}.
-\end{equation}
+Para cada nombre, definimos uso de liquidez:
 
-A high positive \(\rho_t\) indicates that the current book is strongly concentrated in the same names that currently dominate the signal cross-section, which may amplify common-position risk and slippage during rebalances.
+    ell_i,t = |x_i,t| / (ADV_i,t + eps)
 
-\subsection{Composite Crowding Score}
+y agregamos a nivel libro mediante:
 
-Each raw metric is normalized using only trailing information. For any metric \(m_t\), define
+    LP_t = sum_i w_i,t * ell_i,t
 
-\begin{equation}
-z_t(m) =
-\frac{m_t - \mu_{t-1}^{(L)}(m)}
-{\sigma_{t-1}^{(L)}(m) + \varepsilon},
-\end{equation}
-
-where \(\mu_{t-1}^{(L)}\) and \(\sigma_{t-1}^{(L)}\) are the rolling mean and standard deviation over the previous \(L\) trading days, computed strictly out-of-sample.
+Interpretación:
+- LP_t sube cuando el libro no solo está concentrado, sino concentrado en nombres
+  cuyo tamaño relativo frente a ADV es elevado;
+- es preferible a proxies ad hoc de “HHI ajustado por liquidez” porque mantiene
+  monotonía limpia: más alto significa peor;
+- y conecta directamente con riesgo de ejecución, participación forzada y fragilidad
+  al rebalancear.
 
-The default crowding score is
-
-\begin{equation}
-C_t =
-\frac{1}{4}\Big(
-z_t(HHI) + z_t(TS_{10}) + z_t(LP) + z_t(\max\{0,\rho_t\})
-\Big).
-\end{equation}
-
-Equal weights are the default because they are transparent and robust. A supervised weighting scheme may be added later, but only if it is estimated on training data and validated out-of-sample.
-
-\subsection{Alert Policy}
-
-Fixed universal thresholds such as \(HHI > 0.25\) are not appropriate across universes. Instead, thresholds must be calibrated from the training sample:
-
-\begin{equation}
-\texttt{warn}_t \iff C_t > Q_{0.90}^{\mathrm{train}}(C),
-\qquad
-\texttt{hard}_t \iff C_t > Q_{0.97}^{\mathrm{train}}(C).
-\end{equation}
-
-The module therefore emits one of
-
-\[
-\texttt{alert} \in \{\texttt{ok}, \texttt{warn}, \texttt{hard}\}.
-\]
+ADV debe ser PIT-safe y suficientemente robusto.
+Si ADV falta o es poco fiable, el nombre debe excluirse o imputarse de forma conservadora,
+pero nunca introducir sesgo optimista silencioso.
 
-\section{Implementation Logic}
+9. Solapamiento señal-libro
 
-\begin{lstlisting}
-import numpy as np
-import pandas as pd
+El módulo también debe medir si el libro actual se está apilando justamente en los nombres
+que dominan la sección cruzada de señales.
 
-EPS = 1e-12
+Para ello, se construyen versiones robustamente estandarizadas de señal y pesos:
 
-def normalize_abs_weights(dollar_pos: np.ndarray) -> np.ndarray:
-    gross = np.abs(dollar_pos).sum()
-    if gross <= EPS:
-        return np.zeros_like(dollar_pos, dtype=float)
-    return np.abs(dollar_pos) / gross
+    s_tilde_i,t = (s_i,t - median(s_t)) / (MAD(s_t) + eps)
+    w_tilde_i,t = (w_i,t - median(w_t)) / (MAD(w_t) + eps)
 
-def hhi(weights: np.ndarray) -> float:
-    return float(np.sum(weights ** 2))
+y se calcula un coseno robusto:
 
-def top_k_share(weights: np.ndarray, k: int) -> float:
-    if len(weights) == 0:
-        return np.nan
-    k = min(k, len(weights))
-    return float(np.sort(weights)[-k:].sum())
+    rho_t = <s_tilde_t, w_tilde_t> / (||s_tilde_t|| * ||w_tilde_t|| + eps)
 
-def robust_z(x: np.ndarray) -> np.ndarray:
-    med = np.median(x)
-    mad = np.median(np.abs(x - med))
-    return (x - med) / (mad + EPS)
+Interpretación:
+- rho_t alto y positivo indica que el libro está excesivamente alineado con la parte
+  dominante de la señal;
+- eso puede amplificar common-position risk, crowding interno y slippage en rebalanceos;
+- rho_t bajo o negativo indica menor apilamiento libro-señal.
 
-def cosine_overlap(a: np.ndarray, b: np.ndarray) -> float:
-    na = np.linalg.norm(a)
-    nb = np.linalg.norm(b)
-    if na <= EPS or nb <= EPS:
-        return np.nan
-    return float(np.dot(a, b) / (na * nb + EPS))
+En el score compuesto suele tener sentido penalizar solo la parte positiva del solapamiento,
+porque la preocupación operativa está en el apilamiento, no en la anti-alineación.
 
-def crowding_metrics(day_df: pd.DataFrame) -> pd.Series:
-    w = normalize_abs_weights(day_df["dollar_position"].to_numpy())
-    adv = day_df["adv_dollar"].to_numpy()
-    sig = day_df["signal"].to_numpy()
+10. Normalización temporal
 
-    liq_use = np.abs(day_df["dollar_position"].to_numpy()) / (adv + EPS)
-    lp = float(np.sum(w * liq_use))
+Ninguna métrica cruda debe leerse aislada.
+El módulo debe estandarizar cada componente respecto a su propio historial usando
+solo información disponible hasta t-1.
 
-    sig_z = robust_z(sig)
-    w_z = robust_z(w)
-    overlap = cosine_overlap(sig_z, w_z)
+Para cualquier métrica m_t:
 
-    return pd.Series({
-        "n_names": int(len(day_df)),
-        "hhi": hhi(w),
-        "top_5_share": top_k_share(w, 5),
-        "top_10_share": top_k_share(w, 10),
-        "liquidity_pressure": lp,
-        "signal_overlap": overlap,
-    })
+    z_t(m) = (m_t - mu_{t-1}^{(L)}(m)) / (sigma_{t-1}^{(L)}(m) + eps)
 
-positions = pd.read_parquet(positions_history_path)
-signals = pd.read_parquet(signal_history_path)
-liq = pd.read_parquet(liquidity_panel_path)
+donde:
+- mu_{t-1}^{(L)} es la media rolling de longitud L calculada hasta t-1;
+- sigma_{t-1}^{(L)} es la desviación estándar rolling calculada hasta t-1;
+- L debe ser suficientemente grande para estabilizar la referencia histórica.
 
-df = (
-    positions
-    .merge(signals[["date", "asset", "signal"]], on=["date", "asset"], how="left")
-    .merge(liq[["date", "asset", "adv_dollar"]], on=["date", "asset"], how="left")
-)
+Este shift es obligatorio.
+Sin él, el módulo incurre en look-ahead sutil al usar la propia observación de t
+en la normalización de t.
 
-daily = (
-    df.groupby("date", group_keys=False)
-      .apply(crowding_metrics)
-      .sort_index()
-)
+11. Crowding score compuesto
 
-lookback = 252
-for col in ["hhi", "top_10_share", "liquidity_pressure", "signal_overlap"]:
-    mu = daily[col].rolling(lookback, min_periods=63).mean().shift(1)
-    sd = daily[col].rolling(lookback, min_periods=63).std().shift(1)
-    daily[f"z_{col}"] = (daily[col] - mu) / (sd + EPS)
+La especificación base recomendada es:
 
-daily["crowding_score"] = 0.25 * (
-    daily["z_hhi"].fillna(0.0)
-    + daily["z_top_10_share"].fillna(0.0)
-    + daily["z_liquidity_pressure"].fillna(0.0)
-    + daily["z_signal_overlap"].clip(lower=0.0).fillna(0.0)
-)
+    C_t = 0.25 * (
+        z_t(HHI)
+      + z_t(TS_10)
+      + z_t(LP)
+      + z_t(max(0, rho_t))
+    )
 
-q_warn = daily.loc[train_mask, "crowding_score"].quantile(0.90)
-q_hard = daily.loc[train_mask, "crowding_score"].quantile(0.97)
+Interpretación:
+- C_t resume en una sola escala si el libro está más concentrado, menos líquido
+  y más solapado con la señal de lo normal para su propia historia;
+- pesos iguales son el punto de partida correcto porque son transparentes, simples
+  y difíciles de sobreajustar;
+- un esquema supervisado de pesos solo tendría sentido si se entrena exclusivamente
+  en train y demuestra valor OOS adicional.
 
-daily["alert"] = "ok"
-daily.loc[daily["crowding_score"] > q_warn, "alert"] = "warn"
-daily.loc[daily["crowding_score"] > q_hard, "alert"] = "hard"
+Este score no debe interpretarse como una probabilidad calibrada.
+Es un estado sintético de crowding relativo al propio sistema.
 
-daily.to_parquet(output_path)
-\end{lstlisting}
+12. Política de alertas
 
-\section{Calibration Requirements}
+Los umbrales no deben ser universales ni fijados a priori de forma arbitraria.
+Deben calibrarse sobre train, porque la escala de C_t depende del universo,
+la construcción del libro y la liquidez de la estrategia.
 
-The module is only useful if its alerts correlate with future degradation in tradability or alpha retention. Therefore, calibration must be tied to concrete downstream variables rather than arbitrary thresholds.
+Regla base:
 
-Let \(h\) be the forward horizon used by the rebalance engine, typically \(h \in \{1,3,5\}\) trading days. Define one or more forward targets, for example:
+    warn_t si C_t > Q_0.90^train(C)
+    hard_t si C_t > Q_0.97^train(C)
 
-\begin{equation}
-Y_t^{(1)} = \text{future implementation shortfall over } [t,t+h],
-\end{equation}
+con salida discreta:
 
-\begin{equation}
-Y_t^{(2)} = \text{future realized alpha decay over } [t,t+h],
-\end{equation}
+    alert in {ok, warn, hard}
 
-\begin{equation}
-Y_t^{(3)} = \text{future tail loss or drawdown event indicator}.
-\end{equation}
+Interpretación correcta:
+- ok   -> condiciones normales;
+- warn -> crowding elevado respecto al historial propio;
+- hard -> crowding extremo respecto al historial propio.
 
-A valid calibration should show that larger \(C_t\) predicts worse future execution quality and/or weaker realized alpha retention. If not, the score is not economically useful and must not be promoted into production gating.
+Pero estos estados no deben transformarse automáticamente en caps o throttles duros
+sin que exista evidencia de que C_t predice degradación futura relevante.
 
-\section{Validation Protocol}
+13. Validación económica obligatoria del score
 
-Validation must be performed with strict train/validation/test splits and with all rolling statistics shifted to avoid look-ahead bias.
+El módulo solo es realmente útil si C_t anticipa deterioro futuro en variables económicas
+relevantes. Por ello, debe validarse contra targets forward concretos.
 
-The module should be accepted only if most of the following hold out-of-sample:
+Horizontes típicos:
+- h in {1, 3, 5} días.
 
-\begin{enumerate}[label=\arabic*.]
-    \item Monotonicity: higher deciles of \(C_t\) correspond to worse future slippage and/or weaker forward alpha retention.
-    \item Stability: the relationship holds across major liquidity regimes and subperiods.
-    \item Actionability: applying a crowding-aware throttle improves implementation quality without destroying too much gross alpha.
-    \item Incrementality: the score adds information beyond simple concentration proxies such as \(HHI_t\) alone.
-\end{enumerate}
+Targets recomendados:
+- Y_t^(1): implementation shortfall futuro en [t, t+h];
+- Y_t^(2): decay de alpha ex-ante a ex-post en [t, t+h];
+- Y_t^(3): indicador de evento de cola, pérdida severa o drawdown en [t, t+h].
 
-Useful summary diagnostics include decile tables, Spearman rank correlations, conditional means of forward shortfall, and regime-by-regime breakdowns.
+La pregunta correcta no es si C_t “parece razonable”, sino si:
 
-\section{Integration With the Rest of the System}
+- E[Y_t^(1) | C_t alto] empeora;
+- E[Y_t^(2) | C_t alto] empeora;
+- P(Y_t^(3)=1 | C_t alto) aumenta.
 
-This module must integrate explicitly with the rest of the stack:
+Si eso no aparece de forma suficientemente estable OOS, el score puede seguir usándose
+como diagnóstico blando, pero no como mecanismo hard de portfolio gating. :contentReference[oaicite:1]{index=1}
 
-\begin{itemize}
-    \item \textbf{portfolio}: use \texttt{alert} to cap max name weight, reduce concentration, or reallocate across less crowded names.
-    \item \textbf{rebalance}: use \texttt{crowding\_score} to throttle target changes when the portfolio is already capacity-stressed.
-    \item \textbf{execution / impact\_model}: condition impact coefficients or participation limits on current crowding conditions.
-    \item \textbf{capacity\_analysis}: combine crowding diagnostics with AUM scaling studies and turnover-cost curves.
-    \item \textbf{validation}: verify that any crowding-aware intervention improves net performance after realistic costs rather than merely reducing gross exposure.
-\end{itemize}
+14. Procedimiento mínimo de calibración
 
-\section{Edge Cases and Failure Modes}
+El procedimiento mínimo defendible debe ser temporal y leakage-safe.
 
-The implementation must handle the following cases explicitly:
+14.1 Split temporal
+Dividir histórico en:
+- train
+- validation
+- test
 
-\begin{enumerate}[label=\arabic*.]
-    \item \textbf{Too few names}: if \(N_t\) is very small, \(HHI_t\) is mechanically high; interpret relative to historical percentiles, not in isolation.
-    \item \textbf{Missing ADV}: if \(ADV_{i,t}\) is unavailable or stale, the name must be excluded from liquidity-pressure calculations or imputed conservatively.
-    \item \textbf{Near-zero gross}: if total gross exposure is near zero, all concentration metrics should be set to missing rather than forced.
-    \item \textbf{Corporate events / price jumps}: extreme one-day moves can distort dollar weights; optional winsorization may be used, but only before score construction and with auditability.
-    \item \textbf{Universe drift}: thresholds must be recalibrated when the tradable universe or book construction logic changes materially.
-\end{enumerate}
+14.2 Deciles o bins de crowding
+En train, construir bins de C_t:
+- idealmente deciles;
+- o menos bins si el tamaño muestral es limitado.
 
-\section{What This Module Is Not}
+14.3 Curvas de respuesta
+Para cada bin b y target Y^(r), calcular:
 
-This module should not contain unsupported claims about Sharpe uplift, return improvement, or ``ultra-profitable'' outcomes. Those belong to downstream empirical validation. The responsibility of \texttt{crowding\_detector.py} is narrower and more important: to measure concentration and liquidity stress in a way that is statistically defensible, operationally interpretable, and directly usable by portfolio and execution layers.
+    mu_hat_b^(r) = E[Y_t^(r) | C_t in bin b]
 
-\section{References}
+y para targets binarios como eventos de cola:
 
-\begin{thebibliography}{9}
+    p_hat_b = P(Y_t^(3)=1 | C_t in bin b)
 
-\bibitem{greenwood}
-Greenwood, R. and Thesmar, D.
-\textit{Stock Price Fragility}.
-Journal of Financial Economics, 102(3), 2011.
+14.4 Criterio de utilidad
+Se espera que:
+- shortfall futuro empeore al subir el bin de C_t;
+- alpha retention empeore al subir el bin de C_t;
+- y/o la frecuencia de eventos de cola aumente con bins altos.
 
-\bibitem{grinold}
-Grinold, R. C. and Kahn, R. N.
-\textit{Active Portfolio Management}.
-2nd ed., McGraw--Hill, 2000.
+14.5 Confirmación OOS
+La monotonicidad y separación observadas en train deben sostenerse razonablemente
+en validation y test.
+Si no se sostienen, el módulo no debe emplearse para gating duro.
 
-\bibitem{almgren}
-Almgren, R. and Chriss, N.
-\textit{Optimal Execution of Portfolio Transactions}.
-Journal of Risk, 3(2), 2001.
+15. Incertidumbre y bootstrap
 
-\end{thebibliography}
+Para no sobreinterpretar diferencias entre bins o deciles, el módulo debería soportar
+bandas de confianza sobre la curva:
 
-\end{document}
+    bin(C_t) -> E[Y_t]
+
+La forma razonable de hacerlo aquí es bootstrap por bloques temporales, no remuestreo iid,
+porque los targets forward suelen inducir dependencia temporal y solapamiento entre observaciones.
+
+Especificación recomendable:
+- unidad bootstrap: bloque de fechas;
+- tamaño de bloque configurable, por ejemplo 20 días;
+- en cada réplica se recomputa la curva bin -> media target;
+- se obtienen bandas percentiles para cada bin.
+
+Esto no convierte el módulo en un paper, pero sí evita vender como robusta una relación
+decil-shortfall que puede ser puro ruido temporal. :contentReference[oaicite:2]{index=2}
+
+16. Descomposición del score
+
+El módulo debe persistir no sólo C_t, sino también las contribuciones de sus piezas:
+
+- z_hhi
+- z_top_10_share
+- z_liquidity_pressure
+- z_signal_overlap_used
+- contribution_hhi
+- contribution_top_10
+- contribution_lp
+- contribution_overlap
+
+Esto mejora mucho la interpretabilidad operativa:
+no es lo mismo un alert disparado por concentración pura que uno disparado por presión
+de liquidez o por apilamiento libro-señal.
+
+17. Integración con el resto del sistema
+
+El módulo debe integrarse explícitamente con varias capas:
+
+17.1 portfolio
+Puede usar alert o crowding_score para:
+- capar peso máximo por nombre;
+- reducir concentración;
+- redistribuir riesgo hacia nombres menos estresados.
+
+17.2 rebalance
+Puede usar C_t para:
+- throttlear cambios de target;
+- reducir agresividad de rebalance en entornos de crowding alto.
+
+17.3 execution / impact_model
+Puede usar el estado de crowding para:
+- endurecer límites de participación;
+- aumentar prudencia en coeficientes de impacto;
+- ajustar scheduling en ejecución.
+
+17.4 capacity_analysis
+Debe combinarse con:
+- estudios de escalado de AUM;
+- curvas de turnover-cost;
+- y escenarios de capacidad.
+
+18. Edge cases y failure modes
+
+Los casos problemáticos más importantes son:
+
+- pocos nombres:
+  HHI puede salir mecánicamente alto; debe leerse contra percentiles históricos,
+  no como umbral absoluto.
+
+- ADV faltante o stale:
+  LP puede quedar sesgado; conviene excluir o imputar conservadoramente.
+
+- gross casi cero:
+  si el denominador es casi cero, las métricas deben ir a missing, no a números forzados.
+
+- eventos corporativos o price shocks:
+  movimientos extremos pueden distorsionar dollar weights; una winsorización opcional
+  puede ser útil si se documenta y persiste.
+
+- drift del universo:
+  si cambia materialmente el universo, la lógica de posiciones o el régimen de liquidez,
+  deben recalibrarse z-scores y cuantiles de alerta.
+
+- score reactivo a un único nombre:
+  un spike en 1–2 nombres puede inflar el score sin crowding estructural; hay que vigilar
+  la descomposición y, si hace falta, habilitar winsorización o filtros de robustez.
+
+19. Invariantes
+
+Los invariantes obligatorios son:
+
+- todos los z-scores deben usar solo historia hasta t-1;
+- ninguna variable forward puede entrar en la construcción de C_t;
+- la calibración de umbrales warn/hard debe hacerse sólo con train;
+- cualquier recalibración debe quedar versionada y trazable;
+- el score debe persistirse junto con todos sus componentes subyacentes;
+- cualquier winsorización o imputación debe ser explícita y auditable;
+- el módulo debe seguir siendo interpretable bajo cambios razonables de escala del universo.
+
+20. Contrato de salida
+
+La salida canónica debe incluir, para cada fecha t, al menos:
+
+- n_names
+- hhi
+- top_5_share
+- top_10_share
+- liquidity_pressure
+- signal_overlap
+- z_hhi
+- z_top_10_share
+- z_liquidity_pressure
+- z_signal_overlap
+- crowding_score
+- alert
+- calibration_version
+- notes
+
+Ruta típica de persistencia:
+
+    research/capacity_analysis/artifacts/crowding_scores.parquet
+
+Si además se ejecuta calibración offline, deberían persistirse también tablas auxiliares
+de deciles, curvas target-condicionadas y bandas bootstrap.
+
+21. Criterios de aceptación
+
+El módulo solo debe considerarse listo si cumple:
+
+- PIT safety:
+  todas las métricas y z-scores están construidos sin leakage;
+
+- estabilidad:
+  el score no colapsa ante pequeños cambios razonables en lookback o universo;
+
+- interpretabilidad:
+  puede explicarse claramente por qué una fecha sale en warn u hard;
+
+- utilidad económica:
+  bins altos de C_t muestran, al menos de forma razonable, peor ejecución o peor
+  retención de alpha en valid/test;
+
+- accionabilidad:
+  existe una integración downstream plausible que use el score sin destruir alpha
+  por sobreprotección.
+
+22. Qué no debe afirmarse
+
+crowding_detector.py no debe venderse como:
+- fuente directa de Sharpe;
+- prueba de crowding de todo el mercado;
+- sustituto de un impact model estructural;
+- ni filtro milagroso que por sí solo mejore el sistema.
+
+Su responsabilidad es más estrecha y más útil:
+detectar cuándo el propio libro entra en una zona históricamente anómala de concentración,
+presión de liquidez y solapamiento con señal, y comprobar si esa condición anticipa
+deterioro futuro suficientemente consistente como para justificar intervención.
+
+23. Conclusión
+
+crowding_detector.py debe existir para responder, cada día, una pregunta crítica
+de capacidad y robustez:
+
+- si el libro actual está demasiado concentrado;
+- si esa concentración es peligrosa frente a la liquidez disponible;
+- y si ese estado anticipa empeoramiento futuro de ejecución o alpha retention.
+
+Ese es el estándar correcto de un detector de crowding serio en una pipeline profesional
+de small-cap swing trading.

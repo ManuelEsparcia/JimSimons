@@ -1,466 +1,653 @@
-\section{Módulo: \texttt{labels/label\_qc.py}}
+Módulo: labels/label_qc.py
 
-\subsection{Objetivo del módulo}
+1. Objetivo del módulo
 
-El módulo \texttt{labels/label\_qc.py} constituye la capa formal de \emph{control de calidad, integridad metodológica y gobernanza operativa} de los labels del sistema. Su función no es meramente descriptiva ni estadística; actúa como \emph{gatekeeper institucional} entre la construcción de targets y cualquier etapa posterior de entrenamiento, validación o backtesting. En otras palabras, este módulo decide si los labels producidos por \texttt{build\_labels.py}, \texttt{event\_labels.py} o \texttt{neutralized\_targets.py} son suficientemente válidos, completos, coherentes y temporalmente consistentes como para poder entrar en un proceso serio de \emph{quant research}.
+El objetivo de labels/label_qc.py es actuar como capa formal de control de calidad,
+integridad metodológica y gobernanza operativa de los labels del sistema.
 
-En un pipeline de \emph{small caps swing trading}, un conjunto de labels puede estar formalmente presente y, sin embargo, ser metodológicamente inaceptable por múltiples razones: \emph{leakage}, desalineación con features, cobertura insuficiente, degradación estructural en horizontes largos, colapso del balance de clases, outliers espurios inducidos por errores de datos, o incoherencia entre \texttt{label\_valid\_flag} y la razón de exclusión. Por tanto, \texttt{label\_qc.py} debe operar como una capa de \emph{validación ex ante}, no como un simple reporte ex post.
+Su función no es “describir estadísticas del target”, sino decidir si los labels producidos por:
+- labels/build_labels.py,
+- labels/event_labels.py,
+- y cualquier módulo derivado de targets,
+son suficientemente válidos, consistentes, alineados y estables como para entrar en:
 
-Su objetivo general es garantizar simultáneamente que:
+- entrenamiento,
+- validación,
+- backtesting,
+- o promoción de research.
 
-\begin{itemize}
-  \item Los labels válidos poseen integridad estructural, semántica y temporal.
-  \item No existe \emph{feature--label leakage}, ni desajuste entre el instante informativo de las features y la ventana forward del target.
-  \item La cobertura, dispersión, balance y estabilidad de los labels son suficientes para sostener aprendizaje estadístico no degenerado.
-  \item Los errores críticos provocan \texttt{FAIL} automático del pipeline, mientras que problemas menores quedan formalmente clasificados como \texttt{WARN} o \texttt{INFO}.
-  \item Los resultados son auditables por \texttt{run\_id}, horizonte, familia de target y motivo exacto de fallo.
-\end{itemize}
+En un stack serio de small caps, un conjunto de labels puede existir físicamente y, aun así,
+ser inaceptable por razones estructurales o metodológicas:
+- leakage,
+- desalineación con features,
+- cobertura insuficiente,
+- colapso de varianza,
+- labels válidos con NaN/Inf,
+- outliers espurios por errores de datos,
+- incoherencia entre valid flags y exclusion reasons,
+- o drift estructural de cobertura y distribución.
 
-Este módulo debe entenderse, por tanto, como una \emph{capa de control interno de calidad cuantitativa}, análoga a lo que en ingeniería de datos sería una combinación de \emph{schema enforcement}, \emph{data validation}, \emph{temporal integrity checks} y \emph{release gating}. En un entorno serio, ningún modelo debería entrenarse sobre labels que no hayan atravesado satisfactoriamente este filtro \cite{LopezdePrado2018}. 
+Por tanto, labels/label_qc.py debe comportarse como un gatekeeper institucional:
+si falla, no debe permitirse el uso downstream de esos labels salvo política explícita de override,
+que por defecto debe estar desactivada.
 
-\subsection{Principios de diseño}
+2. Principios no negociables
 
-La especificación del módulo se apoya en los siguientes principios:
+2.1 Primacía de la validez temporal
+Cualquier sospecha razonable de leakage, mala alineación PIT o inconsistencia entre
+feature timestamp y label window es crítica.
 
-\begin{enumerate}
-  \item \textbf{Primacía de la validez temporal.} Cualquier sospecha razonable de \emph{leakage}, desalineación temporal o inconsistencia PIT es crítica y debe tener severidad máxima.
-  
-  \item \textbf{Separación entre validez estructural y validez estadística.} Un label puede ser estructuralmente correcto pero estadísticamente inusable, o viceversa. El QC debe evaluar ambas dimensiones de forma separada.
-  
-  \item \textbf{Governance explícita de severidad.} Cada check debe clasificarse como \texttt{FAIL}, \texttt{WARN} o \texttt{INFO}. Sin esta capa, el QC se degrada a diagnóstico cosmético.
-  
-  \item \textbf{Determinismo y reproducibilidad.} Dados los mismos inputs, configuración y thresholds, el resultado del QC debe ser exactamente reproducible.
-  
-  \item \textbf{Jerarquía clara entre observación, horizonte y ejecución global.} El sistema debe poder detectar fallos a nivel de fila, agregarlos por horizonte y consolidarlos en un estado global del \texttt{run}.
-  
-  \item \textbf{No confundir anomalía estadística con error de datos.} En small caps, los movimientos extremos pueden ser reales; el QC debe distinguir entre \emph{tail event legítimo} y \emph{corruption artifact}.
-\end{enumerate}
+2.2 Separación entre validez estructural y validez estadística
+Un label puede ser estructuralmente correcto pero estadísticamente inútil,
+o estadísticamente razonable pero metodológicamente inválido.
+El QC debe evaluar ambas dimensiones por separado.
 
-\subsection{Marco matemático y objetos del QC}
+2.3 Gobernanza explícita
+Todo check debe emitir severidad formal:
+- FAIL
+- WARN
+- INFO
+
+Sin esto, el QC se degrada a diagnóstico cosmético.
+
+2.4 Determinismo
+Dados los mismos inputs, thresholds y config, el resultado debe ser idéntico.
+
+2.5 Gate de producción, no dashboard ornamental
+El módulo debe poder bloquear automáticamente un run defectuoso.
+No basta con producir un informe bonito.
+
+2.6 Robustez > limpieza ingenua
+En small caps hay colas reales.
+El QC debe distinguir entre evento extremo legítimo y corrupción de datos.
+
+2.7 Auditabilidad por run y por horizonte
+Cada decisión de QC debe poder rastrearse por:
+- run_id,
+- horizonte,
+- familia de target,
+- y motivo exacto de fallo.
+
+3. Qué hace y qué no hace
+
+3.1 Qué hace
+- valida schema, claves e integridad estructural;
+- verifica consistencia entre flags y razones de exclusión;
+- calcula cobertura por horizonte;
+- detecta degeneración estadística;
+- analiza balance de clases en targets discretos;
+- detecta outliers robustamente;
+- verifica alineación exacta con features;
+- ejecuta checks temporales anti-leakage;
+- detecta drift estructural en cobertura y distribución;
+- agrega severidades y emite gate global;
+- persiste reportes y artifacts de auditoría.
+
+3.2 Qué no hace
+- no construye labels;
+- no construye features;
+- no sustituye leakage_audit.py;
+- no decide purged splits;
+- no corrige automáticamente errores de labels;
+- no hace model selection;
+- no optimiza thresholds en producción.
+
+4. Rol dentro del stack
+
+Secuencia correcta:
+
+    labels/build_labels.py
+    -> labels/event_labels.py
+    -> labels/label_qc.py
+    -> labels/purged_splits.py
+    -> models/*
+
+Interpretación:
+- build_labels.py y event_labels.py construyen outcomes;
+- label_qc.py valida si esos outcomes son utilizables;
+- purged_splits.py asume que los labels ya son estructuralmente válidos.
+
+5. Entradas contractuales
+
+5.1 Entradas mínimas
+- labels_store_path
+- features_index_path
+- label_qc_config_path
+- run_id
+
+5.2 Entradas opcionales
+- prices_pit_path
+- universe_history_path
+- trading_calendar_path
+- costs_path
+- split_metadata_path
+- label_manifest_path
+
+5.3 Configuración mínima
+- coverage_fail_by_horizon
+- coverage_warn_by_horizon
+- var_min_by_horizon
+- class_balance_warn_by_horizon
+- class_balance_fail_by_horizon
+- outlier_method
+- outlier_thresholds
+- leakage_policy
+- alignment_policy
+- drift_detection_policy
+- qc_window
+- gate_aggregation_policy
+- policy_version
+
+6. Objetos matemáticos básicos
 
 Sea:
-\begin{itemize}
-  \item \( \mathcal{D} = \{(t,i)\} \) el conjunto de observaciones fecha--símbolo.
-  \item \( \mathcal{H} = \{h_1,\dots,h_m\} \) el conjunto de horizontes.
-  \item \( y_{t,i,h} \) el label del activo \( i \) en la fecha \( t \) para el horizonte \( h \).
-  \item \( v_{t,i,h} \in \{0,1\} \) el indicador de validez del label.
-  \item \( r_{t,i,h} \) la razón de exclusión si \( v_{t,i,h}=0 \).
-  \item \( \mathcal{I}_{F} \) el índice de features y \( \mathcal{I}_{L} \) el índice de labels.
-\end{itemize}
+- D = {(t,i)} el conjunto de filas fecha-símbolo;
+- H = {h_1,...,h_m} el conjunto de horizontes;
+- y_{t,i,h} el label en (t,i,h);
+- v_{t,i,h} ∈ {0,1} el indicador de validez;
+- r_{t,i,h} la razón de exclusión;
+- I_F el índice efectivo de features;
+- I_L el índice efectivo de labels.
 
-El QC evalúa tres niveles de consistencia:
+El QC evalúa tres capas:
 
-\begin{enumerate}
-  \item \textbf{Consistencia de tabla}: unicidad de claves, schema, nullability, coherencia de flags y razones de exclusión.
-  \item \textbf{Consistencia estadística}: cobertura, dispersión, colas, balance, degeneración de clases, drift por horizonte.
-  \item \textbf{Consistencia temporal}: alineación con features, ausencia de leakage, correcta invalidez de ventanas incompletas y compatibilidad con purged splits.
-\end{enumerate}
+6.1 Integridad estructural
+- unicidad de claves;
+- schema;
+- flags y reason codes;
+- compatibilidad de persistencia.
 
-\subsection{Checks de integridad estructural}
+6.2 Integridad estadística
+- cobertura;
+- dispersión;
+- balance;
+- outliers;
+- drift de cobertura y distribución.
 
-\subsubsection{Unicidad de clave}
+6.3 Integridad temporal
+- alineación con features;
+- coherencia con decision_lag;
+- ausencia de leakage plausible;
+- compatibilidad con ventanas forward.
 
-Para toda clave relevante del store:
-\begin{equation}
-\forall (t,i), \quad \left| \{k : (t^{(k)}, i^{(k)}) = (t,i)\} \right| = 1.
-\end{equation}
+7. Checks de integridad estructural
 
-Si el store se persiste por horizonte en formato ancho, la unicidad se exige sobre \((t,i)\). Si se persiste en formato largo, la unicidad se exige sobre \((t,i,h)\). La presencia de duplicados constituye un \texttt{FAIL} crítico.
+7.1 Unicidad de clave
 
-\subsubsection{Consistencia entre validez y razón de exclusión}
+Si el store está en formato ancho:
+- clave = (date, symbol)
 
-El QC debe imponer:
-\begin{equation}
-v_{t,i,h} = 1 \iff r_{t,i,h} = \texttt{NULL},
-\end{equation}
-y simétricamente,
-\begin{equation}
-v_{t,i,h} = 0 \iff r_{t,i,h} \neq \texttt{NULL}.
-\end{equation}
+Si el store está en formato largo:
+- clave = (date, symbol, horizon)
 
-No basta con que esta regla se cumpla ``en promedio''; cualquier violación individual debe registrarse. Si la proporción de incoherencias supera un umbral mínimo no nulo, el \texttt{run} debe fallar.
+Debe cumplirse:
 
-\subsubsection{Schema y columnas obligatorias}
+    count(key) = 1
 
-El módulo debe verificar la presencia y tipo correcto, como mínimo, de:
+Toda violación constituye FAIL.
 
-\begin{itemize}
-  \item \texttt{date}
-  \item \texttt{symbol}
-  \item columnas de target por horizonte
-  \item \texttt{label\_valid\_flag} o flags equivalentes por horizonte
-  \item \texttt{label\_exclusion\_reason}
-  \item \texttt{run\_id} o metadata equivalente
-\end{itemize}
+7.2 Schema obligatorio
 
-La ausencia de una columna obligatoria, un tipo incorrecto o una incompatibilidad de schema constituye \texttt{FAIL} automático.
+El módulo debe verificar presencia, tipo y nullability coherente de:
+- date
+- symbol
+- columnas target por horizonte
+- label_valid_flag o equivalente por horizonte
+- label_exclusion_reason
+- run_id
+- n_valid_cross_section si existe en contrato
 
-\subsection{Cobertura y completitud}
+La ausencia de una columna obligatoria o un tipo incompatible es FAIL.
 
-\subsubsection{Cobertura global por horizonte}
+7.3 Coherencia entre valid flag y exclusion reason
+
+Debe cumplirse:
+
+    v_{t,i,h} = 1  <=>  r_{t,i,h} = NULL
+    v_{t,i,h} = 0  <=>  r_{t,i,h} != NULL
+
+Esto no debe evaluarse “en promedio”.
+Toda incoherencia debe contarse individualmente.
+
+Política:
+- cualquier proporción no trivial de incoherencias -> FAIL
+- una sola incoherencia aislada puede marcarse WARN solo en modo exploratorio
+- en modo canónico: FAIL
+
+8. Cobertura y completitud
+
+8.1 Cobertura global por horizonte
 
 Definimos:
-\begin{equation}
-\mathrm{coverage\_rate}_h
-=
-\frac{\#\{(t,i): v_{t,i,h}=1\}}{\#\{(t,i): (t,i)\in \mathcal{D}_{h}^{\mathrm{eligible}}\}}.
-\end{equation}
-
-Aquí, el denominador no debe ser un recuento bruto de filas presentes, sino el conjunto elegible real dado universo histórico, rango temporal y ventana forward completables. Este detalle es importante: medir cobertura sobre un denominador mal definido puede esconder degradaciones materiales.
-
-El módulo debe fijar thresholds oficiales:
-\begin{itemize}
-  \item \texttt{FAIL} si \( \mathrm{coverage\_rate}_h < \gamma^{\mathrm{fail}}_h \)
-  \item \texttt{WARN} si \( \gamma^{\mathrm{fail}}_h \le \mathrm{coverage\_rate}_h < \gamma^{\mathrm{warn}}_h \)
-\end{itemize}
-
-\paragraph{Default canónico.}
-En configuración base, se recomienda:
-\begin{itemize}
-  \item horizontes cortos: \(\gamma^{\mathrm{warn}}_h = 0.90\), \(\gamma^{\mathrm{fail}}_h = 0.80\)
-  \item horizontes largos: thresholds algo más laxos, pero nunca abiertos indefinidamente
-\end{itemize}
-
-\subsubsection{Cobertura temporalmente localizada}
-
-No basta con mirar cobertura agregada. También debe definirse, por ventana temporal \(W\),
-\begin{equation}
-\mathrm{coverage\_rate}_{h,W}
-=
-\frac{\#\{(t,i)\in W : v_{t,i,h}=1\}}{\#\{(t,i)\in W : (t,i)\in \mathcal{D}_{h}^{\mathrm{eligible}}\}}.
-\end{equation}
-
-Esto permite detectar periodos de degradación local severa aunque la media total parezca aceptable. Una caída localizada de cobertura en episodios de estrés puede ser un \texttt{WARN} o \texttt{FAIL} según severidad y duración.
-
-\subsection{Checks numéricos y distribución del label}
-
-\subsubsection{No NaN / No Inf}
-
-Para labels válidos:
-\begin{equation}
-\forall (t,i,h)\ \text{con}\ v_{t,i,h}=1,\quad y_{t,i,h} \in \mathbb{R}.
-\end{equation}
-
-Cualquier \texttt{NaN}, \texttt{+Inf} o \texttt{-Inf} en una observación marcada como válida constituye \texttt{FAIL}. Si el label es inválido por construcción, el valor numérico podrá estar ausente, pero la invalidez debe quedar perfectamente explicada por el \texttt{reason code}.
-
-\subsubsection{Varianza positiva y no degeneración}
-
-Para cada horizonte \(h\), se exige:
-\begin{equation}
-\mathrm{Var}\left(y_{t,i,h}\mid v_{t,i,h}=1\right) > \varepsilon_h.
-\end{equation}
-
-Este check debe aplicarse:
-\begin{itemize}
-  \item globalmente,
-  \item por fecha,
-  \item y opcionalmente por subuniverso o bucket de liquidez.
-\end{itemize}
-
-Si la varianza cross-sectional por fecha colapsa sistemáticamente, el problema no es solo estadístico: puede indicar umbrales mal definidos, target mal construido, sobre-neutralización o error de persistencia.
-
-\subsubsection{Outliers y eventos extremos}
-
-El QC no debe usar una regla ingenua que marque cualquier observación extrema como corrupta. En small caps existen movimientos genuinos de gran magnitud. Por ello, el módulo debe distinguir entre:
-
-\begin{itemize}
-  \item \textbf{Outlier legítimo}: coherente con precios, volumen, evento corporativo o contexto de mercado.
-  \item \textbf{Outlier sospechoso}: magnitud extrema incompatible con la serie de precios subyacente, con corporate actions conocidas o con sanity bounds económicos.
-\end{itemize}
-
-La detección debe combinar varios filtros:
-
-\paragraph{Filtro robusto estadístico.}
-\begin{equation}
-|y_{t,i,h} - \mathrm{med}_h| \le k_{\mathrm{IQR},h}\cdot \mathrm{IQR}_h
-\end{equation}
-o percentiles extremos robustos.
-
-\paragraph{Filtro económico.}
-Comparar el label con:
-\begin{itemize}
-  \item retorno subyacente calculado directamente de precios,
-  \item presencia de split/reverse split,
-  \item delisting return,
-  \item volumen y rango diario,
-  \item evento corporativo asociado.
-\end{itemize}
-
-\paragraph{Política de severidad.}
-\begin{itemize}
-  \item Si el extremo es estadísticamente raro pero económicamente consistente: \texttt{INFO} o \texttt{WARN}.
-  \item Si el extremo es incompatible con precios base o parece error de ajuste: \texttt{FAIL} fila a fila y posible \texttt{FAIL} global si es sistemático.
-\end{itemize}
-
-Este punto es esencial para no destruir señal real bajo una política de limpieza excesivamente escolar.
-
-\subsection{Balance de clases y usabilidad para clasificación}
-
-Para targets discretos binarios:
-\begin{equation}
-\mathrm{class\_balance}_h
-=
-\frac{\#\{(t,i): y_{t,i,h}=1\}}{\#\{(t,i): y_{t,i,h}\in\{0,1\}\}}.
-\end{equation}
-
-Para targets trinarios o de colas, el QC debe medir la fracción por clase y su estabilidad temporal. El objetivo no es imponer balance perfecto, sino detectar configuraciones degeneradas donde una clase se vuelve prácticamente inexistente o dominante de forma estructural.
-
-\paragraph{Thresholds recomendados.}
-\begin{itemize}
-  \item \texttt{FAIL} si una clase esencial cae por debajo de un umbral mínimo operativo.
-  \item \texttt{WARN} si el desequilibrio es severo pero aún entrenable con técnicas apropiadas.
-\end{itemize}
-
-\paragraph{Importante.}
-Un fuerte desbalance puede ser perfectamente legítimo en un régimen concreto; por ello el QC debe distinguir entre:
-\begin{itemize}
-  \item desequilibrio económico genuino,
-  \item y colapso artificial causado por un threshold mal parametrizado.
-\end{itemize}
-
-\subsection{Alineación exacta con features}
-
-Este es uno de los checks más importantes del módulo.
-
-Sea \( \mathcal{I}_F \) el índice efectivo de features y \( \mathcal{I}_L \) el índice efectivo de labels. Definimos:
-\begin{equation}
-n_{\mathrm{mismatch}} = |\mathcal{I}_F \Delta \mathcal{I}_L|.
-\end{equation}
-
-Pero el QC no debe quedarse en una diferencia simétrica agregada. Debe verificar, al menos:
-
-\begin{itemize}
-  \item que toda observación entrenable en features posee label correspondiente o invalidez justificada;
-  \item que no existan labels ``huérfanos'' sin features asociadas;
-  \item que la fecha de decisión implícita en features sea compatible con el \texttt{decision\_lag} usado en labels;
-  \item que los últimos \(h\) días del rango se invaliden correctamente por ventana forward incompleta;
-  \item que no aparezcan labels válidos donde las features aún no eran PIT disponibles.
-\end{itemize}
-
-\paragraph{Política canónica.}
-\begin{equation}
-n_{\mathrm{mismatch}} = 0
-\end{equation}
-para el subconjunto de observaciones elegibles de entrenamiento. Cualquier desviación estructural es \texttt{FAIL}. Mismatches residuales puramente explicables por invalidez formal podrán tolerarse solo si quedan perfectamente documentados.
-
-\subsection{Checks de leakage y consistencia temporal}
-
-El \emph{leakage} no debe evaluarse solo como igualdad de índices. El QC debe incluir controles temporales explícitos:
-
-\begin{itemize}
-  \item verificación de que el horizonte forward comienza después del instante informativo de las features;
-  \item compatibilidad entre \texttt{return\_mode}, \texttt{decision\_lag} y timestamp de las features;
-  \item verificación de que la neutralización, si existe, usa exposiciones PIT;
-  \item validación de que eventos publicados fuera de mercado se asignan al primer instante operable correcto;
-  \item consistencia con ventanas exportadas a \texttt{purged\_splits.py}.
-\end{itemize}
-
-La detección de cualquier leakage plausible constituye \texttt{FAIL} automático del \texttt{run}. Este es un criterio no negociable.
-
-\subsection{Jerarquía de severidad y gate del pipeline}
-
-Cada check debe emitirse con severidad formal:
-\begin{itemize}
-  \item \texttt{FAIL}: rompe el \texttt{run}; no se permite entrenamiento posterior.
-  \item \texttt{WARN}: se permite persistencia, pero el \texttt{run} queda marcado como degradado.
-  \item \texttt{INFO}: diagnóstico sin impacto operativo inmediato.
-\end{itemize}
-
-\subsubsection{Reglas canónicas de severidad}
-
-Deben clasificarse como \texttt{FAIL}, entre otros:
-\begin{itemize}
-  \item duplicados en clave primaria,
-  \item schema roto,
-  \item NaN/Inf en labels válidos,
-  \item mismatch estructural con features,
-  \item leakage temporal,
-  \item cobertura por debajo del umbral crítico,
-  \item inconsistencia entre flags y razones de exclusión.
-\end{itemize}
-
-Deben clasificarse como \texttt{WARN}, entre otros:
-\begin{itemize}
-  \item cobertura moderadamente degradada,
-  \item desbalance severo pero entrenable,
-  \item exceso de outliers legítimos en un periodo concreto,
-  \item drift no crítico en la distribución del label.
-\end{itemize}
-
-\subsubsection{Gate global}
-
-El estado global del módulo será:
-\begin{itemize}
-  \item \texttt{pass}: ningún \texttt{FAIL}, y warnings dentro de tolerancia.
-  \item \texttt{warn}: sin \texttt{FAIL}, pero con warnings materiales.
-  \item \texttt{fail}: al menos un check crítico ha fallado.
-\end{itemize}
-
-Además del gate global, el sistema debe emitir \emph{gates por horizonte} y, opcionalmente, por familia de target.
-
-\subsection{Métricas obligatorias del reporte}
-
-El módulo debe producir, como mínimo:
-
-\begin{itemize}
-  \item \texttt{coverage\_rate\_h}
-  \item \texttt{coverage\_rate\_rolling\_h}
-  \item \texttt{n\_duplicates}
-  \item \texttt{n\_nan\_valid}
-  \item \texttt{n\_inf\_valid}
-  \item \texttt{n\_alignment\_mismatch}
-  \item \texttt{pct\_invalid\_by\_reason}
-  \item \texttt{class\_balance\_h} o distribución de clases
-  \item \texttt{var\_h} y métricas robustas de dispersión
-  \item \texttt{n\_extreme\_labels}
-  \item \texttt{n\_suspect\_outliers}
-\end{itemize}
-
-Esto permite no solo decidir si el \texttt{run} es aceptable, sino también entender \emph{por qué}.
-
-\subsection{Entradas y salidas del módulo}
-
-\subsubsection{Entradas}
-
-\begin{itemize}
-  \item \texttt{labels\_path}: store principal de labels.
-  \item \texttt{features\_index\_path}: índice efectivo de features entrenables.
-  \item \texttt{qc\_config\_path}: thresholds, severidades y políticas.
-  \item \texttt{run\_id}: identificador de ejecución.
-  \item opcionalmente, referencias a precios base, calendario y universe history para validaciones profundas.
-\end{itemize}
-
-\subsubsection{Salidas}
-
-\begin{itemize}
-  \item \texttt{labels/qc/\{run\_id\}/label\_qc\_summary.json}
-  \item \texttt{labels/qc/\{run\_id\}/label\_qc\_by\_horizon.parquet}
-  \item \texttt{labels/qc/\{run\_id\}/label\_qc\_failures.parquet}
-  \item \texttt{labels/qc/\{run\_id\}/label\_qc\_timeseries.parquet}
-  \item \texttt{labels/qc/\{run\_id\}/manifest.json}
-\end{itemize}
-
-El \texttt{manifest} debe incluir:
-\begin{itemize}
-  \item \texttt{run\_id}
-  \item \texttt{config\_hash}
-  \item versión del store de labels
-  \item versión del índice de features
-  \item thresholds activos
-  \item gate global y gates por horizonte
-\end{itemize}
-
-\subsection{Flujo operativo}
-
-El flujo canónico recomendado es:
-
-\begin{enumerate}
-  \item \texttt{load\_labels(...)}
-  \item \texttt{load\_features\_index(...)}
-  \item \texttt{validate\_schema\_and\_keys(...)}
-  \item \texttt{check\_flag\_reason\_consistency(...)}
-  \item \texttt{compute\_coverage\_and\_completeness(...)}
-  \item \texttt{check\_numeric\_integrity(...)}
-  \item \texttt{analyze\_distribution\_and\_outliers(...)}
-  \item \texttt{check\_class\_balance(...)}
-  \item \texttt{check\_feature\_label\_alignment(...)}
-  \item \texttt{run\_temporal\_leakage\_checks(...)}
-  \item \texttt{aggregate\_severity\_and\_emit\_gate(...)}
-  \item \texttt{persist\_qc\_reports(...)}
-\end{enumerate}
-
-\subsection{Defaults canónicos}
-
-Para sonar a spec institucional y no a QC abierto, el módulo debe fijar defaults:
-
-\begin{itemize}
-  \item \texttt{alignment\_policy = exact\_on\_eligible\_rows}
-  \item \texttt{nan\_policy = fail\_if\_valid}
-  \item \texttt{inf\_policy = fail\_if\_valid}
-  \item \texttt{duplicate\_policy = fail}
-  \item \texttt{leakage\_policy = fail}
-  \item \texttt{coverage\_policy = thresholded\_by\_horizon}
-  \item \texttt{outlier\_policy = robust\_plus\_economic\_sanity}
-  \item \texttt{gate\_aggregation = fail\_dominates}
-\end{itemize}
-
-Todo experimento que anule alguno de estos defaults debe quedar marcado como \texttt{non-canonical}.
-
-\subsection{CLI}
-
-Ejemplo:
-
-\begin{verbatim}
-python -m labels.label_qc \
-  --labels-path labels/store \
-  --features-index-path features/store/index.parquet \
-  --config-path configs/labels/label_qc.yaml \
-  --run-id label_qc_20260305_001
-\end{verbatim}
-
-La CLI debe abortar si:
-\begin{itemize}
-  \item no puede cargar el schema esperado,
-  \item faltan inputs mínimos para checks críticos,
-  \item la configuración contiene thresholds inconsistentes,
-  \item o el conjunto de labels no puede reconciliarse con el índice de features.
-\end{itemize}
-
-\subsection{Criterios de aceptación (DoD)}
-
-La \emph{Definition of Done} exige:
-
-\begin{itemize}
-  \item integridad estructural completa del store de labels,
-  \item ausencia de leakage y desalineación material con features,
-  \item cobertura suficiente por horizonte,
-  \item labels válidos libres de NaN/Inf,
-  \item gobernanza formal \texttt{FAIL/WARN/INFO},
-  \item reportes auditables por fila, horizonte y ejecución,
-  \item persistencia reproducible del gate global y de los motivos concretos de fallo.
-\end{itemize}
-
-No basta con ``generar un informe de QC''. El módulo debe ser capaz de impedir automáticamente que un conjunto de labels metodológicamente defectuoso llegue a la etapa de modelado.
-
-\subsection{Casos de prueba mínimos}
-
-La batería mínima de tests debe cubrir:
-
-\begin{itemize}
-  \item detección de duplicados en clave primaria,
-  \item inconsistencia entre \texttt{label\_valid\_flag} y \texttt{label\_exclusion\_reason},
-  \item NaN/Inf en labels válidos,
-  \item cobertura insuficiente por horizonte,
-  \item colapso de varianza cross-sectional,
-  \item outlier real frente a outlier corrupto,
-  \item mismatch entre índice de features e índice de labels,
-  \item leakage inducido por mal \texttt{decision\_lag},
-  \item persistencia correcta de severidad, gate y failures report.
-\end{itemize}
-
-\subsection{Bibliografía y referencias}
-
-\begin{thebibliography}{9}
-
-\bibitem{LopezdePrado2018}
-López de Prado, M. (2018).
-\emph{Advances in Financial Machine Learning}.
-Wiley.
-
-\bibitem{Leakage2023}
-Le et al. (2023).
-\emph{A framework for understanding label leakage in machine learning}.
-
-\bibitem{TemporalLabelNoise2021}
-Le et al. (2021).
-\emph{Learning from Time Series under Temporal Label Noise}.
-
-\bibitem{Bailey2014}
-Bailey, D., Borwein, J., López de Prado, M., \& Zhu, Q. (2014).
-\emph{The Probability of Backtest Overfitting}.
-
-\bibitem{IBM_leakage}
-IBM. (2024).
-\emph{What is Data Leakage in Machine Learning?}
-
-\end{thebibliography}
+
+    coverage_h
+    =
+    |{(t,i): v_{t,i,h}=1}|
+    /
+    |D_h^eligible|
+
+donde D_h^eligible no es el store presente, sino el conjunto realmente elegible dado:
+- universo histórico,
+- rango temporal,
+- ventana forward completables,
+- reglas de exclusión estructural ex ante.
+
+8.2 Thresholds canónicos
+
+Para cada horizonte h:
+- FAIL si coverage_h < gamma_fail(h)
+- WARN si gamma_fail(h) <= coverage_h < gamma_warn(h)
+- PASS si coverage_h >= gamma_warn(h)
+
+8.3 Cobertura localizada en el tiempo
+
+Para ventanas temporales W:
+
+    coverage_{h,W}
+    =
+    |{(t,i) in W: v_{t,i,h}=1}|
+    /
+    |D_{h,W}^eligible|
+
+Esto es obligatorio para no esconder degradación localizada detrás de una media global razonable.
+
+9. Drift estructural de cobertura
+
+9.1 Motivación
+Un target puede ser aceptable en media histórica y, aun así, colapsar en estrés o cambios de régimen.
+Por tanto, la cobertura debe vigilarse dinámicamente.
+
+9.2 CUSUM simple recomendado
+
+Sea c_t^{(h)} la cobertura por fecha para horizonte h.
+
+Definir:
+
+    S_t^+ = max(0, S_{t-1}^+ + (c_t - mu_c - k))
+    S_t^- = min(0, S_{t-1}^- + (c_t - mu_c + k))
+
+donde:
+- mu_c es cobertura media o referencia rolling;
+- k es slack de sensibilidad.
+
+Se dispara drift si:
+- S_t^+ > H
+o
+- |S_t^-| > H
+
+9.3 Severidad
+- drift persistente moderado -> WARN
+- drift abrupto con caída material bajo threshold crítico -> FAIL
+
+10. Checks numéricos básicos
+
+10.1 No NaN / No Inf en labels válidos
+
+Para todo label válido:
+- y_{t,i,h} debe ser número real finito.
+
+Es decir:
+
+    v_{t,i,h}=1 => y_{t,i,h} in R and finite
+
+Cualquier NaN/Inf en fila válida -> FAIL.
+
+10.2 Permisividad en filas inválidas
+En filas inválidas:
+- el target puede estar ausente;
+- pero la invalidez debe estar explicada formalmente.
+
+11. No degeneración estadística
+
+11.1 Varianza global por horizonte
+
+Para cada h:
+
+    Var(y_{t,i,h} | v=1) > epsilon_h
+
+Si la varianza colapsa, el target no sostiene aprendizaje estadístico serio.
+
+11.2 Varianza cross-sectional por fecha
+Además, debe verificarse que para una fracción suficiente de fechas:
+
+    Var_t(y_{i,t,h} | v=1) > epsilon_{t,h}
+
+Si el target es casi constante por fecha, suele indicar:
+- threshold degenerado,
+- target mal construido,
+- sobre-neutralización,
+- o errores de pipeline.
+
+11.3 Severidad
+- colapso global -> FAIL
+- colapso parcial/frecuente -> WARN o FAIL según magnitud
+
+12. Outliers: enfoque robusto y económico
+
+12.1 Principio
+No todo valor extremo es corrupto.
+En small caps, colas reales existen.
+El QC debe evitar:
+- borrar señal verdadera,
+- pero también aceptar artifacts absurdos.
+
+12.2 Regla robusta recomendada
+Usar mediana e IQR o MAD sobre labels válidos por horizonte.
+
+Opción IQR:
+
+    |y - med_h| <= k_IQR(h) * IQR_h
+
+Opción MAD:
+
+    |y - med_h| <= k_MAD(h) * MAD_h
+
+Default recomendado:
+- outlier_method = MAD
+- por mayor robustez frente a colas asimétricas
+
+12.3 Sanity económica adicional
+Un valor extremo solo debe marcarse como sospechoso si además falla alguna verificación económica:
+- incompatibilidad con el retorno subyacente desde precios PIT;
+- ausencia de corporate action que lo justifique;
+- delisting no resuelto;
+- rango de precios imposible;
+- inconsistencia con ejecución o con convención de entrada/salida.
+
+12.4 Severidad
+- extremo estadístico pero económicamente coherente -> INFO o WARN
+- extremo estadístico y económicamente incoherente -> FAIL fila a fila
+- muchos casos sistemáticos -> FAIL global
+
+13. Balance de clases
+
+13.1 Para binario
+
+    class_balance_h
+    =
+    #(y=1)
+    /
+    #(y in {0,1})
+
+13.2 Para trinario
+Medir proporciones de:
+- clase positiva
+- neutral
+- negativa
+
+13.3 Reglas
+El objetivo no es exigir 50/50 perfecto, sino evitar colapso operativo:
+- clase prácticamente inexistente
+- thresholds mal calibrados
+- target degenerado por familia o régimen
+
+13.4 Severidad
+- colapso de clase esencial -> FAIL
+- desbalance severo pero aún entrenable -> WARN
+
+14. Alineación exacta con features
+
+14.1 Definición
+Sea I_F el índice de features entrenables y I_L el índice de labels válidos o elegibles.
+
+Debe evaluarse:
+
+    mismatch = |I_F Δ I_L|
+
+pero no solo a nivel agregado.
+
+14.2 Checks obligatorios
+- toda fila entrenable en features debe tener label correspondiente o invalidez justificada;
+- no deben existir labels huérfanos sin features compatibles;
+- las filas de los últimos h días deben invalidarse correctamente por forward incompleto;
+- la fecha efectiva del label debe ser compatible con decision_lag de las features.
+
+14.3 Política canónica
+
+    mismatch = 0
+
+sobre el subconjunto elegible entrenable.
+
+Violación estructural -> FAIL.
+
+15. Checks anti-leakage y consistencia temporal
+
+15.1 Reglas mínimas
+- el horizonte forward debe comenzar después del instante informativo de las features;
+- el target no puede usar precios o costes que no fueran PIT válidos;
+- la neutralización, si existe, debe usar exposiciones PIT;
+- los labels deben ser compatibles con la convención temporal declarada en build_labels/event_labels.
+
+15.2 Leakage plausible
+Si existe cualquier indicio razonable de:
+- uso de timestamps posteriores,
+- mala resolución del decision_lag,
+- inconsistencia en ventanas forward,
+- o mezcla de universos fuera de fecha,
+
+el gate debe ser FAIL.
+
+15.3 Regla fuerte
+El label_qc no reemplaza leakage_audit.py,
+pero sí debe tener checks duros suficientes para bloquear errores evidentes.
+
+16. Score multivariante de QC (opcional, útil en fase 2)
+
+16.1 Motivación
+Una combinación de pequeñas anomalías puede ser más peligrosa que un único WARN aislado.
+
+16.2 Definición posible
+Construir un vector por horizonte:
+
+    z_h = [coverage_h, var_h, class_balance_h, outlier_rate_h]
+
+y comparar contra un estado “normal” histórico.
+
+Una opción razonable es distancia de Mahalanobis:
+
+    M_h^2 = (z_h - mu)' Sigma^{-1} (z_h - mu)
+
+16.3 Uso
+No debe sustituir los checks duros.
+Solo sirve como capa adicional de WARN/INFO o de priorización de investigación.
+
+17. Agregación formal de severidades
+
+17.1 Regla base
+FAIL domina.
+
+17.2 Gate por horizonte
+Para cada horizonte h:
+- FAIL si existe al menos un check crítico en FAIL
+- WARN si no hay FAIL pero hay warnings materiales
+- PASS en otro caso
+
+17.3 Gate global
+Sea G_h el gate por horizonte.
+Entonces:
+
+- global = FAIL si existe h con FAIL crítico
+- global = WARN si no hay FAIL y existe h con WARN material
+- global = PASS en otro caso
+
+17.4 No compensación
+Un horizonte excelente no compensa otro estructuralmente roto.
+
+18. Inputs contractuales
+
+18.1 Input mínimo
+- labels_store_path
+- features_index_path
+- config_path
+- run_id
+
+18.2 Input opcional
+- prices_pit_path
+- universe_history_path
+- label_manifest_path
+- split_metadata_path
+- cost_manifest_path
+
+19. Outputs obligatorios
+
+19.1 qc_summary.json
+Debe incluir:
+- run_id
+- global_gate
+- gates_by_horizon
+- n_failures
+- n_warnings
+- top_failure_reasons
+- config_hash
+- policy_version
+
+19.2 qc_by_horizon.parquet
+Campos mínimos:
+- horizon
+- coverage
+- variance
+- class_balance
+- outlier_rate
+- alignment_mismatch
+- drift_flag
+- gate
+
+19.3 qc_failures.parquet
+Una fila por fallo material, con:
+- run_id
+- horizon
+- severity
+- check_name
+- object_scope
+- offending_count
+- details
+
+19.4 qc_timeseries.parquet
+Con series temporales de:
+- coverage_t,h
+- variance_t,h
+- class proportions
+- drift statistics
+
+19.5 manifest.json
+Con:
+- run_id
+- labels_version
+- features_index_version
+- config_hash
+- policy_version
+- execution_timestamp
+
+20. Flujo operativo canónico
+
+1. load_labels_store(...)
+2. load_features_index(...)
+3. validate_schema(...)
+4. check_key_uniqueness(...)
+5. check_valid_flag_reason_consistency(...)
+6. compute_coverage_metrics(...)
+7. compute_numeric_integrity_metrics(...)
+8. compute_dispersion_and_class_balance(...)
+9. detect_outliers(...)
+10. check_feature_label_alignment(...)
+11. run_temporal_consistency_checks(...)
+12. run_drift_checks(...)
+13. aggregate_severity(...)
+14. emit_global_gate(...)
+15. persist_qc_outputs(...)
+
+21. Defaults canónicos
+
+- alignment_policy = exact_on_eligible_rows
+- duplicate_policy = fail
+- nan_policy = fail_if_valid
+- inf_policy = fail_if_valid
+- leakage_policy = fail
+- outlier_policy = robust_plus_economic_sanity
+- drift_policy = cusum_on_coverage
+- gate_aggregation_policy = fail_dominates
+
+Todo override de estos defaults debe quedar marcado como non_canonical.
+
+22. Criterios de aceptación
+
+Definition of Done:
+- store íntegro y sin duplicados;
+- labels válidos sin NaN/Inf;
+- coherencia exacta entre flags y reason codes;
+- cobertura aceptable por horizonte;
+- no degeneración estadística material;
+- alineación exacta con features;
+- ausencia de leakage plausible;
+- reportes completos y auditables;
+- gate global reproducible.
+
+No basta con “tener un informe”.
+El módulo debe poder impedir que labels defectuosos entren en modelado.
+
+23. Casos de prueba mínimos
+
+- duplicados en clave primaria
+- NaN en fila válida
+- Inf en fila válida
+- incoherencia flag/reason
+- cobertura por debajo de gamma_fail
+- varianza colapsada
+- colapso de clase
+- mismatch con features
+- leakage inducido por lag incorrecto
+- outlier real vs outlier corrupto
+- drift abrupto de cobertura
+- persistencia correcta de gates y reports
+
+24. MVP vs versión avanzada
+
+24.1 MVP
+- schema y key checks
+- flag/reason consistency
+- coverage por horizonte
+- varianza mínima
+- class balance
+- outlier detection robusta
+- exact alignment con features
+- leakage hard checks
+- gate global FAIL/WARN/PASS
+
+24.2 Avanzado
+- CUSUM drift de cobertura
+- score multivariante de contaminación
+- checks adicionales por familia de label
+- QC diferenciado por subuniverso/liquidity bucket
+- métricas más ricas de estabilidad temporal
+
+25. Qué NO conviene meter ahora
+
+No conviene introducir:
+- Bayesian QC completo
+- online change-point detection sofisticado
+- causal impact analysis
+- modelos generativos de “label corruption”
+- meta-learning de thresholds
+- demasiados pseudo-scores difíciles de gobernar
+
+26. Interpretación correcta
+
+La lectura correcta de labels/label_qc.py no es:
+“sacar unas estadísticas sobre los labels”.
+
+La lectura correcta es:
+“decidir formalmente si el sistema puede confiar en esos labels para research y modelado sin introducir errores metodológicos graves”.
+
+27. Conclusión
+
+labels/label_qc.py debe ser la puerta de control institucional de los targets del sistema.
+
+Su misión es:
+- bloquear labels estructuralmente defectuosos,
+- detectar degradación estadística real,
+- asegurar alineación con features,
+- endurecer la defensa anti-leakage,
+- y dejar una traza auditable exacta de qué falló, dónde y por qué.
+
+Ese es exactamente el comportamiento que debe tener una capa seria de quality control de labels
+en un stack cuantitativo institucional.

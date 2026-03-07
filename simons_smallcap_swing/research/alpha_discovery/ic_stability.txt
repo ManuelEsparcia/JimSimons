@@ -1,455 +1,644 @@
-\documentclass[11pt,a4paper]{article}
-
-\usepackage[spanish,english]{babel}
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
-\usepackage{amsmath,amssymb,amsfonts,amsthm}
-\usepackage{booktabs}
-\usepackage{longtable}
-\usepackage{array}
-\usepackage{hyperref}
-\usepackage{geometry}
-\usepackage{graphicx}
-\usepackage{enumitem}
-\usepackage{natbib}
-\geometry{margin=2cm}
-\bibliographystyle{plainnat}
+Módulo: ic_stability.py
+
+1. Propósito del módulo
+
+El objetivo de ic_stability.py es auditar la robustez temporal de una señal predictiva
+a partir de la serie diaria de su Information Coefficient (IC) fuera de muestra.
+
+La pregunta central no es si una señal tuvo días aislados de alto IC, sino si ha mostrado
+capacidad de ordenación cross-sectional suficientemente persistente, estable y reproducible
+a través del tiempo y, cuando proceda, a través de distintos subperiodos y regímenes.
+
+Este módulo no construye cartera, no optimiza pesos y no certifica explotabilidad económica
+final. Su función correcta es actuar como auditor estadístico de persistencia temporal
+dentro del pipeline de alpha discovery.
+
+2. Qué hace y qué no hace
+
+2.1 Qué hace
+- calcula el IC diario por fecha para una o varias señales;
+- mide media, dispersión, hit rate y cobertura;
+- estima significancia temporal ajustada por dependencia serial;
+- audita estabilidad rolling y consistencia por subperiodos;
+- cuantifica deterioro reciente;
+- segmenta por régimen si existe capa upstream de regime labels;
+- emite gates explícitos PASS/WARN/FAIL;
+- persiste serie diaria, resúmenes y flags de auditoría.
+
+2.2 Qué no hace
+- no estima Sharpe ni rentabilidad de cartera;
+- no corrige leakage upstream: lo detecta y falla;
+- no sustituye al backtest ni a validation_suite;
+- no modela el proceso IC con ARIMA, Kalman o state-space por defecto;
+- no debe convertirse en un módulo de forecasting del IC.
+
+3. Unidad estadística correcta
+
+La unidad primaria del módulo no es la observación pooled (date,symbol), sino la serie
+temporal diaria de calidad cross-sectional de la señal.
+
+Para una señal alpha y una fecha d:
+
+    IC_d = rho_S(alpha_d, y_d)
+
+donde:
+- alpha_d es el vector cross-sectional de scores en la fecha d;
+- y_d es el vector cross-sectional del label futuro para la misma fecha;
+- rho_S es la correlación de Spearman en la sección cruzada del día d.
+
+La serie relevante para la auditoría es:
+
+    { IC_d }_{d=1,...,D}
+
+Todas las métricas y pruebas del módulo deben construirse sobre esta serie temporal,
+no sobre pooling ingenuo de observaciones cross-sectionalmente dependientes.
+
+4. Interpretación correcta del IC
+
+El IC diario mide capacidad ordinal cross-sectional, no rentabilidad.
+Por tanto:
+
+- IC > 0 indica que la señal ordena correctamente, en media, dentro del día;
+- mean(IC) mide potencia ordinal promedio;
+- std(IC) mide estabilidad temporal de esa potencia;
+- hit_rate = Pr(IC_d > 0) mide persistencia direccional;
+- cambios estructurales en la serie IC pueden indicar degradación, cambio de régimen
+  o fragilidad de la señal.
+
+5. Entradas contractuales
+
+5.1 Inputs mínimos
+- signals_panel_path
+- labels_panel_path
+- universe_mask_path
+- config_path
+- run_id
+- data_snapshot_id
+
+5.2 Inputs opcionales
+- regime_labels_path
+- alpha_metadata_path
+- subperiod_scheme_path
+- benchmark alpha ids for comparison
+
+5.3 Requisitos de alineación
+Todo input debe compartir claves:
+- date
+- symbol
+- alpha_id si se analizan varias señales
+
+La alineación entre señales y labels debe ser ya point-in-time correcta.
+Este módulo no debe “arreglar” alineaciones ambiguas.
+
+6. Salidas obligatorias
+
+6.1 ic_daily.parquet
+Campos mínimos:
+- alpha_id
+- date
+- ic_value
+- n_valid_names
+- n_eligible_names
+- coverage
+- regime_label (si existe)
+- split_role (si aplica)
+- run_id
+
+6.2 ic_summary.parquet
+Campos mínimos:
+- alpha_id
+- n_valid_dates
+- mean_ic
+- median_ic
+- std_ic
+- hit_rate_positive
+- coverage_mean
+- coverage_std
+- nw_tstat
+- nw_pvalue
+- ic_halflife
+- recent_decay
+- recent_ratio
+- block_std
+- regime_dispersion
+- pass_flag
+- warn_flag
+- fail_flag
+- binding_reason
+- run_id
+
+6.3 ic_blocks.parquet
+Resumen por subperiodos:
+- alpha_id
+- block_id
+- start_date
+- end_date
+- n_dates
+- mean_ic
+- median_ic
+- std_ic
+- hit_rate
+- coverage_mean
+
+6.4 ic_regimes.parquet
+Resumen por régimen:
+- alpha_id
+- regime_label
+- n_dates
+- mean_ic
+- std_ic
+- hit_rate
+- coverage_mean
+
+6.5 manifest.json
+- run_id
+- config_hash
+- data_snapshot_id
+- labels_version
+- signals_version
+- regime_version
+- n_alphas
+- execution_timestamp
+- gate_policy_version
+
+7. Métricas primarias
+
+7.1 Media temporal del IC
+    mu_IC = (1/D) * sum_d IC_d
+
+Es la medida base de capacidad ordinal promedio.
+
+7.2 Mediana temporal del IC
+    med_IC = median(IC_1,...,IC_D)
+
+Protege frente a episodios extremos y aporta robustez descriptiva.
+
+7.3 Dispersión temporal
+    sigma_IC = std(IC_d)
+
+No debe interpretarse sola; importa junto con mean_ic y hit_rate.
+
+7.4 Hit rate positivo
+    h = (1/D) * sum_d 1{IC_d > 0}
+
+Mide persistencia de signo correcto.
+
+7.5 Cobertura diaria
+Sea:
+- n_d^valid = número de activos con señal y label válidos en d
+- n_d^eligible = número de activos elegibles en d
+
+Entonces:
+    c_d = n_d^valid / n_d^eligible
 
-\title{\textbf{IC Stability Analysis: Especificación Formal para la Auditoría de Persistencia de Señales}}
-\author{Research Pipeline --- Quantitative Research Specification}
-\date{Marzo 2026}
-
-\begin{document}
-
-\maketitle
+y:
+    c_mean = mean_d(c_d)
+    c_std  = std_d(c_d)
 
-\section{Propósito del módulo}
+Una señal con mean_ic aceptable pero cobertura pobre o muy irregular debe degradarse.
 
-El objetivo de este módulo es medir la \textbf{estabilidad temporal} de una señal predictiva mediante el comportamiento histórico de su \emph{Information Coefficient} (IC) fuera de muestra. La cuestión central no es si un alpha tuvo episodios aislados de buen rendimiento, sino si ha mostrado una capacidad de ordenación cross-sectional suficientemente \textbf{persistente, estable y reproducible} a través del tiempo y, cuando proceda, a través de distintos regímenes de mercado.
+8. Inferencia estadística correcta
 
-Este módulo no construye cartera, no optimiza pesos y no certifica explotabilidad económica final. Su función es más acotada y, precisamente por ello, crítica: actuar como \textbf{auditor estadístico de robustez temporal} dentro del pipeline de \texttt{alpha\_discovery}.
+Punto crítico:
+no debe usarse un t-stat ingenuo del tipo:
 
-\section{Principio estadístico}
+    t_naive = sqrt(D) * mean(IC) / std(IC)
 
-Sea \(\alpha_{d,\cdot}\) el vector cross-sectional de scores de una señal en la fecha \(d\), y sea \(y_{d,\cdot}\) el vector cross-sectional del label futuro asociado al horizonte de predicción definido. El IC diario se define como:
+sin corrección, porque la serie IC_d puede exhibir:
+- autocorrelación temporal;
+- heterocedasticidad;
+- dependencia inducida por universos superpuestos.
 
-\[
-IC_d = \rho_S\!\big(\alpha_{d,\cdot}, y_{d,\cdot}\big),
-\]
+8.1 Estadístico recomendado: Newey-West / HAC
+Sea x_d = IC_d - mu_IC.
+Entonces la varianza HAC de la media puede estimarse como:
 
-donde \(\rho_S\) es la correlación de Spearman en la sección cruzada del día \(d\).
+    Var_HAC(mu_IC)
+    =
+    (1/D) * [ gamma_0 + 2 * sum_{l=1}^L w_l * gamma_l ]
 
-La señal no se evalúa por un único valor agregado, sino por la serie temporal
-\[
-\{IC_d\}_{d=1}^{D},
-\]
-ya que es precisamente la dinámica temporal de esa serie la que permite distinguir entre una señal estructuralmente útil y una señal oportunista, inestable o dependiente de un subperiodo muy concreto.
+donde:
+- gamma_l = autocovarianza muestral al lag l de la serie IC_d;
+- w_l = 1 - l/(L+1) son pesos Bartlett;
+- L = nw_lags elegido por config o regla automática.
 
-\section{Pregunta que responde el módulo}
+Entonces:
 
-Dados uno o varios alphas candidatos, el módulo debe responder las siguientes preguntas:
+    t_NW = mu_IC / sqrt(Var_HAC(mu_IC))
 
-\begin{enumerate}[leftmargin=1.5em]
-    \item ¿El IC medio fuera de muestra es persistentemente distinto de cero y con el signo esperado?
-    \item ¿La dispersión temporal del IC es compatible con una señal estable o está dominada por episodios erráticos?
-    \item ¿La señal mantiene capacidad de ordenación en distintos subperiodos?
-    \item ¿La señal depende de un único régimen de mercado o su utilidad es transversal?
-    \item ¿Existe deterioro reciente suficientemente fuerte como para cuestionar su vigencia?
-\end{enumerate}
+y el p-value se obtiene por aproximación normal asintótica o t aproximada
+según la política definida.
 
-\section{Entradas del módulo}
+Este es el estadístico de inferencia por defecto del módulo.
 
-El módulo debe consumir, como mínimo, los siguientes artefactos:
+8.2 Regla práctica para L
+Opciones aceptables:
+- fijo por config;
+- L = floor(4 * (D/100)^(2/9));
+- o regla institucional única versionada.
 
-\begin{longtable}{p{4.5cm} p{9.5cm}}
-\toprule
-\textbf{Entrada} & \textbf{Descripción} \\
-\midrule
-\endhead
+No conviene sobreajustar L por alpha individual.
 
-\texttt{signals\_panel} & Serie temporal de scores por fecha y activo para uno o varios alphas. \\
-\texttt{label\_panel} & Label futuro alineado con el horizonte de predicción. \\
-\texttt{universe\_mask} & Máscara de activos elegibles por fecha. \\
-\texttt{config\_yaml} & Configuración de ventanas, thresholds, reglas de validación y segmentación por régimen. \\
-\texttt{run\_id} & Identificador único de la ejecución. \\
-\texttt{data\_snapshot\_id} & Snapshot exacto de datos utilizado en la evaluación. \\
-\bottomrule
-\end{longtable}
+8.3 Opción avanzada: block bootstrap
+Como versión avanzada, puede estimarse:
+- bootstrap_mean_ic
+- bootstrap_ci_95
+- bootstrap_pvalue
 
-Las señales y labels deben estar ya construidos en formato \emph{point-in-time}. Este módulo no debe corregir ex post errores de alineación; debe validarlos y, en caso de incumplimiento, fallar con mensajes explícitos.
+mediante stationary bootstrap o moving block bootstrap sobre la serie IC_d.
 
-\section{Salida esperada}
+Esto es valioso si la autocorrelación es relevante o el tamaño muestral es moderado,
+pero no es imprescindible para el MVP.
 
-La salida debe componerse de tres niveles:
+9. Estabilidad rolling
 
-\begin{enumerate}[leftmargin=1.5em]
-    \item \textbf{Serie diaria de IC por alpha}: tabla con \(IC_d\), coverage y número de nombres válidos por fecha.
-    \item \textbf{Resumen agregado}: métricas de tendencia central, dispersión, persistencia y deterioro.
-    \item \textbf{Flags de auditoría}: reglas de paso/fallo parametrizadas por configuración.
-\end{enumerate}
+Para una ventana W:
 
-Un esquema mínimo de salida por alpha podría incluir:
+    mu_roll(d;W) = (1/W) * sum_{j=d-W+1}^d IC_j
 
-\begin{verbatim}
-alpha_id
-run_id
-n_valid_dates
-mean_ic
-median_ic
-std_ic
-hit_rate_positive
-t_stat_naive
-rolling_stability
-subperiod_consistency
-regime_consistency
-recent_decay
-coverage_mean
-selection_flag
-drop_reason
-\end{verbatim}
+Debe persistirse la serie rolling y al menos estos resúmenes:
 
-\section{Métricas primarias}
+- rolling_mean_mean(W) = mean_d mu_roll(d;W)
+- rolling_mean_std(W)  = std_d  mu_roll(d;W)
+- rolling_min(W)
+- rolling_max(W)
 
-La métrica primaria del módulo es la serie temporal del IC diario. A partir de ella se derivan agregados básicos.
+La métrica operativa principal de inestabilidad rolling puede ser:
 
-\subsection{Media y mediana}
+    sigma_roll(W) = std_d mu_roll(d;W)
 
-\[
-\overline{IC} = \frac{1}{D}\sum_{d=1}^{D} IC_d,
-\qquad
-\widetilde{IC} = \mathrm{median}(IC_1,\dots,IC_D).
-\]
+Interpretación:
+- sigma_roll alta => la potencia media local cambia mucho en el tiempo;
+- sigma_roll baja  => señal más estable.
 
-La media captura magnitud promedio, mientras que la mediana protege parcialmente frente a episodios extremos o días con secciones cruzadas especialmente ruidosas.
+10. Consistencia por subperiodos
 
-\subsection{Dispersión temporal}
+Sea una partición temporal del histórico en K bloques no solapados T_1,...,T_K.
+Para cada bloque k:
 
-\[
-\sigma_{IC} = \sqrt{\frac{1}{D-1}\sum_{d=1}^{D}(IC_d-\overline{IC})^2}.
-\]
+    mu_IC^(k) = mean_{d in T_k} IC_d
 
-Esta cantidad no debe interpretarse de forma aislada: una señal con buen \(\overline{IC}\) y dispersión moderada puede ser más interesante que otra con media algo superior pero varianza muy superior.
+Debe persistirse:
+- mu_IC^(k)
+- std_IC^(k)
+- hit_rate^(k)
+- coverage_mean^(k)
 
-\subsection{Frecuencia de signo correcto}
+y resumirse la dispersión entre bloques:
 
-\[
-h = \frac{1}{D}\sum_{d=1}^{D}\mathbf{1}_{\{IC_d > 0\}}.
-\]
+    sigma_blocks = std_k( mu_IC^(k) )
 
-El \emph{hit rate} no sustituye al nivel del IC, pero sí informa sobre persistencia direccional. Una señal con media positiva y \(h\) cercano al 50\% suele estar dominada por pocos episodios grandes, lo que exige cautela.
+y el porcentaje de bloques con signo correcto:
 
-\subsection{Cobertura}
+    h_blocks = (1/K) * sum_k 1{mu_IC^(k) > 0}
 
-Sea \(n_d^{\mathrm{valid}}\) el número de activos válidos en la fecha \(d\), y \(n_d^{\mathrm{eligible}}\) el número de activos elegibles. La cobertura diaria es:
+Una señal razonable no necesita dominar todos los bloques,
+pero no debería depender de un único subperiodo excepcional.
 
-\[
-c_d = \frac{n_d^{\mathrm{valid}}}{n_d^{\mathrm{eligible}}}.
-\]
+11. Deterioro reciente
 
-La cobertura media se define como:
-\[
-\overline{c} = \frac{1}{D}\sum_{d=1}^{D} c_d.
-\]
+Sea:
+- mu_full   = mean IC en toda la muestra;
+- mu_recent = mean IC en la ventana reciente;
+- W_recent  = recent_window definido por config.
 
-Una señal con aparente buen IC pero cobertura pobre o muy inestable no debe promocionarse sin revisión adicional.
+Definimos:
 
-\section{Métricas de estabilidad temporal}
+    delta_recent = mu_recent - mu_full
 
-\subsection{Estabilidad rolling}
+y opcionalmente una razón estabilizada:
 
-Para una ventana temporal \(W\), se define la media rolling del IC:
+    ratio_recent = mu_recent / (mu_full + eps_ratio)
 
-\[
-\overline{IC}_{d,W} = \frac{1}{W}\sum_{j=d-W+1}^{d} IC_j.
-\]
+Interpretación:
+- delta_recent muy negativo => deterioro reciente;
+- ratio_recent muy por debajo de 1 => decay fuerte.
 
-La estabilidad rolling puede resumirse mediante la dispersión de esta media móvil:
+El módulo no debe concluir automáticamente que la señal “murió”,
+pero sí activar warning/fail si el deterioro supera thresholds configurados.
 
-\[
-\sigma^{(W)}_{\mathrm{roll}} =
-\sqrt{
-\frac{1}{D-W}
-\sum_{d=W}^{D}
-\left(\overline{IC}_{d,W} - \mu^{(W)}_{\mathrm{roll}}\right)^2
-},
-\]
+12. Half-life del IC
 
-donde \(\mu^{(W)}_{\mathrm{roll}}\) es la media de las medias rolling.
+La half-life no debe definirse ingenuamente a partir de cualquier autocorrelación negativa.
+La forma correcta en MVP es:
 
-La idea no es fabricar una puntuación arbitraria, sino medir cuánto cambia la capacidad predictiva agregada cuando observamos ventanas sucesivas de tamaño fijo.
+12.1 Ajuste AR(1) simple sobre IC_d centrado
+Modelar:
 
-\subsection{Consistencia por subperiodos}
+    IC_d - mu = phi * (IC_{d-1} - mu) + eps_d
 
-Sea la historia total dividida en \(K\) bloques temporales no solapados. Para cada bloque \(k\):
+Si phi pertenece a (0,1), la half-life es:
 
-\[
-\overline{IC}^{(k)} = \frac{1}{D_k}\sum_{d \in \mathcal{T}_k} IC_d.
-\]
+    tau_half = ln(0.5) / ln(phi)
 
-La señal será más creíble cuanto menor sea la dependencia de un único bloque. Por tanto, debe persistirse:
+Si phi <= 0 o phi >= 1, la half-life debe marcarse como:
+- NA / unstable / undefined
 
-\begin{itemize}[leftmargin=1.5em]
-    \item la secuencia \(\{\overline{IC}^{(k)}\}_{k=1}^{K}\),
-    \item la desviación estándar entre bloques,
-    \item el número de bloques con signo correcto.
-\end{itemize}
+según convención del módulo.
 
-Esto es más informativo que depender de una única media global.
+La half-life es útil como métrica descriptiva de persistencia del proceso IC,
+no como criterio único de promoción.
 
-\subsection{Deterioro reciente}
+13. Análisis por régimen
 
-Sea \(\overline{IC}_{\mathrm{full}}\) la media en toda la muestra y \(\overline{IC}_{\mathrm{recent}}\) la media en la ventana más reciente. Puede definirse un estadístico simple de deterioro:
+Si existe regime_labels_path y coverage por régimen suficiente, el módulo debe calcular:
 
-\[
-\Delta_{\mathrm{recent}} = \overline{IC}_{\mathrm{recent}} - \overline{IC}_{\mathrm{full}}.
-\]
+    mu_IC^(r) = mean_{d : regime_d = r} IC_d
+    sigma_IC^(r) = std_{d : regime_d = r} IC_d
+    h^(r) = Pr(IC_d > 0 | regime_d = r)
 
-También puede usarse una razón estabilizada:
+Además puede resumirse la dispersión entre regímenes como:
 
-\[
-R_{\mathrm{recent}} =
-\frac{\overline{IC}_{\mathrm{recent}}}
-{\overline{IC}_{\mathrm{full}} + \varepsilon},
-\]
+    regime_dispersion = std_r( mu_IC^(r) )
 
-con \(\varepsilon > 0\) pequeño para evitar inestabilidades numéricas.
+y/o:
+    regime_range = max_r mu_IC^(r) - min_r mu_IC^(r)
 
-El módulo no debe asumir que un alpha está roto sólo porque el periodo reciente sea peor, pero sí debe registrar el deterioro y convertirlo en \emph{flag} si supera umbrales configurables.
+Importante:
+una señal puede ser válida aunque sea más fuerte en un régimen que en otro.
+Lo relevante es cuantificarlo, no forzar homogeneidad artificial.
 
-\section{Métricas por régimen}
+14. Coverage-weighted IC (opcional)
 
-Si existe una capa upstream que provee etiquetas de régimen \(r_d \in \{1,\dots,R\}\), este módulo debe calcular estabilidad condicional:
+La métrica primaria debe seguir siendo el IC diario simple por fecha.
+Pero puede persistirse además una media ponderada por calidad estadística de la fecha:
 
-\[
-IC_d^{(r)} = \rho_S\!\big(\alpha_{d,\cdot}, y_{d,\cdot} \mid r_d = r\big).
-\]
+    w_d = min(n_d^valid, n_cap) / n_cap
 
-En la práctica, dado que el régimen es una etiqueta por fecha, basta con segmentar las fechas por \(r\) y computar:
+o alternativamente:
+    w_d = sqrt(n_d^valid)
 
-\[
-\overline{IC}^{(r)} = \frac{1}{D_r}\sum_{d: r_d=r} IC_d.
-\]
+y:
 
-La consistencia por régimen no debe reducirse a una única resta del tipo
-\[
-|\overline{IC}^{(\mathrm{bull})} - \overline{IC}^{(\mathrm{bear})}|.
-\]
-Eso puede persistirse, pero debe acompañarse de:
-\begin{itemize}[leftmargin=1.5em]
-    \item cobertura por régimen,
-    \item número de fechas válidas por régimen,
-    \item y, si procede, dispersión intra-régimen.
-\end{itemize}
+    mu_IC_w = sum_d w_d IC_d / sum_d w_d
 
-Una señal puede ser perfectamente válida aunque sea más fuerte en un régimen que en otro; lo relevante es que ese comportamiento quede cuantificado y no oculto por una media global.
+Esto puede ser útil cuando la cobertura varía mucho entre fechas.
+Debe considerarse métrica secundaria, no reemplazo automático de mean_ic.
 
-\section{Inferencia y precaución estadística}
+15. Change-point / break detection
 
-Un estadístico t ingenuo puede definirse como:
+15.1 MVP
+No es imprescindible para el MVP.
 
-\[
-t_{\mathrm{naive}} =
-\frac{\overline{IC}}{\sigma_{IC}/\sqrt{D}}.
-\]
+15.2 Opción avanzada razonable
+CUSUM sobre la serie IC_d centrada:
 
-Sin embargo, la serie \(\{IC_d\}\) puede exhibir autocorrelación y heterocedasticidad temporal, por lo que este estadístico no debe interpretarse como una prueba exacta sin corrección adicional. El módulo puede persistirlo por conveniencia comparativa, pero debe etiquetarlo explícitamente como \texttt{naive} o sustituirlo por una estimación robusta si existe una implementación downstream apropiada.
+    S_t = sum_{d<=t} (IC_d - mean(IC))
 
-La filosofía correcta aquí es de auditoría, no de sobreafirmación inferencial.
+o un Page-CUSUM simple con threshold configurado.
 
-\section{Criterio de decisión}
+Salida:
+- cusum_stat
+- break_flag
+- break_date_estimate (si existe)
 
-El módulo debe evitar un único \emph{score} opaco que mezcle media, volatilidad y persistencia con pesos arbitrarios. En su lugar, debe implementar una lógica de selección basada en \textbf{gates explícitos y configurables}.
+Esto ayuda a detectar rupturas temporales en la estabilidad de la señal,
+pero debe tratarse como diagnóstico complementario, no como veredicto único.
 
-Por ejemplo, una política razonable podría requerir simultáneamente:
+16. Gates de decisión
 
-\begin{enumerate}[leftmargin=1.5em]
-    \item \(\overline{IC}\) con signo correcto y magnitud mínima configurable;
-    \item cobertura media por encima de un umbral;
-    \item mínimo número de fechas válidas;
-    \item hit rate mínimo;
-    \item ausencia de deterioro reciente extremo;
-    \item dispersión inter-bloques por debajo de un umbral.
-\end{enumerate}
+El módulo debe evitar un score opaco único.
+Debe usar gates explícitos, versionados y configurables.
 
-Lo importante no es fijar aquí números supuestamente universales, sino que:
-\begin{itemize}[leftmargin=1.5em]
-    \item los gates sean transparentes,
-    \item se lean desde configuración,
-    \item y queden persistidos junto al motivo de paso o fallo.
-\end{itemize}
+Ejemplo de lógica base:
 
-\section{Validaciones obligatorias}
+PASS si simultáneamente:
+- n_valid_dates >= min_valid_dates
+- coverage_mean >= min_mean_coverage
+- mean_ic >= min_mean_ic
+- hit_rate_positive >= min_hit_rate
+- nw_tstat >= min_nw_tstat
+- abs(delta_recent) <= max_recent_decay_abs
+- sigma_blocks <= max_block_std
+- si hay regímenes: min_dates_per_regime satisfecho
 
-\subsection{Validaciones de alineación}
+WARN si:
+- no hay FAIL
+- pero alguna métrica cae en zona intermedia
 
-\begin{enumerate}[leftmargin=1.5em]
-    \item señal y label deben compartir claves \texttt{date} y \texttt{symbol};
-    \item el label debe corresponder al horizonte futuro definido;
-    \item no deben existir duplicados por \texttt{date-symbol};
-    \item la señal debe calcularse exclusivamente con información disponible en la fecha de decisión.
-\end{enumerate}
+FAIL si:
+- mean_ic con signo incorrecto más allá del tolerance floor
+- n_valid_dates insuficiente
+- coverage colapsada
+- nw_tstat muy débil
+- deterioro reciente extremo
+- o evidencia clara de inestabilidad por bloques
 
-\subsection{Validaciones de cobertura}
+17. Ejemplo de policy declarativa
 
-\begin{enumerate}[leftmargin=1.5em]
-    \item cada fecha debe tener al menos \(n_{\min}\) activos válidos para que el IC sea interpretable;
-    \item el número total de fechas válidas debe superar un umbral mínimo;
-    \item coverage extremadamente irregular debe activar un \emph{warning} o \emph{fail}, según configuración.
-\end{enumerate}
-
-\subsection{Validaciones PIT}
-
-\begin{enumerate}[leftmargin=1.5em]
-    \item no uso de fundamentales revisados sin timestamp original;
-    \item no lookahead en universe membership;
-    \item no filtrado implícito por resultados futuros;
-    \item no contaminación del label dentro de la construcción del alpha.
-\end{enumerate}
-
-\section{Configuración recomendada}
-
-La configuración debe ser declarativa. Un ejemplo mínimo razonable es:
-
-\begin{verbatim}
-windows:
-  rolling: [21, 63, 126, 252]
+analysis:
+  rolling_windows: [21, 63, 126, 252]
   recent_window: 63
   block_scheme: yearly
+  nw_lags: 10
+  half_life_method: ar1
+  regime_enabled: true
 
 minimums:
   min_valid_dates: 126
   min_names_per_date: 25
   min_mean_coverage: 0.80
-
-selection_gates:
-  min_mean_ic: 0.00
-  min_hit_rate_positive: 0.55
-  max_recent_decay_abs: 0.03
-  max_block_std: 0.025
-
-regime_analysis:
-  enabled: true
-  regime_source: "regime_labels/latest"
   min_dates_per_regime: 30
-\end{verbatim}
 
-Obsérvese que estos valores son ilustrativos y deben calibrarse según universo, frecuencia y horizonte.
+gates:
+  min_mean_ic: 0.010
+  min_hit_rate_positive: 0.52
+  min_nw_tstat: 2.0
+  max_recent_decay_abs: 0.020
+  max_block_std: 0.020
 
-\section{Interfaz funcional esperada}
+warnings:
+  warn_mean_ic: 0.015
+  warn_nw_tstat: 2.5
+  warn_hit_rate: 0.55
 
-Las operaciones mínimas del módulo deberían ser:
+Los valores concretos deben adaptarse a frecuencia, universo y horizonte.
 
-\begin{enumerate}[leftmargin=1.5em]
-    \item \texttt{load\_signals(path)}
-    \item \texttt{align\_signals\_and\_labels(signals, labels, universe)}
-    \item \texttt{compute\_daily\_ic(panel)}
-    \item \texttt{compute\_rolling\_stats(ic\_series, windows)}
-    \item \texttt{compute\_subperiod\_stats(ic\_series, scheme)}
-    \item \texttt{compute\_regime\_stats(ic\_series, regime\_labels)}
-    \item \texttt{evaluate\_gates(summary, config)}
-    \item \texttt{persist\_results(results, run\_metadata)}
-\end{enumerate}
+18. Inputs y alineación PIT
 
-\section{Flujo operacional}
+18.1 Reglas duras
+- no duplicados por (date,symbol,alpha_id);
+- labels ya alineados al horizonte correcto;
+- universe_mask aplicada antes del cálculo del IC;
+- exclusiones y missingness coherentes entre señal y label;
+- si una fecha tiene menos de min_names_per_date válidos, no se computa IC_d.
 
-El flujo recomendado es:
+18.2 Regla de consistencia
+Toda fecha usada en IC_d debe cumplir:
+- alpha_d válido
+- label_d válido
+- activo en universo elegible
+- sin contaminación temporal conocida
 
-\[
-\texttt{load}
-\rightarrow
-\texttt{align}
-\rightarrow
-\texttt{validate}
-\rightarrow
-\texttt{compute daily IC}
-\rightarrow
-\texttt{aggregate}
-\rightarrow
-\texttt{regime split}
-\rightarrow
-\texttt{gate evaluation}
-\rightarrow
-\texttt{persist}.
-\]
+19. Interfaz funcional mínima
 
-Desarrollado paso a paso:
+- load_signals(...)
+- load_labels(...)
+- load_universe(...)
+- align_panels(...)
+- validate_inputs(...)
+- compute_daily_ic(...)
+- compute_summary_stats(...)
+- compute_newey_west(...)
+- compute_rolling_stats(...)
+- compute_block_stats(...)
+- compute_regime_stats(...)
+- compute_halflife(...)
+- evaluate_gates(...)
+- persist_results(...)
 
-\begin{enumerate}[leftmargin=1.5em]
-    \item cargar señales, labels y universo elegible;
-    \item alinear por fecha y activo;
-    \item filtrar observaciones inválidas;
-    \item calcular \(IC_d\) por fecha;
-    \item construir métricas agregadas y rolling;
-    \item calcular consistencia por subperiodos;
-    \item segmentar por régimen si hay etiquetas disponibles;
-    \item evaluar reglas de paso/fallo;
-    \item persistir la serie completa y el resumen agregado.
-\end{enumerate}
+20. Flujo canónico del módulo
 
-\section{CLI orientativa}
+1. load inputs
+2. align by date-symbol-alpha_id
+3. validate PIT and keys
+4. mask invalid observations
+5. compute daily cross-sectional IC_d
+6. compute coverage series
+7. compute mean/median/std/hit-rate
+8. compute HAC/Newey-West inference
+9. compute rolling stability
+10. compute block consistency
+11. compute recent decay
+12. compute regime stats if enabled
+13. compute half-life if valid
+14. evaluate gates
+15. persist full artifacts and manifest
 
-Una interfaz tipo CLI podría ser:
+21. Invariantes del módulo
 
-\begin{verbatim}
-python -m research.alpha_discovery.ic_stability \
-  --signals-path signals/latest \
-  --labels-path labels/latest \
-  --config research/alpha_discovery/config/ic_stability.yaml \
-  --run-id 20260306_ic_audit
-\end{verbatim}
+21.1 Definición del IC
+Para toda fecha válida d:
+    IC_d = Spearman(alpha_d, y_d)
 
-La CLI debe materializar tanto tablas intermedias como un resumen final fácilmente consumible por \texttt{alpha\_library} y módulos de selección posteriores.
+21.2 Dominio
+IC_d ∈ [-1, 1]
 
-\section{Criterios de calidad del módulo}
+21.3 Cobertura
+0 <= coverage_d <= 1
 
-El módulo estará correctamente implementado si:
+21.4 Fechas válidas
+IC_d sólo existe si n_valid_names_d >= min_names_per_date
 
-\begin{enumerate}[leftmargin=1.5em]
-    \item calcula IC diario de forma consistente y reproducible;
-    \item rechaza inputs mal alineados o no PIT;
-    \item persiste media, dispersión, hit rate, cobertura y deterioro reciente;
-    \item cuantifica estabilidad rolling y por subperiodos;
-    \item soporta segmentación por régimen sin ambigüedad semántica;
-    \item emite \emph{flags} transparentes con causa explícita;
-    \item no depende de ejemplos decorativos de backtest para justificar su utilidad.
-\end{enumerate}
+21.5 Temporalidad
+No se mezclan observaciones fuera del protocolo PIT.
 
-\section{Definition of Done}
+21.6 Reproducibilidad
+Mismo config + mismo snapshot + mismo run seed -> mismos outputs
 
-El módulo se considera completado cuando:
+22. Failure modes principales
 
-\begin{itemize}[leftmargin=1.5em]
-    \item produce la serie diaria de IC para cada alpha analizado;
-    \item genera un resumen agregado reproducible y auditable;
-    \item calcula estabilidad rolling, consistencia por bloques y deterioro reciente;
-    \item soporta análisis condicional por régimen cuando existan etiquetas válidas;
-    \item aplica reglas de selección configurables y deja constancia del motivo de aceptación o rechazo;
-    \item persiste resultados en formato utilizable por el resto del pipeline.
-\end{itemize}
+- cobertura insuficiente por fecha;
+- coverage variable que infla ruido temporal;
+- dependencia serial ignorada => t-stats optimistas;
+- régimen con muy pocas fechas pero interpretación excesiva;
+- deterioro reciente confundido con ruido de muestra;
+- señal aparentemente buena impulsada por pocos bloques;
+- mal alineamiento señal-label;
+- universe lookahead no detectado upstream.
 
-\section{Conclusión}
+23. Complejidad computacional
 
-La estabilidad del IC es una propiedad más relevante que un resultado brillante en un único periodo. Un alpha útil no necesita dominar todos los subregímenes ni exhibir métricas espectaculares en cada ventana, pero sí debe mostrar una relación razonablemente persistente entre señal y retorno futuro bajo un protocolo temporal limpio. Ese es el objeto de este módulo.
+Sea:
+- D = número de fechas válidas
+- N_d = tamaño cross-sectional válido en fecha d
 
-Por tanto, \texttt{ic\_stability} debe entenderse como una capa de auditoría estadística que transforma una intuición de alpha en evidencia temporal estructurada. Su valor no está en prometer rentabilidades, sino en descartar señales frágiles y priorizar aquellas cuya capacidad ordinal parece menos dependiente del azar o de una fase concreta del mercado.
+El coste dominante es el cálculo diario de Spearman:
 
-\begin{thebibliography}{9}
+    O( sum_d N_d log N_d )
 
-\bibitem[Grinold and Kahn(2000)]{grinold2000}
-Richard C. Grinold and Ronald N. Kahn.
-\newblock \emph{Active Portfolio Management}.
-\newblock McGraw--Hill, 2nd edition, 2000.
+El resto:
+- NW/HAC: O(D * L)
+- rolling stats: O(D * n_windows)
+- block stats: O(D)
+- regime stats: O(D)
 
-\bibitem[L{\'o}pez de Prado(2018)]{lopez2018}
-Marcos L{\'o}pez de Prado.
-\newblock \emph{Advances in Financial Machine Learning}.
-\newblock Wiley, 2018.
+El módulo es barato comparado con entrenamiento de modelos.
+Debe ser completamente viable en pipelines diarios.
 
-\bibitem[Chan(2013)]{chan2013}
-Ernest P. Chan.
-\newblock \emph{Algorithmic Trading: Winning Strategies and Their Rationale}.
-\newblock Wiley, 2013.
+24. Qué NO conviene introducir
 
-\end{thebibliography}
+No conviene meter aquí:
+- ARIMA/GARCH del proceso IC;
+- Kalman filter de “true IC latent”;
+- Bayesian changepoint como default;
+- HMM sobre IC;
+- score opaco aprendido por ML;
+- modelado portfolio-aware.
 
-\end{document}
+Eso convertiría un auditor estadístico claro en un módulo excesivamente complejo
+y menos auditable.
+
+25. Pruebas mínimas del módulo
+
+- IC diario correcto sobre casos sintéticos conocidos
+- exclusión de fechas con n_valid_names insuficiente
+- coverage calculada correctamente
+- Newey-West reproducible sobre serie simulada
+- half-life AR(1) correcta cuando phi conocido
+- NA half-life si phi <= 0 o phi >= 1
+- block stats correctos en partición conocida
+- regime stats correctos con labels sintéticos
+- PASS/WARN/FAIL coherente con config
+- manifest consistente y reproducible
+
+26. MVP vs versión avanzada
+
+26.1 MVP
+- cálculo de IC diario
+- mean/median/std/hit rate
+- coverage diaria y agregada
+- Newey-West t-stat y p-value
+- rolling windows
+- subperiod blocks
+- recent decay
+- regime split simple
+- AR(1) half-life si válida
+- gates explícitos
+- persistencia completa
+
+26.2 Avanzado
+- stationary block bootstrap
+- CUSUM break detection
+- coverage-weighted IC secundario
+- comparación contra benchmark alpha
+- intervalos de confianza bootstrap
+- dashboarding automático
+
+27. Definition of Done
+
+El módulo se considera terminado cuando:
+- calcula la serie diaria de IC de forma reproducible;
+- usa la serie temporal diaria como unidad primaria de auditoría;
+- produce inferencia HAC/Newey-West, no t-stat ingenuo como default;
+- cuantifica estabilidad rolling, por bloques y por régimen;
+- mide deterioro reciente;
+- persiste todos los artefactos auditables;
+- emite PASS/WARN/FAIL con motivo explícito;
+- y puede integrarse sin ambigüedad con alpha_library y validation layers.
+
+28. Interpretación correcta del módulo
+
+La lectura correcta de ic_stability.py no es:
+“comprobar si la señal tiene media positiva y ya está”.
+
+La lectura correcta es:
+“auditar si la señal ha mostrado capacidad ordinal suficientemente persistente,
+estable y estadísticamente defendible en el tiempo como para merecer seguir viva
+en el pipeline”.
+
+29. Conclusión
+
+ic_stability.py debe comportarse como una capa de auditoría temporal seria.
+Su valor está en convertir una intuición de alpha en evidencia estructurada de persistencia,
+no en inflar resultados con tests mal calibrados ni en modelar dinámicas innecesarias.
+
+El output correcto del módulo es una combinación de:
+- serie diaria de IC,
+- métricas agregadas robustas,
+- inferencia temporal ajustada,
+- diagnóstico de estabilidad,
+- y una decisión transparente de gate.
+
+Ese es el comportamiento correcto de un auditor de estabilidad temporal
+en un pipeline cuantitativo institucional.

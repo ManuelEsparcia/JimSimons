@@ -1,343 +1,351 @@
-% Copiar y pegar en LaTeX (guardar como .txt)
-\documentclass{article}
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
-\usepackage[spanish]{babel}
-\usepackage{amsmath,amssymb}
-\usepackage{booktabs}
-\usepackage{hyperref}
-\usepackage{enumitem}
-
-\title{Especificaci\'on Cuantitativa: validation/leakage\_audit.py}
-\author{JimSimons Small Cap Swing --- Validation Research Note}
-\date{Marzo 2026}
-
-\begin{document}
-\maketitle
-
-\section{Prop\'osito del m\'odulo}
-
-El objetivo de \texttt{leakage\_audit.py} no es ``mejorar el Sharpe'' ni seleccionar
-estrategias atractivas, sino verificar que la informaci\'on utilizada por el pipeline
-habr\'ia estado realmente disponible en el instante de decisi\'on y que la geometr\'ia
-de entrenamiento, validaci\'on y etiquetado no introduce dependencia espuria entre pasado
-y futuro.
-
-En un sistema cuantitativo serio, el leakage no es un problema cosm\'etico: invalida la
-interpretaci\'on causal de cualquier backtest. Una estrategia con leakage puede parecer
-estable, robusta y estad\'isticamente significativa, cuando en realidad solo explota
-informaci\'on inaccesible ex ante o una contaminaci\'on de muestras mal definida.
-Por ello, este m\'odulo debe tratar el leakage como una \textbf{violaci\'on de validez del
-experimento}, no como un simple warning de calidad.
-
-\section{Definici\'on formal de leakage}
-
-Sea $t$ el instante en que se forma una decisi\'on de trading y sea $Y_{t+h}$ la variable
-objetivo a horizonte $h$. Sea $X_t$ el vector de features supuestamente disponible en $t$.
-Diremos que existe leakage si alguna componente de $X_t$ depende, directa o indirectamente,
-de informaci\'on cuya disponibilidad real satisface
-\[
-\tau_{\mathrm{avail}}(X_t^{(k)}) > t,
-\]
-o si la construcci\'on de conjuntos de entrenamiento y test permite que la p\'erdida o la
-selecci\'on del modelo utilice observaciones temporalmente ligadas al bloque evaluado fuera
-de muestra.
-
-Equivalentemente, el principio central del m\'odulo es:
-
-\begin{quote}
-\emph{Ninguna transformaci\'on del pipeline puede usar, de forma expl\'icita o impl\'icita,
-informaci\'on cuya disponibilidad real sea posterior al instante de decisi\'on ni permitir
-dependencia indebida entre entrenamiento y evaluaci\'on.}
-\end{quote}
-
-\section{Taxonom\'ia operativa del leakage}
-
-El m\'odulo debe auditar, como m\'inimo, cinco clases de leakage.
-
-\subsection{Leakage temporal de disponibilidad}
-
-Ocurre cuando una feature utiliza datos publicados, consolidados o corregidos despu\'es de la
-hora efectiva de decisi\'on. La condici\'on correcta no es solo ``fecha del dato $\leq$ fecha
-de la barra'', sino:
-\[
-\tau_{\mathrm{avail}}(X_{i,t}^{(k)}) \leq \tau_{\mathrm{decision}}(i,t) - h_{\mathrm{safety}},
-\]
-donde $h_{\mathrm{safety}} \geq 0$ representa el margen operativo exigido por el sistema
-(latencia de proveedores, procesamiento, clock alignment, colas de ingesta, etc.).
-
-\subsection{Leakage por etiquetas mal definidas}
-
-Aparece cuando la variable objetivo y las features comparten informaci\'on solapada de forma
-incorrecta. Si el label se define, por ejemplo, como
-\[
-Y_t = f(P_{t+1},\dots,P_{t+h}),
-\]
-entonces ninguna transformaci\'on de features en el instante $t$ puede incorporar de forma
-encubierta parte de ese mismo intervalo futuro.
-
-\subsection{Leakage por joins y forward fill}
-
-Es frecuente en merges de fundamentales, datos corporativos, anal\'iticos o datasets alternativos.
-Si una tabla de eventos se une a precios por ``fecha de referencia'' en lugar de por fecha real
-de disponibilidad, el pipeline puede filtrar futuro sin que sea evidente en el c\'odigo.
-Igualmente, un \texttt{forward fill} no controlado puede propagar informaci\'on m\'as all\'a
-de su ventana econ\'omicamente justificable.
-
-\subsection{Leakage entre train y test}
-
-Aparece cuando la partici\'on temporal no purga observaciones ligadas por horizonte de label,
-solapamiento de barras, holdings persistentes o efectos de autocorrelaci\'on de features.
-En series financieras no basta con un split cronol\'ogico ingenuo; deben imponerse purga y,
-cuando proceda, embargo temporal.
-
-\subsection{Leakage por normalizaci\'on o transformaciones globales}
-
-Cualquier transformaci\'on ajustada con estad\'isticas de todo el dataset antes del split
-(escalados, winsorizaciones, PCA, imputaciones, neutralizaciones, rankings globales, etc.)
-puede filtrar informaci\'on futura. Toda transformaci\'on dependiente de datos debe ajustarse
-\emph{solo} en el subconjunto de entrenamiento pertinente.
-
-\section{Principios de dise\~no del auditor}
-
-\subsection{Defensa en profundidad}
-
-El leakage no debe modelarse como un check binario \'unico. El auditor debe combinar:
-\begin{itemize}[leftmargin=2em]
-    \item invariantes deterministas,
-    \item verificaciones estructurales de metadatos,
-    \item tests sobre la geometr\'ia temporal del dataset,
-    \item pruebas diferenciales de pipeline,
-    \item diagn\'osticos estad\'isticos auxiliares.
-\end{itemize}
-
-La raz\'on es sencilla: algunos leaks son demostrables por l\'ogica temporal, mientras que otros
-solo aparecen por contradicciones entre versiones del pipeline o por patrones de rendimiento
-demasiado fr\'agiles para ser plausibles.
-
-\subsection{Jerarqu\'ia de evidencia}
-
-No todos los tests tienen el mismo peso. El m\'odulo debe distinguir entre:
-\begin{enumerate}[leftmargin=2em]
-    \item \textbf{Violaciones duras}: prueban inconsistencia temporal o contaminaci\'on estructural.
-    \item \textbf{Violaciones blandas}: no prueban leakage por s\'i solas, pero son suficientemente
-    sospechosas como para requerir revisi\'on.
-    \item \textbf{Diagn\'osticos auxiliares}: ayudan a priorizar investigaci\'on, pero no deben
-    usarse como prueba \'unica.
-\end{enumerate}
-
-\section{Checks nucleares}
-
-\subsection{Check 1: disponibilidad temporal punto-en-el-tiempo}
-
-Para cada feature $X_{i,t}^{(k)}$, el auditor debe verificar la desigualdad:
-\[
-\tau_{\mathrm{avail}}(X_{i,t}^{(k)}) \leq \tau_{\mathrm{decision}}(i,t) - h_{\mathrm{safety}}.
-\]
-
-Este check requiere que cada fuente relevante transporte metadatos de disponibilidad real,
-no solo timestamp nominal. Si dichos metadatos no existen, el m\'odulo debe degradar la
-confianza del check y marcar la fuente como \texttt{UNVERIFIED}.
-
-\paragraph{Salida esperada.}
-\begin{itemize}[leftmargin=2em]
-    \item porcentaje de filas v\'alidas,
-    \item recuento de violaciones,
-    \item peores fuentes,
-    \item m\'aximo retraso negativo observado,
-    \item clasificaci\'on \texttt{PASS/WARN/FAIL}.
-\end{itemize}
-
-\subsection{Check 2: integridad de labels}
-
-Sea $Y_{i,t}^{(h)}$ el label a horizonte $h$. Debe cumplirse que la ventana usada para construir
-el target no se filtra hacia las features contempor\'aneas o hacia transformaciones posteriores.
-Un invariante b\'asico es que la funci\'on de etiquetado sea reproducible a partir de precios
-futuros \emph{solo} en el bloque permitido:
-\[
-Y_{i,t}^{(h)} = g\big(P_{i,t+1},\dots,P_{i,t+h}\big),
-\]
-sin que ninguna etapa de feature engineering consuma total o parcialmente ese mismo intervalo.
-
-\paragraph{Implementaci\'on.}
-El auditor debe inspeccionar:
-\begin{itemize}[leftmargin=2em]
-    \item horizon efectivo del label,
-    \item offsets usados en features rezagadas,
-    \item alineaci\'on entre timestamps de features y target,
-    \item presencia de operaciones de \texttt{shift}, rolling o joins susceptibles de
-    invertirse de signo por error.
-\end{itemize}
-
-\subsection{Check 3: joins y propagaci\'on temporal}
-
-En datasets combinados, cada merge debe auditarse con una regla del tipo:
-\[
-\tau_{\mathrm{left}} \geq \tau_{\mathrm{avail,right}}
-\]
-bajo la l\'ogica econ\'omica correcta de la fuente derecha. Esto es especialmente importante
-en fundamentales, estimaciones de analistas, corporate actions, short interest y datos
-alternativos.
-
-Adem\'as, el auditor debe parametrizar la propagaci\'on permitida:
-\[
-\Delta_{\mathrm{ffill}}^{(k)} \leq \Delta_{\max}^{(k)},
-\]
-donde $\Delta_{\max}^{(k)}$ depende del tipo de dato. Un forward fill de una sesi\'on puede
-ser razonable para un campo cuasi-est\'atico; uno de varias semanas puede ser leakage o, como
-m\'inimo, mala especificaci\'on econ\'omica.
-
-\subsection{Check 4: purga y embargo en validaci\'on temporal}
-
-Sea un label a horizonte $h$ y sean bloques de entrenamiento y test definidos sobre intervalos
-temporales. Para evitar contaminaci\'on, el conjunto de entrenamiento debe excluir observaciones
-cuyas ventanas de informaci\'on o de label interfieran con el test. Formalmente, si una muestra
-de entrenamiento termina en $t_i^{\mathrm{end}}$ y el test comienza en $t_j^{\mathrm{start}}$,
-debe respetarse una separaci\'on efectiva:
-\[
-t_i^{\mathrm{end}} + h + e \leq t_j^{\mathrm{start}},
-\]
-donde $e \geq 0$ es el embargo adicional.
-
-Aqu\'i $h$ y $e$ no son constantes universales; deben derivarse de:
-\begin{itemize}[leftmargin=2em]
-    \item horizonte de label,
-    \item holding period esperado,
-    \item persistencia de se\~nales,
-    \item frecuencia de rebalanceo,
-    \item dependencia serial observada.
-\end{itemize}
-
-\subsection{Check 5: ajuste de transformaciones dentro del fold}
-
-Toda transformaci\'on dependiente de datos debe cumplir:
-\[
-\theta_{\mathrm{transform},m} = \mathcal{F}(D^{\mathrm{train}}_m),
-\]
-y solo despu\'es aplicarse a
-\[
-D^{\mathrm{valid}}_m,\; D^{\mathrm{test}}_m.
-\]
-
-Esto incluye, entre otros:
-\begin{itemize}[leftmargin=2em]
-    \item estandarizaci\'on,
-    \item winsorizaci\'on,
-    \item imputaci\'on,
-    \item PCA y otras reducciones de dimensi\'on,
-    \item neutralizaciones cross-sectional,
-    \item rankings o cuantiles estimados globalmente,
-    \item calibraci\'on de thresholds.
-\end{itemize}
-
-Si el auditor detecta que una transformaci\'on se ajusta antes del split, el resultado debe ser
-\texttt{FAIL} estructural.
-
-\section{Diagn\'osticos auxiliares}
-
-\subsection{Pruebas diferenciales de pipeline}
-
-Un recurso muy potente consiste en recomputar el pipeline bajo versiones m\'as estrictas:
-\begin{itemize}[leftmargin=2em]
-    \item con mayor latencia de seguridad,
-    \item con joins truncados,
-    \item con ventanas de ffill reducidas,
-    \item con purga y embargo m\'as severos,
-    \item con todas las transformaciones re-ajustadas estrictamente por fold.
-\end{itemize}
-
-Si el rendimiento colapsa bruscamente bajo versiones m\'as plausibles temporalmente, ello no
-prueba leakage de forma l\'ogica, pero s\'i constituye evidencia fuerte de fragilidad o de
-especificaci\'on inconsistente.
-
-\subsection{Medidas de dependencia estad\'istica}
-
-Medidas como correlaci\'on adelantada, informaci\'on mutua o tests de permutaci\'on pueden ser
-\'utiles como se\~nal de alerta:
-\[
-I(X_t^{(k)};Y_{t+h}) =
-\sum_{x,y} p(x,y)\log\frac{p(x,y)}{p(x)p(y)}.
-\]
-
-Sin embargo, el auditor no debe usar un umbral fijo del tipo ``$I>0.1$ implica leakage'' como
-regla universal. Esa cantidad depende de discretizaci\'on, tama\~no muestral, no linealidad,
-estructura de dependencia y definici\'on del label. Su funci\'on correcta es auxiliar:
-priorizar investigaci\'on, no certificar culpabilidad.
-
-\subsection{Decay de performance}
-
-La comparaci\'on entre rendimiento in-sample y out-of-sample tambi\'en puede ser informativa.
-Sea
-\[
-R_{\mathrm{decay}} = \frac{S_{\mathrm{OOS}}}{\max(S_{\mathrm{IS}},\varepsilon)}.
-\]
-
-Un valor bajo de $R_{\mathrm{decay}}$ puede indicar sobreajuste, cambio de r\'egimen, mala
-especificaci\'on o leakage. Por s\'i solo, no permite distinguir estas causas. Por tanto,
-debe tratarse como \textbf{diagn\'ostico blando} y nunca como prueba autosuficiente.
-
-\section{Sistema de severidad}
-
-En lugar de una puntuaci\'on arbitraria, se recomienda construir una matriz de incidencias.
-Sea $\mathcal{H}$ el conjunto de checks duros y $\mathcal{S}$ el conjunto de checks blandos.
-
-\[
-N_{\mathrm{hard}} = \sum_{c \in \mathcal{H}} \mathbf{1}\{c \text{ viola invariante}\},
-\qquad
-N_{\mathrm{soft}} = \sum_{c \in \mathcal{S}} \omega_c \mathbf{1}\{c \text{ sospechoso}\},
-\]
-con pesos $\omega_c \in (0,1]$ solo para priorizaci\'on.
-
-La gobernanza recomendada es:
-\[
-\texttt{FAIL} \iff N_{\mathrm{hard}} \geq 1,
-\]
-\[
-\texttt{WARN} \iff N_{\mathrm{hard}} = 0 \;\; \text{y} \;\; N_{\mathrm{soft}} \geq \tau_{\mathrm{warn}},
-\]
-\[
-\texttt{PASS} \iff N_{\mathrm{hard}} = 0 \;\; \text{y} \;\; N_{\mathrm{soft}} < \tau_{\mathrm{warn}}.
-\]
-
-Este esquema es mejor que un score agregado opaco porque evita compensar una violaci\'on temporal
-grave con varios checks menores favorables.
-
-\section{Casos l\'imite que el m\'odulo debe cubrir}
-
-\begin{enumerate}[leftmargin=2em]
-    \item \textbf{Corporate actions retroajustadas.} Una serie ajustada por dividendos o splits
-    puede introducir informaci\'on posterior si no se trata correctamente.
-    \item \textbf{Restatements fundamentales.} Debe distinguirse entre fecha fiscal, fecha de
-    publicaci\'on y fecha de ingesta efectiva.
-    \item \textbf{Delistings y survivorship.} La ausencia de nombres desaparecidos puede inducir
-    sesgo similar a leakage econ\'omico.
-    \item \textbf{Asincron\'ia entre mercados y horarios.} Una feature macro o sectorial puede
-    parecer contempor\'anea cuando en realidad se publica tras el cierre relevante.
-    \item \textbf{Universe selection ex post.} Un filtro de liquidez calculado con informaci\'on
-    futura tambi\'en constituye leakage, aunque no aparezca en las features finales.
-    \item \textbf{Ranking cross-sectional con datos incompletos.} El orden relativo puede usar
-    observaciones que a\'un no estaban disponibles para todos los nombres.
-\end{enumerate}
-
-\section{Invariantes de implementaci\'on}
-
-El auditor debe garantizar al menos los siguientes invariantes:
-
-\begin{itemize}[leftmargin=2em]
-    \item ninguna fuente sin metadatos temporales suficientes puede recibir \texttt{PASS} pleno;
-    \item cualquier transformaci\'on global pre-split provoca \texttt{FAIL};
-    \item cualquier overlap no purgado entre ventana de label y test provoca \texttt{FAIL};
-    \item cualquier merge con disponibilidad posterior a la decisi\'on provoca \texttt{FAIL};
-    \item los diagn\'osticos estad\'isticos solo elevan severidad, nunca la reducen;
-    \item el resultado final debe identificar la causa exacta del fallo y su localizaci\'on
-    en el pipeline.
-\end{itemize}
-
-\section{Salida recomendada del m\'odulo}
-
-La salida debe ser auditable y granular. Una estructura tipo es:
-
-\begin{verbatim}
+Especificación Cuantitativa: validation/leakage_audit.py
+
+1. Propósito del módulo
+
+El objetivo de leakage_audit.py no es mejorar el rendimiento del sistema ni seleccionar estrategias atractivas, sino verificar que el experimento cuantitativo está temporalmente bien definido.
+
+En particular, el módulo debe auditar que:
+- toda la información usada por el pipeline habría estado realmente disponible en el instante de decisión;
+- la construcción de labels no contamina las features;
+- los joins y forward fills respetan disponibilidad económica real;
+- la geometría de train/test evita dependencia indebida;
+- y toda transformación ajustable se entrena exclusivamente dentro del fold correcto.
+
+En un sistema cuantitativo serio, el leakage no es un problema de calidad cosmética. Es una violación de validez experimental. Si existe leakage estructural, cualquier Sharpe, IC o PnL deja de ser interpretable como evidencia económica.
+
+2. Alcance y no-objetivos
+
+2.1 Alcance
+El módulo:
+- audita disponibilidad temporal real de features;
+- verifica integridad de labels;
+- inspecciona joins y forward fill;
+- verifica purga y embargo en splits temporales;
+- audita el alcance de ajuste de transformaciones del pipeline;
+- y produce una salida estructurada PASS / WARN / FAIL con causa vinculante.
+
+2.2 Fuera de alcance
+El módulo no:
+- optimiza estrategias,
+- no calibra modelos,
+- no reemplaza revisión manual de código,
+- no prueba por sí solo ausencia absoluta de leakage semántico oculto,
+- ni debe convertirse en un sistema general de inferencia causal.
+
+3. Modelo temporal y notación
+
+Sea j una observación del dataset, normalmente asociada a una entidad i y un tiempo base t_j.
+
+Para cada observación j definimos:
+
+- X^(j): vector de features
+- Y^(j): label
+- tau_decision(j): timestamp efectivo de decisión
+- tau_avail(j,k): timestamp real de disponibilidad de la componente k de X^(j)
+
+Además, definimos tres ventanas temporales por observación:
+
+3.1 Ventana de features
+Sea:
+[t_feat_start(j), t_feat_end(j)]
+
+el intervalo que cubre toda la información temporal usada para construir X^(j).
+
+Ejemplo:
+si una feature usa retornos de los últimos L días hasta t_j, entonces:
+t_feat_start(j) = t_j - L
+t_feat_end(j)   = t_j
+
+3.2 Ventana de label
+Para un horizonte h:
+[t_label_start(j), t_label_end(j)] = [t_j + 1, t_j + h]
+
+3.3 Ventana total de información
+Definimos:
+[t_info_start(j), t_info_end(j)] =
+[t_feat_start(j), t_label_end(j)]
+
+Esta ventana resume toda la información temporal relevante asociada a la observación j.
+
+4. Definición formal de leakage
+
+Existe leakage si se cumple al menos una de las siguientes condiciones:
+
+4.1 Leakage de disponibilidad
+Existe una componente k tal que:
+tau_avail(j,k) > tau_decision(j) - h_safety
+
+donde h_safety >= 0 representa el margen operativo exigido por el sistema.
+
+4.2 Leakage de label
+La construcción de X^(j), de Y^(j) o de cualquier objeto derivado utiliza de forma indebida información perteneciente a:
+[t_label_start(j), t_label_end(j)]
+
+4.3 Leakage entre train y test
+Existe una observación i en train y una observación j en test tales que sus ventanas relevantes se solapan de forma incompatible con la política de purga y embargo.
+
+4.4 Leakage por transformaciones globales
+Existe una transformación T con parámetros theta ajustados usando datos fuera del subconjunto train del fold correspondiente:
+theta = F(D_full)
+en lugar de:
+theta_m = F(D_train,m)
+
+5. Taxonomía operativa del leakage
+
+El auditor debe cubrir, como mínimo, cinco clases:
+
+5.1 Leakage temporal de disponibilidad
+Uso de datos publicados, consolidados, corregidos o ingeridos después del instante real de decisión.
+
+5.2 Leakage por etiquetas mal definidas
+Uso encubierto del bloque futuro del label dentro de features, targets secundarios o transformaciones derivadas.
+
+5.3 Leakage por joins y forward fill
+Merges con timestamps nominales incorrectos, joins por fecha no económica o propagación excesiva de valores a través del tiempo.
+
+5.4 Leakage entre entrenamiento y evaluación
+Contaminación entre train y test por falta de purga, embargo o separación temporal efectiva.
+
+5.5 Leakage por transformaciones ajustadas globalmente
+Escalado, imputación, winsorización, PCA, rankings, neutralizaciones o thresholds aprendidos usando información del dataset completo.
+
+6. Principios de diseño del auditor
+
+6.1 Defensa en profundidad
+El auditor debe combinar:
+- invariantes deterministas,
+- metadatos temporales,
+- geometría de ventanas,
+- checks estructurales del pipeline,
+- pruebas diferenciales,
+- y diagnósticos auxiliares.
+
+6.2 Jerarquía de evidencia
+No todos los checks pesan igual.
+
+Se distinguen:
+- violaciones duras: prueban inconsistencia estructural;
+- violaciones blandas: indican sospecha fuerte o fragilidad;
+- diagnósticos auxiliares: ayudan a priorizar investigación pero no son prueba autosuficiente.
+
+6.3 Principio de gobernanza
+Una violación dura no puede compensarse con varios checks favorables.
+El auditor debe bloquear PASS cuando exista una inconsistencia estructural.
+
+7. Checks nucleares
+
+7.1 Check 1: disponibilidad punto-en-el-tiempo
+Para toda feature X_k^(j), verificar:
+tau_avail(j,k) <= tau_decision(j) - h_safety
+
+Si una fuente carece de metadatos temporales fiables:
+- marcar como UNVERIFIED,
+- impedir PASS pleno,
+- y elevar severidad al menos a WARN.
+
+Salida mínima:
+- número de observaciones verificadas,
+- porcentaje de violaciones,
+- fuentes afectadas,
+- mayor violación observada,
+- severidad.
+
+7.2 Check 2: integridad de labels
+Sea:
+Y^(j) = g(P_{t_j+1}, ..., P_{t_j+h})
+
+El auditor debe verificar que:
+- la función de etiquetado usa exclusivamente el bloque futuro autorizado;
+- ninguna feature o transformación consume total o parcialmente ese mismo bloque de forma ilegítima;
+- los shifts, rollings y alineamientos temporales están correctamente orientados.
+
+El módulo debe inspeccionar:
+- horizonte efectivo del label,
+- offsets temporales usados,
+- dependencias de columnas derivadas,
+- y coherencia entre timestamps de X e Y.
+
+7.3 Check 3: joins y forward fill
+Para cada join entre tabla left y tabla right, debe cumplirse la relación económica correcta de disponibilidad:
+
+tau_left >= tau_avail,right
+
+según el modelo temporal de la fuente derecha.
+
+Además, el forward fill por feature k debe satisfacer:
+Delta_ffill(k) <= Delta_max(k)
+
+donde Delta_max(k) depende del tipo de dato.
+Ejemplos:
+- dato cuasi-estático: tolerancia moderada
+- fundamental/evento sensible: tolerancia baja
+- dato de mercado: tolerancia prácticamente nula salvo diseño explícito
+
+Violaciones graves:
+- joins usando fecha contable en vez de fecha de disponibilidad real
+- forward fill económicamente injustificable
+
+7.4 Check 4: purga y embargo
+Sea un split temporal con conjuntos train y test.
+
+El auditor debe verificar que para todo par (i en train, j en test) se respeta la política de purga y embargo.
+
+Versión mínima:
+si la parte futura relevante del sample train contamina el bloque test, hay violación.
+
+Versión operativa:
+t_label_end(i) + e <= t_label_start(j)
+
+donde e >= 0 es el embargo.
+
+En versión avanzada, el chequeo debe considerar no solo la ventana de label, sino la ventana total de información cuando corresponda.
+
+7.5 Check 5: ajuste de transformaciones dentro del fold
+El pipeline debe representarse al menos lógicamente como un DAG de transformaciones.
+
+Para cada nodo m con parámetros entrenables theta_m, debe verificarse:
+theta_m = F(D_train,m)
+
+y nunca:
+theta_m = F(D_train,m union D_valid,m)
+ni:
+theta_m = F(D_full)
+
+Esto aplica a:
+- escalado
+- winsorización
+- imputación
+- PCA u otras reducciones
+- neutralización cross-sectional
+- rankings globales
+- calibración de thresholds
+- cualquier estadístico aprendido de datos
+
+Toda transformación ajustada fuera de su train-scope es FAIL estructural.
+
+8. Geometría de independencia train/test
+
+En series financieras, “train/test independientes” no significa solo orden cronológico.
+
+El auditor debe entender que la dependencia puede venir de:
+- labels solapados,
+- ventanas rolling compartidas,
+- persistencia de holdings,
+- autocorrelación de features,
+- y contaminación por transformaciones cross-sectional.
+
+Por tanto, la validación correcta exige:
+- splits temporales ordenados,
+- purga compatible con horizonte de label,
+- embargo cuando la dependencia residual lo requiera,
+- y verificación algorítmica de estas condiciones.
+
+9. Diagnósticos auxiliares
+
+9.1 Pruebas diferenciales de pipeline
+El auditor puede ejecutar el pipeline bajo configuraciones más estrictas:
+- mayor h_safety,
+- menor tolerancia de forward fill,
+- purga mayor,
+- embargo mayor,
+- y transformaciones más estrictamente acotadas al fold.
+
+Si la performance colapsa de forma anómala bajo endurecimientos temporalmente plausibles, se genera un soft flag de fragilidad o sospecha de leakage.
+
+9.2 Información mutua y dependencia adelantada
+Puede medirse, como diagnóstico auxiliar:
+I(X_k^(j); Y^(j))
+
+o su equivalente estimado sobre muestras.
+
+Pero:
+- no debe usarse como prueba única,
+- no debe tener umbral universal,
+- y, si se usa, conviene compararlo con referencias por permutación o shuffled labels.
+
+9.3 Decay de performance
+Definimos:
+R_decay = S_OOS / max(S_IS, eps)
+
+Un valor muy bajo puede reflejar:
+- overfitting,
+- cambio de régimen,
+- o leakage.
+
+Es un indicador blando, nunca una demostración.
+
+9.4 PBO / CSCV
+Si la infraestructura existe, puede incorporarse Probability of Backtest Overfitting (PBO) como evidencia complementaria.
+Pero debe interpretarse correctamente:
+- PBO alto no prueba leakage estructural;
+- simplemente refuerza sospecha de invalidez experimental cuando coincide con otros flags.
+
+10. Sistema de severidad
+
+Sea H el conjunto de checks duros y S el conjunto de checks blandos.
+
+Definimos:
+N_hard = sum_{c in H} 1{c viola invariante}
+N_soft = sum_{c in S} w_c 1{c sospechoso}
+
+con pesos w_c en (0,1] usados solo para priorización.
+
+Reglas de gobernanza:
+
+FAIL si:
+N_hard >= 1
+
+WARN si:
+N_hard = 0
+y N_soft >= tau_warn
+
+PASS si:
+N_hard = 0
+y N_soft < tau_warn
+
+Importante:
+- los diagnósticos auxiliares pueden elevar severidad,
+- pero nunca reducirla,
+- y un hard fail no puede compensarse.
+
+11. Invariantes de implementación
+
+El auditor debe imponer, al menos, estos invariantes:
+
+- ninguna fuente sin metadatos temporales suficientes puede recibir PASS pleno;
+- cualquier transformación global pre-split provoca FAIL;
+- cualquier overlap no purgado incompatible con el split provoca FAIL;
+- cualquier join con disponibilidad posterior a la decisión provoca FAIL;
+- cualquier label contaminado con información no permitida provoca FAIL;
+- la salida final debe identificar la causa exacta, la localización y el tipo de fallo.
+
+12. Failure modes y límites del auditor
+
+El módulo debe reconocer explícitamente sus límites.
+
+12.1 Lo que sí detecta bien
+- violaciones temporales explícitas,
+- joins mal alineados,
+- transformaciones ajustadas fuera del fold,
+- purga/embargo incorrectos,
+- parte importante del leakage estructural reproducible.
+
+12.2 Lo que puede no detectar directamente
+- leakage puramente semántico escondido en código arbitrario,
+- metadata incompleta o incorrecta de proveedores,
+- contaminación lógica no representada en pipeline_spec,
+- supuestos económicos falsos aunque temporalmente consistentes.
+
+En estos casos, el auditor debe:
+- degradar confianza,
+- marcar UNVERIFIED,
+- y recomendar revisión manual.
+
+13. Salida del módulo
+
+La salida debe ser auditable y granular.
+Formato recomendado:
+
 {
   "gate": "PASS|WARN|FAIL",
   "hard_failures": [...],
@@ -350,17 +358,24 @@ La salida debe ser auditable y granular. Una estructura tipo es:
   "transform_fit_summary": {...},
   "diagnostics": {
       "performance_decay": ...,
-      "lead_lag_flags": ...,
-      "mutual_information_flags": ...
+      "mutual_information_flags": ...,
+      "stress_of_leakage_flags": ...,
+      "pbo_flags": ...
   },
   "binding_failure": "...",
   "recommended_action": "..."
 }
-\end{verbatim}
 
-\section{Esqueleto de implementaci\'on}
+Cada fallo debe incluir:
+- check afectado,
+- tipo de severidad,
+- fuente o transformación implicada,
+- localización temporal,
+- descripción corta,
+- acción recomendada.
 
-\begin{verbatim}
+14. Esqueleto de implementación
+
 def audit_leakage(dataset, feature_meta, split_spec, pipeline_spec, config):
     report = init_report()
 
@@ -395,52 +410,48 @@ def audit_leakage(dataset, feature_meta, split_spec, pipeline_spec, config):
     report["recommended_action"] = map_action(gate, binding_failure)
 
     return report
-\end{verbatim}
 
-\section{Interpretaci\'on correcta}
+15. MVP vs versión avanzada
 
-La lectura correcta de \texttt{leakage\_audit.py} no es:
-\begin{quote}
-``este m\'odulo selecciona estrategias m\'as rentables''.
-\end{quote}
+15.1 MVP
+- checks 1–5 implementados sobre metadatos y pipeline_spec,
+- severidad basada en N_hard / N_soft,
+- soporte básico de purga y embargo,
+- MI opcional en pocas features,
+- sin PBO obligatorio,
+- sin stress múltiple pesado.
 
-La lectura correcta es:
-\begin{quote}
-``este m\'odulo comprueba si el experimento es temporalmente v\'alido; si falla, cualquier
-m\'etrica de backtest deja de ser interpretable como evidencia econ\'omica''.
-\end{quote}
+15.2 Versión avanzada
+- ventanas de información completas por observación,
+- verificación exhaustiva de purged CV,
+- DAG más rico de transformaciones,
+- stress de leakage bajo varias configuraciones,
+- integración opcional con PBO/CSCV,
+- trazabilidad más detallada de dependencia temporal entre samples.
 
-Esa diferencia es esencial. En validaci\'on cuantitativa, primero se demuestra que el
-experimento est\'a bien definido; solo despu\'es tiene sentido discutir rendimiento.
+16. Interpretación correcta
 
-\section{Referencias orientativas}
+La interpretación correcta de leakage_audit.py es:
 
-\begin{thebibliography}{9}
+“Este módulo no busca estrategias rentables. Busca demostrar que el experimento cuantitativo no está contaminado por información ilegítima.”
 
-\bibitem{lopez}
-L\'opez de Prado, M. (2018).
-\emph{Advances in Financial Machine Learning}.
-Wiley.
+Si leakage_audit falla, el backtest deja de tener valor epistemológico.
+Primero se demuestra validez temporal.
+Después, y solo después, se discute rendimiento.
 
-\bibitem{bailey}
-Bailey, D., Borwein, J., de Prado, M. y Zhu, Q. (2014--2017).
-Trabajos sobre backtest overfitting, selection bias y validaci\'on en research cuantitativo.
+17. Referencias orientativas
 
-\bibitem{chan}
-Chan, E. (distintas ediciones).
-\emph{Quantitative Trading} y trabajos relacionados sobre dise\~no e implementaci\'on de estrategias.
+- López de Prado, M. (2018), Advances in Financial Machine Learning
+- Bailey et al., trabajos sobre backtest overfitting y PBO
+- documentación y literatura sobre purged k-fold CV y embargo
+- referencias operativas sobre PIT data y disponibilidad real de fuentes
 
-\bibitem{almgren}
-Referencias de microestructura y datos punto-en-el-tiempo cuando se auditen costes, latencias
-o disponibilidad de mercado.
+18. Conclusión
 
-\end{thebibliography}
+leakage_audit.py debe ser un módulo severo, interpretable y automatizable.
+No debe convertirse en un paper teórico ni en un dashboard decorativo.
+Su función es más básica y más importante:
 
-\section{Conclusi\'on}
+verificar que el pipeline respeta causalidad temporal, separación legítima entre entrenamiento y evaluación, y alcance correcto de cada transformación.
 
-Un auditor serio de leakage no debe vender ``SOTA industrial'' ni prometer que, tras filtrar
-errores, aparecer\'an Sharpe elevados. Su tarea es bastante m\'as importante: verificar que el
-pipeline respeta causalidad temporal, separaci\'on correcta entre entrenamiento y evaluaci\'on,
-y alcance leg\'itimo de cada transformaci\'on. Si esa base falla, todo lo dem\'as es irrelevante.
-
-\end{document}
+Si esa base falla, cualquier resultado posterior es irrelevante.

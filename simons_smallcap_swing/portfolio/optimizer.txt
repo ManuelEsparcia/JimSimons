@@ -1,738 +1,587 @@
-\documentclass[11pt,a4paper]{article}
+Especificación Cuantitativa: portfolio/optimizer.py
 
-\usepackage[utf8]{inputenc}
-\usepackage[spanish]{babel}
-\usepackage[T1]{fontenc}
-\usepackage{amsmath,amssymb,amsthm,amsfonts,mathtools}
-\usepackage{graphicx}
-\usepackage{hyperref}
-\usepackage{booktabs}
-\usepackage{siunitx}
-\usepackage{array}
-\usepackage{geometry}
-\geometry{margin=2.5cm}
+1. Propósito del módulo
 
-\hypersetup{
-    colorlinks=true,
-    linkcolor=blue,
-    citecolor=blue,
-    urlcolor=blue
-}
+El objetivo de portfolio/optimizer.py es resolver el problema central de construcción de cartera:
 
-\title{Especificación Operativa de Optimización de Portafolio\\
-\large Módulo \texttt{portfolio/optimizer.py}}
-\author{Quantitative Research Specification}
-\date{Marzo 2026}
+transformar alpha esperado, cartera previa y modelo de riesgo en un vector de pesos implementable que maximice utilidad ex ante bajo restricciones explícitas de:
+- riesgo,
+- coste de rotación,
+- liquidez,
+- gross/net,
+- límites por activo,
+- factores,
+- grupos,
+- y turnover.
 
-\begin{document}
+La pregunta correcta del módulo es:
 
-\maketitle
-\tableofcontents
-\newpage
+“¿Cuál es la cartera factible que maximiza utilidad neta esperada una vez penalizados riesgo y fricción operativa?”
 
-\section{Objetivo del módulo}
+No es un módulo para “hacer Markowitz” en abstracto.
+Es una pieza operativa que debe producir una decisión reproducible, auditable y consistente con small caps swing trading.
 
-El módulo \texttt{portfolio/optimizer.py} resuelve el problema central de construcción de cartera: transformar señales esperadas de retorno en un vector de pesos implementable que maximice utilidad ex-ante bajo restricciones explícitas de riesgo, exposición, liquidez y turnover.
+2. Principios no negociables
 
-Su función no es ``hacer Markowitz'' en abstracto, sino producir un output operativo, reproducible y auditable:
+2.1 Semántica canónica única
+La formulación oficial del módulo es un problema convexo de utilidad:
 
-\[
-\mathbf{w}^{\star}
-=
-\arg\max_{\mathbf{w} \in \mathcal{W}}
-\Big(
-\text{alpha esperado}
--
-\text{penalización de riesgo}
--
-\text{penalización de costes}
-\Big),
-\]
-donde \(\mathcal{W}\) es el conjunto factible definido por límites de posición, gross, net, grupo, factor, liquidez y turnover.
+alpha
+- riesgo cuadrático
+- coste L1 linealizado
 
-Para una estrategia de swing trading sobre small caps, este módulo debe ser especialmente disciplinado, porque el riesgo de sobreconcentración, impacto implícito y falsa capacidad es materialmente mayor que en universos líquidos y diversificados.
+No se permite que cada ejecución cambie de semántica sin declararlo explícitamente.
 
-\section{Principios de diseño}
+2.2 Consistencia temporal estricta
+Alpha, risk model, cartera previa, exposiciones y liquidez deben corresponder a la misma fecha efectiva de decisión.
 
-El módulo se construye bajo los siguientes principios:
+2.3 Separación de responsabilidades
+optimizer.py elige pesos.
+No:
+- entrena modelos,
+- no redefine el universo,
+- no crea factores latentes,
+- no estima intradía,
+- ni reemplaza execution o rebalance.
 
-\begin{enumerate}
-    \item \textbf{Unicidad semántica:} el optimizador tiene una formulación canónica por defecto; variantes robustas o no convexas son extensiones, no el contrato base.
-    \item \textbf{Consistencia temporal estricta:} alpha, covarianza, factores, liquidez y cartera previa deben corresponder a la misma fecha efectiva de decisión.
-    \item \textbf{Separación de responsabilidades:} el optimizador elige pesos; no reentrena modelos ML ni redefine el universo elegible.
-    \item \textbf{Auditabilidad:} el resultado debe ir acompañado de diagnósticos de factibilidad, actividad de constraints, contribuciones marginales al riesgo y verificación post-solver.
-    \item \textbf{Control explícito de fricción:} turnover y coste transaccional no pueden quedar en una nota lateral; forman parte de la definición económica del problema.
-    \item \textbf{Tratamiento explícito de infactibilidad:} si la configuración es inconsistente, el módulo debe declararlo y no fabricar una solución opaca.
-\end{enumerate}
+2.4 Auditabilidad
+Toda optimización debe dejar:
+- status del solver,
+- post-checks numéricos,
+- slacks,
+- constraints activas,
+- before/after,
+- MRC/RC,
+- y versión efectiva del risk model usado.
 
-\section{Qué hace y qué no hace}
+2.5 Infactibilidad visible
+Si la configuración de restricciones es incompatible, el módulo debe devolver infactibilidad explícita.
+Nunca una cartera heurística disfrazada bajo `strict_fail`.
 
-\subsection{Qué hace}
+3. Qué hace y qué no hace
 
-\begin{itemize}
-    \item recibe alpha esperado, risk model, cartera previa y restricciones;
-    \item resuelve pesos óptimos bajo una función objetivo explícita;
-    \item incorpora penalización por riesgo y costes de rotación;
-    \item respeta límites de gross, net, posición, factor, grupo, liquidez y turnover;
-    \item devuelve pesos, diagnósticos KKT y métricas before/after.
-\end{itemize}
+3.1 Qué hace
+- recibe alpha esperado, cartera previa y risk model;
+- construye una función objetivo explícita;
+- impone simultáneamente todas las restricciones activas;
+- resuelve un QP convexo;
+- devuelve pesos óptimos y diagnóstico completo.
 
-\subsection{Qué no hace}
+3.2 Qué no hace
+- no genera alpha,
+- no estima features,
+- no hace Black-Litterman por defecto,
+- no usa RL,
+- no usa CVaR/DRO como contrato base,
+- ni debe reinterpretar upstream outputs.
 
-\begin{itemize}
-    \item no genera la señal predictiva;
-    \item no estima features ni labels;
-    \item no reemplaza a \texttt{rebalance.py} en la traducción final a órdenes;
-    \item no estima por defecto modelos complejos de ejecución intradía;
-    \item no usa reinforcement learning, CVaR, DRO o Black-Litterman como semántica base.
-\end{itemize}
+4. Entradas obligatorias
 
-\section{Contrato exacto del módulo}
+4.1 Alpha esperado
+alpha in R^N
 
-\subsection{Entradas obligatorias}
+Debe venir en convención única y documentada:
+- retorno esperado a horizonte de rebalanceo,
+- o score monotónico ya reescalado coherentemente.
 
-El módulo opera sobre una fecha de decisión \(t\) y recibe las siguientes entradas mínimas.
+4.2 Cartera previa
+w_prev in R^N
 
-\subsubsection*{1. Alpha esperado}
+Debe coincidir exactamente con la cartera heredada antes del rebalanceo actual.
 
-\[
-\boldsymbol{\alpha}_t \in \mathbb{R}^N
-\]
-vector de retornos esperados por activo. Debe venir en una convención única y documentada, por ejemplo retorno esperado a horizonte de rebalanceo o score monotónico reescalado.
+4.3 Risk model
+El módulo admite dos modalidades:
 
-\subsubsection*{2. Cartera previa}
+a) covarianza total:
+    Sigma in R^(N x N)
 
-\[
-\mathbf{w}^{\mathrm{prev}}_t \in \mathbb{R}^N
-\]
-vector de pesos actualmente en cartera antes del rebalanceo.
+b) forma factorial:
+    X in R^(N x K)
+    Omega in R^(K x K)
+    D_idio diagonal in R^(N x N)
 
-\subsubsection*{3. Risk model}
+con:
+    Sigma = X Omega X^T + D_idio
 
-El módulo debe recibir o bien una covarianza total ya construida
-\[
-\Sigma_t \in \mathbb{R}^{N\times N},
-\]
-o bien una descomposición factorial:
+4.4 Restricciones y parámetros
+Vía config versionada:
+- gross_max
+- net_min, net_max o net_target
+- pos_lb, pos_ub
+- factor_bounds
+- group_bounds
+- turnover_max
+- liquidity_caps
+- risk_aversion = lambda_r
+- cost_aversion = lambda_c
+- liquidity_fraction = phi
+- AUM operativo = A
+- solver_name
+- psd_repair
+- infeasibility_policy
+- solver_tolerances
 
-\[
-X_t \in \mathbb{R}^{N\times K}, \qquad
-\Omega_t \in \mathbb{R}^{K\times K}, \qquad
-D_t \in \mathbb{R}^{N\times N} \text{ diagonal},
-\]
-de modo que
-\[
-\Sigma_t = X_t \Omega_t X_t^\top + D_t.
-\]
+4.5 Liquidez y coste
+Por activo:
+- adv_usd
+- spread_bps
+- price
+- tradable_flag
+- halt_flag
+- fee_bps si aplica
+- kappa_i o inputs para construirla
 
-\subsubsection*{4. Restricciones}
-
-La configuración debe definir explícitamente:
-
-\begin{itemize}
-    \item \texttt{gross\_max}
-    \item \texttt{net\_min}, \texttt{net\_max}
-    \item \texttt{pos\_lb}, \texttt{pos\_ub}
-    \item \texttt{factor\_bounds}
-    \item \texttt{group\_bounds}
-    \item \texttt{turnover\_max}
-    \item \texttt{liquidity\_caps}
-    \item \texttt{risk\_aversion} \(=\lambda_r\)
-    \item \texttt{cost\_aversion} \(=\lambda_c\)
-    \item \texttt{solver\_name}
-    \item \texttt{infeasibility\_policy}
-\end{itemize}
-
-\subsubsection*{5. Datos de liquidez y coste}
-
-Para cada activo:
-
-\begin{center}
-\begin{tabular}{>{\ttfamily}m{4.2cm} m{9.0cm}}
-\toprule
-\textnormal{Campo} & \textnormal{Descripción} \\
-\midrule
-adv\_usd & Average Daily Dollar Volume PIT \\
-spread\_bps & Spread estimado o efectivo \\
-price & Precio de referencia \\
-tradable\_flag & Indicador de activo negociable \\
-halt\_flag & Indicador de suspensión \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\subsection{Salidas obligatorias}
+5. Salidas obligatorias
 
 El módulo debe producir:
 
-\begin{enumerate}
-    \item \(\mathbf{w}^{\star}\): pesos óptimos factibles;
-    \item \texttt{optimizer\_report.json}: resumen de parámetros, status, slacks y diagnósticos;
-    \item \texttt{before\_after.parquet}: métricas por activo y agregadas;
-    \item \texttt{status}: \texttt{optimal}, \texttt{optimal\_inaccurate}, \texttt{infeasible} o \texttt{fail\_postcheck}.
-\end{enumerate}
-
-\section{Consistencia temporal obligatoria}
-
-La semántica temporal del módulo debe ser inequívoca. En la fecha \(t\):
-
-\begin{itemize}
-    \item \(\boldsymbol{\alpha}_t\) debe ser calculado exclusivamente con información disponible hasta \(t\);
-    \item \(\Sigma_t\), \(X_t\), \(\Omega_t\) y \(D_t\) deben ser PIT en \(t\);
-    \item \(\mathbf{w}^{\mathrm{prev}}_t\) debe coincidir exactamente con la cartera heredada desde el rebalanceo anterior;
-    \item toda liquidez usada en restricciones o costes debe corresponder a \(t\).
-\end{itemize}
-
-No se permite mezclar un alpha de fecha \(t\) con una covarianza, exposures o cartera previa de otra fecha. Esa inconsistencia invalida la optimización aunque el solver converja.
-
-\section{Notación y definiciones}
-
-Sea \(N\) el número de activos elegibles en la fecha \(t\). Definimos:
-
-\[
-\mathbf{w} \in \mathbb{R}^N
-\quad \text{vector candidato},
-\]
-\[
-\mathbf{w}^{\mathrm{prev}} \in \mathbb{R}^N
-\quad \text{cartera previa},
-\]
-\[
-\boldsymbol{\alpha} \in \mathbb{R}^N
-\quad \text{alpha esperado},
-\]
-\[
-\Sigma \in \mathbb{R}^{N\times N}
-\quad \text{matriz de covarianza total}.
-\]
-
-Las métricas básicas de cartera son:
-
-\[
-G(\mathbf{w}) = \sum_{i=1}^{N} |w_i|
-\qquad \text{(gross exposure)},
-\]
-
-\[
-N(\mathbf{w}) = \sum_{i=1}^{N} w_i
-\qquad \text{(net exposure)},
-\]
+1. w_star
+2. optimizer_report.json
+3. before_after.parquet
+4. status in {optimal, optimal_inaccurate, infeasible, fail_postcheck}
 
-\[
-TO(\mathbf{w},\mathbf{w}^{\mathrm{prev}})
-=
-\sum_{i=1}^{N} |w_i - w_i^{\mathrm{prev}}|
-\qquad \text{(turnover bruto en pesos)}.
-\]
-
-La convención oficial de turnover del módulo será exactamente la anterior. No se dividirá por 2 ni se redefinirá de manera distinta salvo override explícito de sistema. Si otros módulos usan otra convención, la conversión debe hacerse fuera de \texttt{optimizer.py}, no dentro.
-
-\section{Formulación canónica del problema}
+6. Notación
 
-\subsection{Objetivo}
+Sea N el número de activos elegibles.
 
-La formulación por defecto del módulo es el siguiente problema convexo:
+- w in R^N: pesos candidatos
+- w_prev in R^N: cartera previa
+- alpha in R^N: alpha esperado
+- Sigma in R^(N x N): covarianza total
+- u in R^N_+: variable auxiliar para turnover
+- z in R^N_+: variable auxiliar para gross
 
-\[
-\begin{aligned}
-\max_{\mathbf{w},\mathbf{u}}
-\quad &
-\boldsymbol{\alpha}^\top \mathbf{w}
--
-\frac{\lambda_r}{2}\mathbf{w}^\top \Sigma \mathbf{w}
--
-\lambda_c \sum_{i=1}^{N} \kappa_i u_i
-\\
-\text{sujeto a} \quad
-&
-u_i \geq w_i - w_i^{\mathrm{prev}}, \qquad \forall i, \\
-&
-u_i \geq -(w_i - w_i^{\mathrm{prev}}), \qquad \forall i, \\
-&
-u_i \geq 0, \qquad \forall i,
-\end{aligned}
-\]
-más el resto de restricciones de factibilidad.
+Métricas básicas:
 
-Aquí \(\mathbf{u}\) es la variable auxiliar que linealiza el término \(L_1\) de turnover/coste. Esta es la formulación canónica del coste no diferenciable: no se deja implícita ni se delega a una heurística externa.
-
-\subsection{Interpretación económica}
+Gross:
+    G(w) = sum_i |w_i|
 
-La función objetivo maximiza utilidad neta de tres componentes:
+Net:
+    N(w) = sum_i w_i
 
-\begin{enumerate}
-    \item \textbf{beneficio esperado:} \(\boldsymbol{\alpha}^\top \mathbf{w}\),
-    \item \textbf{penalización por riesgo:} \(\frac{\lambda_r}{2}\mathbf{w}^\top \Sigma \mathbf{w}\),
-    \item \textbf{penalización por rotación/coste:} \(\lambda_c \sum_i \kappa_i u_i\).
-\end{enumerate}
+Turnover:
+    TO(w, w_prev) = sum_i |w_i - w_prev_i|
 
-La formulación base es deliberadamente parsimoniosa. Un optimizador serio necesita primero coherencia interna, no complejidad ornamental.
+Participación por nombre:
+    pi_i(w) = A * |w_i - w_prev_i| / (phi * ADV_i_usd)
 
-\subsection{Definición de \(\kappa_i\)}
+7. Formulación canónica
 
-Por defecto, \(\kappa_i\) será el coste marginal lineal por unidad de peso rotada en el activo \(i\), construido a partir de una combinación configurable de spread, fees e iliquidez:
+La formulación oficial del módulo es:
 
-\[
-\kappa_i = \kappa_i^{\mathrm{spread}} + \kappa_i^{\mathrm{fees}} + \kappa_i^{\mathrm{liq}}.
-\]
+    maximize    alpha^T w
+                - (lambda_r / 2) * w^T Sigma w
+                - lambda_c * kappa^T u
 
-Una parametrización canónica mínima es:
+    subject to
+                l <= w <= u_pos
+                sum_i z_i <= G_max
+                z_i >= w_i
+                z_i >= -w_i
+                N_min <= 1^T w <= N_max
+                L_x <= X^T w <= U_x              si hay factores
+                L_b <= B^T w <= U_b              si hay grupos
+                u_i >= w_i - w_prev_i
+                u_i >= w_prev_i - w_i
+                u_i >= 0
+                sum_i u_i <= TO_max
+                A * u_i <= pi_max_i * phi * ADV_i_usd
 
-\[
-\kappa_i^{\mathrm{spread}} = \frac{1}{2}\,\mathrm{spread\_bps}_i,
-\qquad
-\kappa_i^{\mathrm{fees}} = \mathrm{fee\_bps},
-\]
-y una penalización opcional de iliquidez creciente en
-\[
-\frac{A \, |w_i - w_i^{\mathrm{prev}}|}{\phi \, ADV_i^{USD}}.
-\]
+donde:
+- `u` linealiza el término L1 de turnover/coste,
+- `z` linealiza la exposición gross.
 
-En la formulación base, el optimizador usa la parte linealizada del coste. Los modelos no lineales de impacto pueden existir como extensiones posteriores, pero no forman parte del contrato canónico.
+Esta es la semántica base del módulo.
 
-\section{Restricciones canónicas}
+8. Interpretación económica de la función objetivo
 
-El optimizador debe imponer simultáneamente las siguientes restricciones.
+La utilidad optimizada se compone de:
 
-\subsection{Límites por activo}
+8.1 Beneficio esperado
+    alpha^T w
 
-\[
-\ell_i \leq w_i \leq u_i^{(w)},
-\qquad \forall i=1,\dots,N.
-\]
+8.2 Penalización de riesgo
+    (lambda_r / 2) * w^T Sigma w
 
-\subsection{Gross}
+8.3 Penalización de fricción
+    lambda_c * kappa^T u
 
-\[
-\sum_i |w_i| \leq G_{\max}.
-\]
+Interpretación:
+- lambda_r controla aversión al riesgo ex ante,
+- lambda_c controla aversión a rotar en presencia de costes,
+- kappa_i representa coste marginal por unidad de peso rotada.
 
-\subsection{Net}
+9. Construcción de kappa
 
-\[
-N_{\min} \leq \sum_i w_i \leq N_{\max}.
-\]
+La forma mínima canónica de kappa_i es:
 
-\subsection{Factores y grupos}
+    kappa_i = kappa_i_spread + kappa_i_fees + kappa_i_liq
 
-Sea \(X \in \mathbb{R}^{N\times K}\) la matriz de factores continuos y \(B \in \{0,1\}^{N\times G}\) la matriz de grupos categóricos. Entonces:
+Una construcción prudente de MVP puede ser:
 
-\[
-L_k^{(x)} \leq (X^\top \mathbf{w})_k \leq U_k^{(x)}, \qquad \forall k,
-\]
+    kappa_i_spread = 0.5 * spread_bps_i
+    kappa_i_fees   = fee_bps
+    kappa_i_liq    = opcional, función creciente de iliquidez
 
-\[
-L_g^{(b)} \leq (B^\top \mathbf{w})_g \leq U_g^{(b)}, \qquad \forall g.
-\]
+El módulo no debe esconder una no linealidad opaca dentro de kappa sin documentarla.
+Por defecto, la penalización es lineal en `u`.
 
-\subsection{Turnover máximo}
+10. Risk model y PSD repair
 
-Dado que \(u_i \ge |w_i - w_i^{\mathrm{prev}}|\), la restricción oficial de turnover es:
+10.1 Modalidades admitidas
+- Sigma total
+- o Sigma construida como X Omega X^T + D_idio
 
-\[
-\sum_{i=1}^{N} u_i \leq TO_{\max}.
-\]
+10.2 Requisitos mínimos
+Sigma debe ser:
+- simétrica,
+- PIT,
+- alineada exactamente con el universo optimizado,
+- y utilizable numéricamente.
 
-\subsection{Liquidez individual}
+10.3 Reparación PSD
+Si Sigma no es PSD dentro de tolerancia, debe aplicarse una política explícita.
 
-Sea \(A\) el AUM y \(\phi\) la fracción utilizable del \(ADV\). El cambio monetario por activo es:
-\[
-q_i = A\,|w_i - w_i^{\mathrm{prev}}|.
-\]
+Default recomendado:
+    psd_repair = eigenvalue_floor
 
-La participación implícita es:
-\[
-\pi_i = \frac{q_i}{\phi\,ADV_i^{USD}}.
-\]
+Es decir:
+- diagonalizar,
+- elevar autovalores pequeños/negativos a un floor,
+- reconstruir Sigma reparada.
 
-La restricción dura por nombre es:
-\[
-\pi_i \leq \pi_{\max,i},
-\qquad \forall i.
-\]
+Alternativa permitida:
+- shrinkage controlado.
 
-Equivalentemente, usando la variable auxiliar:
-\[
-A\,u_i \leq \pi_{\max,i}\,\phi\,ADV_i^{USD}.
-\]
+La política usada debe quedar registrada.
 
-Esta formulación evita el error de ocultar un nombre imposible de negociar detrás de un promedio benigno de cartera.
+10.4 Condition number check
+Antes de optimizar, el módulo debe computar una medida de condición de Sigma.
+Regla práctica:
+- si cond(Sigma) es extrema, registrar warning
+- si la matriz es demasiado mal condicionada, forzar repair más agresivo o abortar según config
 
-\section{Modelo de riesgo}
+11. Restricciones canónicas
 
-\subsection{Forma general}
+11.1 Límites por activo
+    l_i <= w_i <= u_i^(pos)
 
-El módulo admite dos modalidades:
+11.2 Gross
+Introducir variable z_i >= 0:
+    z_i >= w_i
+    z_i >= -w_i
+    sum_i z_i <= G_max
 
-\begin{enumerate}
-    \item \textbf{covarianza total ya construida,}
-    \item \textbf{risk model factorial,} con
-    \[
-    \Sigma = X\Omega X^\top + D.
-    \]
-\end{enumerate}
+11.3 Net
+    N_min <= sum_i w_i <= N_max
 
-\subsection{Requisitos mínimos}
+o igualdad exacta si la configuración lo exige.
 
-El risk model debe satisfacer:
+11.4 Factores continuos
+    L_x <= X^T w <= U_x
 
-\begin{itemize}
-    \item simetría numérica,
-    \item diagonal no negativa,
-    \item coherencia PIT,
-    \item correspondencia exacta con el universo optimizado.
-\end{itemize}
+11.5 Grupos categóricos
+    L_b <= B^T w <= U_b
 
-\subsection{PSD y regularización}
+11.6 Turnover
+Variable auxiliar:
+    u_i >= w_i - w_prev_i
+    u_i >= w_prev_i - w_i
+    u_i >= 0
+    sum_i u_i <= TO_max
 
-Si \(\Sigma\) no es positiva semidefinida dentro de tolerancia numérica, el módulo debe regularizarla antes de optimizar. La política por defecto será:
+11.7 Liquidez individual
+    A * u_i <= pi_max_i * phi * ADV_i_usd
 
-\begin{center}
-\texttt{psd\_repair = eigenvalue\_floor}
-\end{center}
+Esta restricción debe ser por nombre, no promedio de cartera.
 
-es decir, descomposición espectral y truncado/floor de autovalores negativos pequeños. Como alternativa configurable puede usarse shrinkage. En cualquier caso, la versión regularizada debe persistirse o al menos registrarse en el reporte.
+12. Solver policy
 
-No debe asumirse silenciosamente que el solver ``ya lo arreglará''.
+12.1 Regla simple
+- problema pequeño o relativamente denso: ECOS
+- QP sparse de tamaño medio/grande: OSQP
+- very large / fallback first-order: SCS
 
-\section{Método canónico por defecto}
+12.2 Default recomendado
+OSQP como default del MVP.
 
-La semántica oficial del módulo será:
+12.3 Registro obligatorio
+El solver usado, su status y sus tolerancias deben quedar persistidos.
 
-\begin{center}
-\texttt{objective = alpha - quadratic\_risk - linear\_cost}
-\end{center}
+13. Política de infactibilidad
 
-\begin{center}
-\texttt{solver family = convex quadratic program}
-\end{center}
-
-Esta decisión elimina ambigüedad. El optimizador del sistema, por defecto, es un QP convexo con variables auxiliares para \(L_1\). No es un marco abierto donde cada ejecución pueda significar algo distinto.
-
-\section{Parámetros por defecto}
-
-Hasta disponer de calibración interna más precisa, los defaults deben ser explícitos y conservadores:
-
-\begin{center}
-\begin{tabular}{m{7.3cm} m{5.0cm}}
-\toprule
-\textnormal{Parámetro} & \textnormal{Default} \\
-\midrule
-\texttt{objective} & \texttt{alpha - quadratic\_risk - linear\_cost} \\
-\texttt{solver\_name} & \texttt{OSQP} \\
-\texttt{psd\_repair} & \texttt{eigenvalue\_floor} \\
-\texttt{infeasibility\_policy} & \texttt{strict\_fail} \\
-\texttt{risk\_aversion} \(\lambda_r\) & \(1.0\) \\
-\texttt{cost\_aversion} \(\lambda_c\) & \(1.0\) \\
-\texttt{tolerance\_postcheck} & \(10^{-8}\) a \(10^{-6}\) \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Los parámetros \(\lambda_r\) y \(\lambda_c\) no representan verdades universales; son hiperparámetros del sistema. Su valor debe venir de configuración y, preferiblemente, de un proceso de validación fuera de muestra. El módulo no debe inferirlos de manera implícita.
-
-\section{Precedencia de reglas}
-
-La precedencia correcta no depende del orden textual sino de la definición del conjunto factible:
-
-\begin{enumerate}
-    \item validez de datos y elegibilidad,
-    \item límites por activo,
-    \item liquidez individual,
-    \item turnover máximo,
-    \item gross y net,
-    \item factores y grupos,
-    \item maximización de la utilidad.
-\end{enumerate}
-
-Las seis primeras categorías definen \(\mathcal{W}\). La última elige el mejor punto dentro de \(\mathcal{W}\).
-
-\section{Infactibilidad}
-
-\subsection{Política por defecto}
-
-La política oficial será:
-
-\begin{center}
-\texttt{infeasibility\_policy = strict\_fail}
-\end{center}
+13.1 Política por defecto
+Default:
+    infeasibility_policy = strict_fail
 
 Si el problema es infactible:
+- status = infeasible
+- w_star = None
+- no se devuelve solución parcheada
+- se reportan constraints conflictivas
 
-\begin{enumerate}
-    \item el módulo devuelve \texttt{status = infeasible},
-    \item no fabrica una solución heurística silenciosa,
-    \item persiste un diagnóstico con familias de constraints incompatibles,
-    \item delega la relajación a una política explícita o a la capa upstream.
-\end{enumerate}
+13.2 Relajación opcional
+Solo si config lo activa:
+    prioritized_relaxation
 
-\subsection{Relajación opcional}
+Orden razonable:
+1. factores secundarios
+2. grupos secundarios
+3. turnover
+4. net estrecho
+5. gross
 
-Si se activa
-\texttt{prioritized\_relaxation},
-el orden permitido será:
+Nunca relajar silenciosamente:
+- elegibilidad,
+- halt_flag,
+- liquidez hard,
+- bounds hard por nombre.
 
-\begin{enumerate}
-    \item bandas de factores secundarios,
-    \item bandas de grupos secundarios,
-    \item turnover máximo,
-    \item net band estrecha,
-    \item gross máximo.
-\end{enumerate}
+14. Algoritmo del módulo
 
-Nunca deben relajarse silenciosamente:
-
-\begin{itemize}
-    \item elegibilidad,
-    \item activos suspendidos,
-    \item límites por nombre marcados como hard,
-    \item caps de liquidez individuales hard.
-\end{itemize}
-
-\section{Algoritmo exacto del módulo}
-
-\subsection{Paso 1. Validación de inputs}
-
+14.1 Validación de inputs
 Comprobar:
+- alineación de índices,
+- ausencia de duplicados,
+- dimensiones compatibles,
+- ausencia de NaN/inf,
+- tradabilidad efectiva,
+- límites definidos.
 
-\begin{itemize}
-    \item alineación exacta de \(\boldsymbol{\alpha}\), \(\mathbf{w}^{\mathrm{prev}}\), \(\Sigma\), \(X\), \(B\) y liquidez;
-    \item ausencia de duplicados por activo;
-    \item tradability real de todos los nombres incluidos;
-    \item dimensiones consistentes;
-    \item ausencia de NaN o infinitos;
-    \item definición explícita de bounds y parámetros.
-\end{itemize}
+14.2 Construcción del universo efectivo
+Excluir activos no elegibles o no negociables.
 
-\subsection{Paso 2. Construcción del universo}
+14.3 Construcción / reparación de Sigma
+Construir Sigma si entra factor model.
+Verificar PSD y reparar si hace falta.
 
-Excluir activos con \texttt{eligible\_flag = False}, \texttt{tradable\_flag = False} o \texttt{halt\_flag = True}. La optimización sólo se formula sobre el universo negociable efectivo.
+14.4 Construcción del QP
+Crear variables w, u, z.
+Montar objetivo y todas las constraints simultáneamente.
 
-\subsection{Paso 3. Construcción / reparación del risk model}
+14.5 Resolución
+Resolver con el solver configurado.
+Registrar:
+- solver name
+- solve time
+- objective value
+- primal/dual residuals si existen
+- status crudo del solver
 
-Si entra \(\Sigma\), verificar simetría y PSD.  
-Si entra \((X,\Omega,D)\), construir:
-\[
-\Sigma = X\Omega X^\top + D.
-\]
-Si es necesario, aplicar la política de regularización configurada.
+14.6 Post-check numérico
+Verificar todas las familias de restricciones con tolerancia dependiente del solver.
 
-\subsection{Paso 4. Construcción del QP}
+15. Post-checks obligatorios
 
-Formar variables \(\mathbf{w}\) y \(\mathbf{u}\), objetivo canónico y restricciones completas: posición, gross, net, factor, grupo, turnover y liquidez.
+Tolerancias recomendadas:
+- ECOS: 1e-8
+- OSQP: 1e-6
+- SCS: 1e-5
 
-\subsection{Paso 5. Resolución}
+Checks mínimos:
 
-Resolver con el solver especificado. Registrar:
+15.1 Box
+    max_i max(0, l_i - w_i, w_i - u_i^(pos)) <= eps_solver
 
-\begin{itemize}
-    \item solver usado,
-    \item tiempo de resolución,
-    \item valor objetivo,
-    \item primal status,
-    \item dual status si aplica,
-    \item residuales primal/dual,
-    \item duality gap si el solver la reporta.
-\end{itemize}
+15.2 Gross
+    max(0, sum_i |w_i| - G_max) <= eps_solver
 
-\subsection{Paso 6. Postcheck numérico}
+15.3 Net
+    max(0, N_min - sum_i w_i, sum_i w_i - N_max) <= eps_solver
 
-Aunque el solver devuelva \texttt{optimal}, el módulo debe verificar:
+15.4 Factores
+    max violation factor <= eps_solver
 
-\[
-\max_i \max(0,\ell_i-w_i,w_i-u_i^{(w)}) \leq \varepsilon,
-\]
+15.5 Grupos
+    max violation group <= eps_solver
 
-\[
-\max(0,G(\mathbf{w})-G_{\max}) \leq \varepsilon,
-\]
+15.6 Turnover
+    max(0, sum_i u_i - TO_max) <= eps_solver
 
-\[
-\max(0,N_{\min}-N(\mathbf{w}),N(\mathbf{w})-N_{\max}) \leq \varepsilon,
-\]
+15.7 Liquidez
+    max_i max(0, A*u_i - pi_max_i*phi*ADV_i_usd) <= eps_solver
 
-\[
-\max_i \max(0, A u_i - \pi_{\max,i}\phi ADV_i^{USD}) \leq \varepsilon,
-\]
+Si alguna violación supera tolerancia:
+- status = optimal_inaccurate
+o
+- fail_postcheck si es material
 
-\[
-\max(0,\sum_i u_i - TO_{\max}) \leq \varepsilon,
-\]
-más los checks análogos de grupo y factor.
+16. Diagnósticos obligatorios
 
-Si alguna violación supera tolerancia, el resultado debe degradarse a
-\texttt{optimal\_inaccurate} o \texttt{fail\_postcheck}.
+16.1 Marginal Risk Contribution
+Definir:
 
-\subsection{Paso 7. Persistencia}
+    MRC_i = (Sigma w)_i
 
-Persistir:
+o, si se quiere derivada exacta del término cuadrático completo:
+    d/dw_i [ w^T Sigma w ] = 2 (Sigma w)_i
 
-\begin{itemize}
-    \item pesos óptimos,
-    \item turnover before/after,
-    \item gross/net before/after,
-    \item exposures before/after por factor y grupo,
-    \item constraints activas,
-    \item slacks,
-    \item versión de \(\Sigma\) usada,
-    \item parámetros \(\lambda_r,\lambda_c\),
-    \item hash de configuración.
-\end{itemize}
+Convención:
+- documentar una sola y mantenerla estable.
 
-\section{Diagnósticos obligatorios}
+16.2 Risk Contribution
+    RC_i = w_i * (Sigma w)_i
 
-\subsection{Contribución marginal al riesgo}
+El reporte debe incluir RC por nombre y su porcentaje del riesgo total cuando sea estable.
 
-La contribución marginal al riesgo total es:
+16.3 Constraints activas
+El reporte debe indicar:
+- cuántos nombres están en bounds,
+- si gross está activo,
+- si net está activo,
+- cuántos caps de liquidez están activos,
+- si turnover está activo,
+- factores y grupos más tensos.
 
-\[
-\mathrm{MRC}_i = \frac{\partial}{\partial w_i}\left(\mathbf{w}^\top \Sigma \mathbf{w}\right)
-= 2(\Sigma \mathbf{w})_i.
-\]
+16.4 Slacks
+Cada familia de constraints debe reportar slacks y máximo grado de tensión.
 
-También debe reportarse la contribución total por nombre:
-\[
-\mathrm{RC}_i = w_i (\Sigma \mathbf{w})_i,
-\]
-y su porcentaje sobre el riesgo total, cuando sea numéricamente estable.
+17. Before/after obligatorio
 
-\subsection{Constraints activas}
+before_after.parquet debe incluir al menos:
 
-El reporte debe indicar, como mínimo:
+- alpha_forecast
+- w_prev
+- w_star
+- dw = w_star - w_prev
+- turnover_contrib
+- risk_contrib
+- liq_active_flag
+- bound_active_flag
+- group/factor exposure contributions si aplican
 
-\begin{itemize}
-    \item número de nombres pegados a bounds,
-    \item si gross está activa,
-    \item si net está activa,
-    \item número de caps de liquidez activas,
-    \item si turnover está activo,
-    \item factores y grupos más cercanos a su límite.
-\end{itemize}
+A nivel agregado:
+- gross_before / after
+- net_before / after
+- turnover_before / after
+- portfolio_variance
+- objective_value
 
-\subsection{KKT prácticos}
+18. Invariantes del módulo
 
-No basta con mencionar ``KKT''. El módulo debe reportar información útil:
+Toda salida válida debe cumplir:
 
-\begin{itemize}
-    \item slacks por familia de constraints,
-    \item multiplicadores duales cuando el solver los exponga,
-    \item residual primal,
-    \item residual dual,
-    \item veredicto de postcheck.
-\end{itemize}
+1. mismo universo e índice que las entradas filtradas
+2. ningún activo no negociable con peso operativo
+3. factibilidad numérica dentro de tolerancia
+4. coherencia temporal estricta entre inputs
+5. definición única de turnover
+6. strict_fail nunca devuelve una cartera infactible
+7. si alpha = 0 y el coste de rotar domina totalmente, la solución debe tender razonablemente a w_prev
 
-\section{Métricas before/after obligatorias}
+19. Failure modes importantes
 
-El \texttt{before\_after.parquet} debe contener al menos:
+19.1 Sigma mal condicionada
+Puede volver inestable el QP si no se repara o regulariza.
 
-\begin{center}
-\begin{tabular}{>{\ttfamily}m{5.0cm} m{8.2cm}}
-\toprule
-\textnormal{Métrica} & \textnormal{Descripción} \\
-\midrule
-alpha\_forecast & Alpha esperado por activo \\
-w\_prev / w\_opt & Peso previo y peso óptimo \\
-dw & Cambio de peso \\
-turnover\_contrib & Contribución al turnover \\
-risk\_contrib & Contribución al riesgo \\
-bound\_active & Indicador de bound activo \\
-liq\_active & Indicador de restricción de liquidez activa \\
-gross\_before / after & Exposición gross \\
-net\_before / after & Exposición net \\
-portfolio\_variance & Varianza ex-ante \\
-objective\_value & Valor de la utilidad optimizada \\
-\bottomrule
-\end{tabular}
-\end{center}
+19.2 Targets incompatibles
+Restricciones de factor, grupo, gross, net y liquidez pueden volver el problema infactible. Eso debe reportarse, no maquillarse.
 
-\section{Invariantes del módulo}
+19.3 ADV cero o irreal
+La liquidez individual debe validarse antes de resolver.
 
-Toda salida válida debe satisfacer:
+19.4 Universe desalineado
+Si alpha, Sigma, X, B y liquidity no comparten exactamente el mismo índice, abortar.
 
-\begin{enumerate}
-    \item mismo universo e índice que las entradas ya filtradas;
-    \item todos los activos no negociables fuera del problema;
-    \item factibilidad numérica dentro de tolerancia;
-    \item coherencia temporal entre todas las entradas;
-    \item definición única de turnover y coste;
-    \item si \texttt{strict\_fail} y el problema es infactible, no se devuelve solución parcheada.
-\end{enumerate}
+20. Tests mínimos obligatorios
 
-\section{Fallback permitido}
+20.1 Test de identidad
+Si alpha es nulo, costes dominan y w_prev ya es factible:
+    w_star ≈ w_prev
 
-Si el solver principal falla por razones numéricas o de infraestructura, se permite un \texttt{fallback\_solver} explícito, por ejemplo \texttt{ECOS} tras \texttt{OSQP}, o viceversa.
+20.2 Test L1
+La linealización debe reproducir:
+    u_i = |w_i - w_prev_i| al óptimo
 
-No se permite, como fallback silencioso, sustituir el problema por un simple clip heurístico que altere la semántica del módulo. Si el fallback cambia de clase de problema, debe registrarse:
+20.3 Test gross/net
+El portafolio final debe respetar gross y net dentro de tolerancia.
 
-\[
-\texttt{used\_fallback = True}.
-\]
+20.4 Test liquidez
+Si un activo excede su cap de participación, el óptimo debe reducir rotación o declarar infactibilidad.
 
-\section{Tests mínimos obligatorios}
+20.5 Test PSD
+Si Sigma tiene autovalores negativos pequeños, la política de repair debe producir matriz utilizable y quedar registrada.
 
-\subsection*{1. Test de identidad}
-Si \(\mathbf{w}^{\mathrm{prev}}\) ya es la solución óptima bajo una alpha nula y sin incentivo a rotar, el output debe coincidir con \(\mathbf{w}^{\mathrm{prev}}\) salvo error numérico.
+20.6 Test infactibilidad real
+Si constraints son incompatibles:
+    status = infeasible bajo strict_fail
 
-\subsection*{2. Test de coste \(L_1\)}
-La formulación con variables auxiliares debe reproducir exactamente
-\[
-u_i = |w_i - w_i^{\mathrm{prev}}|
-\]
-al óptimo.
+20.7 Test auditoría
+optimizer_report.json debe contener solver, slacks, constraints activas, métricas de riesgo y post-check final.
 
-\subsection*{3. Test de gross/net}
-Si el problema fuerza una exposición superior a \(G_{\max}\) o fuera de la banda neta, el output debe quedar en el borde correcto o declarar infactibilidad.
+21. Integración con el pipeline
 
-\subsection*{4. Test de liquidez}
-Si un activo exigiría participación superior a su cap, la solución debe reducir la rotación de ese nombre o declarar infactibilidad si el resto de restricciones lo impide.
+Semántica natural:
 
-\subsection*{5. Test de PSD}
-Si la covarianza de entrada tiene autovalores negativos pequeños, la política de reparación debe producir una matriz utilizable y quedar registrada.
+signal
+-> sizing preliminar
+-> optimizer
+-> rebalance
+-> execution
 
-\subsection*{6. Test de factibilidad exacta}
-Si existe una solución interior holgada, el postcheck debe confirmar factibilidad con tolerancias estrictas.
+Si existe constraints.py como proyector final, no debe duplicar silenciosamente el mismo problema con otra semántica.
+Si existe neutralize.py, sus targets deben estar alineados con límites de factor/grupo del optimizador para evitar conflictos artificiales.
 
-\subsection*{7. Test de infactibilidad real}
-Si bounds por activo, gross y net son incompatibles entre sí, el módulo debe devolver \texttt{infeasible} bajo \texttt{strict\_fail}.
+22. Salidas recomendadas
 
-\subsection*{8. Test de auditoría}
-El \texttt{optimizer\_report.json} debe incluir status, solver, slacks, actividad de constraints, parámetros y métricas de riesgo/coste.
+22.1 optimizer_report.json
+Debe incluir:
+- status
+- solver_name
+- solve_time
+- objective_value
+- condition_number_sigma
+- psd_repair_used
+- active_constraints
+- slacks
+- max_violation_by_family
+- infeasibility_reason si aplica
+- lambda_r
+- lambda_c
+- config_hash
 
-\section{Integración con el resto del pipeline}
+22.2 before_after.parquet
+Debe incluir por activo y agregado:
+- pesos before/after
+- contribuciones al turnover
+- contribuciones al riesgo
+- flags de constraints activas
+- métricas de liquidez relevantes
 
-La posición natural del optimizador en el pipeline es:
+23. Defaults razonables
 
-\[
-\texttt{signal}
-\rightarrow
-\texttt{sizing preliminar}
-\rightarrow
-\texttt{optimizer}
-\rightarrow
-\texttt{rebalance}
-\rightarrow
-\texttt{execution}
-\]
+- objective = alpha - quadratic_risk - linear_cost
+- solver_name = OSQP
+- psd_repair = eigenvalue_floor
+- infeasibility_policy = strict_fail
+- risk_aversion = configurable, default 1.0
+- cost_aversion = configurable, default 1.0
 
-Si existe un módulo \texttt{constraints.py} previo, debe funcionar como capa de prevalidación o como projector auxiliar, no como optimizador redundante que reescriba silenciosamente el mismo problema con otra semántica.
+Nunca hardcodear límites económicos del sistema dentro del módulo.
 
-Igualmente, si existe \texttt{neutralize.py}, la neutralización previa debe estar alineada con los límites de factor/grupo del optimizador para evitar dobles penalizaciones o conflictos de factibilidad artificiales.
+24. Interpretación correcta
 
-\section{Resumen ejecutivo}
+La lectura correcta de optimizer.py no es:
+“el solver me ha dado unos pesos”.
 
-La versión correcta de \texttt{portfolio/optimizer.py} no debe parecer una lista de ideas de portfolio theory con referencias ambiciosas, sino una especificación matemática cerrada de la decisión central del sistema.
+La lectura correcta es:
+“hemos resuelto un problema convexo explícito que maximiza utilidad neta bajo riesgo, coste y restricciones operativas, con verificación numérica y auditoría completa”.
 
-Su definición operativa final es:
+Eso convierte el output en una decisión cuantitativa trazable, no en una caja negra.
 
-\begin{enumerate}
-    \item recibe alpha, cartera previa, risk model y restricciones PIT;
-    \item construye un QP convexo con coste \(L_1\) linealizado;
-    \item impone simultáneamente factibilidad por posición, liquidez, turnover, gross, net, grupo y factor;
-    \item resuelve con un solver definido y una política explícita de PSD repair;
-    \item valida numéricamente el resultado;
-    \item persiste diagnósticos de riesgo, costes y constraints activas.
-\end{enumerate}
+25. Conclusión
 
-Eso convierte el optimizador en un módulo programable, testeable y económicamente interpretable. El resultado deja de ser ``unos pesos que salen del solver'' y pasa a ser una decisión cuantitativa auditable, consistente con la realidad operativa de una estrategia de swing trading en small caps.
+portfolio/optimizer.py debe ser el núcleo canónico de decisión del stack de portfolio.
 
-\end{document}
+Recibe alpha, cartera previa, risk model y restricciones PIT.
+Construye un QP convexo con riesgo cuadrático y coste L1 linealizado.
+Impone simultáneamente gross, net, factor, grupo, turnover y liquidez.
+Repara Sigma si hace falta.
+Resuelve con solver explícito.
+Verifica el resultado numéricamente.
+Y persiste un diagnóstico suficiente para entender:
+- qué pesó más en la decisión,
+- qué constraints estuvieron activas,
+- y cuánto riesgo/coste asumió realmente la cartera final.
+
+Ese es exactamente el comportamiento que debe tener un optimizador institucional serio para small caps swing trading.

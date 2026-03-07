@@ -1,468 +1,437 @@
-\documentclass{article}
-\usepackage{amsmath,amssymb}
-\usepackage{parskip}
-\usepackage{enumitem}
-\usepackage{hyperref}
-\usepackage{listings}
-\lstset{language=Python, basicstyle=\ttfamily\small, columns=fullflexible, showstringspaces=false}
+Módulo: research/capacity/turnover_vs_edge.py
+
+1. Objetivo del módulo
 
-\begin{document}
+El objetivo de turnover_vs_edge.py es medir cómo cambia el net edge de la estrategia
+cuando se modifica la intensidad de rebalanceo, y por tanto el turnover realizado,
+manteniendo explícito el trade-off entre captura de alpha, costes de ejecución y
+restricciones operativas.
 
-\title{turnover\_vs\_edge.py --- Net Edge as a Function of Turnover}
-\author{}
-\date{}
-\maketitle
+La pregunta correcta que debe responder este módulo no es “si conviene operar más o menos”
+en abstracto, sino algo mucho más útil:
 
-\section{Purpose}
+- cuánto edge bruto se retiene realmente al rebalancear más despacio;
+- cuánto drag de costes se evita al reducir turnover;
+- dónde deja de compensar aumentar intensidad de trading;
+- y qué rango de turnover sigue siendo económicamente admisible una vez se incorporan
+  Sharpe neto, participación y límites de implementación.
 
-The purpose of \texttt{turnover\_vs\_edge.py} is to estimate how much of the strategy's gross edge survives after turnover-dependent execution costs and signal-decay effects are taken into account. The module is not an optimizer in the abstract; it is a diagnostic and decision-support tool for determining whether the current rebalance intensity is economically justified.
+Este módulo es, por tanto, un módulo de gobernanza de trading intensity.
+No optimiza control dinámico continuo ni resuelve teoría general de ejecución.
+Su función correcta es diagnosticar, con datos y supuestos explícitos, cuál es el
+compromiso razonable entre turnover y edge neto.
 
-Operationally, the module must answer four questions:
+2. Qué hace y qué no hace
 
-\begin{enumerate}[label=\arabic*.]
-    \item How does net edge change as realized turnover increases?
-    \item At what turnover level does additional trading cease to improve net performance?
-    \item How much gross alpha is being lost when turnover is throttled?
-    \item What turnover range is admissible once costs, volatility, and implementation constraints are included?
-\end{enumerate}
+2.1 Qué hace
+- parameteriza intensidad de rebalanceo mediante un throttle lambda en [0,1];
+- construye, para cada lambda, la trayectoria de posiciones ejecutadas;
+- mide turnover inducido, participación y stress de capacidad;
+- estima gross edge y net edge bajo trading throttled;
+- incorpora costes de ejecución dependientes del tamaño y la liquidez;
+- calcula gross/net return, gross/net Sharpe y métricas auxiliares;
+- identifica óptimos por net return y por net Sharpe;
+- define una región admisible sujeta a restricciones operativas;
+- y puede persistir bandas de incertidumbre sobre toda la curva lambda -> métricas.
 
-The module therefore produces a turnover-response curve
-\[
-T \mapsto \left(\mu_{\mathrm{gross}}(T),\; \mu_{\mathrm{net}}(T),\; SR_{\mathrm{net}}(T)\right),
-\]
-together with an admissible turnover region and a recommended operating point.
+2.2 Qué no hace
+- no sustituye un optimizador dinámico de trading;
+- no decide por sí solo la política final de rebalanceo en producción;
+- no debe asumir que reducir turnover solo baja costes sin afectar alpha;
+- no reemplaza profitability_curve.py;
+- no calibra desde cero el cost model si ya existe un execution / impact_model validado;
+- no debe presentar un único lambda óptimo como verdad universal y estable.
 
-\section{Module Contract}
+3. Rol dentro del stack
 
-\subsection{Required Inputs}
+Secuencia conceptual correcta:
 
-The module requires point-in-time safe daily data after signal generation and before final execution:
+    rebalance_panel + impact_model + realized_returns
+    -> turnover_vs_edge.py
+    -> rebalance / execution / portfolio governance
+    -> validacion downstream y politica operativa de rebalanceo
 
-\begin{itemize}
-    \item \texttt{rebalance\_panel}: one row per \((date, asset)\), containing
-    \[
-    \{\texttt{date}, \texttt{asset}, \texttt{w\_prev}, \texttt{w\_target}, \texttt{forecast\_alpha\_bps},
-    \texttt{volatility}, \texttt{adv\_dollar}, \texttt{spread\_bps}\}.
-    \]
-    \item \texttt{impact\_params}: calibrated cost parameters by liquidity / volatility bucket, e.g.
-    \[
-    \{\texttt{impact\_Y}, \texttt{impact\_delta}, \texttt{impact\_gamma}, \texttt{participation\_cap}\}.
-    \]
-    \item \texttt{realized\_returns} or an equivalent forward-return panel for evaluating realized alpha retention under throttled rebalancing.
-    \item \texttt{config}: turnover grid or throttle grid, annualization constants, evaluation horizon, and minimum acceptable net Sharpe.
-\end{itemize}
+Interpretación correcta:
+- el módulo parte de targets ya generados por portfolio construction;
+- evalúa qué ocurre si la convergencia hacia esos targets se hace más rápida o más lenta;
+- traduce esa decisión a turnover, costes, edge neto y restricciones;
+- y devuelve un rango operable, no una fantasía de “óptimo universal”.
 
-\subsection{Outputs}
+4. Preguntas económicas que debe responder
 
-For each grid point \(g\), corresponding either to a turnover target or to a rebalance-throttle parameter, the module produces
+El módulo debe responder, de forma cuantitativa y auditable, al menos a estas preguntas:
 
-\[
-\{\texttt{grid\_value}, \texttt{turnover\_annualized}, \texttt{gross\_edge\_bps},
-\texttt{cost\_drag\_bps}, \texttt{net\_edge\_bps}, \texttt{gross\_return},
-\texttt{net\_return}, \texttt{gross\_sharpe}, \texttt{net\_sharpe},
-\texttt{participation\_mean}, \texttt{capacity\_stress}, \texttt{status}\}.
-\]
+- ¿cómo cambia el net return al variar lambda?
+- ¿cómo cambia el net Sharpe al variar lambda?
+- ¿cuánto gross edge se pierde al throttlear el rebalance?
+- ¿cuánto coste se evita al throttlear el rebalance?
+- ¿cuándo la mejora marginal de subir lambda deja de compensar?
+- ¿qué lambdas siguen siendo admisibles bajo límites de Sharpe y participación?
 
-Results are written to a point-in-time safe artifact such as
+Si el módulo no responde explícitamente a la tercera pregunta, entonces corre el riesgo
+de convertirse en un simple cost curve disfrazado, no en un verdadero turnover-vs-edge module.
 
-\[
-\texttt{research/capacity\_analysis/artifacts/turnover\_vs\_edge.parquet}.
-\]
+5. Inputs requeridos
 
-\section{Mathematical Framework}
+El módulo debe consumir, con alineación PIT ya garantizada upstream, al menos:
 
-\subsection{Realized Turnover}
+- rebalance_panel:
+  una fila por (date, asset) con al menos:
+  w_prev, w_target, forecast_alpha_bps o equivalente,
+  volatility, adv_dollar, spread_bps.
 
-Let \(w_{i,t-1}\) be the live post-trade portfolio weight carried into date \(t\), and let \(w^{\star}_{i,t}\) be the desired target weight generated by the portfolio construction layer. Define the unthrottled desired trade as
+- impact_params:
+  parámetros de coste y límites operativos, idealmente por bucket de liquidez/volatilidad:
+  impact_Y, impact_delta, impact_gamma, participation_cap.
 
-\begin{equation}
-\Delta w^{\star}_{i,t} = w^{\star}_{i,t} - w_{i,t-1}.
-\end{equation}
+- realized_returns o panel forward equivalente:
+  necesario para medir gross alpha retenido bajo rebalance throttled.
 
-Rather than writing down an arbitrary mapping from signal strength to turnover, the module parameterizes execution intensity through a throttle \(\lambda \in [0,1]\):
+- config:
+  throttle_grid, capital, rf, sr_min, pi_max,
+  bootstrap config, reglas de bucketización y switches de análisis por régimen.
 
-\begin{equation}
-w^{(\lambda)}_{i,t} = w_{i,t-1} + \lambda \,\Delta w^{\star}_{i,t}.
-\end{equation}
+Todos los inputs deben ser point-in-time safe.
+Ninguna medición de gross edge throttled puede usar retornos o parámetros no disponibles
+en el contexto temporal correcto del backtest.
 
-Here,
-\begin{itemize}
-    \item \(\lambda = 1\) means full rebalance,
-    \item \(\lambda = 0\) means no rebalance,
-    \item intermediate values represent partial trading toward the target.
-\end{itemize}
+6. Parámetro de throttle
 
-The one-period turnover induced by \(\lambda\) is
+Sea w_i,t-1 el peso vivo post-trade heredado al inicio de t y sea w*_i,t el target deseado.
+La diferencia objetivo es:
 
-\begin{equation}
-T_t(\lambda) = \frac{1}{2}\sum_i \left| w^{(\lambda)}_{i,t} - w_{i,t-1} \right|
-= \frac{\lambda}{2}\sum_i |\Delta w^{\star}_{i,t}|.
-\end{equation}
+    Delta_w*_i,t = w*_i,t - w_i,t-1
 
-Annualized turnover is then
+La intensidad de ajuste se parameteriza con:
 
-\begin{equation}
-T_{\mathrm{ann}}(\lambda) = \frac{252}{N_t}\sum_{t=1}^{N_t} T_t(\lambda),
-\end{equation}
+    w_i,t(lambda) = w_i,t-1 + lambda * Delta_w*_i,t
 
-or an equivalent business-day annualization consistent with the rest of the backtest stack.
+donde:
+- lambda = 1  implica rebalanceo completo;
+- lambda = 0  implica no rebalancear;
+- valores intermedios representan convergencia parcial hacia el target.
 
-\subsection{Gross Edge Retention Under Throttling}
+Esta parameterización es correcta porque:
+- es simple;
+- es interpretable;
+- y convierte la política de trading intensity en una familia ordenada de experimentos.
 
-Lower turnover reduces costs, but it can also reduce alpha capture because the portfolio moves more slowly toward the desired target. Therefore the relevant object is not cost alone but the net effect of slower adjustment.
+7. Turnover inducido
 
-Let \(r^{\mathrm{gross}}_t(\lambda)\) denote the gross portfolio return generated when positions are updated using throttle \(\lambda\). Then the annualized gross edge is
+El turnover de un periodo bajo throttle lambda es:
 
-\begin{equation}
-\mu_{\mathrm{gross}}(\lambda) = \mathrm{AnnMean}\big(r^{\mathrm{gross}}_t(\lambda)\big).
-\end{equation}
+    T_t(lambda) = 0.5 * sum_i | w_i,t(lambda) - w_i,t-1 |
+                = 0.5 * lambda * sum_i | Delta_w*_i,t |
 
-There is no need to impose an arbitrary closed-form expression for gross-edge decay. It should be measured directly from the throttled backtest or from a realistic simulation of delayed target convergence.
+y el turnover anualizado:
 
-\subsection{Cost Model}
+    T_ann(lambda) = 252 * mean_t T_t(lambda)
 
-For each asset \(i\) and date \(t\), let traded dollar volume under throttle \(\lambda\) be \(V_{i,t}(\lambda)\). Per-dollar trading cost is decomposed as
+o equivalente consistente con el resto del stack.
 
-\begin{equation}
-c_{i,t}(\lambda) =
-c^{\mathrm{spread}}_{i,t}(\lambda)
-+ c^{\mathrm{temp}}_{i,t}(\lambda)
-+ c^{\mathrm{perm}}_{i,t}(\lambda),
-\end{equation}
+La curva lambda -> turnover debe ser monótona por construcción.
+Si no lo es, hay un problema de implementación o de path dependence mal controlada.
 
-with total daily cost
+8. Gross edge bajo throttling
 
-\begin{equation}
-K_t(\lambda) = \sum_i c_{i,t}(\lambda)\,V_{i,t}(\lambda).
-\end{equation}
+Este es el punto más importante del módulo.
 
-A parsimonious implementation is:
+Reducir lambda:
+- baja costes;
+- pero también puede destruir captura de alpha al retrasar la convergencia al target.
 
-\begin{equation}
-c^{\mathrm{spread}}_{i,t}(\lambda) = \frac{1}{2}\,\mathrm{spread}_{i,t},
-\end{equation}
+Por tanto, el objeto correcto no es solo modelar costes.
+También hay que medir:
 
-\begin{equation}
-c^{\mathrm{temp}}_{i,t}(\lambda)
-=
-Y_{i,t}\,\sigma_{i,t}\left(
-\frac{V_{i,t}(\lambda)}{ADV_{i,t} + \varepsilon}
-\right)^{\delta_{i,t}},
-\end{equation}
+    r_gross_t(lambda)
 
-\begin{equation}
-c^{\mathrm{perm}}_{i,t}(\lambda) = \gamma_{i,t}\,V_{i,t}(\lambda).
-\end{equation}
+como retorno bruto realmente obtenido por la cartera throttled.
 
-The important point is that the coefficients \((Y,\delta,\gamma)\) must come from the execution / impact model. They are not decorative constants and should not be hard-coded as universal values.
+La política correcta es:
 
-\subsection{Net Edge and Net Sharpe}
+- preferencia fuerte por backtest throttled real;
+- aceptación secundaria de un simulador de delayed execution validado;
+- rechazo de proxies ad hoc no calibradas que reutilicen el gross alpha de lambda = 1.
 
-Define daily net return under throttle \(\lambda\) as
+Dicho de otra forma:
+el gross edge para lambda bajo no debe inventarse con una fórmula cómoda.
+Debe salir de una trayectoria de posiciones throttled aplicada sobre realized forward returns.
 
-\begin{equation}
-r^{\mathrm{net}}_t(\lambda)
-=
-r^{\mathrm{gross}}_t(\lambda)
--
-\frac{K_t(\lambda)}{A_t}
--
-f_t(\lambda),
-\end{equation}
+9. Cost model
 
-where \(A_t\) is capital and \(f_t(\lambda)\) includes borrow, financing, or other non-trading drags if relevant.
+Para cada activo i y fecha t, el notional transado bajo throttle lambda es V_i,t(lambda).
+El coste por dólar puede descomponerse en:
 
-The annualized net edge is
+    c_i,t(lambda) =
+        c_spread_i,t(lambda)
+      + c_temp_i,t(lambda)
+      + c_perm_i,t(lambda)
 
-\begin{equation}
-\mu_{\mathrm{net}}(\lambda) = \mathrm{AnnMean}\big(r^{\mathrm{net}}_t(\lambda)\big),
-\end{equation}
+y el coste total diario:
 
-the annualized net volatility is
+    K_t(lambda) = sum_i c_i,t(lambda) * V_i,t(lambda)
 
-\begin{equation}
-\sigma_{\mathrm{net}}(\lambda) = \mathrm{AnnStd}\big(r^{\mathrm{net}}_t(\lambda)\big),
-\end{equation}
+Forma empírica razonable:
 
-and the net Sharpe is
+- spread:
+    c_spread_i,t = 0.5 * spread_i,t
 
-\begin{equation}
-SR_{\mathrm{net}}(\lambda)
-=
-\frac{\mu_{\mathrm{net}}(\lambda) - r_f}
-{\sigma_{\mathrm{net}}(\lambda) + \varepsilon}.
-\end{equation}
+- temporary impact:
+    c_temp_i,t = Y_i,t * sigma_i,t * (V_i,t(lambda) / (ADV_i,t + eps))^(delta_i,t)
 
-\section{Optimization Objective}
+- permanent impact:
+    c_perm_i,t = gamma_i,t * V_i,t(lambda)
 
-The module should not pretend there is a unique universal optimum. It reports several economically meaningful operating points.
+Los parámetros Y, delta y gamma deben venir del framework de ejecución o de TCA/fills,
+y no deben tratarse como constantes universales del universo.
 
-\subsection{Net-Edge Maximizer}
+10. Costes por bucket
 
-\begin{equation}
-\lambda^{\star}_{\mu}
-\in
-\arg\max_{\lambda \in [0,1]} \mu_{\mathrm{net}}(\lambda).
-\end{equation}
+En small caps, una única calibración global de costes suele ser demasiado pobre.
 
-\subsection{Net-Sharpe Maximizer}
+Por ello, el módulo debería consumir o reconstruir parámetros por buckets de:
+- liquidez;
+- volatilidad;
+- spread;
+- y, si es posible, régimen.
 
-\begin{equation}
-\lambda^{\star}_{SR}
-\in
-\arg\max_{\lambda \in [0,1]} SR_{\mathrm{net}}(\lambda).
-\end{equation}
+Forma recomendada:
 
-\subsection{Admissible Region}
+    (Y, delta, gamma, p_cap) = g(liq_bucket, vol_bucket, spread_bucket, regime_bucket)
 
-Given a minimum acceptable net Sharpe \(SR_{\min}\) and a maximum acceptable average participation \(\pi_{\max}\), define the admissible set
+Esto evita dos errores clásicos:
+- sobreestimar la capacidad o el edge neto de nombres ilíquidos;
+- y subestimar la heterogeneidad real del coste dentro del universo.
 
-\begin{equation}
-\Lambda_{\mathrm{adm}}
-=
-\left\{
-\lambda \in [0,1] :
-SR_{\mathrm{net}}(\lambda) \ge SR_{\min},
-\;
-\bar{\pi}(\lambda) \le \pi_{\max}
-\right\},
-\end{equation}
+11. Net edge y net Sharpe
 
-where \(\bar{\pi}(\lambda)\) is the average participation rate induced by \(\lambda\).
+Para cada lambda, el retorno neto diario es:
 
-In practice, the recommended operating point should come from this admissible region rather than from unconstrained maximization.
+    r_net_t(lambda) = r_gross_t(lambda) - K_t(lambda) / A_t - f_t(lambda)
 
-\section{Implementation Logic}
+donde:
+- A_t es capital;
+- f_t(lambda) incluye borrow, financing u otros drags si aplican.
 
-\begin{lstlisting}
-import numpy as np
-import pandas as pd
+A partir de esa serie:
 
-EPS = 1e-12
+    mu_net(lambda)    = AnnMean(r_net_t(lambda))
+    sigma_net(lambda) = AnnStd(r_net_t(lambda))
+    SR_net(lambda)    = (mu_net(lambda) - rf) / (sigma_net(lambda) + eps)
 
-def annualized_mean(x, periods_per_year=252):
-    return periods_per_year * np.nanmean(x)
+y análogamente para las métricas gross.
 
-def annualized_std(x, periods_per_year=252):
-    return np.sqrt(periods_per_year) * np.nanstd(x, ddof=1)
+12. Óptimos y región admisible
 
-def throttle_targets(df, lam):
-    out = df.copy()
-    out["trade_weight"] = lam * (out["w_target"] - out["w_prev"])
-    out["w_exec"] = out["w_prev"] + out["trade_weight"]
-    return out
+El módulo no debe devolver un único “mejor lambda” sin matices.
+Debe reportar al menos tres objetos:
 
-def turnover_from_trade_weight(trade_weight):
-    return 0.5 * np.abs(trade_weight).sum()
+12.1 Lambda que maximiza net return
 
-def impact_cost_per_dollar(volume, adv, sigma, Y, delta):
-    part = np.maximum(volume / (adv + EPS), 0.0)
-    return Y * sigma * np.power(part, delta)
+    lambda*_mu = argmax_lambda mu_net(lambda)
 
-def permanent_cost_per_dollar(volume, gamma):
-    return gamma * volume
+12.2 Lambda que maximiza net Sharpe
 
-def evaluate_lambda(day_df, lam, capital):
-    df = throttle_targets(day_df, lam)
+    lambda*_SR = argmax_lambda SR_net(lambda)
 
-    df["trade_dollar"] = np.abs(df["trade_weight"]) * capital
-    df["participation"] = df["trade_dollar"] / (df["adv_dollar"] + EPS)
+12.3 Región admisible
 
-    df["spread_cost_per_dollar"] = 0.5 * df["spread_bps"] * 1e-4
-    df["temp_cost_per_dollar"] = impact_cost_per_dollar(
-        volume=df["trade_dollar"].to_numpy(),
-        adv=df["adv_dollar"].to_numpy(),
-        sigma=df["volatility"].to_numpy(),
-        Y=df["impact_Y"].to_numpy(),
-        delta=df["impact_delta"].to_numpy(),
-    )
-    df["perm_cost_per_dollar"] = permanent_cost_per_dollar(
-        volume=df["trade_dollar"].to_numpy(),
-        gamma=df["impact_gamma"].to_numpy(),
-    )
+    Lambda_adm = { lambda in [0,1] :
+                   SR_net(lambda) >= SR_min
+                   and mean_participation(lambda) <= pi_max }
 
-    df["cost_dollar"] = (
-        df["spread_cost_per_dollar"]
-        + df["temp_cost_per_dollar"]
-        + df["perm_cost_per_dollar"]
-    ) * df["trade_dollar"]
+Interpretación correcta:
+- lambda*_mu favorece capturar más edge aunque el perfil de riesgo sea menos atractivo;
+- lambda*_SR favorece eficiencia riesgo-retorno;
+- Lambda_adm impone disciplina operacional y evita óptimos imposibles de desplegar.
 
-    # Gross alpha capture should come from the throttled portfolio path,
-    # not from a hard-coded analytic shortcut.
-    gross_pnl = df["gross_alpha_dollar_throttled"].sum()
-    cost_pnl = df["cost_dollar"].sum()
+La recomendación final debería salir de la intersección entre performance y admisibilidad,
+no de un máximo unconstrained ciego.
 
-    return {
-        "turnover_daily": turnover_from_trade_weight(df["trade_weight"]),
-        "gross_return_daily": gross_pnl / capital,
-        "net_return_daily": (gross_pnl - cost_pnl) / capital,
-        "participation_mean_daily": df["participation"].mean(),
-        "capacity_stress_daily": (df["participation"] > df["participation_cap"]).mean(),
-    }
+13. Análisis marginal
 
-panel = pd.read_parquet(rebalance_panel_path)
+Además del nivel absoluto de la curva, conviene persistir su pendiente numérica.
 
-lambdas = np.linspace(0.0, 1.0, 21)
-results = []
+Métricas útiles:
+- marg_mu_net(lambda) = Delta mu_net / Delta lambda
+- marg_SR_net(lambda) = Delta SR_net / Delta lambda
 
-for lam in lambdas:
-    daily_rows = []
-    for dt, day_df in panel.groupby("date"):
-        daily_rows.append(evaluate_lambda(day_df, lam=lam, capital=capital))
-    daily = pd.DataFrame(daily_rows)
+Esto ayuda a ver:
+- dónde el beneficio marginal de aumentar intensidad cruza cero;
+- dónde seguir subiendo lambda añade poco edge neto;
+- y si la curva tiene un plateau suficientemente ancho como para preferir un punto más robusto
+  aunque no sea el máximo exacto.
 
-    gross_return = annualized_mean(daily["gross_return_daily"])
-    net_return = annualized_mean(daily["net_return_daily"])
-    gross_vol = annualized_std(daily["gross_return_daily"])
-    net_vol = annualized_std(daily["net_return_daily"])
+14. Participación y stress operativo
 
-    results.append({
-        "grid_value": lam,
-        "turnover_annualized": 252 * daily["turnover_daily"].mean(),
-        "gross_edge_bps": 1e4 * gross_return,
-        "cost_drag_bps": 1e4 * (gross_return - net_return),
-        "net_edge_bps": 1e4 * net_return,
-        "gross_return": gross_return,
-        "net_return": net_return,
-        "gross_sharpe": gross_return / (gross_vol + EPS),
-        "net_sharpe": net_return / (net_vol + EPS),
-        "participation_mean": daily["participation_mean_daily"].mean(),
-        "capacity_stress": daily["capacity_stress_daily"].mean(),
-    })
+Reducir o aumentar lambda no solo cambia edge y costes.
+También cambia huella operativa.
 
-curve = pd.DataFrame(results).sort_values("turnover_annualized")
+El módulo debe persistir, para cada lambda:
+- participation_mean;
+- participation_p95;
+- fraction_over_participation_cap;
+- capacity_stress_pct;
+- turnover_annualized.
 
-sr_min = 1.0
-pi_max = 0.05
+Esto es importante porque un lambda con Sharpe atractivo puede seguir siendo inviable
+si dispara participación extrema en demasiados nombres.
 
-curve["status"] = "inadmissible"
-mask = (
-    (curve["net_sharpe"] >= sr_min) &
-    (curve["participation_mean"] <= pi_max)
-)
-curve.loc[mask, "status"] = "admissible"
+15. Bandas de incertidumbre
 
-curve.to_parquet(output_path, index=False)
-\end{lstlisting}
+La curva lambda -> mu_net(lambda), SR_net(lambda) no debe presentarse como exacta.
 
-\section{Calibration Requirements}
+Debe poder acompañarse de bandas de incertidumbre, idealmente mediante block bootstrap temporal:
+- dividir el historial en bloques;
+- remuestrear bloques con reemplazo;
+- recomputar la curva completa;
+- construir intervalos percentiles por cada lambda.
 
-This module is only as good as its calibration. The following requirements are mandatory.
+Este bootstrap debe preservar:
+- autocorrelación temporal en retornos;
+- persistencia en liquidez;
+- y dependencia serial del alpha decay.
 
-\subsection{Cost Calibration}
+Un remuestreo iid de días o trades sería demasiado optimista para este problema.
 
-Spread, temporary impact, and permanent impact must be imported from the execution-cost framework or estimated from fills / TCA. Constants such as
-\[
-\gamma T + \eta \sqrt{T}
-\]
-may be useful for toy intuition, but they are not sufficient as a production specification unless linked back to actual traded notional, liquidity, and fills.
+16. Estabilidad por régimen
 
-\subsection{Alpha-Retention Measurement}
+El lambda óptimo rara vez es estable entre entornos.
 
-The key quantity missing in simplistic turnover models is the amount of gross alpha retained under slower trading. This must be estimated from one of the following:
+Por eso, el módulo debería soportar curvas condicionadas por:
+- high-vol vs low-vol;
+- calm vs stressed liquidity;
+- estados de regime_detector;
+- y, si procede, estados de crowding.
 
-\begin{enumerate}[label=\arabic*.]
-    \item a true throttled backtest in which targets are only partially implemented,
-    \item a delayed-execution simulator with signal decay,
-    \item a validated reduced-form model mapping trade delay to alpha loss.
-\end{enumerate}
+Esto permite responder preguntas más útiles que un único óptimo agregado:
+- ¿conviene throttlear más en estrés?
+- ¿el lambda óptimo cambia cuando sube el crowding?
+- ¿qué parte del edge de high-turnover desaparece fuera de mercados calmados?
 
-Without explicit alpha-retention measurement, the module understates the cost of reducing turnover.
+17. Integración con otros módulos
 
-\subsection{Participation Constraints}
+17.1 rebalance
+Es la fuente natural de:
+- w_prev;
+- w_target;
+- y la lógica a la que se aplicará el lambda recomendado.
 
-If throttling is used partly to control market footprint, the module must report not only net edge but also average participation, tail participation, and the fraction of names whose execution exceeds policy limits.
+17.2 execution / impact_model
+Debe aportar:
+- coste por bucket;
+- participación máxima;
+- y supuestos realistas de implementación.
 
-\section{Validation Protocol}
+17.3 profitability_curve
+Aporta visión complementaria:
+- cómo interactúa el turnover óptimo con el AUM desplegado.
 
-A turnover policy should be accepted only if it survives the following out-of-sample checks:
+17.4 crowding_detector
+Puede condicionar:
+- políticas más conservadoras de lambda cuando el libro entra en zona de crowding.
 
-\begin{enumerate}[label=\arabic*.]
-    \item \textbf{Monotonic cost realism}: cost drag rises with realized turnover in a way consistent with fills or TCA.
-    \item \textbf{Alpha-retention realism}: low-turnover variants lose gross edge in a way consistent with known signal decay.
-    \item \textbf{Economic optimum stability}: the recommended turnover range is reasonably stable across subperiods and liquidity regimes.
-    \item \textbf{Incrementality}: the module adds useful information beyond raw turnover alone by explaining the interaction between turnover, costs, and realized edge.
-    \item \textbf{Deployability}: the chosen operating region respects participation and execution constraints.
-\end{enumerate}
+17.5 regime_detector
+Permite:
+- curvas condicionadas por estado de mercado;
+- y recomendaciones menos frágiles.
 
-Useful diagnostics include:
-\begin{itemize}
-    \item turnover deciles versus realized implementation shortfall,
-    \item turnover versus net edge curve with confidence bands,
-    \item turnover versus average and 95th-percentile participation,
-    \item regime-by-regime optimal turnover ranges,
-    \item sensitivity of \(\lambda^{\star}_{\mu}\) and \(\lambda^{\star}_{SR}\) to cost calibration.
-\end{itemize}
+18. Contrato de salida
 
-\section{Integration With the Rest of the System}
+La salida canónica debe contener, para cada valor del grid de lambda, al menos:
 
-This module must integrate explicitly with the following components:
+- grid_value
+- turnover_annualized
+- gross_edge_bps
+- cost_drag_bps
+- net_edge_bps
+- gross_return
+- net_return
+- gross_sharpe
+- net_sharpe
+- participation_mean
+- participation_p95
+- capacity_stress
+- status
+- marginal_mu_net
+- marginal_sr_net
+- ci_mu_net_low            # si bootstrap.enabled
+- ci_mu_net_high           # si bootstrap.enabled
+- ci_sr_net_low            # si bootstrap.enabled
+- ci_sr_net_high           # si bootstrap.enabled
+- regime                   # si regime_conditional
+- notes
 
-\begin{itemize}
-    \item \textbf{rebalance}: source of target weights and destination for turnover throttle recommendations.
-    \item \textbf{execution / impact\_model}: source of cost coefficients and participation limits.
-    \item \textbf{profitability\_curve}: complementary view of how turnover interacts with deployed capital.
-    \item \textbf{crowding\_detector}: optional conditioning variable for reducing turnover in crowded states.
-    \item \textbf{portfolio}: consumer of the recommended admissible turnover band.
-    \item \textbf{validation}: verifies that turnover adjustments improve realized net performance out-of-sample.
-\end{itemize}
+Ruta típica de persistencia:
 
-\section{Edge Cases and Failure Modes}
+    research/capacity_analysis/artifacts/turnover_vs_edge.parquet
 
-The implementation must handle the following cases explicitly:
+19. Invariantes
 
-\begin{enumerate}[label=\arabic*.]
-    \item \textbf{Near-zero trading days}: turnover and cost ratios become noisy; use robust aggregation and avoid over-interpreting sparse rebalance dates.
-    \item \textbf{Missing liquidity fields}: ADV or spread gaps must be imputed conservatively or excluded from calibration.
-    \item \textbf{Highly concentrated books}: turnover reduction may protect costs but increase concentration risk; this should be checked jointly with crowding diagnostics.
-    \item \textbf{Regime shifts}: calm-period optima may not survive stressed liquidity conditions; scenario overlays should be run.
-    \item \textbf{Signal half-life mismatch}: if signal decay is faster than the rebalance cadence, low-turnover settings may look artificially attractive in cost-only models.
-\end{enumerate}
+Los invariantes obligatorios son:
 
-\section{What This Module Is Not}
+- r_gross_t(lambda) debe medirse con backtest throttled real o simulador validado;
+- nunca se debe reutilizar el gross alpha de lambda = 1 como proxy universal;
+- los parámetros de coste deben ser coherentes con bucket de liquidez/volatilidad;
+- el bootstrap debe ser por bloques temporales, no naive resampling;
+- la región admisible debe respetar siempre SR_min y pi_max configurables;
+- cualquier cambio en grid, parámetros o bucketización debe quedar versionado;
+- la curva debe seguir siendo interpretable bajo cambios razonables de muestra.
 
-This module should not contain unsupported claims such as specific Sharpe improvements, return uplifts, or ``optimal zones'' presented as universal empirical truths. Those belong to downstream research results.
+20. Edge cases y failure modes
 
-The responsibility of \texttt{turnover\_vs\_edge.py} is narrower and more important: to estimate the trade-off between trading intensity and retained net edge under assumptions that are explicit, calibratable, and falsifiable.
+Los fallos más peligrosos del módulo son:
 
-\section{Extensions}
+- medir costes correctamente pero gross edge throttled incorrectamente;
+- usar un proxy simplista que hace parecer demasiado atractivos los lambdas bajos;
+- usar parámetros de coste globales en un universo extremadamente heterogéneo;
+- ignorar participation caps o solo reportar medias y no colas;
+- vender como estable un lambda óptimo que en realidad cambia mucho por régimen;
+- y tratar una curva ruidosa como si tuviera precisión quirúrgica.
 
-Once the core version is validated, the following extensions are legitimate:
+21. Criterios de aceptación
 
-\begin{enumerate}[label=\arabic*.]
-    \item state-dependent throttling \(\lambda_t = \lambda(s_t)\) conditioned on volatility, crowding, and liquidity,
-    \item joint optimization of turnover and capacity constraints,
-    \item uncertainty bands via block bootstrap,
-    \item regime-conditional turnover surfaces,
-    \item dynamic control formulations inspired by the dynamic-trading literature.
-\end{enumerate}
+El módulo solo debe considerarse listo si cumple:
 
-These are extensions, not substitutes for a clean core specification.
+- plausibilidad económica:
+  al subir lambda, sube captura de alpha pero también suben costes de forma creíble;
 
-\section{References}
+- realismo de alpha retention:
+  lambdas bajos muestran pérdida de gross edge consistente con el retraso real de ejecución;
 
-\begin{thebibliography}{9}
+- realismo de costes:
+  cost_drag crece con turnover de forma defendible frente a fills o TCA;
 
-\bibitem{garleanu}
-G\^{a}rleanu, N. and Pedersen, L. H.
-\textit{Dynamic Trading with Predictable Returns and Transaction Costs}.
-Journal of Finance, 68(6), 2013.
+- incertidumbre:
+  la recomendación final sobre lambda viene acompañada de bandas o, al menos,
+  de evidencia de estabilidad;
 
-\bibitem{grinold}
-Grinold, R. C. and Kahn, R. N.
-\textit{Active Portfolio Management}.
-2nd ed., McGraw--Hill, 2000.
+- deployability:
+  el rango recomendado respeta límites de participación y ejecución;
 
-\bibitem{kissell}
-Kissell, R.
-\textit{The Science of Algorithmic Trading and Portfolio Management}.
-Academic Press, 2013.
+- integración:
+  el output puede convertirse en política operativa de rebalanceo sin ambigüedad excesiva.
 
-\bibitem{lodp}
-L\'opez de Prado, M.
-\textit{Advances in Financial Machine Learning}.
-Wiley, 2018.
+22. Qué no debe afirmarse
 
-\end{thebibliography}
+turnover_vs_edge.py no debe usarse para afirmar:
+- que existe un lambda óptimo universal para todos los regímenes;
+- que reducir turnover siempre mejora Sharpe;
+- o que la curva observada es estructural y estable por sí misma.
 
-\end{document}
+La responsabilidad correcta del módulo es más estrecha y más útil:
+estimar el compromiso entre intensidad de rebalanceo y net edge retenido bajo hipótesis
+explícitas, calibradas y falsables.
+
+23. Conclusión
+
+turnover_vs_edge.py debe existir para responder una pregunta central de gobernanza
+de trading:
+
+- cuánto edge neto se gana o se pierde al rebalancear más o menos;
+- qué intensidad de trading sigue siendo económicamente razonable;
+- y qué rango de turnover es realmente desplegable sin destruir Sharpe ni violar
+  restricciones operativas.
+
+Ese es el estándar correcto para un módulo serio de turnover vs edge en una pipeline
+profesional de small-cap swing trading.

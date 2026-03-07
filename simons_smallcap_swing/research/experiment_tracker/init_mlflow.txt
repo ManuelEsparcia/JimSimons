@@ -1,695 +1,497 @@
-\documentclass[12pt,a4paper]{article}
-
-\usepackage[spanish]{babel}
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
-\usepackage{lmodern}
-\usepackage{geometry}
-\usepackage{amsmath,amssymb,amsfonts}
-\usepackage{booktabs}
-\usepackage{array}
-\usepackage{hyperref}
-\usepackage{graphicx}
-\usepackage{listings}
-\usepackage{xcolor}
-\usepackage{enumitem}
-
-\geometry{margin=2.5cm}
-\hypersetup{
-    colorlinks=true,
-    linkcolor=blue,
-    urlcolor=blue,
-    citecolor=blue
-}
-
-\lstset{
-    basicstyle=\ttfamily\small,
-    breaklines=true,
-    frame=single,
-    columns=fullflexible
-}
-
-\title{\textbf{Especificación Formal de \texttt{init\_mlflow.py}}\\
-Inicialización Determinista del Tracking Experimental en \textit{Small-Cap Swing Trading}}
-\author{Research Specification}
-\date{Marzo 2026}
-
-\begin{document}
-
-\maketitle
-
-\section{Propósito del módulo}
-
-El módulo \texttt{init\_mlflow.py} establece el contexto mínimo y verificable a partir del cual un experimento puede empezar a registrar métricas, parámetros, tags y artefactos en MLflow de forma reproducible.
-
-Su objetivo no es entrenar modelos, lanzar \textit{sweeps} ni registrar artefactos complejos. Su responsabilidad es más estrecha y más importante: dejar creado, validado y documentado el \emph{plano de control experimental} sobre el que operarán los módulos posteriores.
-
-Formalmente, el módulo debe producir un estado válido
-
-\[
-\mathcal{S}_{\mathrm{ready}}
-=
-(\texttt{tracking\_uri}, \texttt{artifact\_uri}, \texttt{experiment\_id}, \texttt{required\_tags}, \texttt{manifest})
-\]
-
-tal que cualquier \texttt{run} posterior herede una configuración consistente, auditable e idempotente.
-
-\section{Objetivo operacional}
-
-El problema que resuelve \texttt{init\_mlflow.py} puede expresarse así:
-
-\begin{quote}
-Dado un archivo de configuración, un contexto de proyecto y un conjunto de metadatos obligatorios, inicializar MLflow de manera que el sistema sepa exactamente \emph{dónde} registrar, \emph{bajo qué experimento}, \emph{con qué identidad de configuración} y \emph{con qué garantías mínimas de consistencia}.
-\end{quote}
-
-En términos prácticos, esto implica:
-
-\begin{itemize}
-    \item resolver el \texttt{tracking\_uri};
-    \item resolver o crear el experimento de destino;
-    \item validar accesibilidad del backend;
-    \item fijar tags obligatorios;
-    \item persistir un resumen de inicialización;
-    \item dejar trazado si la inicialización fue completa, parcial o fallida.
-\end{itemize}
-
-\section{Principios de diseño}
-
-Este módulo debe obedecer cinco principios:
-
-\begin{enumerate}[label=\textbf{P\arabic*.}]
-    \item \textbf{Enfoque único}: inicializa MLflow, no una mezcla difusa de trackers.
-    \item \textbf{Idempotencia}: reejecutarlo con el mismo contexto no debe crear estados inconsistentes.
-    \item \textbf{Explícito antes que implícito}: ningún URI, experimento o tag crítico debe derivarse silenciosamente.
-    \item \textbf{Fallos observables}: toda degradación debe producir un estado y un error identificables.
-    \item \textbf{Persistencia mínima suficiente}: debe dejar evidencia local de qué quedó inicializado y cómo.
-\end{enumerate}
-
-\section{Alcance y no-alcance}
-
-\subsection{Alcance}
-
-\texttt{init\_mlflow.py} cubre:
-
-\begin{itemize}
-    \item carga y validación de configuración;
-    \item resolución de \texttt{tracking\_uri} y \texttt{artifact\_location};
-    \item autenticación indirecta mediante variables de entorno o configuración segura;
-    \item verificación básica de conectividad con el backend MLflow;
-    \item resolución o creación del experimento;
-    \item validación de tags obligatorios;
-    \item escritura de \texttt{init\_summary.json} y \texttt{manifest.json}.
-\end{itemize}
-
-\subsection{No-alcance}
-
-No corresponde a este módulo:
-
-\begin{itemize}
-    \item registrar artefactos de entrenamiento;
-    \item iniciar \texttt{runs} hijos;
-    \item optimizar hiperparámetros;
-    \item resolver linaje de datasets;
-    \item gestionar borrado de experimentos;
-    \item ocultar complejidad del backend bajo abstracciones vacías.
-\end{itemize}
-
-\section{Modelo formal de entrada}
-
-Definimos la entrada como
-
-\[
-\mathcal{I} = (\mathcal{C}, \mathcal{P}, \mathcal{E})
-\]
-
-donde:
-
-\begin{itemize}
-    \item \(\mathcal{C}\): configuración declarativa;
-    \item \(\mathcal{P}\): contexto del proyecto;
-    \item \(\mathcal{E}\): entorno de ejecución.
-\end{itemize}
-
-\subsection{Configuración declarativa \(\mathcal{C}\)}
-
-La configuración debe incluir, como mínimo:
-
-\begin{center}
-\begin{tabular}{>{\ttfamily}p{4.5cm} p{8.5cm}}
-\toprule
-tracking\_uri & URI del servidor MLflow o backend local \\
-artifact\_location & Ruta base de artefactos, si aplica \\
-experiment\_name & Nombre lógico del experimento \\
-required\_tags & Diccionario de tags mínimos obligatorios \\
-schema\_version & Versión del esquema de configuración \\
-timeout\_seconds & Timeout máximo por operación de inicialización \\
-max\_retries & Número máximo de reintentos transitorios \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\subsection{Contexto del proyecto \(\mathcal{P}\)}
-
-Debe contener al menos:
-
-\begin{itemize}
-    \item nombre del proyecto;
-    \item nombre del módulo o pipeline que inicializa;
-    \item commit de Git o identificador equivalente;
-    \item hash de configuración;
-    \item hash de snapshot de datos, si ya existe en el pipeline.
-\end{itemize}
-
-\subsection{Entorno \(\mathcal{E}\)}
-
-Incluye:
-
-\begin{itemize}
-    \item variables de entorno relevantes;
-    \item credenciales necesarias para autenticar contra el backend;
-    \item hostname o identidad de ejecución;
-    \item marca temporal UTC.
-\end{itemize}
-
-\section{Precedencia de resolución}
-
-Para evitar ambigüedad, la resolución del backend debe seguir un orden determinista. Para \texttt{tracking\_uri}:
-
-\[
-\texttt{tracking\_uri}^{*}
-=
-\begin{cases}
-\texttt{CLI override} & \text{si existe} \\
-\texttt{config.tracking\_uri} & \text{si existe} \\
-\texttt{MLFLOW\_TRACKING\_URI} & \text{si existe} \\
-\texttt{error} & \text{en otro caso}
-\end{cases}
-\]
-
-El mismo principio aplica a \texttt{artifact\_location}, con la salvedad de que puede ser opcional en determinados backends.
-
-Este orden debe quedar documentado y no puede depender de ramas implícitas del código.
-
-\section{Credenciales y política de secretos}
-
-Una crítica habitual en módulos de inicialización es hablar de reproducibilidad y olvidar la parte más frágil: la autenticación. La política correcta es:
-
-\begin{enumerate}
-    \item el módulo \textbf{puede leer} secretos del entorno o de un proveedor seguro;
-    \item el módulo \textbf{no debe persistir} secretos en \texttt{manifest.json}, \texttt{init\_summary.json} ni logs;
-    \item cualquier URI persistida debe almacenarse en versión \emph{sanitizada};
-    \item si faltan credenciales necesarias, el fallo debe ser explícito y temprano.
-\end{enumerate}
-
-Sea \(\mathrm{sanitize}(\cdot)\) una función que elimina tokens, passwords o query parameters sensibles. Entonces toda persistencia de backend debe satisfacer:
-
-\[
-\texttt{persisted\_uri} = \mathrm{sanitize}(\texttt{tracking\_uri})
-\]
-
-No basta con “no imprimir secretos”; hay que impedir que entren en los ficheros de salida.
-
-\section{Contrato de salida}
-
-El módulo debe producir dos salidas persistentes mínimas:
-
-\begin{enumerate}
-    \item \texttt{init\_summary.json}
-    \item \texttt{manifest.json}
-\end{enumerate}
-
-\subsection{\texttt{init\_summary.json}}
-
-Resume el resultado operacional de la inicialización. Debe incluir:
-
-\begin{itemize}
-    \item \texttt{status}
-    \item \texttt{tracking\_uri\_sanitized}
-    \item \texttt{artifact\_location\_sanitized}
-    \item \texttt{experiment\_name}
-    \item \texttt{experiment\_id}
-    \item \texttt{schema\_version}
-    \item \texttt{resolved\_at\_utc}
-    \item \texttt{latency\_ms}
-    \item \texttt{retry\_count}
-\end{itemize}
-
-\subsection{\texttt{manifest.json}}
-
-Es la pieza auditora. Debe incluir:
-
-\begin{itemize}
-    \item \texttt{project\_name}
-    \item \texttt{module\_name}
-    \item \texttt{git\_commit}
-    \item \texttt{config\_hash}
-    \item \texttt{data\_snapshot\_hash} (si existe)
-    \item \texttt{required\_tags}
-    \item \texttt{experiment\_name}
-    \item \texttt{experiment\_id}
-    \item \texttt{init\_key}
-\end{itemize}
-
-\section{Idempotencia}
-
-La inicialización no debe depender de que “la primera vez salga bien”. Debe poder reintentarse sin inflar el estado.
-
-Definimos la clave de idempotencia como:
-
-\[
-K_{\mathrm{init}}
-=
-(\texttt{tracking\_uri\_sanitized},
- \texttt{experiment\_name},
- \texttt{config\_hash},
- \texttt{git\_commit},
- \texttt{schema\_version})
-\]
-
-Si dos ejecuciones comparten \(K_{\mathrm{init}}\), entonces deben converger al mismo estado lógico:
-
-\[
-K_{\mathrm{init}}^{(1)} = K_{\mathrm{init}}^{(2)}
-\Rightarrow
-\mathcal{S}_{\mathrm{ready}}^{(1)} \equiv \mathcal{S}_{\mathrm{ready}}^{(2)}
-\]
-
-Esto implica dos reglas:
-
-\begin{itemize}
-    \item si el experimento ya existe, debe resolverse, no recrearse;
-    \item si ya se produjo un \texttt{manifest} compatible, la reejecución debe tratarse como \emph{replay seguro}.
-\end{itemize}
-
-\section{Tags obligatorios}
-
-Los tags obligatorios no son decoración documental; son el mínimo necesario para poder interpretar un \texttt{run} semanas después.
-
-Definimos:
-
-\[
-T_{\mathrm{req}} =
-\{
-\texttt{git\_commit},
-\texttt{config\_hash},
-\texttt{schema\_version}
-\}
-\]
-
-y opcionalmente, si la fase del pipeline ya lo permite,
-
-\[
-T_{\mathrm{opt}} =
-\{
-\texttt{data\_snapshot\_hash},
-\texttt{project\_name},
-\texttt{research\_stage},
-\texttt{universe\_id}
-\}
-\]
-
-Por tanto:
-
-\[
-T = T_{\mathrm{req}} \cup T_{\mathrm{opt}}
-\]
-
-La inicialización debe fallar si falta un tag obligatorio. El comportamiento correcto no es rellenarlo silenciosamente con \texttt{unknown}, sino abortar o exigir su provisión explícita.
-
-\section{Estado interno e invariantes}
-
-Un \texttt{init\_mlflow} serio debe mantener invariantes. Los principales son los siguientes.
-
-\subsection{Invariante de backend válido}
-
-Si \texttt{status = ready}, entonces el backend responde a una operación mínima de cliente dentro del timeout configurado.
-
-\[
-\texttt{ready} \Rightarrow \texttt{backend\_reachable} = 1
-\]
-
-\subsection{Invariante de experimento resuelto}
-
-Si \texttt{status = ready}, entonces existe un \texttt{experiment\_id} único asociado al \texttt{experiment\_name} resuelto.
-
-\[
-\texttt{ready} \Rightarrow \exists!\ \texttt{experiment\_id}
-\]
-
-\subsection{Invariante de manifiesto consistente}
-
-Si \texttt{manifest.json} se escribe, entonces su \texttt{config\_hash} y \texttt{experiment\_id} deben corresponder exactamente a la inicialización completada.
-
-\[
-\texttt{manifest\_written} \Rightarrow
-(\texttt{config\_hash}, \texttt{experiment\_id})_{\mathrm{manifest}}
-=
-(\texttt{config\_hash}, \texttt{experiment\_id})_{\mathrm{runtime}}
-\]
-
-\section{Creación y resolución del experimento}
-
-El punto delicado no es “crear el experimento”, sino manejar correctamente carreras, duplicidades y respuestas parciales del backend.
-
-La secuencia correcta es:
-
-\begin{enumerate}
-    \item consultar si \texttt{experiment\_name} ya existe;
-    \item si existe, recuperar su \texttt{experiment\_id};
-    \item si no existe, intentar crear;
-    \item si la creación responde con conflicto o estado ya existente, volver a consultar;
-    \item solo declarar éxito cuando se obtiene un \texttt{experiment\_id} final y estable.
-\end{enumerate}
-
-Esta pauta implementa una semántica \texttt{get-or-create} robusta frente a concurrencia moderada.
-
-\subsection{Semántica de atomicidad}
-
-No hay transacción global perfecta entre servidor MLflow, sistema local y escritura de ficheros de manifiesto. Por tanto, el módulo no debe prometer atomicidad total; debe ofrecer \textbf{publicación ordenada y recuperación clara}.
-
-La regla operativa recomendada es:
-
-\begin{quote}
-\textbf{primero} resolver backend y experimento, \textbf{después} escribir los ficheros locales de evidencia.
-\end{quote}
-
-Esto minimiza el peor caso: un manifiesto local que afirma un experimento que realmente no quedó disponible.
-
-\section{Fallbacks y política de degradación}
-
-La degradación debe ser explícita, nunca silenciosa.
-
-\subsection{Fallback permitido}
-
-Solo deben existir fallbacks declarados por configuración. Por ejemplo:
-
-\[
-\texttt{primary\_tracking\_uri} \rightarrow \texttt{secondary\_tracking\_uri}
-\]
-
-si y solo si la política lo permite.
-
-\subsection{Fallback prohibido}
-
-Quedan prohibidos por defecto:
-
-\begin{itemize}
-    \item cambiar de backend remoto a \texttt{file://} local sin aviso;
-    \item crear un experimento alternativo con nombre modificado silenciosamente;
-    \item eliminar tags obligatorios para “dejar pasar” la inicialización.
-\end{itemize}
-
-En investigación cuantitativa, un fallback silencioso suele ser peor que un fallo temprano, porque destruye la trazabilidad sin que el operador lo perciba.
-
-\section{Semántica de reintentos}
-
-Los reintentos deben aplicarse solo a errores transitorios. Denotemos por \(\mathcal{E}_T\) el conjunto de errores transitorios y por \(\mathcal{E}_P\) el de errores permanentes.
-
-\[
-\mathcal{E} = \mathcal{E}_T \cup \mathcal{E}_P,
-\qquad
-\mathcal{E}_T \cap \mathcal{E}_P = \varnothing
-\]
-
-Ejemplos razonables:
-
-\begin{itemize}
-    \item \(\mathcal{E}_T\): timeout, error temporal de red, respuesta 5xx;
-    \item \(\mathcal{E}_P\): credenciales inválidas, configuración incompleta, nombre de experimento inválido.
-\end{itemize}
+Módulo: ops/tracking/init_mlflow.py
+
+1. Objetivo del módulo
+
+El objetivo de init_mlflow.py es dejar preparado, de forma determinista y auditable,
+el plano mínimo de tracking experimental sobre el que podrán ejecutarse después los
+runs de research.
+
+Este módulo no entrena modelos, no lanza sweeps, no registra artefactos complejos y
+no reemplaza a artifact_logger.py. Su responsabilidad es más estrecha y más crítica:
+
+- resolver exactamente qué backend de MLflow se usará;
+- verificar que ese backend responde;
+- resolver o crear el experimento de destino de forma idempotente;
+- fijar la identidad mínima del contexto experimental;
+- y persistir evidencia local suficiente para reconstruir qué quedó inicializado.
+
+La pregunta correcta que responde no es “si MLflow está instalado”, sino algo mucho
+más útil para reproducibilidad:
+
+- si este pipeline puede empezar a registrar runs bajo una identidad de backend,
+  experimento y metadatos que después podamos reconstruir sin ambigüedad.
+
+2. Qué hace y qué no hace
+
+2.1 Qué hace
+- carga y valida configuración de inicialización;
+- resuelve tracking_uri con precedencia explícita;
+- resuelve artifact_location cuando aplica;
+- sanitiza URIs antes de persistirlas;
+- construye cliente MLflow y valida conectividad básica;
+- resuelve o crea el experimento objetivo con semántica get-or-create;
+- valida tags obligatorios;
+- construye una clave de idempotencia del contexto de init;
+- escribe init_summary.json;
+- escribe manifest.json;
+- y devuelve un estado ready, partial o failed claramente interpretable.
+
+2.2 Qué no hace
+- no abre runs de entrenamiento;
+- no registra métricas ni artefactos del experimento;
+- no hace sweeps ni búsqueda de hiperparámetros;
+- no versiona datasets completos;
+- no sustituye un artifact registry;
+- no debe caer silenciosamente a un file:// local salvo política explícita;
+- no debe inventar tags obligatorios faltantes.
+
+3. Rol dentro del stack
+
+Secuencia conceptual correcta:
+
+    config + project context + env
+    -> init_mlflow.py
+    -> run creation / training / logging / artifact publishing
+    -> auditabilidad y reproducibilidad downstream
+
+Interpretación correcta:
+- init_mlflow.py no es el tracker completo;
+- es el bootstrap reproducible del entorno de tracking;
+- deja cerrado dónde registrar, bajo qué experimento y con qué identidad mínima;
+- y crea la base sobre la que luego operarán training, evaluation y artifact logging.
+
+4. Qué significa “estado listo”
+
+El módulo debe producir un estado listo verificable, no una intuición vaga de que
+“parece que todo está configurado”.
+
+Conceptualmente, el estado ready debe incluir al menos:
+
+- tracking_uri resuelto y sanitizado;
+- artifact_uri o artifact_location resuelto, si aplica;
+- experiment_name;
+- experiment_id;
+- required_tags;
+- manifest persistido;
+- summary persistido;
+- status final consistente.
+
+La semántica correcta es:
+
+- ready:
+  backend validado, experimento resuelto, evidencia local escrita;
+
+- partial:
+  backend o experimento resueltos, pero evidencia local incompleta o inconsistente;
+
+- failed:
+  no existe garantía suficiente para iniciar tracking de forma reproducible.
+
+5. Inputs requeridos
+
+El módulo debe consumir tres bloques de entrada:
+
+5.1 Configuración declarativa
+Como mínimo:
+- tracking_uri
+- artifact_location
+- experiment_name
+- schema_version
+- timeout_seconds
+- max_retries
+- required_tags opcionales o derivables
+
+5.2 Contexto de proyecto
+Como mínimo:
+- project_name
+- module_name
+- git_commit
+- config_hash
+- data_snapshot_hash si ya existe
+- timestamp UTC de inicialización
+
+5.3 Entorno de ejecución
+Como mínimo:
+- variables de entorno relevantes;
+- credenciales necesarias para el backend;
+- hostname o identidad de ejecución;
+- directorio local de escritura de evidencia.
+
+6. Resolución determinista del backend
+
+Uno de los puntos más importantes del módulo es evitar que tracking_uri dependa
+de una mezcla opaca de defaults implícitos.
+
+La resolución debe seguir una precedencia fija y documentada:
+
+- override explícito por CLI o llamada;
+- config declarativa;
+- variable de entorno MLFLOW_TRACKING_URI;
+- error explícito si no existe ninguna fuente válida.
+
+La regla clave es esta:
+- la resolución debe ser determinista;
+- y el orden no puede depender de ramas ocultas del código ni de fallback silencioso.
+
+Lo mismo aplica, cuando corresponda, a artifact_location.
+
+7. Política de secretos y sanitización
+
+Este módulo puede leer secretos del entorno o de un proveedor seguro,
+pero no debe persistirlos nunca en ficheros de evidencia ni en logs.
+
+Toda URI persistida debe pasar por una función de sanitización que elimine, al menos:
+- tokens;
+- passwords;
+- query params sensibles;
+- credenciales embebidas en la URI.
+
+Regla correcta:
+- el runtime puede usar la URI real;
+- manifest.json e init_summary.json solo deben guardar la URI sanitizada.
+
+Si faltan credenciales necesarias:
+- el fallo debe ser temprano;
+- explícito;
+- y clasificarse como permanente, no como retryable.
+
+8. Tags obligatorios
+
+Los tags obligatorios no son decoración.
+Son el mínimo contexto necesario para poder interpretar un run después.
+
+El conjunto mínimo recomendado es:
+- git_commit
+- config_hash
+- schema_version
+
+Y, cuando ya existe en la pipeline:
+- data_snapshot_hash
+- project_name
+- research_stage
+- universe_id
 
 La política correcta es:
+- si falta un tag obligatorio, la inicialización no debe declararse ready;
+- queda prohibido rellenar con “unknown” o valores ficticios por conveniencia.
 
-\begin{itemize}
-    \item reintentar solo si \(e \in \mathcal{E}_T\);
-    \item número de reintentos finito y visible;
-    \item espera entre reintentos explícita y determinista o con \textit{backoff} acotado;
-    \item registrar cada intento en el resumen o logs estructurados.
-\end{itemize}
+9. Contrato de salida
 
-\section{Estados parciales y recuperación}
+La inicialización debe producir al menos dos artefactos locales:
 
-El módulo debe modelar estados intermedios. Un conjunto suficiente es:
+- init_summary.json
+- manifest.json
 
-\[
-\{\texttt{started}, \texttt{backend\_validated}, \texttt{experiment\_resolved}, \texttt{manifest\_written}, \texttt{ready}, \texttt{failed}\}
-\]
+9.1 init_summary.json
+Debe resumir el resultado operacional de la inicialización e incluir, como mínimo:
+- status
+- tracking_uri_sanitized
+- artifact_location_sanitized
+- experiment_name
+- experiment_id
+- schema_version
+- resolved_at_utc
+- latency_ms
+- retry_count
 
-Un fallo puede ocurrir, por ejemplo, después de resolver el experimento pero antes de escribir el manifiesto. Ese estado no es equivalente a un fallo completo; requiere reconciliación.
+9.2 manifest.json
+Debe ser la pieza de trazabilidad y contener, como mínimo:
+- project_name
+- module_name
+- git_commit
+- config_hash
+- data_snapshot_hash si existe
+- required_tags
+- experiment_name
+- experiment_id
+- init_key
 
-La rutina de recuperación debe seguir la lógica:
+Estos ficheros no son accesorios.
+Son la evidencia mínima local de que el plano de tracking quedó realmente inicializado.
 
-\[
-\texttt{recover()} :
-\begin{cases}
-\text{si backend y experimento existen, escribir manifiesto faltante} \\
-\text{si backend no responde, marcar fallo recuperable} \\
-\text{si el estado local contradice el remoto, abortar con inconsistencia}
-\end{cases}
-\]
+10. Idempotencia
 
-El principio clave es que el sistema pueda distinguir entre:
+La inicialización debe poder reintentarse sin generar estados inconsistentes.
 
-\begin{itemize}
-    \item \textbf{no inicializado};
-    \item \textbf{inicializado remotamente pero no confirmado localmente};
-    \item \textbf{inicialización lista y consistente}.
-\end{itemize}
+Una clave razonable de idempotencia es:
 
-\section{Validaciones obligatorias}
+    K_init = (
+        tracking_uri_sanitized,
+        experiment_name,
+        config_hash,
+        git_commit,
+        schema_version
+    )
 
-Antes de declarar \texttt{ready}, el módulo debe validar al menos:
+Interpretación:
+- si dos ejecuciones comparten K_init, deben converger al mismo estado lógico;
+- no deben crear experimentos duplicados;
+- no deben producir manifiestos contradictorios;
+- y la segunda ejecución debe resolverse como replay seguro.
 
-\begin{enumerate}
-    \item que la configuración carga y cumple el esquema esperado;
-    \item que \texttt{tracking\_uri} está resuelto;
-    \item que el backend responde;
-    \item que el nombre del experimento es válido;
-    \item que el experimento se puede consultar o crear;
-    \item que los tags obligatorios existen;
-    \item que \texttt{init\_summary.json} y \texttt{manifest.json} se pueden escribir localmente.
-\end{enumerate}
+La idempotencia aquí no es un lujo.
+Es una propiedad crítica para reintentos tras fallos transitorios o relanzamientos de pipeline.
 
-\subsection{Validez del nombre de experimento}
+11. Invariantes
 
-Una política razonable consiste en imponer un patrón conservador, por ejemplo:
+Los invariantes obligatorios son:
 
-\[
-\texttt{experiment\_name} \in \texttt{Regex}(\texttt{[A-Za-z0-9\_\-/]\{1,128\}})
-\]
+- si status = ready, el backend responde dentro del timeout configurado;
+- si status = ready, existe exactamente un experiment_id resuelto para el experiment_name usado;
+- el manifest persistido debe reflejar exactamente config_hash y experiment_id del runtime;
+- la URI persistida debe estar sanitizada;
+- no debe existir fallback silencioso a backend alternativo salvo política explícita;
+- el mismo contexto idempotente no debe inflar el estado ni crear duplicados.
 
-El objetivo no es ser ornamental, sino impedir nombres ambiguos, no portables o conflictivos.
+Si alguno de estos invariantes falla, el módulo no debe declarar ready.
 
-\section{Observabilidad}
+12. Resolución del experimento
 
-La observabilidad correcta aquí no es “muchos logs”, sino logs con contexto suficiente para diagnosticar.
+La semántica correcta para el experimento es get-or-create robusto, no create ciego.
 
-Cada evento importante debe emitir, como mínimo:
+Secuencia correcta:
+- consultar si el experimento ya existe;
+- si existe, devolver experiment_id;
+- si no existe, intentar create_experiment;
+- si hay conflicto o carrera, volver a consultar;
+- solo declarar éxito cuando existe un experiment_id final y estable.
 
-\begin{itemize}
-    \item \texttt{event\_time\_utc}
-    \item \texttt{module = init\_mlflow}
-    \item \texttt{status}
-    \item \texttt{tracking\_uri\_sanitized}
-    \item \texttt{experiment\_name}
-    \item \texttt{experiment\_id} (si existe)
-    \item \texttt{retry\_count}
-    \item \texttt{latency\_ms}
-\end{itemize}
+Esto es especialmente importante bajo concurrencia moderada.
+El módulo no debe asumir que “si create falla, entonces no existe”.
+Puede tratarse de una carrera con otra inicialización concurrente.
+
+13. Race conditions y creación concurrente
+
+La creación concurrente del mismo experimento es uno de los fallos reales más importantes.
+
+La política correcta es:
+- query;
+- create si no existe;
+- si create devuelve conflicto, esperar brevemente;
+- requery;
+- repetir un número acotado de veces;
+- abortar con error tipado si no se alcanza convergencia.
+
+Esto elimina la tentación de:
+- crear nombres alternativos silenciosos;
+- duplicar experimentos;
+- o suponer éxito sin confirmar el experiment_id final.
+
+No hace falta vestir esto de teoría cuantitativa.
+Basta con implementarlo como un patrón robusto de concurrencia moderada.
+
+14. Reintentos y backoff
+
+Los reintentos solo deben aplicarse a fallos transitorios.
+
+Clasificación mínima recomendable:
+- transitorios:
+  timeout, connection error, backend 5xx;
+- permanentes:
+  credenciales inválidas, config inválida, nombre de experimento inválido, conflicto no resoluble.
+
+La política correcta es:
+- retry solo si el error es transitorio;
+- número finito de reintentos;
+- exponential backoff explícito y acotado;
+- registro de retry_count y latency total.
+
+Una forma razonable es:
+- delay_i = base_delay * 2^i hasta max_retries;
+- con un bound total visible en config o documentación.
+
+Esto evita retry storms y hace el comportamiento operacional predecible.
+
+15. Escritura local atómica
+
+Aunque no exista atomicidad global entre backend MLflow y filesystem local,
+la escritura de init_summary.json y manifest.json sí debe ser atómica localmente.
+
+Pauta correcta:
+- escribir en fichero temporal;
+- flush y fsync si procede;
+- rename atómico al destino final.
+
+Esto evita:
+- manifiestos truncados;
+- resúmenes corruptos;
+- y estados locales ambiguos tras interrupciones.
+
+16. Estados parciales y recovery
+
+El módulo debe reconocer que puede fallar a mitad de camino.
+
+Estados intermedios útiles:
+- started
+- backend_validated
+- experiment_resolved
+- summary_written
+- manifest_written
+- ready
+- failed
+
+Situaciones reales:
+- backend validado pero manifest no escrito;
+- experimento resuelto remotamente pero evidencia local incompleta;
+- summary escrito y manifest fallido;
+- contradicción entre estado remoto y local.
+
+La rutina de recovery debe poder distinguir entre:
+- no inicializado;
+- inicializado remotamente pero no confirmado localmente;
+- inicializado y consistente;
+- inconsistencia que requiere abortar.
+
+La política correcta no es ocultar estos estados,
+sino hacerlos detectables y reconciliables.
+
+17. Política de fallbacks
+
+La degradación debe ser explícita, no silenciosa.
+
+Fallbacks permitidos:
+- solo los declarados por configuración;
+- por ejemplo, primary_tracking_uri -> secondary_tracking_uri.
+
+Fallbacks prohibidos por defecto:
+- cambiar silenciosamente a file:// local;
+- renombrar el experimento para “hacerlo pasar”;
+- eliminar tags obligatorios para no fallar.
+
+En research reproducible, un fallback silencioso suele ser peor que un fallo temprano,
+porque rompe trazabilidad sin que el usuario lo perciba.
+
+18. Observabilidad
+
+La observabilidad correcta aquí no consiste en “loggear mucho”,
+sino en loggear con contexto suficiente.
+
+Cada evento importante debería incluir:
+- event_time_utc
+- module = init_mlflow
+- status
+- tracking_uri_sanitized
+- experiment_name
+- experiment_id si existe
+- retry_count
+- latency_ms
 
 Métricas mínimas útiles:
+- init_ready_flag
+- manifest_written_flag
+- experiment_created_flag
+- retry_count
+- latency_ms
+- error_class
 
-\[
-\mathbb{I}(\texttt{ready}),\quad
-\texttt{latency\_ms},\quad
-\texttt{retry\_count},\quad
-\mathbb{I}(\texttt{manifest\_written}),\quad
-\mathbb{I}(\texttt{experiment\_created})
-\]
+19. Interfaz recomendada
 
-\section{Interfaz propuesta}
+La interfaz debe ser estrecha, tipada y explícita.
 
-La interfaz debe ser estrecha. Un diseño razonable es:
+Objetos razonables:
+- InitConfig
+- InitContext
+- InitResult
 
-\begin{lstlisting}[language=Python]
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
+Campos mínimos de InitConfig:
+- tracking_uri
+- artifact_location
+- experiment_name
+- schema_version
+- timeout_seconds
+- max_retries
 
-@dataclass(frozen=True)
-class InitConfig:
-    tracking_uri: str
-    artifact_location: Optional[str]
-    experiment_name: str
-    schema_version: str
-    timeout_seconds: float
-    max_retries: int
+Campos mínimos de InitContext:
+- project_name
+- module_name
+- git_commit
+- config_hash
+- data_snapshot_hash opcional
 
-@dataclass(frozen=True)
-class InitContext:
-    project_name: str
-    module_name: str
-    git_commit: str
-    config_hash: str
-    data_snapshot_hash: Optional[str] = None
+Campos mínimos de InitResult:
+- status
+- tracking_uri_sanitized
+- artifact_location_sanitized
+- experiment_name
+- experiment_id
+- manifest_path
+- summary_path
+- retry_count
+- latency_ms
 
-@dataclass(frozen=True)
-class InitResult:
-    status: str
-    tracking_uri_sanitized: str
-    artifact_location_sanitized: Optional[str]
-    experiment_name: str
-    experiment_id: str
-    manifest_path: Path
-    summary_path: Path
-    retry_count: int
-    latency_ms: int
+20. Tipos de error
 
-def init_mlflow(
-    config: InitConfig,
-    context: InitContext,
-    output_dir: Path,
-) -> InitResult:
-    ...
-\end{lstlisting}
+Las excepciones deben estar tipadas al menos así:
 
-\section{Pseudocódigo operacional}
-
-\begin{lstlisting}[language=Python]
-def init_mlflow(config, context, output_dir):
-    validate_config(config)
-    validate_context(context)
-
-    tracking_uri = resolve_tracking_uri(config)
-    tracking_uri_sanitized = sanitize_uri(tracking_uri)
-
-    client = build_mlflow_client(tracking_uri)
-    validate_backend(client, timeout=config.timeout_seconds)
-
-    experiment_id = get_or_create_experiment(
-        client=client,
-        experiment_name=config.experiment_name,
-        artifact_location=config.artifact_location,
-        max_retries=config.max_retries,
-    )
-
-    required_tags = {
-        "git_commit": context.git_commit,
-        "config_hash": context.config_hash,
-        "schema_version": config.schema_version,
-    }
-
-    if context.data_snapshot_hash is not None:
-        required_tags["data_snapshot_hash"] = context.data_snapshot_hash
-
-    validate_required_tags(required_tags)
-
-    summary = build_init_summary(...)
-    manifest = build_manifest(...)
-
-    write_json_atomic(output_dir / "init_summary.json", summary)
-    write_json_atomic(output_dir / "manifest.json", manifest)
-
-    return InitResult(
-        status="ready",
-        tracking_uri_sanitized=tracking_uri_sanitized,
-        artifact_location_sanitized=sanitize_uri(config.artifact_location),
-        experiment_name=config.experiment_name,
-        experiment_id=experiment_id,
-        manifest_path=output_dir / "manifest.json",
-        summary_path=output_dir / "init_summary.json",
-        retry_count=...,
-        latency_ms=...,
-    )
-\end{lstlisting}
-
-\section{Escritura atómica local}
-
-Aunque el backend MLflow no garantice atomicidad total con el sistema local, la escritura de ficheros de resumen sí debe ser atómica a nivel local. La pauta recomendada es:
-
-\begin{enumerate}
-    \item escribir en un fichero temporal;
-    \item hacer \texttt{flush} y \texttt{fsync} si procede;
-    \item renombrar de forma atómica al destino final.
-\end{enumerate}
-
-Esto evita manifiestos truncados o resúmenes corruptos en caso de interrupción.
-
-\section{Matriz mínima de pruebas}
-
-Un módulo de inicialización serio debe probarse contra rutas felices y rutas de degradación.
-
-\subsection{Casos obligatorios}
-
-\begin{enumerate}
-    \item configuración válida y backend accesible;
-    \item \texttt{tracking\_uri} ausente;
-    \item credenciales ausentes;
-    \item backend inaccesible;
-    \item experimento ya existente;
-    \item carrera de creación con conflicto;
-    \item fallo transitorio seguido de éxito en reintento;
-    \item nombre de experimento inválido;
-    \item ausencia de \texttt{git\_commit};
-    \item escritura fallida de \texttt{manifest.json};
-    \item replay idempotente completo;
-    \item estado remoto válido con manifiesto local faltante.
-\end{enumerate}
-
-\subsection{Criterio de calidad}
-
-No basta con cobertura superficial. El criterio útil es:
-
-\begin{itemize}
-    \item cobertura alta de funciones críticas;
-    \item tests explícitos de idempotencia;
-    \item tests de recuperación de estados parciales;
-    \item tests de sanitización de secretos;
-    \item tests de escritura atómica local.
-\end{itemize}
-
-\section{Errores y semántica de fallo}
-
-Las excepciones deben ser tipadas. Un conjunto suficiente sería:
-
-\begin{itemize}
-    \item \texttt{ConfigError}
-    \item \texttt{CredentialError}
-    \item \texttt{BackendConnectionError}
-    \item \texttt{ExperimentResolutionError}
-    \item \texttt{ManifestWriteError}
-    \item \texttt{RecoveryError}
-\end{itemize}
+- ConfigError
+- CredentialError
+- BackendConnectionError
+- ExperimentResolutionError
+- ManifestWriteError
+- RecoveryError
 
 Semántica correcta:
+- ConfigError y CredentialError no se reintentan;
+- BackendConnectionError puede ser retryable;
+- inconsistencias remoto/local deben elevarse a RecoveryError o equivalente;
+- ningún error debe dejar status = ready sin experiment_id verificable.
 
-\begin{itemize}
-    \item los errores de configuración o credenciales son permanentes;
-    \item los errores de red pueden ser transitorios;
-    \item las inconsistencias entre estado remoto y local requieren reconciliación, no ocultación;
-    \item ningún error debe dejar un \texttt{status=ready} sin \texttt{experiment\_id} verificable.
-\end{itemize}
+21. Matriz mínima de pruebas
 
-\section{Conclusión}
+Este módulo no debe validarse solo con casos felices.
 
-\texttt{init\_mlflow.py} no debe vender “infraestructura industrial” ni acumular referencias laterales. Debe resolver con precisión una pregunta mucho más concreta y mucho más exigente:
+Casos obligatorios:
+- configuración válida y backend accesible;
+- tracking_uri ausente;
+- credenciales ausentes;
+- backend inaccesible;
+- experimento ya existente;
+- carrera de creación con conflicto;
+- fallo transitorio seguido de éxito;
+- nombre de experimento inválido;
+- ausencia de git_commit;
+- fallo de escritura de manifest.json;
+- replay idempotente completo;
+- estado remoto válido con evidencia local faltante.
 
-\begin{quote}
-¿Puede este pipeline empezar a registrar experimentos bajo una identidad de configuración, backend y experimento que podamos reconstruir exactamente más adelante?
-\end{quote}
+La calidad aquí no depende solo de coverage global,
+sino de cubrir bien idempotencia, sanitización, recovery y concurrencia.
 
-La respuesta correcta depende de pocas cosas, pero debe dejarlas completamente cerradas:
+22. Complejidad y rendimiento
 
-\begin{itemize}
-    \item cómo se resuelve el backend;
-    \item cómo se autentica sin filtrar secretos;
-    \item cómo se crea o recupera el experimento sin duplicidades;
-    \item qué tags son obligatorios;
-    \item qué significa reintentar;
-    \item qué evidencia local queda escrita;
-    \item cómo se recupera un estado parcial.
-\end{itemize}
+El coste relevante del módulo no está en estructuras algorítmicas complejas,
+sino en latencia de red, round-trips al backend y escritura local.
 
-Si este módulo satisface esos invariantes, entonces el resto del sistema ---\textit{sweeps}, training, artifact logging y evaluación OOS--- podrá apoyarse sobre una base experimental realmente reproducible. Esa es la propiedad valiosa.
+La formalización útil aquí es simple:
+- coste O(1) en metadata local por inicialización;
+- más coste de llamadas remotas;
+- más coste de reintentos si el backend falla transitoriamente.
 
-\end{document}
+Eso basta para documentación útil.
+No hay que disfrazar este módulo de “math-heavy”.
+
+23. Qué no debe afirmarse
+
+init_mlflow.py no debe venderse como:
+- módulo cuantitativo;
+- sistema completo de experiment management;
+- garantía mágica de consistencia perfecta global;
+- ni capa que “resuelve toda la reproducibilidad”.
+
+Su responsabilidad correcta es más concreta y más valiosa:
+dejar inicializado, de forma determinista, segura y auditable,
+el backend experimental sobre el que luego se apoyará el resto de la pipeline.
+
+24. Conclusión
+
+init_mlflow.py debe existir para cerrar, antes de cualquier training o logging posterior,
+unas pocas preguntas críticas de infraestructura:
+
+- qué backend exacto se va a usar;
+- con qué experimento se va a registrar;
+- con qué identidad mínima de configuración y commit;
+- qué evidencia local queda escrita;
+- y cómo se distingue un ready real de un estado parcial o fallido.
+
+Ese es el estándar correcto para una inicialización seria de MLflow en una pipeline
+profesional de research cuantitativo.

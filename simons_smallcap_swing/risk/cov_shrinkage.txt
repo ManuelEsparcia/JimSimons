@@ -1,541 +1,516 @@
-\documentclass{article}
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
-\usepackage{amsmath,amssymb,amsfonts,mathtools}
-\usepackage{booktabs}
-\usepackage{array}
-\usepackage{enumitem}
-\usepackage{geometry}
-\usepackage{hyperref}
-\usepackage{listings}
-\usepackage{xcolor}
-\geometry{margin=1in}
+Especificación Cuantitativa: risk/cov_shrinkage.py
 
-\title{\textbf{Especificación Técnica: \texttt{risk/cov\_shrinkage.py}}}
-\author{Quant Research Infrastructure}
-\date{Marzo 2026}
+1. Propósito del módulo
 
-\begin{document}
-\maketitle
+El objetivo de risk/cov_shrinkage.py es estimar una matriz de covarianza ex-ante robusta y utilizable para:
 
-\tableofcontents
-\newpage
+- optimización de cartera,
+- control de riesgo,
+- reporting de exposición,
+- y stress testing aguas abajo.
 
-\section{Propósito del módulo}
+La pregunta correcta del módulo es:
 
-Este módulo estima matrices de covarianza robustas para su uso en optimización de cartera, construcción de riesgo ex--ante, control de exposición y análisis de estabilidad numérica en estrategias \emph{swing} sobre small caps.
+“Dado un bloque temporal de retornos PIT con cobertura imperfecta y posible ruido transversal elevado, ¿qué matriz de covarianza estable y numéricamente utilizable debemos entregar al resto del stack?”
 
-El problema central es bien conocido: la covarianza muestral
-\[
-\hat{\Sigma}_{\text{sample}}
-=
-\frac{1}{T-1}(X-\bar{X})^\top (X-\bar{X}),
-\qquad
-X \in \mathbb{R}^{T \times N},
-\]
-es un estimador de alta varianza cuando la dimensión transversal \(N\) no es pequeña respecto a la longitud temporal efectiva \(T\), cuando existen datos faltantes, cuando el universo rota con frecuencia o cuando la estructura de correlación cambia de régimen. En estas condiciones, la optimización basada directamente en \(\hat{\Sigma}_{\text{sample}}\) tiende a producir pesos inestables, concentraciones espurias y sensibilidad excesiva al error de estimación.
+El módulo no busca maximizar Sharpe ni seleccionar estrategias.
+Su función es reducir error de estimación y mejorar estabilidad numérica en la capa de riesgo.
 
-La función del módulo es reemplazar esa matriz frágil por una matriz regularizada
-\[
-\hat{\Sigma}_{\text{shrink}}
-=
-(1-\delta)\hat{\Sigma}_{\text{sample}}
-+
-\delta \Sigma_{\text{target}},
-\qquad
-\delta \in [0,1],
-\]
-donde \(\Sigma_{\text{target}}\) es una estructura más parsimoniosa y estable, y \(\delta\) controla la intensidad de regularización.
+2. Principios no negociables
 
-\section{Objetivo operativo}
+2.1 Validez primero
+La matriz final debe ser:
+- simétrica,
+- PSD o al menos corregida a PSD dentro de política explícita,
+- y compatible con optimización cuadrática.
 
-El módulo debe producir una matriz de covarianza que cumpla simultáneamente cuatro propiedades:
+2.2 Robustez sobre sofisticación
+El método canónico debe priorizar:
+- trazabilidad,
+- estabilidad,
+- comportamiento predecible bajo cobertura imperfecta,
+sobre técnicas más sofisticadas pero más frágiles.
 
-\begin{enumerate}[label=\arabic*.]
-    \item \textbf{Simetría y semidefinición positiva}: la matriz debe ser válida para cálculo de volatilidad, riesgo marginal y optimización cuadrática.
-    \item \textbf{Estabilidad numérica}: el acondicionamiento debe ser suficientemente bueno para evitar soluciones de cartera dominadas por ruido.
-    \item \textbf{Robustez ante datos incompletos y universos cambiantes}: el módulo no debe colapsar cuando faltan observaciones o entran y salen símbolos.
-    \item \textbf{Trazabilidad}: deben persistirse tanto la matriz final como los diagnósticos necesarios para auditar por qué se eligió una determinada regularización.
-\end{enumerate}
+2.3 Point-in-time estricto
+La estimación debe usar exclusivamente retornos y universo disponibles en la fecha efectiva de cálculo.
 
-El objetivo del módulo no es maximizar por sí mismo Sharpe, Calmar o retorno. Su función es reducir error de estimación en la capa de riesgo para que los módulos aguas abajo tomen decisiones sobre una base más estable.
+2.4 Separación de responsabilidades
+cov_shrinkage.py construye infraestructura de riesgo.
+No:
+- estima alpha,
+- no selecciona targets macro,
+- no hace modelado dinámico de regímenes,
+- no sustituye a factor_model.py,
+- ni a stress_tests.py.
 
-\section{Entradas, salidas y contrato del módulo}
+2.5 Fallbacks conservadores
+Si el estimador “bonito” falla, el módulo debe caer a un target más conservador, no inventar estructura frágil.
 
-\subsection{Entradas}
+3. Qué hace y qué no hace
 
-El módulo recibe, como mínimo:
+3.1 Qué hace
+- recibe una matriz de retornos;
+- filtra activos con cobertura insuficiente;
+- estima covarianza muestral;
+- construye un target estructural;
+- aplica shrinkage lineal;
+- corrige PSD si hace falta;
+- computa diagnósticos;
+- y persiste la matriz final con trazabilidad suficiente.
 
-\begin{itemize}
-    \item una matriz de retornos \(X\) de dimensión \(T \times N\), alineada temporalmente y con columnas identificadas por símbolo;
-    \item parámetros de configuración:
-    \begin{itemize}
-        \item \texttt{lookback},
-        \item \texttt{min\_obs},
-        \item \texttt{target\_type},
-        \item \texttt{shrinkage\_method},
-        \item \texttt{nan\_policy},
-        \item \texttt{psd\_policy},
-        \item \texttt{diag\_floor},
-        \item \texttt{jitter},
-        \item \texttt{universe\_policy}.
-    \end{itemize}
-\end{itemize}
+3.2 Qué no hace
+- no ejecuta nonlinear shrinkage por defecto;
+- no estima dinámicas GARCH multivariantes;
+- no hace clustering jerárquico complejo;
+- no decide allocation;
+- no “predice” la covarianza futura con modelos de ML.
 
-\subsection{Salida principal}
+4. Entradas obligatorias
 
-La salida principal es una matriz
-\[
-\hat{\Sigma}_{\text{final}} \in \mathbb{R}^{N \times N}
-\]
-indexada por símbolo y lista para ser consumida por:
+4.1 Retornos
+Matriz:
 
-\begin{itemize}
-    \item \texttt{portfolio/optimizer.py},
-    \item \texttt{risk/factor\_model.py},
-    \item \texttt{risk/stress\_tests.py},
-    \item \texttt{risk/exposure\_report.py}.
-\end{itemize}
+    X in R^(T x N)
 
-\subsection{Artefactos persistidos}
+con:
+- filas = fechas
+- columnas = activos
+- retornos PIT ya alineados temporalmente
+
+4.2 Configuración
+La config debe incluir al menos:
+- lookback
+- min_obs
+- target_type
+- shrinkage_method
+- nan_policy
+- psd_policy
+- diag_floor
+- jitter
+- universe_policy
+- max_condition_number
+- fallback_policy
+
+4.3 Universo efectivo
+El módulo debe recibir o inferir:
+- símbolos activos en la fecha de cálculo,
+- máscara de elegibilidad,
+- metadata suficiente para registrar cobertura.
+
+5. Salidas obligatorias
 
 El módulo debe persistir:
 
-\begin{itemize}
-    \item \texttt{cov\_shrunk.parquet}: matriz final;
-    \item \texttt{cov\_sample.parquet}: matriz muestral usada como punto de partida;
-    \item \texttt{cov\_target.parquet}: target de shrinkage;
-    \item \texttt{diagnostics.json}: metadatos y métricas de calidad;
-    \item \texttt{universe\_stats.json}: cobertura efectiva por activo y universo final usado.
-\end{itemize}
-
-\subsection{Campos mínimos de \texttt{diagnostics.json}}
-
-\begin{itemize}
-    \item fecha de cálculo;
-    \item número de activos \(N\);
-    \item número de observaciones efectivas \(T\);
-    \item método de shrinkage;
-    \item target utilizado;
-    \item \(\delta\) final;
-    \item condición numérica;
-    \item fracción de valores faltantes;
-    \item número de autovalores corregidos por política PSD;
-    \item si se activó \emph{fallback};
-    \item motivo del \emph{fallback}, si aplica.
-\end{itemize}
-
-\section{Formulación matemática}
-
-\subsection{Covarianza muestral}
-
-Sea \(X = (x_{t,i})\) la matriz de retornos. La covarianza muestral es
-\[
-\hat{\Sigma}_{\text{sample}}
-=
-\frac{1}{T-1}
-(X-\bar{X})^\top (X-\bar{X}).
-\]
-
-Este estimador es consistente en el límite clásico, pero en práctica es muy sensible a:
-
-\begin{itemize}
-    \item relaciones \(N/T\) elevadas;
-    \item colinealidad entre activos;
-    \item heterogeneidad de volatilidades;
-    \item observaciones faltantes;
-    \item ventanas temporales cortas;
-    \item cambios de régimen.
-\end{itemize}
-
-\subsection{Shrinkage lineal}
-
-El estimador de shrinkage lineal es
-\[
-\hat{\Sigma}_{\text{shrink}}
-=
-(1-\delta)\hat{\Sigma}_{\text{sample}}
-+
-\delta \Sigma_{\text{target}},
-\qquad
-\delta \in [0,1].
-\]
-
-Interpretación:
-
-\begin{itemize}
-    \item si \(\delta=0\), se usa la covarianza muestral pura;
-    \item si \(\delta=1\), se usa el target puro;
-    \item valores intermedios equilibran fidelidad empírica y robustez estructural.
-\end{itemize}
-
-\subsection{Targets soportados}
-
-\paragraph{1. Target diagonal escalado}
-\[
-\Sigma_{\text{target}} = \operatorname{diag}(\hat{\Sigma}_{11}, \ldots, \hat{\Sigma}_{NN}).
-\]
-Preserva volatilidades individuales y anula correlaciones cruzadas. Es el target más conservador y el \emph{fallback} por defecto.
-
-\paragraph{2. Target identidad escalada}
-\[
-\Sigma_{\text{target}} = \bar{\sigma}^2 I,
-\qquad
-\bar{\sigma}^2 = \frac{1}{N}\sum_{i=1}^{N}\hat{\Sigma}_{ii}.
-\]
-Se usa solo como último recurso cuando las diagonales estimadas no son fiables o la cobertura es extremadamente baja.
-
-\paragraph{3. Target de correlación constante}
-Sea
-\[
-\bar{\rho}
-=
-\frac{2}{N(N-1)}
-\sum_{i<j}\hat{\rho}_{ij},
-\]
-donde \(\hat{\rho}_{ij}\) son correlaciones muestrales válidas. Entonces
-\[
-(\Sigma_{\text{target}})_{ij}
-=
-\begin{cases}
-\hat{\sigma}_i^2, & i=j,\\
-\bar{\rho}\,\hat{\sigma}_i \hat{\sigma}_j, & i\neq j.
-\end{cases}
-\]
-Este target es útil cuando se desea capturar una correlación media de mercado sin heredar toda la inestabilidad de la matriz completa.
+1. cov_shrunk.parquet
+2. cov_sample.parquet
+3. cov_target.parquet
+4. diagnostics.json
+5. universe_stats.json
 
-\paragraph{4. Target factorial}
-Si existe un modelo factorial ya estimado,
-\[
-\Sigma_{\text{target}} = B \Omega_f B^\top + D,
-\]
-donde \(B\) es la matriz de cargas, \(\Omega_f\) la covarianza factorial y \(D\) la matriz diagonal de riesgo específico. Este target solo debe activarse si el modelo factorial aguas arriba cumple validaciones mínimas de cobertura y estabilidad.
-
-\section{Selección del estimador de shrinkage}
+La salida principal es:
 
-\subsection{Métodos soportados}
+    Sigma_final in R^(N x N)
 
-\begin{itemize}
-    \item \textbf{Ledoit--Wolf}: opción canónica por defecto;
-    \item \textbf{OAS}: preferible cuando \(T\) es reducido respecto a \(N\);
-    \item \textbf{Shrinkage fijo}: \(\delta\) configurado manualmente para depuración o estudios controlados.
-\end{itemize}
-
-\subsection{Política por defecto}
-
-La política por defecto debe ser:
+indexada por símbolo y lista para consumo downstream.
 
-\begin{center}
-\begin{tabular}{>{\raggedright\arraybackslash}p{4.3cm} >{\raggedright\arraybackslash}p{8.7cm}}
-\toprule
-Condición & Método por defecto \\
-\midrule
-\(T \ge 3N\) y cobertura alta & Ledoit--Wolf con target diagonal escalado o correlación constante \\
-\(N < T < 3N\) & OAS o Ledoit--Wolf con target diagonal \\
-\(T < N\) o cobertura débil & Target diagonal con \emph{fallback} conservador \\
-Modelo factorial validado disponible & Target factorial opcional \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\subsection{Decisión sobre \(\delta\)}
-
-Cuando el método es automático, \(\delta\) debe calcularse por el estimador elegido. Cuando el método es fijo, debe imponerse:
-\[
-0 \le \delta \le 1.
-\]
+6. Problema estadístico que resuelve
 
-No se debe introducir una \(\delta\) ``adaptativa por régimen'' en la versión canónica del módulo salvo que exista un protocolo documentado, reproducible y testeado para dicha adaptación. Esa idea puede existir como extensión experimental, pero no como comportamiento implícito del módulo base.
-
-\section{Política de datos faltantes y universo}
-
-\subsection{Mínimo de observaciones}
-
-Un activo \(i\) solo puede participar en la estimación si cumple:
-\[
-\#\{t: x_{t,i}\ \text{observado}\} \ge \texttt{min\_obs}.
-\]
-
-La recomendación base para \texttt{min\_obs} es:
-\[
-\texttt{min\_obs} = \max(30, \lfloor 0.6 \cdot \texttt{lookback} \rfloor)
-\]
-en universos con alta rotación, o una fracción algo mayor en universos estables.
-
-\subsection{Política por defecto ante NaN}
-
-La política canónica debe ser:
+La covarianza muestral clásica:
 
-\begin{enumerate}[label=\arabic*.]
-    \item filtrar activos que no alcanzan \texttt{min\_obs};
-    \item alinear por fechas comunes del conjunto restante;
-    \item estimar covarianza sobre las observaciones válidas;
-    \item no imputar correlaciones faltantes con cero salvo que se documente expresamente como \emph{fallback} de emergencia.
-\end{enumerate}
+    Sigma_sample =
+    (1/(T-1)) (X - X_bar)^T (X - X_bar)
 
-Asignar beta, correlación o covarianza cero por defecto a observaciones faltantes no debe ser una regla base del sistema.
+es válida en teoría, pero en práctica se vuelve muy inestable cuando:
+- N no es pequeño frente a T,
+- el universo rota,
+- hay missingness,
+- hay colinealidad,
+- o el régimen de correlación es ruidoso.
 
-\subsection{Universo cambiante}
+Por ello, el módulo reemplaza Sigma_sample por un estimador shrinked:
 
-Cuando el universo rota, el módulo debe construir la matriz sobre el subconjunto elegible en cada fecha de cálculo. El \texttt{diagnostics.json} debe registrar:
+    Sigma_shrink =
+    (1 - delta) Sigma_sample
+    + delta Sigma_target
 
-\begin{itemize}
-    \item activos entrantes y salientes;
-    \item cobertura media y mínima;
-    \item dimensión final de la matriz.
-\end{itemize}
+con:
+    delta in [0,1]
 
-\section{Garantía de simetría y semidefinición positiva}
+7. Semántica canónica del módulo
 
-Aunque el estimador teórico sea PSD, en práctica pueden aparecer pequeños autovalores negativos por error numérico, datos incompletos o transformaciones intermedias. Por ello, la política PSD debe ser explícita.
+La semántica oficial del módulo es:
 
-\subsection{Paso 1: simetrización}
+    mode = linear_shrinkage_canonical
 
-Antes de cualquier corrección espectral:
-\[
-\hat{\Sigma} \leftarrow \frac{1}{2}\left(\hat{\Sigma} + \hat{\Sigma}^\top\right).
-\]
+Es decir:
+- estimación muestral,
+- target explícito,
+- shrinkage lineal tipo Ledoit-Wolf / OAS / fijo,
+- simetrización,
+- reparación PSD,
+- diagnósticos.
 
-\subsection{Paso 2: corrección espectral}
+Razón:
+esto ofrece el mejor equilibrio entre:
+- rigor,
+- estabilidad,
+- facilidad de test,
+- y utilidad operativa.
 
-Sea la descomposición espectral
-\[
-\hat{\Sigma} = Q \Lambda Q^\top.
-\]
-Definimos
-\[
-\Lambda^+ = \operatorname{diag}\left(\max(\lambda_1,\varepsilon), \ldots, \max(\lambda_N,\varepsilon)\right),
-\]
-con \(\varepsilon > 0\) pequeño, y reconstruimos:
-\[
-\hat{\Sigma}_{\text{PSD}} = Q \Lambda^+ Q^\top.
-\]
+8. Targets soportados
 
-\subsection{Paso 3: regularización diagonal}
+8.1 Diagonal escalada
+    Sigma_target = diag(Sigma_sample)
 
-Si el acondicionamiento sigue siendo excesivo, se añade
-\[
-\hat{\Sigma}_{\text{final}}
-=
-\hat{\Sigma}_{\text{PSD}} + \eta I,
-\]
-con \(\eta = \texttt{jitter}\), típicamente pequeño respecto a la escala diagonal.
+Preserva varianzas individuales y elimina correlaciones cruzadas.
+Es el fallback conservador por defecto.
 
-\subsection{Regla operativa}
+8.2 Identidad escalada
+    Sigma_target = sigma_bar^2 I
 
-Toda corrección PSD debe quedar reflejada en el diagnóstico. No debe realizarse silenciosamente.
+donde sigma_bar^2 es la media diagonal.
 
-\section{Algoritmo de referencia}
+Debe reservarse para fallbacks severos, no como target principal salvo configuración explícita.
 
-\begin{enumerate}[label=\arabic*.]
-    \item Cargar retornos en ventana \texttt{lookback}.
-    \item Filtrar activos con menos de \texttt{min\_obs}.
-    \item Alinear matriz y calcular cobertura efectiva.
-    \item Construir \(\hat{\Sigma}_{\text{sample}}\).
-    \item Construir \(\Sigma_{\text{target}}\) según \texttt{target\_type}.
-    \item Estimar \(\delta\) según \texttt{shrinkage\_method}.
-    \item Formar \(\hat{\Sigma}_{\text{shrink}}\).
-    \item Simetrizar y corregir PSD si es necesario.
-    \item Calcular diagnósticos: condición, rango efectivo, autovalores mínimos, cobertura, \(\delta\), norma de la diferencia respecto al target.
-    \item Persistir matriz final, componentes y metadatos.
-\end{enumerate}
+8.3 Correlación constante
+Sea rho_bar la media de las correlaciones válidas.
+Entonces:
 
-\section{Criterios de \emph{fallback}}
+- diagonal = varianzas muestrales
+- off-diagonal = rho_bar * sigma_i * sigma_j
 
-Los \emph{fallbacks} deben ser escasos, explícitos y conservadores. Se activan solo si ocurre alguno de los siguientes casos:
+Este target es útil cuando se desea capturar una correlación media sin heredar toda la inestabilidad del estimador completo.
 
-\begin{itemize}
-    \item \(N < 2\) tras filtros de cobertura;
-    \item la matriz muestral contiene NaN o infinitos no resolubles;
-    \item falla la estimación automática de \(\delta\);
-    \item la corrección PSD requiere un recorte espectral excesivo;
-    \item el número de condición excede un umbral máximo tras la regularización.
-\end{itemize}
+8.4 Target factorial
+Si existe un factor model ya validado:
 
-\subsection{Jerarquía de fallback}
+    Sigma_target = B Omega_f B^T + D
 
-\begin{enumerate}[label=\arabic*.]
-    \item target diagonal escalado;
-    \item identidad escalada;
-    \item abortar y emitir error controlado si ni siquiera puede construirse una diagonal fiable.
-\end{enumerate}
+Solo debe activarse si esa infraestructura existe y está validada aguas arriba.
 
-La regla ``usar identidad si \(T<50\)'' es demasiado rígida para ser una política general. El criterio correcto debe depender de la relación entre \(T\), \(N\) y la cobertura efectiva, no solo de un umbral absoluto en \(T\).
+9. Métodos de shrinkage soportados
 
-\section{Métricas diagnósticas obligatorias}
+9.1 Ledoit-Wolf
+Default recomendado del módulo.
 
-\subsection{Número de condición}
+Ventajas:
+- robusto,
+- ampliamente aceptado,
+- buena estabilidad cuando T y N son del mismo orden.
 
-\[
-\kappa(\Sigma) = \frac{\lambda_{\max}(\Sigma)}{\lambda_{\min}(\Sigma)}.
-\]
+9.2 OAS
+Adecuado cuando T es relativamente pequeño y se desea una aproximación MMSE simple.
 
-Este indicador no debe presentarse como una métrica de marketing, sino como una señal de estabilidad numérica. La reducción de \(\kappa\) es deseable, pero no existe un umbral universal válido para todas las escalas y universos.
+9.3 Delta fijo
+Útil para debugging, estudios controlados y comparación de sensibilidad.
 
-\subsection{Norma de ajuste al target}
+9.4 Nonlinear shrinkage
+Puede existir como:
 
-\[
-d_{\text{target}}
-=
-\left\|
-\hat{\Sigma}_{\text{shrink}} - \Sigma_{\text{target}}
-\right\|_F.
-\]
+    mode = nonlinear_shrinkage_experimental
 
-\subsection{Magnitud del recorte espectral}
+pero no debe ser la semántica base del módulo canónico.
+Si se implementa, debe quedar claramente marcado como experimental o fase 2.
 
-\[
-d_{\lambda}
-=
-\sum_{i=1}^{N} \max(0,\varepsilon-\lambda_i).
-\]
+10. Selección de método por defecto
 
-\subsection{Cobertura media}
+Regla práctica razonable:
 
-\[
-\text{coverage}
-=
-\frac{1}{N}
-\sum_{i=1}^{N}
-\frac{\#\text{obs}_i}{T}.
-\]
+- si T >= 3N y coverage alta:
+  Ledoit-Wolf con target diagonal o const_corr
 
-\subsection{Rango efectivo}
+- si N < T < 3N:
+  Ledoit-Wolf u OAS
 
-Puede medirse, por ejemplo, como el número de autovalores estrictamente positivos tras corrección o mediante una variante entrópica si se desea mayor riqueza diagnóstica.
+- si T <= N o coverage débil:
+  target diagonal + shrinkage conservador + fallback preparado
 
-\section{Interacción con módulos aguas abajo}
+- si hay factor model validado:
+  target factorial opcional
 
-\subsection{Con \texttt{portfolio/optimizer.py}}
+No debe usarse una regla ingenua del tipo “si T < 50 entonces identidad”.
+La lógica correcta depende de:
+- T,
+- N,
+- cobertura,
+- y conditioning.
 
-La matriz final se utiliza para:
+11. Política de min_obs y universo
 
-\begin{itemize}
-    \item cálculo de volatilidad ex--ante;
-    \item contribuciones marginales y totales al riesgo;
-    \item problemas de optimización cuadrática;
-    \item penalización por concentración de riesgo.
-\end{itemize}
+11.1 Mínimo de observaciones
+Un activo i entra en el cálculo solo si:
 
-El optimizador no debe asumir que la matriz proviene siempre del mismo target ni del mismo estimador; debe leer metadatos.
+    obs_i >= min_obs
 
-\subsection{Con \texttt{risk/factor\_model.py}}
+Default razonable:
+    min_obs = max(30, floor(0.6 * lookback))
 
-Cuando exista modelo factorial, este módulo puede:
+11.2 Política de NaN
+El comportamiento canónico debe ser:
 
-\begin{itemize}
-    \item usar la covarianza shrinked como referencia de robustez;
-    \item o construir un target factorial para la siguiente iteración.
-\end{itemize}
+1. filtrar activos que no alcanzan min_obs
+2. trabajar sobre el subconjunto resultante
+3. estimar con observaciones válidas del bloque
+4. evitar imputaciones arbitrarias de correlación cero salvo fallback explícito
 
-La dependencia debe ser explícita para evitar ciclos ambiguos.
+11.3 Universo cambiante
+El módulo debe registrar:
+- número de activos de entrada,
+- número final usados,
+- cobertura media,
+- cobertura mínima,
+- símbolos excluidos por baja observación.
 
-\subsection{Con \texttt{risk/stress\_tests.py}}
+12. Algoritmo canónico
 
-Las matrices stressadas deben derivarse de una matriz base válida. Por tanto, \texttt{stress\_tests.py} debe fallar rápido si \texttt{cov\_shrinkage.py} no ha producido una matriz PSD auditada.
+Paso 1:
+validar matriz X y metadatos
 
-\section{Pruebas mínimas de aceptación}
+Paso 2:
+filtrar activos con obs < min_obs
 
-El módulo no debe considerarse listo por ``sonar bien''. Debe superar al menos los siguientes tests.
+Paso 3:
+construir Sigma_sample
 
-\subsection{Test 1: simetría}
-\[
-\|\Sigma - \Sigma^\top\|_{\infty} < \tau_{\text{sym}}.
-\]
+Paso 4:
+construir Sigma_target según target_type
 
-\subsection{Test 2: PSD}
-Todos los autovalores deben cumplir
-\[
-\lambda_i \ge -\tau_{\text{psd}}.
-\]
+Paso 5:
+estimar delta según shrinkage_method
 
-\subsection{Test 3: robustez ante datos faltantes}
-Dado un conjunto sintético con NaN estructurados, el módulo debe devolver o bien una matriz válida o bien un error controlado con razón explícita.
+Paso 6:
+construir Sigma_shrink
 
-\subsection{Test 4: estabilidad del acondicionamiento}
-La matriz final no debe empeorar de forma sistemática el número de condición respecto a la matriz muestral en datasets mal condicionados.
+Paso 7:
+simetrizar
 
-\subsection{Test 5: invariancia dimensional}
-Si dos activos idénticos se duplican artificialmente, la rutina debe seguir produciendo una matriz PSD y trazable.
+Paso 8:
+aplicar PSD repair si hace falta
 
-\subsection{Test 6: persistencia}
-Todos los artefactos esperados deben escribirse con índices consistentes y metadatos completos.
+Paso 9:
+añadir jitter si la condición sigue siendo mala
 
-\section{Implementación de referencia}
+Paso 10:
+calcular diagnósticos y persistir artefactos
 
-\begin{lstlisting}[language=Python,basicstyle=\ttfamily\small,breaklines=true]
-from sklearn.covariance import LedoitWolf, OAS
-import numpy as np
+13. Simetrización y PSD repair
 
-def estimate_shrunk_cov(returns, method="ledoit_wolf"):
-    x = np.asarray(returns, dtype=float)
+13.1 Simetrización
+Antes de cualquier corrección:
 
-    if method == "ledoit_wolf":
-        est = LedoitWolf(assume_centered=False).fit(x)
-        cov = est.covariance_
-        delta = getattr(est, "shrinkage_", None)
+    Sigma <- 0.5 * (Sigma + Sigma^T)
 
-    elif method == "oas":
-        est = OAS(assume_centered=False).fit(x)
-        cov = est.covariance_
-        delta = getattr(est, "shrinkage_", None)
+13.2 Reparación espectral
+Si Sigma no es PSD dentro de tolerancia:
+- diagonalizar,
+- truncar autovalores por debajo del floor,
+- reconstruir.
 
-    else:
-        raise ValueError(f"Unknown method: {method}")
+Forma recomendada:
 
-    cov = 0.5 * (cov + cov.T)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    eps = 1e-8
-    eigvals = np.maximum(eigvals, eps)
-    cov = eigvecs @ np.diag(eigvals) @ eigvecs.T
-    cov = 0.5 * (cov + cov.T)
+    lambda_i <- max(lambda_i, eps_psd)
 
-    return cov, delta
-\end{lstlisting}
+o una versión relativa:
+    lambda_i <- max(lambda_i, floor * lambda_max)
 
-\section{Qué no debe hacer este módulo}
+13.3 Jitter diagonal
+Si tras PSD repair el número de condición sigue siendo excesivo:
+    Sigma <- Sigma + jitter * I
 
-Para mantener una especificación limpia, el módulo base no debe:
+Todo esto debe quedar registrado.
 
-\begin{itemize}
-    \item prometer mejoras de Sharpe, Calmar o drawdown sin un protocolo experimental separado;
-    \item mezclar en la implementación canónica GARCH multivariante, nonlinear shrinkage, copulas o PCA espectral avanzada;
-    \item introducir reglas implícitas dependientes de VIX, regímenes o señales macro sin un contrato formal;
-    \item usar tablas de \emph{backtest} sintético como sustituto de tests de aceptación.
-\end{itemize}
+14. Diagnósticos obligatorios
 
-Todas esas extensiones pueden existir, pero deben ir en investigación o detrás de flags experimentales, no dentro del contrato base.
+El módulo debe computar al menos:
 
-\section{Extensiones futuras razonables}
+14.1 delta final
+- valor de shrinkage efectivo
 
-Una vez la versión canónica esté estable y testeada, las siguientes extensiones son razonables:
+14.2 coverage
+    coverage_mean
+    coverage_min
 
-\begin{itemize}
-    \item shrinkage no lineal sobre autovalores;
-    \item targets jerárquicos sector--factor;
-    \item covarianza condicional por régimen;
-    \item integración con modelo factorial dinámico;
-    \item validación ex--ante vs volatilidad realizada.
-\end{itemize}
+14.3 número de condición
+    cond_num = lambda_max / lambda_min
 
-Estas extensiones solo deben incorporarse cuando exista evidencia empírica reproducible de que mejoran estabilidad o calidad predictiva sin degradar trazabilidad.
+14.4 effective_rank
+Diagnóstico recomendado:
 
-\section{Resumen ejecutivo}
+    p_i = lambda_i / sum_j lambda_j
+    effective_rank = exp( - sum_i p_i log p_i )
 
-\texttt{risk/cov\_shrinkage.py} debe ser una pieza de infraestructura cuantitativa sobria y confiable. Su valor no está en un lenguaje grandilocuente ni en promesas de rendimiento, sino en entregar una matriz de covarianza:
+o alternativamente otro rango efectivo documentado.
 
-\begin{itemize}
-    \item válida,
-    \item estable,
-    \item auditable,
-    \item robusta a universos imperfectos,
-    \item y útil para optimización, control de riesgo y stress testing.
-\end{itemize}
+14.5 distancia al target
+Norma tipo Frobenius:
 
-La prioridad de diseño correcta es:
+    d_target = ||Sigma_shrink - Sigma_target||_F
 
-\[
-\text{validez} \;\rightarrow\; \text{estabilidad} \;\rightarrow\; \text{trazabilidad} \;\rightarrow\; \text{sofisticación}.
-\]
+14.6 magnitud de PSD repair
+- min_eig_before
+- min_eig_after
+- num_fixed_eigs
 
-\end{document}
+14.7 dimensión final
+- N_used
+- T_effective
+
+15. Fallback policy
+
+Los fallbacks deben ser explícitos y conservadores.
+
+Activadores típicos:
+- N_used < 2
+- Sigma_sample con NaN/inf no resolubles
+- método automático falla
+- repair PSD excesivo
+- condición numérica descontrolada tras repair
+
+Jerarquía recomendada:
+1. target diagonal escalado
+2. identidad escalada
+3. abortar con error controlado si ni la diagonal es fiable
+
+Nunca debe activarse un fallback silencioso sin dejar constancia en diagnostics.
+
+16. Políticas auto y experimentales
+
+16.1 target_type = auto
+Permitido, pero con lógica acotada y trazable.
+Ejemplo razonable:
+- empezar por const_corr si coverage alta
+- si no, diagonal
+- si factor model validado y config lo pide, factorial
+
+No debe convertirse en un selector “inteligente” opaco sin trazabilidad.
+
+16.2 nonlinear_shrinkage_experimental
+Puede existir en fase 2, pero:
+- no es contrato base,
+- debe ir detrás de flag explícito,
+- y sus diagnósticos deben distinguirse claramente.
+
+17. Invariantes del módulo
+
+Toda salida válida debe cumplir:
+
+1. Sigma_final = Sigma_final^T dentro de tolerancia
+2. lambda_min(Sigma_final) >= 0 dentro de política PSD
+3. cond_num finito y reportado
+4. solo activos con coverage suficiente participan
+5. target, delta y fallback quedan persistidos
+6. la salida se alinea exactamente con el universo final usado
+
+18. Failure modes importantes
+
+18.1 T muy pequeño frente a N
+El shrinkage ayuda, pero no hace magia.
+La salida puede seguir siendo pobre; debe quedar reflejado en diagnostics.
+
+18.2 Cobertura heterogénea extrema
+Un activo con cobertura marginal puede contaminar estabilidad global si no se filtra bien.
+
+18.3 Colinealidad extrema
+Puede destruir conditioning y exigir PSD repair fuerte.
+
+18.4 Factor target débil
+Si el target factorial entra mal validado, puede empeorar el estimador en vez de ayudar.
+
+18.5 Uso aguas abajo ciego
+optimizer.py no debe asumir que todas las matrices vienen de la misma política.
+
+19. Tests mínimos obligatorios
+
+19.1 Simetría
+    ||Sigma - Sigma^T|| pequeño
+
+19.2 PSD
+autovalores no negativos dentro de tolerancia
+
+19.3 Robustez ante missingness
+Dado un input con NaN estructurados:
+- o matriz válida
+- o error controlado y trazable
+
+19.4 Mejora o no empeoramiento fuerte de conditioning
+En casos mal condicionados, el shrinkage no debe empeorar sistemáticamente cond_num de forma absurda
+
+19.5 Persistencia
+Todos los artefactos deben escribirse con índices y metadata consistentes
+
+19.6 Reproducibilidad
+Mismas entradas y config deben producir la misma salida
+
+20. Salida recomendada de diagnostics.json
+
+Debe incluir como mínimo:
+
+- calc_date
+- lookback
+- N_input
+- N_used
+- T_effective
+- target_type
+- shrinkage_method
+- delta
+- coverage_mean
+- coverage_min
+- cond_num
+- effective_rank
+- min_eig_before
+- min_eig_after
+- num_fixed_eigs
+- psd_policy
+- jitter_used
+- fallback_used
+- fallback_reason
+- config_hash
+
+21. Integración con el stack
+
+La ubicación semántica natural es:
+
+returns / universe PIT
+-> cov_shrinkage
+-> factor_model / optimizer / risk reports / stress tests
+
+Este módulo entrega la matriz base robusta.
+No debe cargar con lógica que pertenece a:
+- modelado factorial profundo,
+- simulación de régimen,
+- ni selección táctica de cartera.
+
+22. Defaults razonables
+
+- mode = linear_shrinkage_canonical
+- shrinkage_method = ledoit_wolf
+- target_type = diag o auto_conservative
+- min_obs = max(30, floor(0.6 * lookback))
+- psd_policy = eigenvalue_floor
+- diag_floor = 1e-8 relativo
+- jitter pequeño y explícito
+- fallback_policy conservadora
+
+23. Interpretación correcta
+
+La lectura correcta de cov_shrinkage.py no es:
+“hemos metido una técnica elegante de shrinkage”.
+
+La lectura correcta es:
+“hemos construido una matriz de covarianza utilizable y estable para que el resto del stack no optimice sobre ruido transversal puro”.
+
+Eso es mucho más importante que tener la versión más sofisticada del estimador.
+
+24. Conclusión
+
+risk/cov_shrinkage.py debe ser una pieza de infraestructura cuantitativa sobria y confiable.
+
+Recibe retornos PIT con cobertura imperfecta.
+Construye la covarianza muestral.
+La regulariza hacia un target estructural.
+Asegura simetría y PSD.
+Controla conditioning.
+Aplica fallback conservador si hace falta.
+Y persiste suficiente diagnóstico para que downstream sepa exactamente qué matriz está usando y por qué.
+
+Ese es exactamente el comportamiento que debe tener una capa seria de covarianza shrinked en un stack cuantitativo institucional.

@@ -1,428 +1,503 @@
-\documentclass[12pt,a4paper]{article}
-\usepackage[utf8]{inputenc}
-\usepackage[spanish]{babel}
-\usepackage{amsmath, amssymb, bm, amsthm, mathtools}
-\usepackage{hyperref}
-\usepackage{booktabs}
-\usepackage{longtable}
-\usepackage{enumitem}
-\usepackage{siunitx}
+Especificación Cuantitativa: models/gbdt/tune_hyperparams.py
 
-\DeclareMathOperator{\E}{\mathbb{E}}
-\DeclareMathOperator{\Var}{Var}
-\DeclareMathOperator{\Cov}{Cov}
-\DeclareMathOperator{\Corr}{Corr}
-\DeclareMathOperator{\Prob}{\mathbb{P}}
-\DeclareMathOperator{\IC}{IC}
-\DeclareMathOperator{\AUC}{AUC}
-\DeclareMathOperator{\NDCG}{NDCG}
-\DeclareMathOperator{\RMSE}{RMSE}
-\DeclareMathOperator{\MAE}{MAE}
-\DeclareMathOperator{\MSE}{MSE}
-\DeclareMathOperator{\LL}{LL}
-\DeclareMathOperator{\Gap}{Gap}
-\DeclareMathOperator{\argmin}{arg\,min}
-\DeclareMathOperator{\argmax}{arg\,max}
+1. Propósito del módulo
 
-\title{Optimización de hiperparámetros GBDT con validación temporal purged \\ \texttt{models/gbdt/tune\_hyperparams.py}}
-\author{}
-\date{}
+El objetivo de models/gbdt/tune_hyperparams.py es seleccionar una configuración de hiperparámetros robusta para modelos GBDT bajo validación temporal purged, de modo que el entrenamiento final use una región del espacio de parámetros con buena utilidad fuera de muestra, estabilidad razonable y riesgo controlado de meta-overfitting.
 
-\begin{document}
+La función correcta del módulo no es “buscar el máximo score posible”, sino gobernar la exploración de Θ bajo disciplina temporal y criterios explícitos de robustez.
 
-\maketitle
+La pregunta exacta que debe responder el módulo es:
 
-\section{Objetivo estratégico del módulo}
+“Dado un espacio de hiperparámetros Θ y un esquema de validación temporal limpio, qué configuración θ ofrece la mejor combinación entre rendimiento OOS, estabilidad entre folds, gap de sobreajuste aceptable y viabilidad operativa para pasar a entrenamiento final?”
 
-El módulo \texttt{models/gbdt/tune\_hyperparams.py} optimiza los hiperparámetros de modelos \textbf{Gradient Boosting Decision Trees} (\texttt{LightGBM} y \texttt{XGBoost}) bajo un protocolo de \textbf{validación temporal purged} diseñado para preservar causalidad, reducir leakage y producir una configuración \texttt{best\_params} reutilizable por \texttt{train\_lgbm.py} y \texttt{train\_xgb.py}.
+2. Principios no negociables
 
-Su finalidad no es encontrar la configuración que maximiza una métrica por azar dentro de una búsqueda agresiva, sino identificar una región del espacio de hiperparámetros que ofrezca \textbf{buen rendimiento fuera de muestra, estabilidad inter-fold, robustez temporal y gobernanza experimental suficiente} para ser promovida a entrenamiento final.
+2.1 La cronología es inviolable
+El tuning nunca puede usar el test final como fuente de selección de hiperparámetros.
 
-Por tanto, este módulo debe entenderse como una pieza de \textbf{optimización cuantitativa con disciplina de producción}, no como una llamada genérica a una librería de hyperparameter search.
+2.2 El mejor trial no equivale automáticamente a best_params
+La selección final debe privilegiar robustez sobre máximos aislados.
 
-\section{Naturaleza del problema de tuning}
+2.3 El tuner también puede sobreajustar
+El proceso de búsqueda tiene riesgo propio de meta-overfitting y debe tratarse como tal.
 
-Sea \(\bm{\theta} \in \Theta\) el vector de hiperparámetros del modelo. En GBDT, \(\bm{\theta}\) puede incluir, entre otros, tasa de aprendizaje, profundidad máxima, número de hojas, regularización L1/L2, subsampling de filas y columnas, mínimo tamaño de hoja, número máximo de rondas y parámetros específicos del objetivo.
+2.4 La métrica principal debe fijarse ex ante
+No se puede cambiar la métrica dominante a mitad del tuning según convenga al mejor trial.
 
-Dado un esquema temporal de validación con \(K\) folds purged, el problema de optimización puede escribirse como:
-\begin{equation}
-\bm{\theta}^{\star}
-=
-\argmax_{\bm{\theta}\in\Theta}
-\mathcal{J}(\bm{\theta}),
-\end{equation}
-donde \(\mathcal{J}\) representa una utilidad agregada fuera de muestra. En su forma más simple,
-\begin{equation}
-\mathcal{J}(\bm{\theta})
-=
-\frac{1}{K}\sum_{k=1}^{K} M_k(\bm{\theta}),
-\end{equation}
-siendo \(M_k(\bm{\theta})\) la métrica OOS primaria del fold \(k\).
+2.5 Reproducibilidad total
+Mismos datos, misma config y misma seed deben producir una trayectoria de búsqueda reconstruible dentro de las tolerancias del backend usado.
 
-Sin embargo, en un sistema cuantitativo serio esta formulación es insuficiente. No basta con maximizar la media de una métrica. También hay que controlar:
-\begin{itemize}[leftmargin=2em]
-    \item el \textbf{overfit gap} entre entrenamiento y validación,
-    \item la \textbf{varianza entre folds},
-    \item la \textbf{factibilidad operativa} de la configuración,
-    \item y el riesgo de \textbf{meta-overfitting} del propio proceso de tuning.
-\end{itemize}
+2.6 El módulo optimiza hiperparámetros; no entrena el modelo final
+Su salida es una configuración robusta y artefactos de tuning, no un modelo promocionado por sí mismo.
 
-Por ello, el módulo trabaja con una utilidad ajustada:
-\begin{equation}
-\tilde{\mathcal{J}}(\bm{\theta})
-=
-\hat{M}(\bm{\theta})
--
-\beta \,\Gap(\bm{\theta})
--
-\gamma \,\Var_k[M_k(\bm{\theta})]
--
-\eta \,\Pi(\bm{\theta}),
-\end{equation}
+3. Qué hace y qué no hace
+
+3.1 Qué hace
+- carga datos, labels y splits válidos;
+- construye el search space;
+- ejecuta trials bajo validación temporal purged;
+- evalúa cada trial con métrica primaria y penalizaciones de robustez;
+- consolida resultados;
+- selecciona best_params robustos;
+- persiste artefactos completos de tuning.
+
+3.2 Qué no hace
+- no entrena el modelo final productivo;
+- no calibra probabilidades;
+- no combina engines como contrato base;
+- no usa test final para seleccionar θ;
+- no convierte automáticamente la búsqueda en un problema research multiobjetivo sofisticado.
+
+4. Rol dentro del stack
+
+La secuencia correcta es:
+
+features + labels + temporal_splits
+-> tune_hyperparams
+-> best_params.json
+-> train_lgbm.py o train_xgb.py
+-> calibrate / inference / validation
+
+Interpretación correcta:
+tune_hyperparams.py gobierna la exploración del espacio de configuración, no sustituye a train_lgbm.py ni a train_xgb.py.
+
+5. Formulación matemática del problema
+
+Sea θ ∈ Θ el vector de hiperparámetros.
+
+El problema base puede escribirse como:
+
+    θ* = argmax_{θ ∈ Θ} J(θ)
+
+donde, en su forma simple,
+
+    J(θ) = (1/K) * sum_{k=1}^K M_k(θ)
+
+siendo M_k(θ) la métrica OOS del fold k.
+
+Sin embargo, el contrato serio del módulo no debe quedarse ahí.
+La utilidad robusta recomendada es:
+
+    J_tilde(θ)
+    =
+    M_hat(θ)
+    - beta * Gap(θ)
+    - gamma * Var_k[M_k(θ)]
+    - eta * Pi(θ)
+
 donde:
-\begin{itemize}[leftmargin=2em]
-    \item \(\hat{M}(\bm{\theta})\) es la métrica OOS agregada,
-    \item \(\Gap(\bm{\theta})\) mide divergencia entre train y valid,
-    \item \(\Var_k[M_k(\bm{\theta})]\) penaliza inestabilidad temporal,
-    \item \(\Pi(\bm{\theta})\) recoge penalizaciones por complejidad o configuraciones no deseables.
-\end{itemize}
-
-\section{Principios de diseño}
-
-El módulo se apoya en los siguientes principios:
-
-\begin{enumerate}[leftmargin=2em]
-    \item \textbf{El tuning debe respetar la cronología.} Ninguna observación del test final puede entrar en el bucle de optimización.
-    
-    \item \textbf{El mejor trial no es necesariamente el mejor conjunto de parámetros.} La selección final debe privilegiar robustez sobre picos aislados.
-    
-    \item \textbf{La búsqueda debe ser reproducible.} Mismo \texttt{seed}, mismos datos y misma configuración deben producir la misma trayectoria de exploración dentro de lo razonablemente determinista.
-    
-    \item \textbf{La flexibilidad del tuner debe estar gobernada.} Un proceso de búsqueda demasiado amplio o demasiado largo puede sobreajustar la propia validación.
-    
-    \item \textbf{La salida del módulo debe ser auditable.} Toda decisión relevante del tuner debe quedar reflejada en artefactos persistidos.
-\end{enumerate}
-
-\section{Qué significa “buen tuning” en este sistema}
-
-En esta arquitectura, un tuning correcto no es el que simplemente encuentra el mayor valor de una métrica. Es el que identifica parámetros que cumplen simultáneamente las siguientes propiedades:
-
-\begin{itemize}[leftmargin=2em]
-    \item buen rendimiento agregado fuera de muestra,
-    \item dispersión moderada entre folds,
-    \item sensibilidad razonable a perturbaciones locales del search space,
-    \item ausencia de señales fuertes de sobreajuste,
-    \item compatibilidad con entrenamiento final, calibración y ensemble.
-\end{itemize}
-
-Esto es importante porque, en finanzas, el hiperparámetro óptimo de una ventana histórica concreta puede ser solo el mejor \emph{accidente estadístico} dentro de un gran número de pruebas. El módulo está diseñado precisamente para evitar esa ilusión.
-
-\section{Estrategias de búsqueda soportadas}
-
-Según \texttt{search\_method}, el módulo soporta dos grandes familias de exploración del espacio \(\Theta\).
-
-\subsection{Búsqueda aleatoria}
-
-En búsqueda aleatoria, cada trial genera una muestra:
-\[
-\bm{\theta}^{(i)} \sim p(\Theta),
-\]
-donde \(p(\Theta)\) es una distribución definida por el \texttt{search\_space}. La evaluación asociada es:
-\begin{equation}
-\hat{M}(\bm{\theta}^{(i)})
-=
-\frac{1}{K}\sum_{k=1}^{K} M_k(\bm{\theta}^{(i)}).
-\end{equation}
-
-La búsqueda aleatoria tiene varias ventajas en este contexto:
-\begin{itemize}[leftmargin=2em]
-    \item simplicidad,
-    \item paralelización natural,
-    \item robustez cuando la geometría del espacio es irregular,
-    \item menor riesgo de sobre-explotar tempranamente una región ruidosa.
-\end{itemize}
-
-Por ello, es el método preferido cuando:
-\begin{itemize}[leftmargin=2em]
-    \item el search space es amplio y poco estructurado,
-    \item el presupuesto de trials es razonable,
-    \item o se desea una exploración inicial relativamente agnóstica.
-\end{itemize}
-
-\subsection{Optimización bayesiana}
-
-La optimización bayesiana modela la relación entre hiperparámetros y métrica mediante un surrogate probabilístico. Denotando por \(\mathcal{D}_{\mathrm{trials}}\) el histórico de evaluaciones, el siguiente trial se elige como:
-\begin{equation}
-\bm{\theta}^{(i+1)}
-=
-\argmax_{\bm{\theta}\in\Theta}
-\alpha(\bm{\theta}\mid \mathcal{D}_{\mathrm{trials}}),
-\end{equation}
-donde \(\alpha\) es una función de adquisición, por ejemplo \emph{Expected Improvement}.
-
-Este enfoque suele ser más eficiente en número de evaluaciones, especialmente cuando cada trial es costoso. Sin embargo, en entornos financieros presenta un riesgo importante: el surrogate puede sobre-explotar irregularidades de la validación si el presupuesto es bajo, la métrica es muy ruidosa o el espacio contiene regiones con comportamiento altamente no estacionario.
-
-Por ello, la optimización bayesiana se permite, pero bajo disciplina:
-\begin{itemize}[leftmargin=2em]
-    \item search space acotado y económicamente razonable,
-    \item semilla fija,
-    \item pruning controlado,
-    \item y reglas explícitas de consolidación final.
-\end{itemize}
-
-\section{Regla oficial de selección del método de búsqueda}
-
-El módulo establece la siguiente doctrina:
-
-\begin{enumerate}[leftmargin=2em]
-    \item \textbf{Random search} es el método por defecto para exploración inicial y para espacios amplios o mal entendidos.
-    \item \textbf{Bayesian optimization} se activa cuando existe una hipótesis razonable de que el espacio ya está acotado y el coste por trial justifica una exploración más eficiente.
-    \item Si ambos métodos están habilitados, la salida final no se decide por el mejor trial absoluto, sino por la configuración que mejor cumpla los criterios de robustez definidos en el módulo.
-\end{enumerate}
-
-La idea central es que la eficiencia computacional no debe comprarse al precio de un aumento del riesgo de meta-overfitting.
-
-\section{Diseño del search space}
-
-El search space debe ser \textbf{económicamente plausible, estadísticamente razonable y computacionalmente factible}. No se acepta un espacio arbitrariamente amplio solo porque sea técnicamente posible.
-
-Formalmente, si
-\[
-\Theta = \prod_{j=1}^{p}\Theta_j,
-\]
-cada subespacio \(\Theta_j\) debe definirse con:
-\begin{itemize}[leftmargin=2em]
-    \item dominio permitido,
-    \item tipo de escala (lineal, logarítmica, discreta),
-    \item restricciones cruzadas con otros parámetros,
-    \item y, cuando proceda, valores por defecto o anclas razonables.
-\end{itemize}
-
-Ejemplos de restricciones deseables:
-\begin{itemize}[leftmargin=2em]
-    \item evitar combinaciones de profundidad extrema con hojas demasiado pequeñas,
-    \item impedir tasas de aprendizaje incompatibles con el número máximo de rondas,
-    \item limitar configuraciones cuya complejidad haga inviable el modelo en small caps con cobertura alta.
-\end{itemize}
-
-El tuner no debe desperdiciar trials en regiones manifiestamente no factibles.
-
-\section{Validación temporal purged y anti-leakage}
-
-Todo el proceso de tuning utiliza exclusivamente folds \texttt{train/valid} construidos con separación temporal, purging y embargo. El bloque \texttt{test} queda estrictamente fuera del bucle de optimización.
-
-Para cada fold \(k\), se exige:
-\begin{equation}
-t_i^{\mathrm{train}} < t_j^{\mathrm{valid}}
-\qquad
-\forall i \in \mathcal{D}_{\mathrm{train}}^{(k)},\;
-\forall j \in \mathcal{D}_{\mathrm{valid}}^{(k)},
-\end{equation}
-junto con las restricciones adicionales de no solapamiento derivadas del purging y del embargo.
-
-Las reglas explícitas del módulo son:
-\begin{itemize}[leftmargin=2em]
-    \item el \texttt{test} final nunca interviene en la selección de hiperparámetros;
-    \item el early stopping de cada trial se realiza solo sobre \texttt{valid};
-    \item ninguna métrica post-hoc de test puede retroalimentar el proceso de búsqueda dentro de la misma ejecución;
-    \item no se aceptan folds temporalmente mal ordenados ni coverage insuficiente.
-\end{itemize}
-
-\section{Métrica primaria y jerarquía de evaluación}
-
-Una de las carencias más frecuentes en tuning es dejar coexistir varias métricas sin una jerarquía clara. Este módulo corrige eso fijando una doctrina explícita:
-
-\begin{itemize}[leftmargin=2em]
-    \item si el modelo final se usará para \textbf{ranking cross-sectional}, la métrica principal debe ser una métrica ordinal OOS por fecha, como \(\mathrm{median}(\IC_t)\) o \(\NDCG@k\);
-    \item si el modelo final se usará para \textbf{clasificación probabilística}, la métrica principal debe ser logloss o AUC según el objetivo económico concreto;
-    \item métricas auxiliares como \(\RMSE\), \(\MAE\), coverage o tiempo de ejecución no sustituyen a la métrica principal.
-\end{itemize}
-
-La comparación entre trials, la consolidación final y la promoción a entrenamiento final deben depender de una métrica primaria definida \emph{ex ante}.
-
-\section{Medidas de robustez del trial}
-
-Cada trial registra, como mínimo, los siguientes elementos:
-
-\begin{itemize}[leftmargin=2em]
-    \item métrica primaria agregada \(\hat{M}(\bm{\theta})\),
-    \item métricas por fold \(M_k(\bm{\theta})\),
-    \item overfit gap,
-    \item varianza entre folds,
-    \item coverage efectivo,
-    \item número de boosting rounds retenido por early stopping,
-    \item runtime total.
-\end{itemize}
-
-El \textbf{overfit gap} puede definirse, según orientación de la métrica, como:
-\begin{equation}
-\Gap(\bm{\theta})
-=
-\mathcal{M}_{\mathrm{train}}(\bm{\theta})
--
-\mathcal{M}_{\mathrm{valid}}(\bm{\theta}),
-\end{equation}
-o con signo invertido si la métrica es de minimización. Su valor no debe interpretarse mecánicamente, pero sí como una señal de alerta cuando una configuración luce excelente en entrenamiento y mediocre en validación.
-
-\section{Meta-overfitting del tuner}
-
-Este es el punto que una spec de alto nivel no puede dejar implícito. Incluso si el modelo base no fuga información, el propio proceso de tuning puede sobreajustar la validación tras suficientes trials. Ese fenómeno se denomina aquí \textbf{meta-overfitting del tuner}.
-
-El riesgo aumenta cuando:
-\begin{itemize}[leftmargin=2em]
-    \item el número de trials es muy alto en relación con el ruido de la métrica,
-    \item el search space es demasiado amplio,
-    \item la métrica OOS es inestable entre folds,
-    \item el tuner explota excesivamente una región afortunada de la validación.
-\end{itemize}
-
-Para mitigarlo, el módulo incorpora las siguientes políticas:
-\begin{enumerate}[leftmargin=2em]
-    \item límite explícito de \texttt{n\_trials} o \texttt{timeout\_sec},
-    \item penalización por varianza inter-fold,
-    \item preferencia por regiones estables frente a máximos aislados,
-    \item consolidación final basada en robustez, no solo en el mejor score puntual,
-    \item y, cuando la infraestructura lo permita, validación adicional de sanidad sobre un bloque no tocado por el tuner.
-\end{enumerate}
-
-\section{Consolidación de \texttt{best\_params}}
-
-El mejor trial absoluto no siempre debe convertirse automáticamente en \texttt{best\_params}. El módulo necesita una regla más fuerte.
-
-La política oficial es:
-\begin{enumerate}[leftmargin=2em]
-    \item identificar el conjunto de trials de alto rendimiento según la métrica primaria;
-    \item descartar aquellos con overfit gap excesivo, varianza inter-fold elevada o coverage insuficiente;
-    \item entre los supervivientes, seleccionar la configuración más robusta, no necesariamente la de score máximo;
-    \item si existen varias configuraciones cercanas, preferir la más parsimoniosa o la situada en una región más estable del espacio.
-\end{enumerate}
-
-En otras palabras, \texttt{best\_params} debe representar una \textbf{solución robusta}, no un máximo accidental.
-
-\section{Flujo operativo del módulo}
-
-El flujo oficial es el siguiente:
-
-\begin{enumerate}[leftmargin=2em]
-    \item Cargar \texttt{features\_path}, \texttt{labels\_path}, \texttt{splits\_path}, \texttt{config\_path} y \texttt{run\_id}.
-    \item Inferir el algoritmo objetivo: \texttt{lgbm} o \texttt{xgb}.
-    \item Construir el \texttt{search\_space} validando restricciones y factibilidad.
-    \item Inicializar el motor de búsqueda con \texttt{seed}, presupuesto y política de parada.
-    \item Para cada trial:
-    \begin{itemize}[leftmargin=2em]
-        \item muestrear o proponer \(\bm{\theta}^{(i)}\),
-        \item entrenar por fold con validación temporal purged,
-        \item aplicar early stopping solo sobre validación,
-        \item registrar métricas agregadas y por fold,
-        \item persistir resultado del trial.
-    \end{itemize}
-    \item Consolidar resultados y seleccionar \texttt{best\_params} robustos.
-    \item Persistir artefactos finales y emitir veredicto del tuning.
-\end{enumerate}
-
-\section{Artefactos de salida}
-
-Toda ejecución debe persistir como mínimo:
-
-\begin{itemize}[leftmargin=2em]
-    \item \texttt{trials.parquet} con un registro por trial;
-    \item \texttt{best\_params.json};
-    \item \texttt{tuning\_summary.json};
-    \item \texttt{manifest.json};
-    \item opcionalmente, gráficos de evolución del mejor score, dispersión de trials y sensibilidad de hiperparámetros.
-\end{itemize}
-
-Cada fila de \texttt{trials.parquet} debe incluir al menos:
-\[
-\bm{\theta}^{(i)},\;
-\hat{M}(\bm{\theta}^{(i)}),\;
-\Gap(\bm{\theta}^{(i)}),\;
-\Var_k[M_k(\bm{\theta}^{(i)})],\;
-\texttt{runtime\_sec},\;
-\texttt{status},\;
-\texttt{seed},\;
-\texttt{run\_id}.
-\]
-
-Esto permite reconstruir la historia completa de exploración del espacio de búsqueda.
-
-\section{Validaciones obligatorias}
-
-Antes de aceptar el tuning como válido, deben superarse al menos estas comprobaciones:
-
-\subsection{Integridad experimental}
-\begin{itemize}[leftmargin=2em]
-    \item el \texttt{test} no intervino en ningún trial;
-    \item los folds respetan cronología, purging y embargo;
-    \item el \texttt{run\_id} y la configuración quedan registrados.
-\end{itemize}
-
-\subsection{Sanidad de trials}
-\begin{itemize}[leftmargin=2em]
-    \item no hay \texttt{NaN} ni infinitos en métricas críticas;
-    \item el número de trials exitosos supera un umbral mínimo;
-    \item las configuraciones inviables quedan marcadas como \texttt{failed} o descartadas explícitamente.
-\end{itemize}
-
-\subsection{Reproducibilidad}
-\begin{itemize}[leftmargin=2em]
-    \item con mismo \texttt{seed}, mismos datos y misma configuración, la secuencia de proposals debe ser reproducible en la medida permitida por el backend;
-    \item los artefactos persistidos deben permitir reconstruir la decisión final.
-\end{itemize}
-
-\subsection{Robustez}
-\begin{itemize}[leftmargin=2em]
-    \item la configuración seleccionada no depende enteramente de un único fold excepcional;
-    \item el overfit gap se mantiene dentro de tolerancia;
-    \item la solución final pertenece a una región razonablemente estable del espacio.
-\end{itemize}
-
-\section{Criterio de promoción a entrenamiento final}
-
-El hecho de obtener \texttt{best\_params} no implica automáticamente que deban usarse en \texttt{train\_lgbm.py} o \texttt{train\_xgb.py}. El tuning solo se considera promocionable si:
-
-\begin{enumerate}[leftmargin=2em]
-    \item la métrica primaria OOS mejora de forma material respecto a defaults o baseline;
-    \item la mejora no viene acompañada de un deterioro grave en estabilidad;
-    \item el número de trials útiles es suficiente para justificar la selección;
-    \item no hay evidencia fuerte de meta-overfitting;
-    \item la configuración es operativamente viable para entrenamiento final y despliegue.
-\end{enumerate}
-
-Si estas condiciones no se cumplen, la política preferida es conservar una configuración más simple o volver a una región más conservadora del espacio de búsqueda.
-
-\section{Interfaz de línea de comandos}
-
-La interfaz de referencia es:
-
-\begin{verbatim}
-python -m models.gbdt.tune_hyperparams ^
-  --features-path features/store ^
-  --labels-path labels/store ^
-  --splits-path labels/splits/purged_splits_latest.parquet ^
-  --config-path configs/models/tune_gbdt.yaml ^
-  --run-id tune_gbdt_20260305_001
-\end{verbatim}
-
-La salida debe quedar versionada en un directorio del tipo:
-\begin{verbatim}
-models/tuning/{run_id}/
-\end{verbatim}
-de forma que \texttt{best\_params.json} pueda ser consumido directamente por los módulos de entrenamiento sin romper la trazabilidad experimental.
-
-\section{Definición de Done}
-
-El módulo \texttt{tune\_hyperparams.py} solo se considera terminado si:
-
-\begin{enumerate}[leftmargin=2em]
-    \item se han ejecutado trials válidos suficientes o se ha agotado el presupuesto definido;
-    \item existe un \texttt{best\_params.json} trazable y reproducible;
-    \item \texttt{tuning\_summary.json} documenta rendimiento, estabilidad y overfit gap;
-    \item el proceso ha respetado cronología, purging y exclusión del test;
-    \item la configuración seleccionada representa una solución robusta, no solo el mejor trial absoluto;
-    \item y todos los artefactos necesarios para auditoría han sido persistidos correctamente.
-\end{enumerate}
-
-En consecuencia, \texttt{tune\_hyperparams.py} no debe interpretarse como un simple buscador de knobs. Es el módulo que gobierna la exploración del espacio de capacidad de los GBDT bajo disciplina temporal, control del meta-overfitting y criterios explícitos de robustez para que la configuración final merezca entrar en entrenamiento definitivo.
-
-\end{document}
+- M_hat(θ) es la métrica OOS agregada,
+- Gap(θ) penaliza sobreajuste,
+- Var_k penaliza inestabilidad entre folds,
+- Pi(θ) recoge penalizaciones por complejidad o inviabilidad.
+
+La salida del módulo debe entenderse respecto a esta utilidad robusta, no solo respecto al mejor score bruto.
+
+6. Significado correcto de best_params
+
+best_params no debe interpretarse como:
+
+“el trial con score máximo”.
+
+Debe interpretarse como:
+
+“la configuración robusta seleccionada tras explorar el espacio y filtrar configuraciones con fragilidad, inestabilidad o sobreajuste material”.
+
+Este punto es central en la semántica del módulo.
+
+7. Entradas contractuales
+
+7.1 Entradas mínimas
+- features_path
+- labels_path
+- splits_path
+- config_path
+- run_id
+
+7.2 Campos mínimos de join
+- date
+- symbol
+
+7.3 Configuración mínima
+- engine ∈ {lgbm, xgb}
+- search_method ∈ {random, bayes}
+- primary_metric
+- n_trials o timeout_sec
+- search_space
+- seed
+- robustness_penalties
+- promotion_policy
+- policy_version
+
+8. Requisitos de integridad previa
+
+Antes de iniciar trials, el módulo debe verificar:
+
+- unicidad de claves;
+- consistencia entre features y labels;
+- validez de splits;
+- que el test final no esté incluido en el conjunto de tuning;
+- search space bien formado;
+- límites plausibles de cada hiperparámetro;
+- constraints cruzadas cuando proceda.
+
+No debe lanzarse una búsqueda seria sobre un espacio mal definido o sobre splits ambiguos.
+
+9. Validación temporal purged
+
+Todo el tuning utiliza exclusivamente train/valid definidos con cronología, purging y embargo.
+
+Para cada fold k, debe cumplirse:
+
+- observaciones de valid posteriores al bloque train,
+- ausencia de filas purged,
+- embargo respetado,
+- test final excluido completamente del proceso de selección.
+
+El tuner no puede reinterpretar ni relajar esto.
+
+10. Métrica primaria
+
+La métrica primaria debe fijarse ex ante y gobernar:
+
+- comparación entre trials,
+- consolidación de resultados,
+- y selección de best_params.
+
+Ejemplos correctos:
+- ranking cross-sectional: median(IC_t) OOS
+- clasificación: AUC o logloss según uso downstream
+- regresión con uso ordinal: métrica cross-sectional por fecha, no RMSE agregado sin más
+
+Métricas auxiliares como runtime, coverage o fold_std no sustituyen a la primary_metric.
+Se usan para penalización y gobernanza.
+
+11. Medidas mínimas por trial
+
+Cada trial debe registrar al menos:
+
+- θ trial
+- métrica primaria agregada
+- métricas por fold
+- overfit_gap
+- fold_std o equivalente
+- coverage
+- runtime_sec
+- status
+- best_iteration promedio o por fold
+- seed
+- run_id
+
+12. Overfit gap
+
+Definir explícitamente:
+
+    Gap(θ) = M_train(θ) - M_valid(θ)
+
+o la convención equivalente según orientación de la métrica.
+
+El manifiesto debe dejar clara la convención.
+El valor no debe interpretarse aislado, sino junto con la métrica OOS y la dispersión entre folds.
+
+13. Varianza entre folds
+
+La media de la métrica no basta.
+
+El tuner debe penalizar configuraciones que:
+- funcionan excepcionalmente bien en un fold,
+- pero de forma mediocre o errática en otros.
+
+La estabilidad entre folds es una dimensión estructural de la calidad de θ.
+
+14. Penalización de complejidad o inviabilidad
+
+La componente Pi(θ) puede incluir, si se desea:
+
+- runtime excesivo,
+- número de boosting rounds demasiado alto,
+- profundidad o leaves claramente agresivos,
+- cobertura anómala,
+- parámetros en bordes patológicos del search space.
+
+No es obligatorio usar una Pi compleja, pero sí conviene que el módulo pueda descartar configuraciones operativamente poco sanas.
+
+15. Métodos de búsqueda soportados
+
+La versión canónica debe soportar:
+
+15.1 Random search
+Muestreo de θ desde distribuciones definidas por search_space.
+
+15.2 Bayesian optimization
+Solo cuando el espacio ya está razonablemente acotado y el coste por trial justifica una búsqueda más eficiente.
+
+La especificación base no debe obligar a SMAC3, TPE u otro backend concreto.
+Debe hablar en términos de familia de búsqueda y dejar el backend como detalle configurable.
+
+16. Regla oficial de selección del search method
+
+Doctrina recomendada:
+
+- random search por defecto para exploración inicial o espacios amplios;
+- bayesian optimization cuando el search space ya está bien acotado y el presupuesto de trials es valioso;
+- si ambos están disponibles, la salida final sigue siendo robust best_params, no el mejor punto encontrado por el método más sofisticado.
+
+17. Diseño del search space
+
+El search space debe ser:
+
+- económicamente plausible,
+- estadísticamente razonable,
+- computacionalmente viable.
+
+Cada dimensión debe registrar:
+- dominio permitido,
+- escala lineal o log,
+- tipo continuo/discreto/categórico,
+- restricciones cruzadas con otros parámetros si aplica.
+
+Está prohibido usar espacios absurdamente amplios solo porque el optimizador pueda recorrerlos.
+
+18. Constraints cruzadas recomendadas
+
+Ejemplos típicos:
+- learning_rate extremadamente bajo exige rounds suficientes;
+- profundidad agresiva no debe convivir con hojas microscópicas sin justificación;
+- subsampling extremo no debe combinarse con regularización laxa en universos pequeños;
+- parámetros incompatibles con el engine deben descartarse antes del trial.
+
+19. Meta-overfitting del tuner
+
+Este punto debe quedar explícito.
+
+Incluso si cada trial es causalmente limpio, el proceso global de tuning puede sobreajustar la validación si:
+- hay demasiados trials,
+- la métrica es ruidosa,
+- el search space es muy grande,
+- el optimizador explota una región afortunada.
+
+El módulo debe mitigar esto mediante:
+
+- límite explícito de n_trials o timeout,
+- penalización por fold variance,
+- preferencia por configuraciones robustas frente a picos aislados,
+- consolidación final no basada solo en el máximo trial score,
+- y, cuando proceda, comparación contra baseline o región conservadora.
+
+20. Selección final de best_params
+
+La política canónica recomendada es:
+
+Paso 1:
+identificar trials de alto rendimiento según la primary_metric.
+
+Paso 2:
+descartar aquellos con:
+- Gap excesivo,
+- fold variance excesiva,
+- coverage insuficiente,
+- runtime inviable,
+- o parámetros claramente patológicos.
+
+Paso 3:
+entre los supervivientes, elegir:
+- el más robusto,
+- o el situado en una región estable del espacio,
+- no necesariamente el score máximo absoluto.
+
+Esta semántica debe quedar cristalina en el módulo.
+
+21. Política válida de “no mejora suficiente”
+
+El módulo puede concluir que no hay mejora material frente a baseline/defaults.
+
+Eso no es fallo.
+Es una salida válida si:
+- el search budget no descubre una región mejor,
+- la mejora es demasiado frágil,
+- o el coste en robustez supera el beneficio.
+
+En ese caso:
+- best_params puede apuntar a defaults conservadores,
+- o el run puede marcarse como no promocionable.
+
+22. Trial status
+
+Cada trial debe etiquetarse explícitamente como:
+- success
+- failed
+- pruned
+- invalid
+- timeout
+
+No deben desaparecer trials silenciosamente del historial.
+
+23. Flujo operativo canónico
+
+Paso 1:
+cargar features, labels, splits y config
+
+Paso 2:
+validar integridad experimental y construir search_space
+
+Paso 3:
+inicializar motor de búsqueda con seed y budget
+
+Paso 4:
+para cada trial:
+- proponer o muestrear θ
+- entrenar por folds con validación temporal purged
+- aplicar early stopping solo en valid
+- registrar métricas agregadas y por fold
+- persistir resultado del trial
+
+Paso 5:
+consolidar trials válidos
+
+Paso 6:
+seleccionar best_params robustos
+
+Paso 7:
+persistir summary, manifest y artefactos finales
+
+24. Early stopping dentro del tuning
+
+La política debe ser inequívoca:
+- early stopping solo en valid
+- nunca en test
+- mejor iteración registrada por fold o trial
+- el efecto del early stopping forma parte del trial y debe quedar auditado
+
+25. Relación con train_lgbm.py y train_xgb.py
+
+El tuning no reemplaza el entrenamiento final.
+
+Su salida principal es:
+- best_params.json
+- historial de trials
+- evidencia de robustez suficiente o insuficiente
+
+El entrenamiento final debe volver a ejecutarse en su propio módulo usando esa configuración.
+
+26. Reproducibilidad
+
+El módulo debe poder reconstruir:
+- secuencia de trials
+- config exacta
+- search_space exacto
+- seeds
+- métricas y estados
+- decisión final de selección
+
+Misma seed + mismos datos + misma config deben producir una trayectoria reproducible dentro de las tolerancias del backend.
+
+27. Tests mínimos obligatorios
+
+27.1 Test isolation
+El test final no puede intervenir en el proceso de tuning.
+
+27.2 Temporal purity
+Los folds de validación respetan orden, purging y embargo.
+
+27.3 Trials auditables
+Todo trial tiene status y métricas mínimas registradas.
+
+27.4 Search space válido
+Toda configuración evaluada pertenece a Θ y respeta constraints cruzadas.
+
+27.5 Reproducibilidad
+La ejecución es repetible con misma seed y mismos inputs.
+
+27.6 Selección robusta
+best_params no debe provenir de un trial inválido, fallido o no consolidado.
+
+28. Artefactos obligatorios
+
+28.1 trials.parquet
+Un registro por trial, incluyendo θ, métricas, runtime, status y metadata.
+
+28.2 best_params.json
+Configuración final seleccionada para entrenamiento posterior.
+
+28.3 tuning_summary.json
+Resumen de rendimiento, estabilidad, overfit gap y decisión final.
+
+28.4 tuning_manifest.json
+Huella completa de inputs, config, search method, seeds y política de selección.
+
+29. Campos mínimos de tuning_summary.json
+
+- run_id
+- engine
+- search_method
+- primary_metric_name
+- best_trial_metric
+- selected_metric
+- selected_overfit_gap
+- selected_fold_std
+- selected_runtime_sec
+- n_trials_total
+- n_trials_success
+- n_trials_failed
+- accepted_flag
+- rejection_reason if any
+- config_hash
+
+30. Campos mínimos de tuning_manifest.json
+
+- run_id
+- input hashes
+- config hash
+- engine
+- search_space_definition
+- seed
+- n_trials or timeout
+- primary_metric
+- no_test_in_tuning_assertion
+- robustness_policy
+- selection_policy
+- policy_version
+
+31. Qué no debe hacer este módulo
+
+La versión canónica no debe:
+- imponer SMAC3 como requisito base,
+- convertir Pareto front en semántica mínima obligatoria,
+- usar Sobol/importancia de hiperparámetros como gate duro,
+- promocionar por el mejor trial bruto sin robustez,
+- ni tratar el tuning como un simple benchmark de librerías.
+
+32. Extensiones futuras razonables
+
+Como fase 2 o research:
+- backend bayesiano específico (SMAC/TPE/etc.)
+- Pareto front multiobjetivo
+- hyperparameter importance
+- pruning más inteligente
+- comparación cruzada entre engines
+- budget adaptativo o multi-fidelity
+
+Pero ninguna de estas extensiones debe contaminar el contrato mínimo.
+
+33. Interpretación correcta
+
+La lectura correcta de tune_hyperparams.py no es:
+“probamos muchos knobs hasta que sale el mejor”.
+
+La lectura correcta es:
+“exploramos el espacio de hiperparámetros bajo validación temporal limpia, penalizamos fragilidad, controlamos el meta-overfitting y seleccionamos una configuración robusta para entrenamiento final.”
+
+Ese es su rol real.
+
+34. Conclusión
+
+models/gbdt/tune_hyperparams.py debe ser una pieza central de optimización cuantitativa sobria y disciplinada.
+
+Recibe datos, splits y search space.
+Explora Θ con cronología limpia.
+Evalúa cada trial con métrica primaria y penalizaciones de robustez.
+Controla el meta-overfitting del propio tuner.
+Selecciona best_params robustos.
+Y persiste suficiente evidencia como para justificar por qué esa configuración merece pasar a entrenamiento definitivo.
+
+Ese es exactamente el comportamiento que debe tener una capa seria de tuning de hiperparámetros en un stack cuantitativo institucional.

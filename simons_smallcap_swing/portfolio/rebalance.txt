@@ -1,711 +1,514 @@
-\documentclass[11pt,a4paper]{article}
+Especificación Cuantitativa: portfolio/rebalance.py
 
-\usepackage[utf8]{inputenc}
-\usepackage[spanish]{babel}
-\usepackage[T1]{fontenc}
-\usepackage{amsmath,amssymb,amsthm,amsfonts,mathtools}
-\usepackage{graphicx}
-\usepackage{hyperref}
-\usepackage{booktabs}
-\usepackage{siunitx}
-\usepackage{array}
-\usepackage{geometry}
-\geometry{margin=2.5cm}
+1. Propósito del módulo
 
-\hypersetup{
-    colorlinks=true,
-    linkcolor=blue,
-    citecolor=blue,
-    urlcolor=blue
-}
+El objetivo de portfolio/rebalance.py es transformar un portafolio objetivo ya validado aguas arriba en un conjunto de órdenes ejecutables, respetando simultáneamente:
 
-\title{Especificación Operativa de Generación de Órdenes de Rebalanceo\\
-\large Módulo \texttt{portfolio/rebalance.py}}
-\author{Quantitative Research Specification}
-\date{Marzo 2026}
+- presupuesto de turnover,
+- thresholds operativos,
+- lot sizing,
+- negociabilidad real,
+- y restricciones hard heredadas del portfolio final.
 
-\begin{document}
+La pregunta correcta del módulo es:
 
-\maketitle
-\tableofcontents
-\newpage
+“Dado un portafolio actual y un portafolio objetivo, ¿cuál es la implementación discreta más cercana al target que sigue siendo contablemente coherente, operativamente ejecutable y compatible con el budget disponible?”
 
-\section{Objetivo del módulo}
+Este módulo no decide cuál debe ser la cartera óptima. Esa decisión ya ha sido tomada aguas arriba por:
+- optimizer.py,
+- constraints.py,
+- neutralize.py,
+- o una arquitectura equivalente.
 
-El módulo \texttt{portfolio/rebalance.py} transforma un portafolio objetivo ya validado aguas arriba en un conjunto de órdenes ejecutables, respetando presupuesto de rotación, umbrales operativos, tamaños mínimos de lote, restricciones de negociabilidad y coherencia contable entre pesos, acciones y efectivo.
+Su función correcta es traducir un target ya aprobado en un plan de órdenes consistente.
 
-Su función no es decidir cuál debe ser la cartera óptima. Esa decisión ya ha sido tomada por \texttt{optimizer.py}, \texttt{constraints.py} o la arquitectura equivalente. La función correcta de \texttt{rebalance.py} es más precisa:
+2. Principios no negociables
 
-\begin{quote}
-\emph{Dados unos pesos actuales y unos pesos objetivo, construir el portafolio ejecutable más cercano al objetivo dentro del presupuesto operativo disponible y convertir esa solución en órdenes concretas, auditables y consistentes con la microestructura básica de trading.}
-\end{quote}
+2.1 Separación de responsabilidades
+rebalance.py no optimiza alpha-riesgo. Solo traduce pesos objetivo a órdenes operativas.
 
-En una estrategia de swing trading sobre small caps, esta capa es crítica porque una cartera objetivo matemáticamente válida puede dejar de ser operativa en el momento en que se imponen budgets de turnover, filtros de micro-trade y redondeo por lotes.
+2.2 Semántica cerrada
+El módulo debe tener una semántica única y reproducible:
+- target continuo ejecutable,
+- traducción a acciones,
+- rounding,
+- reparación discreta,
+- postcheck final.
 
-\section{Principios de diseño}
+2.3 Precedencia explícita
+Las reglas deben tener prioridad fija:
+1. validez de datos y negociabilidad
+2. órdenes obligatorias
+3. presupuesto de turnover
+4. thresholds discrecionales
+5. rounding por lotes
+6. repair final
+7. postcheck hard
 
-El módulo se rige por los siguientes principios:
+2.4 Consistencia contable
+Pesos, acciones, notional y efectivo deben cuadrar dentro de tolerancia.
 
-\begin{enumerate}
-    \item \textbf{Separación de responsabilidades:} \texttt{rebalance.py} no optimiza alpha-riesgo; traduce un target ya decidido a una implementación operativa.
-    \item \textbf{Semántica cerrada:} el módulo debe tener una definición única de cómo pasar de pesos objetivo a pesos ejecutables y de ahí a órdenes.
-    \item \textbf{Precedencia explícita:} las órdenes obligatorias de salida o reducción prevalecen sobre las discrecionales.
-    \item \textbf{Consistencia contable:} toda orden debe cuadrar simultáneamente en pesos, acciones, notional y efectivo.
-    \item \textbf{Determinismo:} dadas las mismas entradas, la salida debe ser idéntica; no se permiten heurísticas opacas no trazadas.
-    \item \textbf{Auditabilidad:} toda orden omitida, truncada, redondeada o diferida debe dejar una razón explícita.
-\end{enumerate}
+2.5 Determinismo
+Mismas entradas -> misma salida.
+No se permiten heurísticas opacas no trazadas.
 
-\section{Qué hace y qué no hace}
+2.6 Auditabilidad
+Toda orden omitida, truncada, redondeada o diferida debe dejar:
+- razón explícita,
+- prioridad,
+- y efecto sobre drift residual.
 
-\subsection{Qué hace}
+3. Qué hace y qué no hace
 
-\begin{itemize}
-    \item recibe pesos objetivo y pesos actuales;
-    \item impone thresholds, presupuesto de turnover y lot sizing;
-    \item convierte el target ideal en un portafolio ejecutable continuo;
-    \item redondea a acciones negociables y repara residuos de efectivo/turnover;
-    \item genera órdenes con lado, acciones, notional, prioridad y \texttt{skip\_reason};
-    \item reporta el portafolio post-órdenes y su desviación respecto al target.
-\end{itemize}
+3.1 Qué hace
+- recibe pesos objetivo y pesos actuales;
+- clasifica órdenes en obligatorias, discrecionales o bloqueadas;
+- construye un portafolio ejecutable continuo bajo budget;
+- lo convierte a acciones;
+- redondea a lotes;
+- repara residuos discretos;
+- genera órdenes con `skip_reason`;
+- y produce el portafolio estimado post-trade.
 
-\subsection{Qué no hace}
+3.2 Qué no hace
+- no genera alpha;
+- no recalcula optimizer;
+- no sustituye execution;
+- no estima trayectorias intradía;
+- no inventa liquidez ni precios faltantes.
 
-\begin{itemize}
-    \item no estima alpha;
-    \item no recalcula el optimizador de cartera;
-    \item no sustituye al simulador de ejecución;
-    \item no decide trayectorias intradía tipo Almgren-Chriss como semántica base;
-    \item no inventa liquidez o precios faltantes.
-\end{itemize}
+4. Entradas obligatorias
 
-\section{Contrato exacto del módulo}
+4.1 Estado actual
+- w_current
+- shares_current
+- cash_current
+- NAV
 
-\subsection{Entradas obligatorias}
+4.2 Target upstream
+- w_target
+- target_source opcional
 
-El módulo opera sobre una única fecha de rebalanceo \(t\) y requiere al menos:
+4.3 Datos de mercado y operabilidad
+- price
+- lot_size
+- min_notional
+- tradable_flag
+- halt_flag
+- eligible_flag
+- adv_usd opcional si se usa cap de participación
+- cualquier bound hard heredado del upstream
 
-\subsubsection*{1. Estado actual de cartera}
+4.4 Configuración
+- weight_threshold = theta_w
+- notional_threshold = n_min
+- turnover_budget = B_TO
+- rounding_policy
+- repair_policy
+- mandatory_exit_policy
+- participation_cap si aplica
+- posttrade_tolerance
+- budget_selection_policy
+- solver_name si se usa proyección continua
+- constraints heredadas activas: gross/net/posición si corresponde
 
-\begin{center}
-\begin{tabular}{>{\ttfamily}m{4.2cm} m{9.0cm}}
-\toprule
-\textnormal{Campo} & \textnormal{Descripción} \\
-\midrule
-w\_current & Peso actual por activo \\
-shares\_current & Acciones actuales por activo \\
-cash\_current & Efectivo actual \\
-nav & Valor liquidativo total de referencia \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\subsubsection*{2. Target de cartera}
-
-\begin{center}
-\begin{tabular}{>{\ttfamily}m{4.2cm} m{9.0cm}}
-\toprule
-\textnormal{Campo} & \textnormal{Descripción} \\
-\midrule
-w\_target & Peso objetivo validado aguas arriba \\
-target\_source & Etiqueta opcional del módulo upstream que generó el target \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\subsubsection*{3. Datos de mercado y negociabilidad}
-
-\begin{center}
-\begin{tabular}{>{\ttfamily}m{4.2cm} m{9.0cm}}
-\toprule
-\textnormal{Campo} & \textnormal{Descripción} \\
-\midrule
-price & Precio de referencia para traducir pesos a acciones \\
-lot\_size & Tamaño mínimo de lote \\
-min\_notional & Notional mínimo operativo \\
-tradable\_flag & Indicador de activo negociable \\
-halt\_flag & Indicador de suspensión \\
-eligible\_flag & Indicador de pertenencia al universo elegible \\
-adv\_usd & Liquidez PIT opcional para checks de participación \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\subsubsection*{4. Configuración}
-
-La configuración debe declarar explícitamente:
-
-\begin{itemize}
-    \item \texttt{weight\_threshold} \(\theta_w\),
-    \item \texttt{notional\_threshold} \(n_{\min}\),
-    \item \texttt{turnover\_budget} \(B_{TO}\),
-    \item \texttt{rounding\_policy},
-    \item \texttt{repair\_policy},
-    \item \texttt{mandatory\_exit\_policy},
-    \item \texttt{participation\_cap} si se controla liquidez,
-    \item \texttt{posttrade\_tolerance},
-    \item \texttt{budget\_selection\_policy}.
-\end{itemize}
-
-\subsection{Salidas obligatorias}
+5. Salidas obligatorias
 
 El módulo debe persistir:
 
-\begin{enumerate}
-    \item \texttt{orders.parquet}: una fila por orden generada;
-    \item \texttt{rebalance\_report.json}: resumen before/after, budget usado, drift residual y razones de skip;
-    \item \texttt{posttrade\_portfolio.parquet}: pesos y acciones estimadas tras las órdenes generadas;
-    \item \texttt{status}: \texttt{ok}, \texttt{partial}, \texttt{blocked} o \texttt{fail\_postcheck}.
-\end{enumerate}
+1. orders.parquet
+2. rebalance_report.json
+3. posttrade_portfolio.parquet
+4. status in {ok, partial, blocked, fail_postcheck}
 
-\section{Notación y definiciones}
+6. Notación
 
-Sea \(N\) el número de activos considerados en la fecha \(t\). Definimos:
+Sea N el número de activos en la fecha t.
 
-\[
-\mathbf{w}^{\mathrm{cur}} \in \mathbb{R}^N
-\quad \text{pesos actuales},
-\]
-\[
-\mathbf{w}^{\mathrm{tgt}} \in \mathbb{R}^N
-\quad \text{pesos objetivo},
-\]
-\[
-\mathbf{p} \in \mathbb{R}_+^N
-\quad \text{precios de referencia},
-\]
-\[
-\mathbf{s}^{\mathrm{cur}} \in \mathbb{Z}^N
-\quad \text{acciones actuales},
-\]
-\[
-NAV > 0
-\quad \text{valor liquidativo de referencia}.
-\]
+- w_cur in R^N: pesos actuales
+- w_tgt in R^N: pesos objetivo
+- p in R_+^N: precios
+- s_cur in Z^N: acciones actuales
+- NAV > 0
 
-La diferencia ideal de pesos es:
-\[
-\Delta w_i^{\mathrm{ideal}} = w_i^{\mathrm{tgt}} - w_i^{\mathrm{cur}}.
-\]
+Diferencia ideal en pesos:
+    Delta w_i^ideal = w_tgt_i - w_cur_i
 
-El turnover bruto ideal es:
-\[
-TO^{\mathrm{ideal}} = \sum_{i=1}^{N} |\Delta w_i^{\mathrm{ideal}}|.
-\]
+Turnover ideal:
+    TO_ideal = sum_i |Delta w_i^ideal|
 
-Las acciones objetivo continuas asociadas al target son:
-\[
-s_i^{\mathrm{tgt,cont}} = \frac{NAV \cdot w_i^{\mathrm{tgt}}}{p_i}.
-\]
+Acciones objetivo continuas:
+    s_i^(tgt,cont) = NAV * w_tgt_i / p_i
 
-La orden continua ideal en acciones es:
-\[
-\Delta s_i^{\mathrm{ideal}} = s_i^{\mathrm{tgt,cont}} - s_i^{\mathrm{cur}}.
-\]
+Orden continua ideal:
+    Delta s_i^ideal = s_i^(tgt,cont) - s_cur_i
 
-El notional ideal asociado es:
-\[
-n_i^{\mathrm{ideal}} = p_i \cdot |\Delta s_i^{\mathrm{ideal}}|
-= NAV \cdot |\Delta w_i^{\mathrm{ideal}}|.
-\]
+Notional ideal:
+    n_i^ideal = p_i * |Delta s_i^ideal|
+              = NAV * |Delta w_i^ideal|
 
-\section{Semántica canónica del módulo}
+7. Clasificación exacta de activos
 
-La salida del módulo no será, por defecto, un simple filtrado secuencial tipo
-\[
-\text{target} \rightarrow \text{threshold} \rightarrow \text{budget} \rightarrow \text{rounding},
-\]
-porque esa lógica deja ambigüedades cuando varias reglas colisionan.
+Cada activo debe pertenecer exactamente a una de estas clases:
 
-La semántica oficial será una arquitectura en tres capas:
+7.1 Mandatory
+Órdenes obligatorias:
+- salida completa de nombres no elegibles,
+- cierre forzado,
+- reducción hard impuesta upstream,
+- cualquier otra orden marcada como no discrecional.
 
-\begin{enumerate}
-    \item \textbf{Capa A: selección del target ejecutable continuo} bajo presupuesto y filtros.
-    \item \textbf{Capa B: traducción a acciones y redondeo por lotes.}
-    \item \textbf{Capa C: reparación discreta final para reconciliar efectivo, turnover y drift residual.}
-\end{enumerate}
+7.2 Discretionary
+Órdenes destinadas a acercar la cartera al target, sujetas a threshold y budget.
 
-Esto distingue claramente entre un portafolio \emph{ejecutable continuo} y las \emph{órdenes discretas} que realmente se envían.
+7.3 Blocked
+Activos no operables:
+- tradable_flag = False
+- halt_flag = True
+- price faltante o no válido
+- lote inválido
+- o cualquier bloqueo real equivalente
 
-\section{Precedencia exacta de reglas}
+8. Threshold canónico
 
-Cuando varias reglas entran en conflicto, la precedencia obligatoria es:
+La regla de threshold se aplica solo a órdenes discrecionales.
 
-\begin{enumerate}
-    \item validez de datos y negociabilidad;
-    \item órdenes obligatorias de cierre o reducción hard;
-    \item presupuesto total de turnover;
-    \item thresholds de micro-trade;
-    \item redondeo por lotes;
-    \item reparación final para minimizar drift residual.
-\end{enumerate}
+Un activo discrecional queda congelado en:
+    w_i = w_cur_i
 
-Esto implica, por ejemplo, que una orden de cierre completo por salida del universo o por mandato de riesgo no puede ser eliminada simplemente por no superar un \texttt{min\_notional}. Del mismo modo, un redondeo por lotes no puede violar el presupuesto ya fijado.
-
-\section{Clasificación de órdenes}
-
-Cada activo debe clasificarse exactamente en una de las siguientes categorías:
-
-\subsection{1. Orden obligatoria}
-Órdenes que deben intentarse siempre que el activo sea negociable:
-
-\begin{itemize}
-    \item salida completa de nombres no elegibles;
-    \item cierre por peso objetivo cero si la política lo marca como obligatorio;
-    \item reducciones impuestas por restricciones hard aguas arriba;
-    \item coberturas o cierres regulatorios si el sistema los contempla.
-\end{itemize}
-
-\subsection{2. Orden discrecional}
-Órdenes destinadas a acercar la cartera al target, sujetas a threshold y presupuesto.
-
-\subsection{3. No ejecutable}
-Casos con \texttt{halt\_flag = True}, precio faltante, lote inválido o activo no negociable. Deben quedar reportados, nunca ignorados.
-
-\section{Definición del portafolio ejecutable continuo}
-
-\subsection{Motivación}
-
-El problema real bajo presupuesto no es simplemente ``ordenar por tamaño y cortar''. Lo correcto es encontrar el portafolio continuo más cercano al target dentro del turnover disponible.
-
-Por tanto, el método canónico por defecto será la siguiente proyección convexa:
-
-\[
-\begin{aligned}
-\min_{\mathbf{w}}
-\quad &
-\frac{1}{2}(\mathbf{w}-\mathbf{w}^{\mathrm{tgt}})^\top D (\mathbf{w}-\mathbf{w}^{\mathrm{tgt}})
-\\
-\text{sujeto a} \quad
-&
-\sum_{i=1}^{N} |w_i-w_i^{\mathrm{cur}}| \leq B_{TO}, \\
-&
-w_i = w_i^{\mathrm{cur}} \quad \text{si el nombre queda bloqueado por no negociable}, \\
-&
-w_i = w_i^{\mathrm{tgt}} \quad \text{si la orden es obligatoria y es factible}, \\
-&
-w_i = w_i^{\mathrm{cur}} \quad \text{si la orden discrecional cae por debajo del threshold configurado}, \\
-&
-\text{cualquier bound hard adicional heredado del portafolio upstream.}
-\end{aligned}
-\]
-
-Aquí \(D\) es una matriz diagonal positiva definida. Por defecto:
-\[
-D = I.
-\]
-
-El resultado será el portafolio ejecutable continuo
-\[
-\mathbf{w}^{\mathrm{exe,cont}}.
-\]
-
-\subsection{Threshold canónico}
-
-La regla de threshold se aplica sólo a órdenes discrecionales. Un nombre discrecional queda congelado en
-\[
-w_i = w_i^{\mathrm{cur}}
-\]
 si simultáneamente:
-
-\[
-|\Delta w_i^{\mathrm{ideal}}| < \theta_w
-\]
+    |Delta w_i^ideal| < theta_w
 y
-\[
-n_i^{\mathrm{ideal}} < n_{\min}.
-\]
+    n_i^ideal < n_min
 
-La lógica usa \textbf{AND}, no \textbf{OR}, para evitar eliminar órdenes materialmente relevantes en una de las dos dimensiones. Las órdenes obligatorias quedan exentas de este filtro salvo imposibilidad operativa real.
+La lógica oficial es AND, no OR.
 
-\subsection{Convención oficial de budget}
+Las órdenes obligatorias quedan exentas de este filtro salvo bloqueo operativo real.
 
-El presupuesto de rebalanceo se define como:
+9. Target ejecutable continuo
 
-\[
-B_{TO} = \sum_{i=1}^{N} |w_i^{\mathrm{exe,cont}} - w_i^{\mathrm{cur}}|.
-\]
+9.1 Idea central
+La salida continua del módulo no debe surgir de un simple ranking codicioso por tamaño.
+La semántica canónica es un problema de proyección convexa bajo budget.
 
-Esa es la única convención oficial del módulo para budget de turnover. Si otro módulo usa media compra-venta o define turnover dividido entre dos, la conversión debe hacerse fuera de \texttt{rebalance.py}.
+9.2 Problema canónico
+Sea w el portafolio ejecutable continuo buscado.
 
-\section{Fallback determinista si no se usa proyección convexa}
+Resolver:
 
-Si la configuración exige una política puramente heurística, el único \texttt{fallback} permitido será un ranking determinista con precedencia explícita:
+    minimize    1/2 (w - w_tgt)^T D (w - w_tgt)
 
-\begin{enumerate}
-    \item ejecutar primero órdenes obligatorias;
-    \item sobre las discrecionales restantes, ordenar por
-    \[
-    \mathrm{priority}_i = \frac{| \Delta w_i^{\mathrm{ideal}} |}{\max(c_i,c_{\mathrm{floor}})},
-    \]
-    donde \(c_i\) es un coste lineal estimado y \(c_{\mathrm{floor}}>0\);
-    \item acumular órdenes hasta consumir el presupuesto;
-    \item congelar el resto en \(w_i^{\mathrm{cur}}\).
-\end{enumerate}
+    subject to
+                sum_i |w_i - w_cur_i| <= B_TO
+                w_i = w_tgt_i       para i en mandatory si factible
+                w_i = w_cur_i       para i en blocked
+                w_i = w_cur_i       para discrecionales bajo threshold
+                restricciones hard heredadas del upstream
 
-Este \texttt{fallback} debe marcarse explícitamente:
-\[
-\texttt{used\_fallback = True}.
-\]
+Default:
+    D = I
 
-No debe confundirse con la semántica principal.
+Si el sistema quiere ponderar por volatilidad o liquidez, debe declararlo explícitamente en config.
 
-\section{Traducción a acciones y notional}
+9.3 Restricciones hard heredadas
+Si el target upstream ya venía condicionado por gross/net/bounds y se desea preservarlos tras budgeting, el módulo puede imponer adicionalmente:
 
-Una vez obtenido \(\mathbf{w}^{\mathrm{exe,cont}}\), se calculan las acciones continuas deseadas:
+- box:
+    l <= w <= u
 
-\[
-s_i^{\mathrm{exe,cont}} = \frac{NAV \cdot w_i^{\mathrm{exe,cont}}}{p_i}.
-\]
+- gross:
+    sum_i |w_i| <= G_max
 
-La orden continua asociada es:
-\[
-\Delta s_i^{\mathrm{exe,cont}} = s_i^{\mathrm{exe,cont}} - s_i^{\mathrm{cur}}.
-\]
+- net:
+    N_min <= sum_i w_i <= N_max
 
-\section{Política canónica de redondeo por lotes}
+Estas restricciones deben activarse solo si la configuración las declara como hard también en rebalance.
 
-La conversión a órdenes discrecionales debe usar una política única y explícita. Por defecto:
+10. Reformulación convexa explícita
 
-\begin{center}
-\texttt{rounding\_policy = toward\_zero\_to\_lot}
-\end{center}
+Para implementar la proyección continua sin ambigüedad:
 
-Esto significa:
+10.1 Turnover budget
+Introducir variable u_i >= 0:
+    u_i >= w_i - w_cur_i
+    u_i >= w_cur_i - w_i
+    sum_i u_i <= B_TO
 
-\[
-\Delta s_i^{\mathrm{lot}}
-=
-\operatorname{lotfloor}(\Delta s_i^{\mathrm{exe,cont}}, l_i),
-\]
-donde \(l_i\) es el tamaño de lote y \(\operatorname{lotfloor}\) redondea hacia cero al múltiplo entero de lote más cercano.
+10.2 Gross heredado opcional
+Si gross está activo, introducir z_i >= 0:
+    z_i >= w_i
+    z_i >= -w_i
+    sum_i z_i <= G_max
 
-Esta convención evita que el redondeo sobrepase accidentalmente el target continuo o el presupuesto de turnover.
+10.3 Net heredado opcional
+    N_min <= sum_i w_i <= N_max
 
-El notional discreto resultante es:
-\[
-n_i^{\mathrm{lot}} = p_i \cdot |\Delta s_i^{\mathrm{lot}}|.
-\]
+10.4 Mandatory / blocked / threshold
+- mandatory:
+    w_i = w_tgt_i
+- blocked:
+    w_i = w_cur_i
+- below-threshold discretionary:
+    w_i = w_cur_i
 
-\section{Reconciliación tras redondeo}
+11. Fallback determinista
 
-El redondeo genera inevitablemente un residuo entre el target continuo y las órdenes discretas. El módulo debe capturarlo con claridad.
+Si la configuración desactiva la proyección continua, el único fallback permitido será un ranking determinista con precedencia explícita:
 
-Las acciones post-órdenes son:
-\[
-s_i^{\mathrm{post}} = s_i^{\mathrm{cur}} + \Delta s_i^{\mathrm{lot}}.
-\]
+1. ejecutar primero mandatory,
+2. sobre discrecionales restantes, ordenar por prioridad
+   priority_i = |Delta w_i^ideal| / max(c_i, c_floor)
+3. acumular hasta agotar B_TO,
+4. congelar el resto.
 
-Los pesos post-órdenes estimados son:
-\[
-w_i^{\mathrm{post}} = \frac{s_i^{\mathrm{post}} p_i}{NAV}.
-\]
+Si se usa:
+    used_fallback = True
 
-El drift residual por activo es:
-\[
-r_i = w_i^{\mathrm{exe,cont}} - w_i^{\mathrm{post}}.
-\]
+Nunca debe confundirse con la semántica oficial del módulo.
 
-La desviación total al target ejecutable continuo se mide como:
-\[
-\mathrm{Drift}_{1} = \sum_{i=1}^{N} |r_i|.
-\]
+12. Conversión a acciones
 
-\subsection{Repair loop canónico}
+Una vez obtenido w_exe_cont:
 
-Tras el redondeo, el módulo debe ejecutar una reparación discreta final:
+    s_i^(exe,cont) = NAV * w_i^(exe,cont) / p_i
 
-\begin{enumerate}
-    \item ordenar los nombres con mayor \(|r_i|\) entre los que admiten un lote adicional factible;
-    \item probar un incremento o decremento de un lote en la dirección que reduzca \(|r_i|\);
-    \item aceptar el ajuste sólo si no viola:
-    \begin{itemize}
-        \item el presupuesto de turnover,
-        \item el efectivo disponible,
-        \item las restricciones hard heredadas,
-        \item la regla de no sobrepasar el target continuo si así se configura;
-    \end{itemize}
-    \item repetir hasta que no queden mejoras factibles o el drift residual sea menor que la tolerancia.
-\end{enumerate}
+Orden continua:
+    Delta s_i^(exe,cont) = s_i^(exe,cont) - s_cur_i
 
-Esto cierra el problema que suele quedar abierto en especificaciones más débiles: el rounding no es el final del proceso; es una etapa que debe ser seguida por una reparación controlada.
+13. Política de rounding
 
-\section{Preservación de constraints tras filtros y rounding}
+13.1 Política oficial
+Default:
+    rounding_policy = toward_zero_to_lot
 
-Uno de los errores habituales en esta clase de módulo es asumir que, porque \(\mathbf{w}^{\mathrm{tgt}}\) ya era válido, cualquier versión filtrada y redondeada seguirá siéndolo. Eso es falso.
+Es decir:
 
-Por tanto, el módulo debe verificar después del \texttt{repair loop}:
+    Delta s_i^(lot) = lotfloor(Delta s_i^(exe,cont), lot_i)
 
-\begin{itemize}
-    \item exposición gross,
-    \item exposición net,
-    \item límites por nombre,
-    \item cualquier bound sectorial o factorial marcado como hard y heredado del upstream,
-    \item turnover final,
-    \item efectivo residual dentro de tolerancia.
-\end{itemize}
+donde el redondeo se hace hacia cero al múltiplo válido más cercano.
 
-Si alguna restricción hard queda violada por encima de tolerancia, el estado debe degradarse a:
+13.2 Razón
+Esta política evita:
+- sobrepasar el target continuo,
+- consumir más budget del previsto,
+- y fabricar notional discreto artificialmente agresivo.
 
-\[
-\texttt{status = fail\_postcheck}
-\]
+13.3 Notional discreto
+    n_i^(lot) = p_i * |Delta s_i^(lot)|
 
-o, si la violación proviene de bloqueos operativos inevitables, a:
+14. Repair loop canónico
 
-\[
-\texttt{status = partial}.
-\]
+Tras el rounding, el módulo debe ejecutar una reparación discreta final.
 
-\section{Negociabilidad y bloqueos}
+14.1 Acciones post-órdenes
+    s_i^post = s_cur_i + Delta s_i^(lot)
 
-Si un activo tiene:
+14.2 Pesos post-órdenes
+    w_i^post = s_i^post * p_i / NAV
 
-\begin{itemize}
-    \item \texttt{halt\_flag = True},
-    \item precio faltante,
-    \item lote no válido,
-    \item \texttt{tradable\_flag = False},
-\end{itemize}
+14.3 Drift residual respecto al target continuo
+    r_i = w_i^(exe,cont) - w_i^post
 
-entonces la orden no puede generarse y el activo queda congelado en su posición actual. El módulo debe registrar:
+Métrica agregada:
+    Drift_1 = sum_i |r_i|
 
-\begin{center}
-\texttt{skip\_reason = blocked\_nontradable}
-\end{center}
+14.4 Repair loop
+El repair loop por defecto será:
 
-Si el activo debía cerrarse obligatoriamente y no puede negociarse, el reporte debe marcarlo además como riesgo residual no ejecutado.
+1. ordenar activos por mayor |r_i| entre los que admiten un lote adicional factible;
+2. proponer un lote extra en la dirección que reduzca |r_i|;
+3. aceptar solo si no viola:
+   - turnover budget,
+   - efectivo disponible,
+   - lot validity,
+   - caps hard heredadas,
+   - y, si está activo, no excede el target continuo más allá de tolerancia;
+4. repetir hasta que:
+   - no haya mejora factible,
+   - o el drift residual quede por debajo de tolerancia.
 
-\section{Liquidez opcional}
+14.5 Naturaleza del método
+Este repair loop es heurístico pero determinista.
+No garantiza optimalidad global discreta, pero sí una política clara, estable y suficiente para el MVP.
 
-Si se activa el control de participación, el módulo debe calcular para cada orden discreta:
+15. Liquidez opcional
 
-\[
-\pi_i = \frac{p_i |\Delta s_i^{\mathrm{lot}}|}{\phi \, ADV_i^{USD}}.
-\]
+Si se activa cap de participación por nombre, calcular:
 
-La restricción opcional por nombre es:
-\[
-\pi_i \leq \pi_{\max}.
-\]
+    pi_i = p_i * |Delta s_i^(lot)| / (phi * ADV_i^USD)
 
-Si una orden potencial la viola, debe truncarse hasta el máximo factible o marcarse como parcialmente ejecutable. Esta lógica debe aplicarse antes del cierre final del \texttt{repair loop}.
+Restricción:
+    pi_i <= pi_max
 
-\section{Algoritmo exacto del módulo}
+Si una orden la viola:
+- truncarla al máximo factible,
+- o marcarla como parcialmente ejecutada / bloqueada por liquidez.
 
-\subsection{Paso 1. Validación de inputs}
+Esto debe aplicarse antes del cierre final del repair loop.
 
-Verificar:
+16. Postcheck hard
 
-\begin{itemize}
-    \item alineación exacta entre pesos, acciones, precios y flags;
-    \item unicidad por activo;
-    \item \(NAV > 0\);
-    \item \(p_i > 0\) para todo activo negociable;
-    \item \(l_i \in \mathbb{N}_{+}\) o convención equivalente válida;
-    \item ausencia de NaN o infinitos en columnas activas.
-\end{itemize}
+Después del repair loop, el módulo debe verificar:
 
-\subsection{Paso 2. Clasificación de activos}
+16.1 Turnover
+    TO_exec <= B_TO + eps
 
-Asignar a cada activo una de las tres clases:
-\texttt{mandatory}, \texttt{discretionary}, \texttt{blocked}.
+16.2 Gross y net heredados, si activos
+- gross_post <= G_max + eps
+- N_min - eps <= net_post <= N_max + eps
 
-\subsection{Paso 3. Aplicación de threshold}
+16.3 Posición por nombre si aplica
+- bounds individuales respetados
 
-Congelar activos discrecionales que no superen simultáneamente threshold en peso o notional.
+16.4 Efectivo residual
+- cash_post dentro de tolerancia
 
-\subsection{Paso 4. Resolución del target ejecutable continuo}
+16.5 Lote válido
+- todas las órdenes múltiples válidos de lot_size
 
-Resolver la proyección convexa canónica o, si se configura, el \texttt{fallback} determinista.
+Si una restricción hard queda violada materialmente:
+    status = fail_postcheck
 
-\subsection{Paso 5. Conversión a acciones continuas}
+Si la violación proviene de imposibilidad operativa real documentada:
+    status = partial
 
-Traducir \(\mathbf{w}^{\mathrm{exe,cont}}\) a \(\mathbf{s}^{\mathrm{exe,cont}}\) y a órdenes continuas ideales.
+17. Taxonomía obligatoria de skip_reason
 
-\subsection{Paso 6. Redondeo por lotes}
+El módulo debe usar vocabulario controlado:
 
-Aplicar \texttt{toward\_zero\_to\_lot} por defecto.
+- below_threshold
+- budget_exhausted
+- blocked_nontradable
+- lot_round_to_zero
+- liquidity_cap
+- cash_insufficient
+- hard_constraint_repair
+- fully_executed
+- partially_executed
 
-\subsection{Paso 7. Repair loop}
+No se permiten razones libres no normalizadas en la salida principal.
 
-Reducir drift residual mediante ajustes discretos factibles de un lote.
+18. Métricas before/after obligatorias
 
-\subsection{Paso 8. Postcheck}
+El reporte agregado debe incluir al menos:
 
-Validar constraints hard, turnover final, coherencia contable y tolerancia de efectivo.
+- turnover_ideal
+- turnover_executed
+- budget_usage
+- num_orders
+- num_skipped
+- num_mandatory_blocked
+- cash_residual
+- l1_drift_to_target
+- l1_drift_to_cont
+- gross_before / after
+- net_before / after
+- max_name_drift
 
-\subsection{Paso 9. Persistencia}
-
-Guardar órdenes, portafolio estimado post-trade y reporte agregado.
-
-\section{Campos obligatorios del archivo de órdenes}
-
-Cada orden persistida debe contener como mínimo:
-
-\begin{center}
-\begin{tabular}{>{\ttfamily}m{4.4cm} m{8.8cm}}
-\toprule
-\textnormal{Campo} & \textnormal{Descripción} \\
-\midrule
-date & Fecha de rebalanceo \\
-asset\_id & Identificador del activo \\
-side & buy / sell / cover / short \\
-shares\_order & Acciones ordenadas \\
-price\_ref & Precio de referencia \\
-notional\_order & Notional estimado \\
-w\_current & Peso actual \\
-w\_target & Peso objetivo upstream \\
-w\_exe\_cont & Peso ejecutable continuo \\
-w\_post\_est & Peso estimado post-orden \\
-order\_class & mandatory / discretionary / blocked \\
-priority\_score & Prioridad usada si aplica \\
-skip\_reason & Razón de omisión o truncado \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\section{Taxonomía obligatoria de \texttt{skip\_reason}}
-
-Para evitar ambigüedad operativa, el módulo debe usar un vocabulario controlado:
-
-\begin{itemize}
-    \item \texttt{below\_threshold}
-    \item \texttt{budget\_exhausted}
-    \item \texttt{blocked\_nontradable}
-    \item \texttt{lot\_round\_to\_zero}
-    \item \texttt{liquidity\_cap}
-    \item \texttt{cash\_insufficient}
-    \item \texttt{hard\_constraint\_repair}
-    \item \texttt{fully\_executed}
-    \item \texttt{partially\_executed}
-\end{itemize}
-
-\section{Métricas before/after obligatorias}
-
-El reporte agregado debe incluir como mínimo:
-
-\begin{center}
-\begin{tabular}{>{\ttfamily}m{5.0cm} m{8.2cm}}
-\toprule
-\textnormal{Métrica} & \textnormal{Descripción} \\
-\midrule
-turnover\_ideal & Turnover del target ideal \\
-turnover\_executed & Turnover de las órdenes finales \\
-budget\_usage & Fracción del budget consumida \\
-num\_orders & Número de órdenes generadas \\
-num\_skipped & Número de órdenes omitidas \\
-num\_mandatory\_blocked & Órdenes obligatorias no ejecutables \\
-cash\_residual & Efectivo residual estimado \\
-l1\_drift\_to\_target & Distancia final al target original \\
-l1\_drift\_to\_cont & Distancia final al target ejecutable continuo \\
-gross\_before / after & Exposición gross \\
-net\_before / after & Exposición net \\
-max\_name\_drift & Máximo drift por nombre \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\section{Invariantes del módulo}
+19. Invariantes del módulo
 
 Toda salida válida debe cumplir:
 
-\begin{enumerate}
-    \item las órdenes respetan la convención contable entre pesos, acciones y notional;
-    \item ninguna orden discrecional supera el presupuesto total;
-    \item ninguna orden obligatoria es eliminada por threshold salvo imposibilidad operativa real;
-    \item el portafolio post-órdenes es el resultado estimado de aplicar exactamente las órdenes persistidas;
-    \item cualquier desviación material respecto al target queda cuantificada y explicada.
-\end{enumerate}
+1. las órdenes respetan coherencia contable entre pesos, acciones y notional;
+2. ninguna orden discrecional supera el presupuesto total;
+3. ninguna orden obligatoria se elimina por threshold salvo bloqueo real;
+4. el portafolio posttrade es exactamente el que resulta de aplicar las órdenes persistidas;
+5. cualquier desviación material respecto a w_tgt o w_exe_cont queda cuantificada y explicada.
 
-\section{Parámetros por defecto}
+20. Estado final
 
-Hasta una calibración más fina, los defaults deben ser conservadores y explícitos:
+La semántica recomendada es:
 
-\begin{center}
-\begin{tabular}{m{7.3cm} m{5.0cm}}
-\toprule
-\textnormal{Parámetro} & \textnormal{Default} \\
-\midrule
-\texttt{budget\_selection\_policy} & \texttt{continuous\_projection} \\
-\texttt{rounding\_policy} & \texttt{toward\_zero\_to\_lot} \\
-\texttt{repair\_policy} & \texttt{greedy\_one\_lot} \\
-\texttt{mandatory\_exit\_policy} & \texttt{always\_attempt} \\
-\texttt{posttrade\_tolerance} & \(10^{-8}\) a \(10^{-6}\) en pesos \\
-\texttt{weight\_threshold} & configuración externa, nunca hardcodeada \\
-\texttt{turnover\_budget} & configuración externa, nunca hardcodeada \\
-\bottomrule
-\end{tabular}
-\end{center}
+- ok:
+  ejecución coherente y postcheck limpio
 
-\section{Tests mínimos obligatorios}
+- partial:
+  algunas órdenes no pudieron ejecutarse plenamente por restricciones reales, pero la salida sigue siendo usable y auditada
 
-\subsection*{1. Test de identidad}
-Si
-\[
-\mathbf{w}^{\mathrm{cur}} = \mathbf{w}^{\mathrm{tgt}},
-\]
-el módulo no debe generar órdenes salvo correcciones obligatorias externas.
+- blocked:
+  la mayor parte de la implementación queda impedida por no negociabilidad o bloqueos dominantes
 
-\subsection*{2. Test de threshold}
-Una orden discrecional por debajo de \(\theta_w\) y \(n_{\min}\) debe quedar congelada con
-\texttt{skip\_reason = below\_threshold}.
+- fail_postcheck:
+  la salida final rompe restricciones hard por encima de tolerancia
 
-\subsection*{3. Test de orden obligatoria}
-Una orden de cierre obligatoria no debe eliminarse por threshold ni por lote mínimo, salvo bloqueo operativo real.
+21. Tests mínimos obligatorios
 
-\subsection*{4. Test de presupuesto}
-El turnover ejecutado debe satisfacer:
-\[
-TO^{\mathrm{exec}} \leq B_{TO} + \varepsilon.
-\]
+21.1 Test identidad
+Si w_cur = w_tgt y no hay mandatory externos:
+    no debe generarse orden discrecional
 
-\subsection*{5. Test de rounding}
-Tras aplicar lotes, las acciones resultantes deben ser múltiplos válidos de \(l_i\).
+21.2 Test threshold
+Una orden discrecional por debajo de theta_w y n_min:
+    skip_reason = below_threshold
 
-\subsection*{6. Test de repair loop}
-La reparación no puede aumentar el drift residual si no reduce alguna métrica objetivo o si rompe una constraint hard.
+21.3 Test mandatory
+Una orden mandatory no debe desaparecer por threshold
 
-\subsection*{7. Test de coherencia contable}
-Para cada orden:
-\[
-|\,p_i \cdot \Delta s_i^{\mathrm{lot}} - NAV \cdot \Delta w_i^{\mathrm{est}}\,|
-\]
-debe ser pequeño dentro de tolerancia de discretización.
+21.4 Test budget
+    TO_exec <= B_TO + eps
 
-\subsection*{8. Test de postcheck}
-El portafolio final estimado debe respetar los límites hard heredados o marcar estado \texttt{partial}/\texttt{fail\_postcheck}.
+21.5 Test rounding
+Todas las órdenes deben ser múltiplos válidos de lot_size
 
-\section{Integración con el resto del pipeline}
+21.6 Test repair
+El repair loop no puede aumentar drift si rompe budget o constraints
 
-La posición correcta del módulo es:
+21.7 Test contable
+Para cada activo:
+    |p_i * Delta s_i - NAV * Delta w_i_est| <= tol_disc razonable
 
-\[
-\texttt{signal}
-\rightarrow
-\texttt{optimizer / constraints}
-\rightarrow
-\texttt{rebalance}
-\rightarrow
-\texttt{execution}
-\]
+21.8 Test postcheck
+La cartera final debe respetar constraints heredadas o marcar fail_postcheck/partial
 
-El módulo recibe un target ya validado y devuelve órdenes operativas. El simulador de ejecución posterior podrá introducir fills parciales, slippage real o retrasos, pero \texttt{rebalance.py} debe definir el \emph{plan inicial de implementación} de forma inequívoca.
+22. Integración correcta en el pipeline
 
-\section{Resumen ejecutivo}
+Ubicación semántica natural:
 
-La versión correcta de \texttt{portfolio/rebalance.py} no debe ser una colección abierta de ideas sobre thresholds y staggering. Debe ser una especificación operativa cerrada.
+signal
+-> optimizer / constraints / neutralize
+-> rebalance
+-> execution
 
-Su definición final es:
+rebalance.py define el plan inicial de implementación.
+execution.py o el simulador posterior modelarán:
+- fills parciales,
+- slippage real,
+- retrasos,
+- y demás fricciones de mercado.
 
-\begin{enumerate}
-    \item clasificar activos en obligatorios, discrecionales o bloqueados;
-    \item construir el portafolio ejecutable continuo más cercano al target bajo presupuesto;
-    \item traducir ese portafolio a acciones;
-    \item redondear por lotes con una política conservadora;
-    \item reparar discretamente el residuo sin romper constraints;
-    \item persistir órdenes y explicar toda desviación material.
-\end{enumerate}
+23. Fase 2 opcional: LP exacta de rounding+repair
 
-Eso elimina la ambigüedad de priorización bajo budget, hace trazable el efecto del rounding y convierte el rebalanceo en un módulo programable, testeable y compatible con una arquitectura cuantitativa seria.
+Como mejora opcional, puede existir una versión avanzada que resuelva conjuntamente rounding y repair como LP/MILP pequeño bajo budget y cash.
 
-\end{document}
+Pero:
+- no debe ser la semántica base del MVP,
+- ni justificar complejidad excesiva en small caps swing si el gain marginal es pequeño.
+
+24. Interpretación correcta
+
+La lectura correcta de rebalance.py no es:
+“filtramos un target y redondeamos como podamos”.
+
+La lectura correcta es:
+“construimos primero el portafolio continuo ejecutable más cercano al target bajo budget, luego lo discretizamos y finalmente reparamos de forma determinista el residuo sin romper constraints.”
+
+Eso convierte el rebalanceo en una capa:
+- programable,
+- testeable,
+- auditable,
+- y compatible con una arquitectura cuantitativa seria.
+
+25. Conclusión
+
+portfolio/rebalance.py debe ser una especificación cerrada de traducción operativa.
+
+Recibe un target ya validado.
+Clasifica activos por prioridad y ejecutabilidad.
+Construye un target continuo bajo budget.
+Lo convierte a acciones.
+Redondea de forma conservadora.
+Repara el residuo discreto.
+Postchequea constraints hard.
+Y persiste órdenes junto con una explicación completa de toda desviación material.
+
+Ese es exactamente el comportamiento que debe tener una capa seria de rebalanceo en un stack cuantitativo institucional.

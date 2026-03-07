@@ -1,419 +1,441 @@
-\documentclass[12pt,a4paper]{article}
-\usepackage[utf8]{inputenc}
-\usepackage[spanish]{babel}
-\usepackage{amsmath, amssymb, bm, amsthm, mathtools}
-\usepackage{hyperref}
-\usepackage{graphicx}
-\usepackage{booktabs}
-\usepackage{longtable}
-\usepackage{siunitx}
-\usepackage{enumitem}
-
-\DeclareMathOperator{\E}{\mathbb{E}}
-\DeclareMathOperator{\Var}{Var}
-\DeclareMathOperator{\Bias}{Bias}
-\DeclareMathOperator{\Prob}{\mathbb{P}}
-\DeclareMathOperator{\Acc}{Acc}
-\DeclareMathOperator{\Conf}{Conf}
-\DeclareMathOperator{\Softmax}{Softmax}
-\DeclareMathOperator{\Logit}{Logit}
-\DeclareMathOperator{\Brier}{Brier}
-\DeclareMathOperator{\ECE}{ECE}
-\DeclareMathOperator{\MCE}{MCE}
-\DeclareMathOperator{\NLL}{NLL}
-\DeclareMathOperator{\argmin}{arg\,min}
-\DeclareMathOperator{\argmax}{arg\,max}
-
-\title{Calibración de probabilidades en modelos GBDT \\ \texttt{models/gbdt/calibrate.py}}
-\author{}
-\date{}
-
-\begin{document}
-
-\maketitle
-
-\section{Objetivo estratégico del módulo}
-
-El módulo \texttt{models/gbdt/calibrate.py} convierte las salidas crudas de modelos Gradient Boosting Decision Trees (GBDT), típicamente LightGBM o XGBoost, en probabilidades \emph{operacionalmente utilizables}. Su propósito no es mejorar artificialmente el \emph{ranking} del modelo base, sino corregir la relación entre score y frecuencia empírica del evento para que una probabilidad predicha de, por ejemplo, \(0.70\), signifique aproximadamente que el evento ocurre un \(70\%\) de las veces en datos fuera de muestra comparables.
-
-En un stack cuantitativo serio, esta distinción es central. Un modelo puede discriminar bien entre activos ``mejores'' y ``peores'' y, sin embargo, estar mal calibrado. Esa situación puede ser tolerable si el score solo se usa para ordenar nombres, pero resulta deficiente cuando el output alimenta:
-\begin{itemize}[leftmargin=2em]
-    \item reglas de \textbf{thresholding} de entrada o exclusión,
-    \item \textbf{position sizing} dependiente de convicción,
-    \item \textbf{risk overlays} basados en probabilidad estimada,
-    \item combinación con otros modelos dentro de un \textbf{ensemble probabilístico},
-    \item o monitorización de deriva entre score y realización empírica.
-\end{itemize}
-
-Por tanto, el calibrador se trata como una capa formal del sistema de inferencia, no como una posdata cosmética. El modelo base aprende una función de scoring \(f\), mientras que este módulo aprende una transformación monotónica o cuasi-monotónica \(g\) tal que la probabilidad final
-\[
-\hat{p}_i = g(s_i), \qquad s_i = f(x_i),
-\]
-sea estadísticamente interpretable y estable en producción.
-
-\section{Definición formal del problema}
-
-Sea un conjunto de observaciones indexado por \(i\), con variables predictoras \(x_i \in \mathcal{X}\), etiqueta binaria \(y_i \in \{0,1\}\) y score bruto del modelo base \(s_i \in \mathbb{R}\). El objetivo es construir un calibrador
-\[
-g: \mathbb{R} \rightarrow [0,1]
-\]
-tal que, idealmente,
-\begin{equation}
-\Prob(y=1 \mid g(s)=p) = p.
-\label{eq:perfect_calibration}
-\end{equation}
-
-En la práctica, esta condición se interpreta de forma agregada: para subconjuntos de observaciones con probabilidad predicha similar, la frecuencia empírica del evento debe aproximarse a la confianza media del modelo. Equivalentemente, si \(B\) es un subconjunto de ejemplos definidos por un rango de scores o probabilidades, se desea que
-\begin{equation}
-\E[y \mid i \in B] \approx \E[\hat{p} \mid i \in B].
-\label{eq:group_calibration}
-\end{equation}
-
-La tarea del módulo no consiste en reentrenar el GBDT, sino en resolver un problema unidimensional o de muy baja dimensión sobre predicciones ya generadas fuera de muestra. Esa separación es esencial para mantener limpieza metodológica, trazabilidad y capacidad de auditoría.
-
-\section{Filosofía cuantitativa de diseño}
-
-Este módulo se apoya en cinco principios no negociables:
-
-\begin{enumerate}[leftmargin=2em]
-    \item \textbf{La calibración se entrena solo sobre predicciones genuinamente fuera de muestra.} Nunca se calibra sobre el mismo bloque usado para ajustar el GBDT.
-    
-    \item \textbf{La cronología manda.} En presencia de estructura temporal, el calibrador debe respetar el orden causal de la información y no incorporar observaciones futuras respecto al periodo de inferencia.
-    
-    \item \textbf{La calibración no debe ``comprar'' mejora de una métrica a costa de destruir otra sin justificación económica.} Reducir ECE empeorando fuertemente NLL, Brier o estabilidad de ranking no se considera éxito.
-    
-    \item \textbf{La complejidad del calibrador debe ser proporcional al tamaño y estabilidad del conjunto de calibración.} Métodos muy flexibles con poca muestra producen sobreajuste de segundo orden.
-    
-    \item \textbf{La salida del módulo debe ser reutilizable, versionada y auditable.} El calibrador persistido pasa a formar parte del artefacto final de inferencia.
-\end{enumerate}
-
-\section{Inputs y outputs contractuales}
-
-\subsection{Entradas}
-
-El módulo recibe como entradas mínimas:
-
-\begin{itemize}[leftmargin=2em]
-    \item \texttt{oof\_predictions.parquet}: predicciones fuera de muestra del modelo base, una fila por observación.
-    \item \texttt{y\_true.parquet} o equivalente: etiquetas verdaderas alineadas por clave temporal e identificador.
-    \item \texttt{calibration.yaml}: configuración del método, hiperparámetros, reglas de validación y política de persistencia.
-    \item Metadatos opcionales: \texttt{timestamp}, \texttt{asset\_id}, \texttt{fold\_id}, \texttt{model\_type}, \texttt{objective}, \texttt{run\_id}.
-\end{itemize}
-
-\subsection{Salidas}
-
-El módulo produce:
-
-\begin{itemize}[leftmargin=2em]
-    \item \texttt{calibrator.pkl} o artefacto serializado equivalente.
-    \item \texttt{calibrated\_predictions.parquet} con probabilidades calibradas alineadas fila a fila.
-    \item \texttt{calibration\_summary.json} con métricas antes/después, decisión tomada y metadatos del ajuste.
-    \item \texttt{manifest.json} con huellas de integridad, conteos, rutas y versión de configuración.
-    \item Opcionalmente, gráficos de diagnóstico: reliability diagram, histograma de scores, drift entre score bruto y score calibrado, y curva de densidad por clase.
-\end{itemize}
+Especificación Cuantitativa: models/gbdt/calibrate.py
 
-\section{Métodos de calibración soportados}
+1. Propósito del módulo
 
-El módulo soporta tres familias de calibradores. La elección entre ellas no es estética; responde al sesgo-varianza del problema de calibración.
-
-\subsection{Platt scaling}
-
-Dado un score escalar \(s_i\), Platt scaling ajusta una transformación logística:
-\begin{equation}
-\hat{p}_i = \sigma(A s_i + B) = \frac{1}{1+\exp(-(A s_i + B))},
-\end{equation}
-donde \((A,B)\) se obtienen resolviendo
-\begin{equation}
-(A^\star,B^\star) =
-\argmin_{A,B}
-\sum_{i \in \mathcal{C}}
-\left[
--y_i \log \sigma(A s_i + B)
--(1-y_i)\log(1-\sigma(A s_i + B))
-\right],
-\end{equation}
-siendo \(\mathcal{C}\) el conjunto de calibración.
-
-Este método es adecuado cuando:
-\begin{itemize}[leftmargin=2em]
-    \item el score base ya ordena razonablemente bien,
-    \item la distorsión principal es una compresión o expansión sigmoidea,
-    \item el tamaño de muestra de calibración es moderado,
-    \item y se desea un calibrador parsimonioso, estable y fácilmente monitorizable.
-\end{itemize}
+El objetivo de models/gbdt/calibrate.py es transformar los scores crudos producidos por un modelo GBDT en probabilidades utilizables, comparables y auditables.
 
-En términos de gobernanza cuantitativa, Platt scaling es el \emph{default} preferido cuando no existe evidencia suficiente para justificar un método más flexible.
-
-\subsection{Isotonic regression}
+La función correcta del módulo no es “mejorar el ranking” del modelo base, sino corregir la relación entre score y frecuencia empírica del evento para que una probabilidad predicha tenga interpretación estadística razonable fuera de muestra.
 
-La regresión isotónica aprende una función no decreciente \(g\) resolviendo:
-\begin{equation}
-g^\star
-=
-\argmin_{g \in \mathcal{G}_{\uparrow}}
-\sum_{i \in \mathcal{C}} (y_i - g(s_i))^2,
-\end{equation}
-donde \(\mathcal{G}_{\uparrow}\) es el conjunto de funciones monótonas no decrecientes.
+La pregunta exacta que debe responder el módulo es:
 
-La solución resultante es una función por tramos, típicamente escalonada, capaz de capturar desviaciones de calibración más complejas que una simple sigmoide. Su ventaja es la flexibilidad; su coste es el riesgo de sobreajuste cuando el conjunto de calibración es pequeño, ruidoso o inestable entre regímenes.
+“Dado un score crudo s = f(x), qué transformación g(s) produce probabilidades p̂ coherentes con la frecuencia empírica observada en datos temporalmente limpios?”
 
-En este sistema, isotonic regression solo es aceptable cuando:
-\begin{itemize}[leftmargin=2em]
-    \item el tamaño efectivo de la muestra de calibración es suficientemente grande,
-    \item la curva de reliability del modelo base muestra una no linealidad clara y persistente,
-    \item y la mejora se verifica en bloques temporales independientes, no solo en el conjunto donde se ajustó.
-\end{itemize}
+2. Principios no negociables
 
-\subsection{Temperature scaling}
+2.1 El calibrador no reentrena el modelo base
+El modelo base produce scores.
+Este módulo aprende una transformación posterior:
+    p̂ = g(s)
 
-Cuando el modelo base entrega logits o scores comparables a logits, se permite una transformación por temperatura:
-\begin{equation}
-\hat{p}_i = \sigma\left(\frac{s_i}{T}\right), \qquad T > 0,
-\end{equation}
-o en el caso multiclase,
-\begin{equation}
-\hat{p}_i^{(k)} =
-\frac{\exp(z_i^{(k)}/T)}{\sum_{j=1}^{C}\exp(z_i^{(j)}/T)}.
-\end{equation}
+2.2 No leakage
+Nunca se calibra sobre predicciones in-sample.
 
-El parámetro \(T\) se estima resolviendo
-\begin{equation}
-T^\star = \argmin_{T>0} \sum_{i\in \mathcal{C}} \ell(y_i,\hat{p}_i(T)),
-\end{equation}
-con \(\ell\) típicamente igual a cross-entropy.
+2.3 Cronología primero
+En presencia de estructura temporal, la calibración debe respetar el orden causal de la información.
 
-Temperature scaling es extremadamente ligero y suele preservar mejor el ranking que métodos más flexibles. No obstante, solo corrige un tipo específico de distorsión: la escala global del score. Por ello, es apropiado cuando la miscalibración parece esencialmente de ``sobreconfianza'' o ``infra-confianza'' homogénea, pero no cuando la curva empírica requiere una forma local más rica.
+2.4 Parsimonia por defecto
+La flexibilidad adicional debe ganarse empíricamente.
+No se concede por defecto.
 
-\section{Regla oficial de selección del calibrador}
+2.5 La calibración no puede comprar una mejora cosmética a costa de romper otras propiedades
+Reducir ECE empeorando fuertemente NLL, Brier o estabilidad del score no se considera éxito.
 
-La carpeta necesita una doctrina explícita de decisión; por tanto, este módulo adopta la siguiente jerarquía:
+2.6 Auditabilidad total
+La salida debe incluir:
+- método activo,
+- muestra usada,
+- métricas antes/después,
+- decisión final,
+- y artefacto serializado reproducible.
 
-\begin{enumerate}[leftmargin=2em]
-    \item \textbf{Platt scaling} es el método por defecto.
-    \item \textbf{Temperature scaling} se usa cuando el modelo base expone logits o scores con interpretación natural de escala y se quiere máxima parsimonia.
-    \item \textbf{Isotonic regression} solo se promueve a método activo si demuestra mejora robusta y repetible en bloques temporales independientes sin deterioro material de NLL/Brier ni inestabilidad manifiesta de la curva calibrada.
-\end{enumerate}
+3. Qué hace y qué no hace
 
-En otras palabras: la flexibilidad adicional debe ganarse empíricamente. No se concede por defecto.
+3.1 Qué hace
+- recibe scores OOF o scores de un bloque cronológicamente válido;
+- ajusta uno o varios calibradores candidatos;
+- evalúa calibración probabilística;
+- selecciona método activo o decide no calibrar;
+- persiste calibrador y predicciones calibradas.
 
-\section{Construcción correcta del conjunto de calibración}
+3.2 Qué no hace
+- no reentrena el GBDT;
+- no usa datos futuros para calibrar;
+- no sustituye a inferencia o ensemble;
+- no convierte automáticamente todo score en “mejor modelo”.
 
-La validez del módulo depende más de cómo se construye el conjunto de calibración que del algoritmo elegido. El ajuste del calibrador debe realizarse sobre una de estas dos fuentes, en orden de preferencia:
+4. Formulación matemática
 
-\subsection{OOF estricto}
+Sea:
+- x_i: features
+- y_i in {0,1}: etiqueta
+- s_i = f(x_i): score crudo del modelo base
 
-La opción estándar es utilizar predicciones \emph{out-of-fold} generadas por un esquema temporalmente limpio del modelo base. Cada observación del conjunto de calibración debe estar predicha por un modelo que no la vio durante entrenamiento. Este caso permite maximizar tamaño muestral sin contaminar la calibración.
+El calibrador aprende una función:
+    g: R -> [0,1]
 
-\subsection{Bloque de validación cronológico separado}
+y produce:
+    p̂_i = g(s_i)
 
-Cuando existe un bloque de validación posterior al entrenamiento y anterior al test, el calibrador puede ajustarse en dicho bloque, siempre que permanezca estrictamente anterior al periodo donde se evaluará o desplegará el modelo calibrado.
+La condición ideal de calibración perfecta es:
 
-\subsection{Prohibiciones explícitas}
+    P(y=1 | g(s)=p) = p
 
-Se consideran metodológicamente inválidas las siguientes prácticas:
-\begin{itemize}[leftmargin=2em]
-    \item calibrar sobre predicciones in-sample,
-    \item mezclar entrenamiento y calibración sin separación clara,
-    \item usar información del test final para elegir calibrador o hiperparámetros,
-    \item recalibrar con datos futuros respecto al bloque donde se mide performance.
-\end{itemize}
+En práctica, se usa una versión agregada por grupos o bins:
+    E[y | i in B] ≈ E[p̂ | i in B]
 
-\section{Métricas de evaluación}
+5. Rol dentro del stack
 
-La evaluación debe capturar no solo calibración media, sino coste probabilístico y estabilidad.
+Este módulo vive después de:
+- entrenamiento del GBDT
+- generación de scores OOF o bloque de validación limpio
 
-\subsection{Expected Calibration Error}
+Y antes de:
+- signal gating
+- thresholding
+- conviction sizing
+- ensemble probabilístico
+- monitorización de drift probabilístico
 
-Dados \(M\) bins \(\{B_m\}_{m=1}^{M}\) sobre el intervalo \([0,1]\), definimos
-\begin{align}
-\Acc(B_m) &= \frac{1}{|B_m|}\sum_{i\in B_m} y_i,\\
-\Conf(B_m) &= \frac{1}{|B_m|}\sum_{i\in B_m} \hat{p}_i.
-\end{align}
-Entonces,
-\begin{equation}
-\ECE = \sum_{m=1}^{M}\frac{|B_m|}{n}\left|\Acc(B_m)-\Conf(B_m)\right|.
-\end{equation}
+6. Entradas contractuales
 
-La ECE resume desalineación media entre confianza y frecuencia observada. Es útil, pero no suficiente por sí sola, porque depende del binning y puede ocultar errores locales.
+6.1 Entradas mínimas
+- predictions_oof.parquet o equivalente
+- labels.parquet
+- config de calibración
 
-\subsection{Maximum Calibration Error}
+6.2 Campos recomendados
+- timestamp
+- asset_id
+- fold_id
+- model_id
+- run_id
+- score_type
 
-Como medida complementaria:
-\begin{equation}
-\MCE = \max_{1\le m\le M}\left|\Acc(B_m)-\Conf(B_m)\right|.
-\end{equation}
-Esta métrica penaliza los peores tramos de descalibración, relevantes cuando ciertas regiones de score se usan para decisiones de alto impacto.
+6.3 Requisito crítico
+La unión entre scores y labels debe ser uno a uno y auditada.
 
-\subsection{Brier score}
+7. Salidas contractuales
 
-\begin{equation}
-\Brier(y,\hat{p}) = \frac{1}{n}\sum_{i=1}^{n}(y_i-\hat{p}_i)^2.
-\end{equation}
+El módulo debe producir al menos:
 
-El Brier score mezcla calibración y refinamiento. Es especialmente útil porque castiga probabilidades extremas erróneas sin la explosividad de la logloss.
+- calibrator.pkl
+- calibrated_predictions.parquet
+- calibration_summary.json
+- manifest.json
 
-\subsection{Negative log-likelihood}
+Opcionalmente:
+- reliability diagram
+- histogramas de score/probabilidad
+- tablas por bin
+- estabilidad temporal por subperiodos
 
-\begin{equation}
-\NLL(y,\hat{p}) = \frac{1}{n}\sum_{i=1}^{n}\left[-y_i\log \hat{p}_i -(1-y_i)\log(1-\hat{p}_i)\right].
-\end{equation}
+8. Métodos soportados
 
-Esta es la métrica probabilística más exigente para eventos binarios. Si un calibrador empeora sustancialmente NLL, normalmente está sobreajustando o distorsionando las colas de confianza.
+La versión canónica del módulo debe soportar:
 
-\subsection{Métricas de discriminación}
+8.1 Platt scaling
+    p̂_i = sigma(A s_i + B)
 
-Aunque el calibrador no tiene por objetivo primario mejorar discriminación, el módulo también reporta, al menos de forma diagnóstica:
-\begin{itemize}[leftmargin=2em]
-    \item AUC, si la tarea es clasificación binaria,
-    \item Spearman o IC, si el score se usa de manera ordinal,
-    \item y métricas de ranking internas si el output entra en construcción de cartera.
-\end{itemize}
+con (A,B) estimados por minimización de NLL.
 
-Un calibrador que mejora ECE pero destruye de forma material la capacidad ordinal del score debe ser revisado o rechazado.
+8.2 Isotonic regression
+Función monótona no decreciente g que minimiza error cuadrático o equivalente sobre el conjunto de calibración.
 
-\section{Política de binning y estabilidad de ECE}
-
-Para evitar arbitrariedad, el módulo fija una política explícita:
-\begin{itemize}[leftmargin=2em]
-    \item Por defecto, \(\,M=10\) bins.
-    \item Se prioriza \textbf{equal-frequency binning} frente a equal-width cuando la distribución de scores es muy concentrada.
-    \item Si el tamaño muestral por bin cae por debajo del umbral mínimo configurado, la ECE se marca como inestable y se acompaña de advertencia en el resumen.
-\end{itemize}
+8.3 Temperature scaling
+    p̂_i = sigma(s_i / T)
+o extensión multicategoría si aplica.
 
-Esta decisión es importante: una métrica de calibración solo es útil si su estimación tiene masa suficiente por tramo.
+La implementación puede soportar métodos adicionales, pero no forman parte del contrato base.
 
-\section{Criterio formal de aceptación del calibrador}
+9. Política canónica de selección
 
-Un calibrador no se acepta por el mero hecho de existir. El módulo define reglas explícitas de promoción:
+La regla recomendada es:
 
-\begin{enumerate}[leftmargin=2em]
-    \item Debe mejorar \(\ECE\) de forma no trivial.
-    \item No debe empeorar materialmente \(\NLL\) ni \(\Brier\).
-    \item No debe introducir una degradación relevante en discriminación/ranking si el score se usa para ordenar activos.
-    \item La mejora debe ser estable por bloques temporales o, al menos, no depender enteramente de un único subperiodo.
-    \item La transformación aprendida debe ser razonable desde el punto de vista económico y estadístico; por ejemplo, se rechazan funciones excesivamente escalonadas o concentradas en extremos si eso refleja escasez de muestra.
-\end{enumerate}
+1. Platt scaling como método por defecto
+2. Temperature scaling si el score tiene semántica de logit o escala compatible
+3. Isotonic solo si hay muestra suficiente y mejora robusta
 
-Si estas condiciones no se cumplen, la política por defecto es \textbf{no calibrar} y conservar el score base.
+Interpretación correcta:
+- Platt es el baseline institucional
+- isotonic es una excepción justificada, no un derecho automático
+- temperature es una alternativa ligera cuando la distorsión es principalmente de escala
 
-\section{Tratamiento de cambio de régimen y heterogeneidad}
+10. Construcción correcta del conjunto de calibración
 
-En small caps y, en general, en sistemas cross-sectional financieros, la relación entre score y frecuencia del evento puede cambiar por régimen de volatilidad, liquidez, microestructura o amplitud del universo. Por ello, el módulo reconoce explícitamente que la calibración es potencialmente \emph{no estacionaria}.
+La calibración solo puede entrenarse sobre una de estas fuentes:
 
-Sin embargo, esa observación no autoriza a fragmentar indiscriminadamente la muestra. La calibración por subpoblación o régimen solo se habilita si:
-\begin{itemize}[leftmargin=2em]
-    \item existe suficiente muestra en cada segmento,
-    \item la segmentación responde a una hipótesis económica plausible,
-    \item y la mejora supera el coste adicional de complejidad operativa.
-\end{itemize}
+10.1 OOF estricto
+Cada observación debe venir de un modelo que no la vio en entrenamiento.
 
-En ausencia de evidencia fuerte, el calibrador global domina por robustez.
+10.2 Bloque cronológico separado
+Si existe un bloque de validación posterior al entrenamiento y anterior al test o despliegue.
 
-\section{Implementación operativa en \texttt{calibrate.py}}
+Están prohibidas:
+- predicciones in-sample
+- mezcla entrenamiento + calibración sin separación limpia
+- uso del test final para elegir calibrador
 
-El flujo oficial del módulo es el siguiente:
+11. Métricas obligatorias
 
-\begin{enumerate}[leftmargin=2em]
-    \item \textbf{Carga y validación de entradas.} Se leen predicciones, etiquetas y configuración. Se valida unicidad de claves, alineación de filas, cobertura temporal y ausencia de duplicados.
-    
-    \item \textbf{Determinación del tipo de score.} El módulo identifica si recibe probabilidades, logits o scores arbitrarios y normaliza el camino de calibración correspondiente.
-    
-    \item \textbf{Construcción del conjunto de calibración.} Se filtran exclusivamente filas elegibles según la política temporal definida en configuración.
-    
-    \item \textbf{Ajuste de calibradores candidatos.} Se entrenan uno o varios métodos permitidos por configuración.
-    
-    \item \textbf{Evaluación comparativa.} Se computan \(\ECE\), \(\MCE\), \(\Brier\), \(\NLL\) y métricas de discriminación antes y después.
-    
-    \item \textbf{Selección final.} Se aplica la regla oficial de aceptación; si ningún calibrador supera al baseline bajo las restricciones establecidas, se conserva el score original.
-    
-    \item \textbf{Persistencia de artefactos.} Se serializa el calibrador seleccionado, se guardan predicciones calibradas y se registran métricas, hashes, configuración y \texttt{run\_id}.
-\end{enumerate}
+El módulo debe reportar al menos:
 
-\section{Validaciones obligatorias}
+- ECE
+- MCE
+- Brier score
+- NLL
 
-Antes de marcar el módulo como correcto, deben superarse las siguientes comprobaciones:
+Y, como diagnóstico adicional:
+- AUC o equivalente si la tarea es binaria
+- Spearman / IC si el score se usa ordinalmente
+- correlación score vs calibrated score
+- drift por subperiodos si está habilitado
 
-\subsection{Integridad de datos}
-\begin{itemize}[leftmargin=2em]
-    \item mismo número de filas entre predicciones y etiquetas tras el \textit{join},
-    \item ausencia de duplicados por clave lógica,
-    \item cobertura total o explicación explícita de filas descartadas.
-\end{itemize}
+12. Definiciones métricas base
 
-\subsection{Validez probabilística}
-\begin{itemize}[leftmargin=2em]
-    \item toda salida calibrada debe pertenecer a \([0,1]\),
-    \item no se admiten NaNs ni infinitos,
-    \item en multiclase, las probabilidades deben sumar uno por fila.
-\end{itemize}
+12.1 ECE
+Con bins B_m:
 
-\subsection{Consistencia de orden}
-Para calibradores monótonos, el módulo debe verificar que la transformación no invierte el orden relativo del score salvo tolerancias numéricas o excepciones explícitas del método.
+    ECE = sum_m (|B_m| / n) * |Acc(B_m) - Conf(B_m)|
 
-\subsection{Estabilidad numérica}
-Se aplican \emph{clips} mínimos y máximos, por ejemplo \([\varepsilon,1-\varepsilon]\), antes de computar logloss, para evitar explosiones numéricas por probabilidades exactamente \(0\) o \(1\).
+12.2 MCE
 
-\subsection{Sanidad del calibrador}
-\begin{itemize}[leftmargin=2em]
-    \item isotonic no debe activarse con muestra insuficiente,
-    \item temperature scaling debe producir \(T>0\),
-    \item Platt scaling no debe colapsar en pendientes absurdamente extremas sin que el módulo lo marque.
-\end{itemize}
+    MCE = max_m |Acc(B_m) - Conf(B_m)|
 
-\section{Persistencia, trazabilidad y reproducibilidad}
+12.3 Brier
 
-Todo calibrador aceptado debe ser reproducible. Por ello, el directorio de salida contiene, como mínimo:
-\begin{itemize}[leftmargin=2em]
-    \item configuración exacta usada,
-    \item versión del código o commit hash,
-    \item ruta del modelo base del que procede el score,
-    \item métricas pre y post calibración,
-    \item tamaño de muestra de calibración,
-    \item ventana temporal cubierta,
-    \item método elegido y justificación resumida.
-\end{itemize}
+    Brier = (1/n) sum_i (y_i - p̂_i)^2
 
-Esta trazabilidad no es burocracia; es la condición mínima para poder auditar por qué una probabilidad usada en trading fue la que fue.
+12.4 NLL
 
-\section{Interfaz CLI}
+    NLL = (1/n) sum_i [ -y_i log(p̂_i) - (1-y_i) log(1-p̂_i) ]
 
-La interfaz de línea de comandos sigue la forma:
+13. Política de binning
 
-\begin{verbatim}
-python -m models.gbdt.calibrate ^
-  --oof-predictions-path models/predictions/lgbm/run_latest/oof.parquet ^
-  --y-true-path labels/store/latest.parquet ^
-  --config-path configs/models/calibration.yaml ^
-  --run-id calibrate_20260305_001
-\end{verbatim}
+La versión base debe fijar política explícita.
+Recomendación:
 
-La CLI debe ser determinista dado el mismo input, configuración y semilla. Si el método contiene componentes aleatorias, estas deben exponerse y registrarse explícitamente.
+- n_bins = 10 por defecto
+- equal-frequency binning por defecto
+- fallback a fewer bins si tamaño muestral por bin es insuficiente
 
-\section{Interacción con el resto del sistema}
+Si un bin cae por debajo de `min_bin_size`, la ECE debe marcarse como inestable.
 
-El output calibrado de este módulo puede alimentar varias capas del stack:
-\begin{itemize}[leftmargin=2em]
-    \item \textbf{signal gating}: operar solo cuando \(\hat{p}\) supera cierto umbral,
-    \item \textbf{conviction sizing}: escalar exposición con una función creciente de \(\hat{p}\),
-    \item \textbf{ensemble weighting}: combinar probabilidades calibradas de varios modelos en un meta-modelo,
-    \item \textbf{risk control}: limitar exposición cuando las probabilidades caen en zonas históricamente inestables.
-\end{itemize}
+14. Regla de aceptación del calibrador
 
-Por ello, la calidad del calibrador debe evaluarse no solo en abstracto, sino también por su impacto downstream en las capas que consumen probabilidad.
+El calibrador no se acepta porque “reduce algo el ECE”.
+Debe superar una política explícita.
 
-\section{Definición de Done}
+Regla recomendada:
 
-El módulo se considera terminado únicamente si se cumplen todas las condiciones siguientes:
+Aceptar calibrador C solo si:
 
-\begin{enumerate}[leftmargin=2em]
-    \item existe un artefacto serializado reutilizable en inferencia;
-    \item existe un resumen versionado con métricas antes y después;
-    \item el conjunto de calibración es metodológicamente válido y queda documentado;
-    \item el método activo ha sido seleccionado bajo una regla explícita, no ad hoc;
-    \item las validaciones de integridad, rango, estabilidad y cobertura han pasado;
-    \item el calibrador aceptado demuestra mejora probabilística neta o, en su defecto, el módulo decide explícitamente conservar el modelo sin calibración.
-\end{enumerate}
+1. mejora ECE de forma no trivial
+2. no empeora materialmente NLL
+3. no empeora materialmente Brier
+4. no degrada de forma relevante la capacidad ordinal si el score se usa para ranking
+5. la mejora no depende enteramente de un único subperiodo
 
-En consecuencia, \texttt{calibrate.py} no es simplemente una utilidad para ``suavizar scores''. Es la capa que transforma un score de boosting en una probabilidad defendible, trazable y económicamente interpretable dentro de un sistema cuantitativo de producción.
+Si no se cumple lo anterior:
+- se conserva el score base
+- o se usa identity calibrator
 
-\end{document}
+15. Política de “no calibrar” es válida
+
+Este punto debe quedar claro en el contrato:
+el módulo puede concluir que el mejor calibrador es “ninguno”.
+
+Eso no es fallo.
+Es una decisión válida si:
+- la muestra es pequeña,
+- la mejora es inestable,
+- o el coste en robustez supera el beneficio.
+
+16. Estabilidad temporal
+
+La especificación base debe incluir, al menos, una evaluación descriptiva por bloques temporales.
+
+Ejemplos:
+- train calibrator on OOF global
+- evaluar por año / semestre / terciles temporales
+- comparar ECE, Brier, NLL por subperiodo
+
+La estabilidad temporal es parte de la validación.
+No hace falta imponer CUSUM como contrato base, pero sí hace falta que el módulo detecte si la mejora está concentrada en un solo tramo del histórico.
+
+17. Isotonic: política de uso responsable
+
+Isotonic no debe activarse si:
+- la muestra de calibración es pequeña,
+- el score tiene demasiados empates,
+- la curva resultante es excesivamente escalonada,
+- o la mejora desaparece fuera del bloque donde se ajustó.
+
+La versión base debe exigir:
+- tamaño mínimo de muestra,
+- tamaño mínimo por bin o por tramo efectivo,
+- y mejora robusta frente a Platt.
+
+18. Temperature scaling: política correcta
+
+Temperature scaling tiene sentido cuando:
+- el score es cercano a logit,
+- o se usa una familia de modelos donde la miscalibración parece principalmente de escala
+
+No debe activarse automáticamente sobre cualquier score arbitrario sin justificación de escala.
+
+19. Transformación y ranking
+
+Para métodos monótonos:
+- el orden relativo del score no debe invertirse salvo tolerancias numéricas o ties
+
+Para isotonic:
+- pueden aparecer ties
+- eso debe aceptarse como parte de la semántica del método, no como bug
+
+20. Clips y estabilidad numérica
+
+Antes de computar NLL:
+- clip de probabilidades a [eps, 1-eps]
+
+Regla recomendada:
+- eps configurable, por ejemplo 1e-6 o 1e-8
+
+Además:
+- no se permiten NaN
+- no se permiten infinidades
+- toda salida debe pertenecer a [0,1]
+
+21. Flujo operativo canónico
+
+Paso 1:
+cargar scores, labels y config
+
+Paso 2:
+validar integridad del join y cobertura
+
+Paso 3:
+identificar score_type y elegibilidad temporal
+
+Paso 4:
+construir conjunto de calibración válido
+
+Paso 5:
+ajustar candidatos permitidos por config
+
+Paso 6:
+evaluar métricas antes/después
+
+Paso 7:
+aplicar regla formal de aceptación
+
+Paso 8:
+persistir calibrador activo, predicciones calibradas y resumen
+
+22. Invariantes del módulo
+
+Toda salida válida debe cumplir:
+
+- 0 <= p̂_i <= 1
+- no leakage
+- artefacto serializable
+- mismo número de filas alineadas tras calibración
+- toda decisión final queda registrada
+- si se activa identity/no calibration, debe quedar explícito
+
+23. Tests mínimos obligatorios
+
+23.1 Integridad
+Predicciones y labels deben alinear uno a uno sin duplicados.
+
+23.2 No leakage
+El módulo debe rechazar un conjunto de calibración que incluya filas in-sample si esa información está disponible.
+
+23.3 Rango probabilístico
+Toda probabilidad calibrada debe estar en [0,1].
+
+23.4 Monotonicidad
+Platt y temperature deben preservar orden.
+Isotonic debe ser no decreciente.
+
+23.5 Reproducibilidad
+Mismos inputs + misma config + misma seed => mismo calibrador
+
+23.6 Métricas
+ECE, Brier y NLL deben poder recomputarse desde calibrated_predictions.
+
+24. Campos mínimos de calibrated_predictions.parquet
+
+- timestamp
+- asset_id
+- y_true
+- raw_score
+- raw_prob si existe
+- calibrated_prob
+- calibrator_method
+- calibrator_version
+- fold_id
+- run_id
+
+25. Campos mínimos de calibration_summary.json
+
+- method_selected
+- methods_evaluated
+- n_samples_calibration
+- date_range
+- ece_before
+- ece_after
+- mce_before
+- mce_after
+- brier_before
+- brier_after
+- nll_before
+- nll_after
+- discrimination_before
+- discrimination_after
+- accepted_flag
+- rejection_reason if any
+- config_hash
+
+26. Campos mínimos de manifest.json
+
+- run_id
+- input hashes
+- config hash
+- score_type
+- method_selected
+- calibration_dataset_definition
+- no_leakage_assertion
+- policy_version
+
+27. Qué no debe hacer este módulo
+
+La versión canónica no debe:
+- imponer BBQ o beta calibration como default
+- activar isotonic por moda
+- confundir mejor ECE con mejor modelo
+- usar datos futuros para recalibrar
+- vender una mejora cosmética como mejora económica real
+
+28. Extensiones futuras razonables
+
+Como fase 2 o research:
+- beta calibration / BBQ
+- smoothed isotonic
+- formal drift tests
+- calibration by regime
+- multiclass extensions más avanzadas
+
+Pero ninguna de estas extensiones debe contaminar el contrato mínimo.
+
+29. Interpretación correcta
+
+La lectura correcta de calibrate.py no es:
+“suavizamos los scores del GBDT”.
+
+La lectura correcta es:
+“aprendemos una transformación probabilística post-modelo, temporalmente limpia y auditable, que convierte scores en probabilidades defendibles para las capas downstream del sistema.”
+
+Ese es su rol real.
+
+30. Conclusión
+
+models/gbdt/calibrate.py debe ser una pieza sobria y fuerte de infraestructura ML.
+
+Recibe scores fuera de muestra y etiquetas válidas.
+Ajusta calibradores candidatos.
+Evalúa calibración con métricas apropiadas.
+Acepta uno o ninguno bajo una regla explícita.
+Serializa el artefacto.
+Y deja una traza suficiente para justificar por qué una probabilidad final fue la que fue.
+
+Ese es exactamente el comportamiento que debe tener una capa seria de calibración probabilística en un stack cuantitativo institucional.

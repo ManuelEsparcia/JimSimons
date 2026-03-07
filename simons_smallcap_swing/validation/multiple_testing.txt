@@ -1,353 +1,384 @@
-% Copiar y pegar en LaTeX (guardar como .txt)
-\documentclass{article}
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
-\usepackage[spanish]{babel}
-\usepackage{amsmath,amssymb}
-\usepackage{booktabs}
-\usepackage{hyperref}
-\usepackage{enumitem}
+Especificación Cuantitativa: validation/multiple_testing.py
 
-\title{Especificaci\'on Cuantitativa: validation/multiple\_testing.py}
-\author{JimSimons Small Cap Swing --- Validation Research Note}
-\date{Marzo 2026}
+1. Propósito del módulo
 
-\begin{document}
-\maketitle
+El objetivo de multiple_testing.py no es identificar “los mejores backtests”, sino corregir el sesgo estadístico inevitable que aparece cuando un proceso de research explora muchas hipótesis, muchas variantes paramétricas o muchas combinaciones de reglas sobre un mismo universo de datos.
 
-\section{Prop\'osito del m\'odulo}
+En investigación cuantitativa, observar varios resultados con Sharpe alto o p-values bajos no constituye evidencia suficiente si esos resultados han sido seleccionados entre muchos intentos.
+Cuanto mayor es el espacio de búsqueda, mayor es la probabilidad de que aparezcan resultados extremos por azar.
 
-El objetivo de \texttt{multiple\_testing.py} no es ``encontrar los mejores backtests'', sino
-corregir el sesgo inevitable que aparece cuando una plataforma de research prueba muchas ideas,
-muchas variantes param\'etricas o muchas combinaciones de filtros sobre el mismo universo de datos.
-
-En un entorno de investigaci\'on cuantitativa, observar varios Sharpe altos no constituye evidencia
-fuerte si esos resultados emergen tras cientos o miles de ensayos. Cuanto mayor es el espacio de
-b\'usqueda, mayor es la probabilidad de que algunos resultados extremos aparezcan por azar. Por ello,
-este m\'odulo debe tratar el problema como una cuesti\'on de \textbf{inferencia post-selecci\'on} y
-no como una simple tabla de p-values ajustados.
+Por ello, este módulo debe tratar el problema como inferencia post-selección y no como una simple tabla de p-values ajustados.
 
 Su responsabilidad es triple:
+- controlar el error estadístico derivado de pruebas múltiples;
+- distinguir entre significación individual y selección entre muchos candidatos;
+- impedir que el pipeline promueva estrategias cuya aparente excepcionalidad desaparece una vez corregido el proceso real de búsqueda.
 
-\begin{itemize}[leftmargin=2em]
-    \item controlar el n\'umero esperado de falsos descubrimientos;
-    \item distinguir entre contraste estad\'istico individual y selecci\'on entre muchos candidatos;
-    \item impedir que el pipeline promueva estrategias cuya aparente significaci\'on desaparece una vez
-    corregido el espacio real de experimentaci\'on.
-\end{itemize}
+2. Alcance y no-objetivos
 
-\section{Planteamiento formal}
+2.1 Alcance
+El módulo:
+- recibe un conjunto de experimentos ya ejecutados y ya validados temporalmente;
+- agrupa hipótesis por familias comparables;
+- ajusta p-values para control FWER o FDR;
+- estima el número efectivo de pruebas;
+- calcula una versión operativa del Deflated Sharpe Ratio (DSR);
+- y emite una decisión PASS / WARN / FAIL por familia y por candidato.
 
-Sea una familia de $m$ hip\'otesis
-\[
-\mathcal{H} = \{H_1,\dots,H_m\},
-\]
-donde cada $H_j$ representa una afirmaci\'on del tipo:
-\begin{quote}
-\emph{``la estrategia, se\~nal o configuraci\'on $j$ posee capacidad predictiva o rentabilidad ajustada
-por riesgo distinta de cero bajo el protocolo de validaci\'on definido''.}
-\end{quote}
+2.2 Fuera de alcance
+El módulo no:
+- calcula los p-values brutos desde cero para cualquier estadístico imaginable;
+- no sustituye a leakage_audit, walkforward_bias ni pbo_cscv;
+- no reoptimiza estrategias;
+- no reconstruye retrospectivamente un espacio de búsqueda no registrado;
+- ni debe convertirse en un framework general de inferencia post-selección de frontera.
 
-A cada hip\'otesis se asocia:
-\begin{itemize}[leftmargin=2em]
-    \item un estad\'istico de test $T_j$,
-    \item un p-value bruto $p_j$,
-    \item una m\'etrica de magnitud econ\'omica, por ejemplo $\widehat{SR}_j$,
-    \item metadatos sobre familia experimental, dependencia, horizonte y longitud de muestra.
-\end{itemize}
+3. Prerrequisitos
 
-El problema no es decidir si un $p_j$ aislado es peque\~no, sino si un subconjunto seleccionado
-de resultados sigue siendo interpretable \emph{despu\'es} de corregir por el n\'umero efectivo de pruebas.
+El módulo solo es interpretable si se cumplen, al menos, estas condiciones previas:
 
-\section{Tres niveles de correcci\'on}
+- leakage_audit = PASS o, como mínimo, sin hard failures;
+- splits temporales correctamente purgados y con embargo cuando aplique;
+- p-values brutos calculados mediante un procedimiento razonable para datos financieros;
+- y registro suficientemente fiel del conjunto real de experimentos ejecutados.
 
-\subsection{Nivel I: control de error familiar (FWER)}
+Si el espacio de búsqueda real no está registrado de forma mínimamente creíble, la salida del módulo debe degradarse a WARN o FAIL, aunque algunos candidatos parezcan muy buenos.
 
-Si el objetivo es minimizar dr\'asticamente la probabilidad de un solo falso positivo dentro de
-la familia de tests, debe usarse control de family-wise error rate:
-\[
-\mathrm{FWER} = \mathbb{P}(V \ge 1),
-\]
-donde $V$ es el n\'umero de falsas reyecciones.
+4. Modelo formal
 
-La correcci\'on m\'as simple es Bonferroni:
-\[
-p_j^{\mathrm{Bonf}} = \min(1, m p_j).
-\]
+Sea una familia homogénea de hipótesis:
 
-Bonferroni es v\'alido y transparente, pero a menudo demasiado conservador cuando $m$ es grande
-o cuando las hip\'otesis son dependientes. Por eso, en uso pr\'actico, suele ser preferible Holm:
-\begin{itemize}[leftmargin=2em]
-    \item ordenar $p_{(1)} \le \cdots \le p_{(m)}$;
-    \item rechazar secuencialmente mientras
-    \[
-    p_{(k)} \le \frac{\alpha}{m-k+1}.
-    \]
-\end{itemize}
+H = {H_1, ..., H_m}
 
-\subsection{Nivel II: control de falsos descubrimientos (FDR)}
+Cada hipótesis H_j representa una afirmación del tipo:
+“la estrategia, señal o configuración j posee capacidad predictiva o rentabilidad ajustada por riesgo distinta de cero bajo el protocolo de validación especificado”.
 
-Cuando el sistema de research explora una familia amplia de se\~nales y quiere aceptar que un
-porcentaje peque\~no de hallazgos pueda ser falso, el objeto correcto es:
-\[
-\mathrm{FDR} = \mathbb{E}\left[\frac{V}{\max(R,1)}\right],
-\]
-donde $R$ es el n\'umero total de hip\'otesis rechazadas.
+A cada j se le asocia:
+- un estadístico T_j,
+- un p-value bruto p_j,
+- una métrica económica principal, por ejemplo SR_hat_j,
+- longitud muestral T_j,
+- estimaciones de skewness gamma_3,j y kurtosis gamma_4,j si se usa DSR,
+- metadatos de familia, ciclo de research y dependencia con otras estrategias.
 
-El procedimiento de Benjamini--Hochberg (BH) ordena p-values
-\[
-p_{(1)} \le \cdots \le p_{(m)}
-\]
-y define
-\[
-k^\star = \max\left\{k: p_{(k)} \le \frac{k}{m}q \right\},
-\]
-donde $q$ es la FDR objetivo. Entonces se rechazan
-\[
-H_{(1)},\dots,H_{(k^\star)}.
-\]
+La decisión relevante no es si un p_j aislado es pequeño, sino si el subconjunto seleccionado sigue siendo interpretable después de corregir:
+- el número de pruebas;
+- la dependencia entre pruebas;
+- y el sesgo adicional de haber elegido el mejor Sharpe entre muchas alternativas.
 
-BH controla FDR bajo independencia y bajo ciertas estructuras de dependencia positiva. Si la
-dependencia entre tests es fuerte, jer\'arquica o dif\'icil de caracterizar, el m\'odulo debe
-permitir alternativas m\'as conservadoras, como Benjamini--Yekutieli o procedimientos bootstrap.
+5. Familias de hipótesis
 
-\subsection{Nivel III: ajuste por selecci\'on de Sharpe}
+El ajuste debe hacerse sobre familias homogéneas.
+No debe mezclarse en una misma familia:
+- señales base,
+- filtros de entrada,
+- variantes de cartera,
+- reglas de ejecución,
+- ni objetivos estadísticos distintos,
+si la interpretación económica cambia de forma material.
 
-Incluso despu\'es de corregir p-values, un investigador puede seguir seleccionando el candidato
-con mejor Sharpe, mejor Calmar o mejor retorno neto. Ah\'i aparece un segundo problema:
-\emph{el mejor de muchos estimadores de performance tiende a estar inflado por selecci\'on.}
+Ejemplo de partición razonable:
 
-Por eso, adem\'as de FWER/FDR, el m\'odulo debe auditar la significaci\'on del Sharpe observado
-frente a un benchmark nulo que ya incorpore:
-\begin{itemize}[leftmargin=2em]
-    \item n\'umero efectivo de pruebas,
-    \item longitud de la serie,
-    \item asimetr\'ia y curtosis de los retornos,
-    \item dependencia entre estrategias probadas.
-\end{itemize}
+H =
+H_signals
+union H_filters
+union H_portfolio
+union H_execution
 
-\section{El papel correcto del Deflated Sharpe Ratio}
+Cada familia debe tener:
+- identificador,
+- descripción,
+- criterio de inclusión,
+- método primario de corrección,
+- nivel alpha o q,
+- y política de dependencia.
 
-El Deflated Sharpe Ratio (DSR) no debe implementarse como una divisi\'on ad hoc por el cubo
-ra\'iz del n\'umero de trials. Su funci\'on correcta es estimar la probabilidad de que un Sharpe
-observado exceda un umbral nulo \emph{ajustado por selecci\'on y por no normalidad}.
+6. Nivel I: control de FWER
 
-Sea $\widehat{SR}$ el Sharpe observado, $T$ la longitud de la muestra, $\gamma_3$ la asimetr\'ia,
-$\gamma_4$ la curtosis y $SR_0$ el Sharpe de referencia bajo el benchmark de selecci\'on.
-Entonces el contraste DSR puede expresarse, de forma abstracta, como:
-\[
-\mathrm{DSR} = \Phi\!\left(Z_{\mathrm{DSR}}\right),
-\]
-donde
-\[
-Z_{\mathrm{DSR}}
-=
-\frac{(\widehat{SR} - SR_0)\sqrt{T-1}}
-{\sqrt{1 - \gamma_3 \widehat{SR} + \frac{\gamma_4 - 1}{4}\widehat{SR}^2}}.
-\]
+Si el objetivo operativo es minimizar agresivamente la probabilidad de al menos un falso positivo en la familia, debe usarse control de Family-Wise Error Rate:
 
-La cantidad clave no es solo $\widehat{SR}$, sino la construcci\'on de $SR_0$, que debe reflejar
-el mejor Sharpe esperable por azar en una familia de $N_{\mathrm{eff}}$ pruebas efectivas.
-Aqu\'i $N_{\mathrm{eff}}$ no coincide necesariamente con el n\'umero bruto de backtests, ya que
-muchos experimentos son variantes muy correlacionadas de una misma idea.
+FWER = P(V >= 1)
 
-\subsection{Consecuencia pr\'actica}
+donde V es el número de falsas reyecciones.
 
-Un DSR alto indica que el Sharpe observado sigue siendo extraordinario incluso despu\'es de tener
-en cuenta selecci\'on m\'ultiple y no normalidad. Un DSR bajo indica que el resultado puede ser
-perfectamente compatible con mining de especificaciones.
+6.1 Bonferroni
+p_j_bonf = min(1, m * p_j)
 
-Por tanto:
-\begin{quote}
-\emph{DSR no sustituye al control FDR/FWER; lo complementa desde la perspectiva de performance
-ajustada por selecci\'on.}
-\end{quote}
+Es transparente y robusto, pero a menudo demasiado conservador.
 
-\section{N\'umero efectivo de pruebas}
+6.2 Holm (método FWER por defecto)
+Ordenar:
+p_(1) <= ... <= p_(m)
 
-Uno de los errores m\'as comunes en research es igualar el n\'umero de pruebas al n\'umero de
-backtests almacenados. Eso sobreestima o subestima el sesgo seg\'un la estructura de dependencia.
+y rechazar secuencialmente mientras:
+p_(k) <= alpha / (m - k + 1)
 
-El m\'odulo debe distinguir entre:
-\begin{itemize}[leftmargin=2em]
-    \item \textbf{n\'umero bruto de ensayos}: total de configuraciones ejecutadas;
-    \item \textbf{familias experimentales}: conjuntos de variantes sobre una misma idea base;
-    \item \textbf{n\'umero efectivo de pruebas} $N_{\mathrm{eff}}$: complejidad estad\'istica
-    real del proceso de b\'usqueda.
-\end{itemize}
+Holm debe ser el método FWER por defecto salvo motivo explícito para usar otro.
 
-Una aproximaci\'on razonable consiste en estimar $N_{\mathrm{eff}}$ a partir de la dependencia
-entre estad\'isticos de performance o entre series de retornos, por ejemplo mediante estructura
-de correlaci\'on, clustering o dimensionalidad efectiva. El principio es:
-\[
-1 \le N_{\mathrm{eff}} \le m.
-\]
+7. Nivel II: control de FDR
 
-El m\'odulo no debe asumir impl\'icitamente que cada backtest es independiente.
+Cuando el proceso de research explora una familia amplia y se acepta que una fracción pequeña de descubrimientos pueda ser falsa, el objeto correcto es:
 
-\section{Dise\~no correcto de hip\'otesis}
+FDR = E[V / max(R,1)]
 
-No toda estrategia necesita el mismo test. Antes de ajustar p-values, debe definirse qu\'e
-se est\'a contrastando exactamente. Ejemplos:
+donde R es el número total de hipótesis rechazadas.
 
-\begin{itemize}[leftmargin=2em]
-    \item media de retornos distinta de cero;
-    \item alpha frente a benchmark condicional;
-    \item Sharpe superior a un umbral m\'inimo;
-    \item superioridad respecto a una estrategia base;
-    \item estabilidad OOS por bloques temporales.
-\end{itemize}
+7.1 Benjamini–Hochberg (BH, método FDR por defecto)
+Ordenar:
+p_(1) <= ... <= p_(m)
 
-Si una familia mezcla hip\'otesis econ\'omicamente distintas, el ajuste global pierde interpretaci\'on.
-Por ello, \texttt{multiple\_testing.py} debe agrupar tests homog\'eneos por familia experimental:
-\[
-\mathcal{H}
-=
-\mathcal{H}^{\mathrm{signals}}
-\cup
-\mathcal{H}^{\mathrm{filters}}
-\cup
-\mathcal{H}^{\mathrm{portfolio}}
-\cup
-\mathcal{H}^{\mathrm{execution}}.
-\]
+y definir:
+k* = max { k : p_(k) <= (k/m) * q }
 
-Cada familia puede requerir su propio control FDR o su propia l\'ogica jer\'arquica.
+Rechazar:
+H_(1), ..., H_(k*)
 
-\section{Arquitectura de validaci\'on recomendada}
+BH controla FDR bajo independencia y ciertas formas de dependencia positiva.
 
-El flujo correcto del m\'odulo debe ser:
+7.2 Dependencia fuerte
+Si la familia presenta dependencia compleja o muy fuerte, el módulo debe permitir, como opción avanzada:
+- Benjamini–Yekutieli,
+- o métodos bootstrap/resampling más conservadores.
 
-\begin{enumerate}[leftmargin=2em]
-    \item recolectar todos los experimentos ejecutados dentro del mismo ciclo de research;
-    \item agruparlos por familia homog\'enea de hip\'otesis;
-    \item construir estad\'isticos y p-values coherentes con cada objetivo;
-    \item estimar dependencia y, si procede, $N_{\mathrm{eff}}$;
-    \item aplicar correcci\'on FWER o FDR seg\'un el modo operativo;
-    \item calcular DSR o estad\'istico equivalente sobre los candidatos supervivientes;
-    \item emitir una decisi\'on \texttt{PASS/WARN/FAIL} con justificaci\'on auditable.
-\end{enumerate}
+Pero el MVP no necesita implementarlos por defecto.
 
-\section{Governance: qu\'e significa PASS, WARN y FAIL}
+8. Número efectivo de pruebas
 
-Un esquema serio de gobernanza podr\'ia ser el siguiente:
+Uno de los errores más comunes en research cuant es igualar el número de pruebas al número bruto de backtests almacenados.
+Eso puede ser incorrecto en ambas direcciones:
+- sobrepenaliza si muchas variantes son casi equivalentes;
+- subpenaliza si el proceso real de búsqueda es mucho mayor que el registrado.
 
-\subsection{PASS}
-Se asigna \texttt{PASS} a una estrategia candidata solo si:
-\begin{itemize}[leftmargin=2em]
-    \item pertenece a una familia de hip\'otesis bien definida;
-    \item supera el control estad\'istico elegido ($p_{\mathrm{adj}} \le \alpha$ o equivalente);
-    \item su DSR supera el umbral interno fijado por investigaci\'on;
-    \item el resultado es consistente por subperiodos y no depende de una cola aislada de observaciones.
-\end{itemize}
+El módulo debe distinguir entre:
+- n_tests_raw: número bruto de experimentos registrados;
+- n_tests_family: número de experimentos de la familia;
+- N_eff: número efectivo de pruebas.
 
-\subsection{WARN}
-Se asigna \texttt{WARN} si:
-\begin{itemize}[leftmargin=2em]
-    \item la estrategia pasa BH pero no Holm/Bonferroni;
-    \item el DSR es marginal;
-    \item el n\'umero efectivo de pruebas es incierto;
-    \item la dependencia entre tests hace fr\'agil la interpretaci\'on.
-\end{itemize}
+8.1 Estimación MVP de N_eff
+Sea C la matriz de correlación entre series de retornos de las estrategias de la familia, o alternativamente entre sus vectores de scores/performance coherentes.
 
-\subsection{FAIL}
-Se asigna \texttt{FAIL} si:
-\begin{itemize}[leftmargin=2em]
-    \item no sobrevive ning\'un control por pruebas m\'ultiples;
-    \item el Sharpe ajustado por selecci\'on no es estad\'isticamente excepcional;
-    \item el candidato resulta ser el producto de una b\'usqueda muy amplia sin penalizaci\'on adecuada;
-    \item el experimento no registra cu\'al fue el verdadero espacio de especificaciones evaluado.
-\end{itemize}
+Sea:
+C = Q Lambda Q^T
+con eigenvalues lambda_1, ..., lambda_m
 
-\section{Sobre los umbrales}
+Definir la dimensión efectiva:
 
-No deben presentarse umbrales universales del tipo:
-\[
-p_{\mathrm{adj}} < 0.05,\qquad \mathrm{DSR} > 1.96
-\]
-como si fuesen constantes naturales aplicables a cualquier pipeline.
+N_eff =
+( sum_k lambda_k )^2 / ( sum_k lambda_k^2 )
 
-El m\'odulo debe permitir configurar:
-\begin{itemize}[leftmargin=2em]
-    \item nivel $\alpha$ o $q$ por familia,
-    \item tipo de correcci\'on (Holm, BH, BY, bootstrap, etc.),
-    \item umbral de DSR o probabilidad m\'inima de superioridad,
-    \item requerimientos adicionales de magnitud econ\'omica.
-\end{itemize}
+Invariantes:
+- truncar N_eff al intervalo [1, m]
+- si C es casi identidad, N_eff ≈ m
+- si todas las estrategias son casi idénticas, N_eff ≈ 1
 
-En investigaci\'on cuantitativa, la significaci\'on estad\'istica sin magnitud econ\'omica no es suficiente,
-y la magnitud econ\'omica sin correcci\'on por selecci\'on tampoco.
+Esta será la definición por defecto del MVP.
 
-\section{Casos l\'imite y trampas frecuentes}
+8.2 Interpretación
+N_eff no mide cuántos experimentos se lanzaron, sino cuánta complejidad estadística efectiva tuvo la búsqueda.
+No sustituye al registro del número bruto de ensayos: lo complementa.
 
-El m\'odulo debe protegerse contra varios errores comunes:
+9. Nivel III: ajuste por selección de Sharpe
 
-\begin{enumerate}[leftmargin=2em]
-    \item \textbf{P-hacking por stopping informal.} Repetir pruebas hasta encontrar una que funcione
-    sin registrar las descartadas invalida la familia de hip\'otesis observada.
-    \item \textbf{Hiperpar\'ametros no registrados.} Si el repositorio solo guarda la versi\'on final,
-    se subestima el verdadero n\'umero de pruebas.
-    \item \textbf{Dependencia fuerte entre variantes.} Cientos de grid points sobre el mismo filtro
-    no equivalen a cientos de ideas independientes.
-    \item \textbf{Uso de un mismo OOS para muchas rondas de selecci\'on.} Ese bloque deja de ser
-    verdaderamente fuera de muestra.
-    \item \textbf{M\'ultiples m\'etricas objetivo.} Elegir ex post entre Sharpe, CAGR, Calmar o hit-rate
-    tambi\'en ampl\'ia el espacio de selecci\'on.
-    \item \textbf{Re-etiquetar la familia tras ver los resultados.} La definici\'on de la familia debe ser
-    previa o, como m\'inimo, exhaustivamente auditada.
-\end{enumerate}
+Incluso si un candidato sobrevive a FWER/FDR, sigue existiendo el sesgo de haber escogido el mejor Sharpe entre muchas alternativas.
+Por eso el módulo debe incorporar una capa adicional de control de excepcionalidad económica condicionada a selección.
 
-\section{Invariantes de implementaci\'on}
+9.1 Idea central
+No basta con comparar SR_hat_j contra cero.
+Debe compararse contra un benchmark nulo SR_0 que represente el mejor Sharpe esperable por azar al explorar N_eff pruebas efectivas.
 
-\begin{itemize}[leftmargin=2em]
-    \item ning\'un resultado puede recibir \texttt{PASS} si el experimento no registra la familia de b\'usqueda;
-    \item los p-values deben ajustarse sobre la familia realmente explorada, no sobre una submuestra conveniente;
-    \item DSR no debe implementarse como funci\'on mon\'otona arbitraria del n\'umero de trials;
-    \item el n\'umero efectivo de pruebas debe poder ser distinto del n\'umero bruto de backtests;
-    \item una estrategia no debe promocionarse solo por tener Sharpe alto si no supera el ajuste post-selecci\'on.
-\end{itemize}
+10. Construcción operativa de SR_0
 
-\section{Salida recomendada del m\'odulo}
+10.1 Opción MVP: aproximación analítica
+Bajo nulo, aproximar la distribución de Sharpe estimado mediante una normal centrada cuya escala depende de la longitud muestral y de la no normalidad del retorno.
 
-La salida debe ser estructurada y auditable:
+Sea sigma_SR_hat una escala razonable del estimador del Sharpe bajo nulo.
 
-\begin{verbatim}
+Aproximar la CDF del máximo de N_eff gaussianas por:
+
+F_max(x) ≈ [ Phi(x / sigma_SR_hat) ] ^ N_eff
+
+Escoger SR_0 como el cuantil 1 - alpha_sel de esa distribución:
+
+SR_0 = F_max^{-1}(1 - alpha_sel)
+
+donde alpha_sel es un nivel configurable, por ejemplo 0.05.
+
+10.2 Opción avanzada: bootstrap del máximo bajo nulo
+Re-samplear retornos bajo nulo mediante:
+- permutación,
+- bootstrap bloqueado,
+- o null simulations coherentes con la dependencia temporal.
+
+En cada réplica:
+- recalcular Sharpe de todos los candidatos;
+- tomar el máximo;
+- construir la distribución empírica del máximo;
+- y definir SR_0 como un cuantil alto de esa distribución.
+
+El MVP usará la aproximación analítica.
+La versión bootstrap queda para fase 2.
+
+11. Deflated Sharpe Ratio (DSR)
+
+Para cada estrategia j, calcular:
+
+Z_DSR,j =
+( (SR_hat_j - SR_0) * sqrt(T_j - 1) ) /
+sqrt( 1 - gamma_3,j * SR_hat_j + ((gamma_4,j - 1)/4) * SR_hat_j^2 )
+
+y definir:
+DSR_j = Phi(Z_DSR,j)
+
+Interpretación:
+- DSR alto: el Sharpe observado sigue siendo excepcional tras ajustar selección y no normalidad.
+- DSR bajo: el resultado es compatible con mining o lucky selection.
+
+Invariantes:
+- si T_j es demasiado pequeño, DSR_j debe marcarse como poco fiable;
+- DSR no debe implementarse mediante penalizaciones ad hoc del número bruto de trials;
+- SR_0 debe quedar explícitamente documentado junto con N_eff y el método usado.
+
+12. Estadísticos y p-values por defecto
+
+El módulo no debe aceptar p-values “mágicos” sin trazabilidad.
+Debe exigir o definir explícitamente, por familia, qué se está contrastando.
+
+Ejemplos razonables:
+- H0: media de retornos = 0
+- H0: alpha = 0
+- H0: Sharpe <= S0
+- H0: diferencia frente a benchmark = 0
+
+Para el MVP, el módulo debe requerir que cada experimento aporte:
+- test_statistic
+- p_value_raw
+- method_used
+- sample_length
+- metric_primary
+
+Si method_used es incompatible con datos financieros o no está documentado, elevar severidad.
+
+13. Gobernanza PASS / WARN / FAIL
+
+13.1 PASS
+Un candidato recibe PASS solo si:
+- pertenece a una familia bien definida;
+- el espacio de búsqueda está suficientemente documentado;
+- supera el ajuste primario elegido (FWER o FDR);
+- tiene DSR por encima del umbral interno;
+- y no presenta señales fuertes de selección oportunista no contabilizada.
+
+13.2 WARN
+Un candidato recibe WARN si:
+- pasa BH pero no Holm;
+- DSR es marginal;
+- N_eff es incierto o inestable;
+- la dependencia entre estrategias hace frágil la interpretación;
+- o el registro del espacio de búsqueda parece incompleto pero no totalmente inutilizable.
+
+13.3 FAIL
+Un candidato recibe FAIL si:
+- no sobrevive al ajuste estadístico principal;
+- DSR es bajo incluso con N_eff razonable;
+- falta trazabilidad del conjunto real de ensayos;
+- o la familia está tan mal definida que el ajuste pierde interpretación.
+
+14. Trampas frecuentes
+
+El módulo debe proteger explícitamente contra:
+
+14.1 P-hacking por stopping informal
+Repetir pruebas hasta encontrar una que funcione sin registrar descartes invalida el análisis.
+
+14.2 Hiperparámetros no registrados
+Si solo se guarda la versión final, el número real de pruebas queda subestimado.
+
+14.3 Dependencia extrema entre variantes
+Cientos de grid points sobre la misma idea no equivalen a cientos de hipótesis independientes.
+
+14.4 Reutilización reiterada del mismo OOS
+Un bloque usado muchas veces para seleccionar deja de ser verdaderamente fuera de muestra.
+
+14.5 Múltiples métricas objetivo
+Elegir ex post entre Sharpe, CAGR, Calmar, hit-rate o drawdown amplía el espacio de selección y debe constar como parte del research budget.
+
+14.6 Re-etiquetar la familia después de ver resultados
+La familia experimental no debe redefinirse de forma oportunista ex post.
+
+15. Invariantes de implementación
+
+El módulo debe imponer, al menos, estos invariantes:
+
+- ningún candidato puede recibir PASS si n_tests_raw o la familia real son desconocidos;
+- p-values deben ajustarse sobre la familia realmente explorada, no sobre una submuestra conveniente;
+- N_eff puede ser distinto de n_tests_raw, pero nunca sustituye el registro bruto;
+- DSR no puede calcularse sin exponer N_eff, SR_0 y método;
+- una estrategia con Sharpe alto no se promociona si no sobrevive al ajuste post-selección.
+
+16. Salida del módulo
+
+Formato recomendado:
+
 {
   "family_id": "...",
+  "family_description": "...",
   "n_tests_raw": ...,
+  "n_tests_family": ...,
   "n_tests_effective": ...,
-  "method_primary": "holm|bonferroni|bh|by|bootstrap",
+  "primary_method": "holm|bonferroni|bh|by|bootstrap",
   "alpha_or_q": ...,
+  "dependence_mode": "...",
   "pvals_raw": [...],
   "pvals_adj": [...],
   "rejections": [...],
   "sharpe_raw": [...],
   "dsr": [...],
+  "sr0": ...,
   "selected_candidates": [...],
   "gate": "PASS|WARN|FAIL",
   "binding_reason": "...",
   "notes": [...]
 }
-\end{verbatim}
 
-\section{Esqueleto de implementaci\'on}
+Cada candidato relevante debe incluir:
+- hypothesis_id
+- metric_primary
+- p_value_raw
+- p_value_adj
+- rejected
+- sharpe
+- dsr
+- status
 
-\begin{verbatim}
+17. Esqueleto de implementación
+
 def run_multiple_testing_audit(experiments, config):
     grouped = group_by_hypothesis_family(experiments)
-
     reports = []
+
     for family in grouped:
+        check_prerequisites(family, config)
+
         stats = compute_test_statistics(family, config)
         pvals = compute_raw_pvalues(stats, config)
 
-        n_eff = estimate_effective_number_of_tests(family, stats, config)
+        n_eff = estimate_effective_number_of_tests(
+            family_returns=stats["returns_matrix"],
+            config=config
+        )
 
         p_adj, reject = adjust_pvalues(
-            pvals,
+            pvals=pvals,
             method=config.primary_method,
             alpha=config.alpha,
-            dependence=config.dependence_mode
+            q=config.q,
+            dependence_mode=config.dependence_mode
+        )
+
+        sr0 = estimate_selection_benchmark_sharpe(
+            n_eff=n_eff,
+            stats=stats,
+            config=config
         )
 
         dsr = compute_deflated_sharpe_ratio(
@@ -355,76 +386,79 @@ def run_multiple_testing_audit(experiments, config):
             sample_length=stats["T"],
             skew=stats["skew"],
             kurtosis=stats["kurtosis"],
-            n_eff=n_eff,
+            sr0=sr0,
             config=config
         )
 
         gate, reason = apply_multiple_testing_governance(
+            family=family,
             p_adj=p_adj,
             reject=reject,
             dsr=dsr,
-            family=family,
+            n_eff=n_eff,
             config=config
         )
 
         reports.append({
             "family_id": family.id,
-            "n_tests_raw": len(family),
+            "n_tests_raw": family.n_tests_raw,
+            "n_tests_family": len(family),
             "n_tests_effective": n_eff,
+            "primary_method": config.primary_method,
             "pvals_adj": p_adj,
             "reject": reject,
+            "sr0": sr0,
             "dsr": dsr,
             "gate": gate,
             "binding_reason": reason
         })
 
     return reports
-\end{verbatim}
 
-\section{Interpretaci\'on correcta}
+18. MVP vs versión avanzada
 
-La lectura correcta de este m\'odulo no es:
-\begin{quote}
-``aplicamos BH-FDR y ahora nuestras survivors tienen Sharpe institucional''.
-\end{quote}
+18.1 MVP
+- familias homogéneas obligatorias,
+- Holm y BH implementados,
+- estimación de N_eff por eigenvalues,
+- SR_0 analítico,
+- DSR por candidato,
+- prerequisito explícito de validación temporal correcta,
+- gobernanza PASS / WARN / FAIL.
+
+18.2 Versión avanzada
+- bootstrap de la distribución del máximo Sharpe,
+- métodos más conservadores bajo dependencia fuerte,
+- integración opcional con PBO / CSCV,
+- tracking del budget real de pruebas por ciclo de research,
+- auditoría cruzada con estabilidad temporal de survivors.
+
+19. Interpretación correcta
+
+La lectura correcta del módulo no es:
+“aplicamos BH y ahora nuestros survivors son institucionales”.
 
 La lectura correcta es:
-\begin{quote}
-``una vez contabilizado el espacio real de pruebas y ajustada la inflaci\'on por selecci\'on,
-solo un subconjunto peque\~no de resultados sigue siendo compatible con una se\~nal econ\'omica
-genuina''.
-\end{quote}
+“una vez contabilizado el coste estadístico de haber buscado entre muchas alternativas, solo un subconjunto pequeño de resultados sigue siendo compatible con señal económica genuina”.
 
-Ese lenguaje es menos vistoso, pero es mucho m\'as cercano a una especificaci\'on de research seria.
+Este módulo no certifica rentabilidad futura.
+Solo impide promocionar hallazgos que probablemente son artefactos de selección.
 
-\section{Referencias orientativas}
+20. Referencias orientativas
 
-\begin{thebibliography}{9}
+- Holm (1979)
+- Benjamini y Hochberg (1995)
+- trabajos de Harvey y Liu sobre factor zoo y multiple testing
+- Bailey y López de Prado sobre PSR, DSR y backtest overfitting
+- literatura estándar de large-scale inference para dependencia y FDR
 
-\bibitem{bh}
-Benjamini, Y. y Hochberg, Y. (1995).
-Controlling the false discovery rate: a practical and powerful approach to multiple testing.
+21. Conclusión
 
-\bibitem{holm}
-Holm, S. (1979).
-A simple sequentially rejective multiple test procedure.
+multiple_testing.py debe ser un módulo estadísticamente sobrio, interpretable y auditable.
+No debe presumir de encontrar “ganadores”.
+Debe reconstruir el coste estadístico del proceso de investigación y exigir que cualquier candidato sobreviva:
+- a la corrección por pruebas múltiples,
+- a la dependencia efectiva entre variantes,
+- y al sesgo adicional de haber sido elegido entre muchas.
 
-\bibitem{harveyliu}
-Harvey, C. R. y Liu, Y. (2015 y trabajos posteriores).
-Backtesting, multiple testing y selecci\'on en asset pricing y estrategias cuantitativas.
-
-\bibitem{bailey}
-Bailey, D. H. y L\'opez de Prado, M.
-Trabajos sobre Probabilistic Sharpe Ratio, Deflated Sharpe Ratio y backtest overfitting.
-
-\end{thebibliography}
-
-\section{Conclusi\'on}
-
-Un m\'odulo serio de multiple testing no presume de retornos anuales de los ``survivors'' ni
-vende una tasa de filtrado como si fuese prueba de excelencia. Su tarea es m\'as disciplinada:
-reconstruir el verdadero coste estad\'istico del proceso de investigaci\'on y exigir que cualquier
-estrategia candidata sobreviva no solo al backtest, sino tambi\'en al sesgo introducido por haber
-sido elegida entre muchas alternativas.
-
-\end{document}
+Si no pasa esas tres capas, no hay evidencia suficiente para promoción.

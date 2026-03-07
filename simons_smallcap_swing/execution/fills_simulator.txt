@@ -1,536 +1,548 @@
-\section{Módulo: execution/fills\_simulator.py}
+Especificación Cuantitativa: execution/fills_simulator.py
 
-\subsection{Objetivo y papel económico dentro del stack}
-\label{sec:fills-simulator-objective}
+1. Propósito del módulo
 
-El propósito de \texttt{execution/fills\_simulator.py} es convertir órdenes admitidas por el motor de cartera en una secuencia de \textbf{fills simulados, económica y operacionalmente plausibles}, preservando la distinción entre:
+El objetivo de execution/fills_simulator.py es convertir órdenes admitidas por el stack de cartera en una secuencia de fills económicamente plausibles y operacionalmente auditables.
 
-\begin{itemize}
-    \item \textbf{intención de rebalance},
-    \item \textbf{capacidad admisible},
-    \item \textbf{ejecución efectivamente obtenida},
-    \item \textbf{remanente no ejecutado},
-    \item y \textbf{estado final de la orden}.
-\end{itemize}
+La función real del módulo no es “rellenar órdenes” sin más, sino imponer una capa de realidad entre:
+- orden deseada,
+- orden admitida,
+- intento de ejecución,
+- fill conseguido,
+- remanente pendiente,
+- y estado final de la orden.
 
-En una arquitectura cuantitativa seria, este módulo no es un accesorio cosmético. Es la capa que impide que una estrategia capture P\&L sobre una suposición ficticia del tipo “todo se ejecuta al precio de referencia y en el tamaño deseado”. Su función central es aproximar la fricción de implementación entre la orden teórica y la posición realmente alcanzable, bajo restricciones de liquidez, prioridad, latencia operativa y capacidad diaria.
+La pregunta correcta del módulo es:
 
-Más concretamente, el módulo debe responder, sin ambigüedad, a las siguientes preguntas:
+“Dada una orden admitida y una capacidad diaria finita del símbolo, ¿qué parte puede ejecutarse, en qué fecha, a qué precio y qué ocurre con la parte no ejecutada?”
 
-\begin{enumerate}
-    \item ¿Qué parte de una orden puede ejecutarse en la fecha de intento?
-    \item ¿A qué precio de fill debe imputarse esa ejecución bajo la política seleccionada?
-    \item ¿Qué ocurre con la parte no ejecutada: se cancela, se mantiene pendiente o se arrastra?
-    \item ¿Cómo se resuelven colisiones entre múltiples órdenes que compiten por la misma capacidad?
-    \item ¿Cómo se registra la secuencia de eventos para que \texttt{cost\_model}, \texttt{backtest/engine} y \texttt{validation} puedan reconciliar el run sin huecos?
-\end{enumerate}
+2. Principios no negociables
 
-\subsection{Principio rector}
-\label{sec:fills-simulator-principle}
+2.1 Capacidad compartida real
+La liquidez de un símbolo-fecha es finita y compartida entre todas las órdenes activas sobre ese símbolo en esa fecha.
 
-La filosofía del módulo puede resumirse así:
+2.2 Semántica temporal estricta
+Debe distinguirse siempre entre:
+- order_date
+- attempt_date
+- fill_date
+- completion_date
 
-\begin{quote}
-\textit{una orden no debe ejecutarse por deseo, sino por capacidad observable y reglas explícitas de prioridad, temporización y precio.}
-\end{quote}
+2.3 No regalar liquidez
+Una orden no se ejecuta por deseo, sino por capacidad disponible y reglas explícitas de prioridad.
 
-Esto implica cinco reglas de diseño:
+2.4 Precio con coherencia direccional
+El precio de fill debe deteriorarse en la dirección económica correcta de la orden.
 
-\begin{enumerate}
-    \item Los fills se generan sobre \textbf{órdenes admitidas}, no sobre señales brutas.
-    \item La \textbf{capacidad diaria} debe ser finita y compartida entre órdenes que compiten por el mismo símbolo-fecha.
-    \item El \textbf{precio de fill} debe ser consistente con la política de ejecución y con la dirección de la orden.
-    \item El \textbf{remanente} de una orden debe tener una política de vida explícita: \texttt{carry}, \texttt{expire} o \texttt{cancel}.
-    \item Los eventos de mercado anómalos (\textit{halts}, gaps extremos, falta de datos, rango de precios inconsistente) deben resolverse mediante precedencias formales, nunca mediante heurísticas implícitas.
-\end{enumerate}
+2.5 Remanente explícito
+Toda parte no ejecutada debe tener una política explícita:
+- carry,
+- cancel,
+- expire.
 
-\subsection{Alcance del módulo}
-\label{sec:fills-simulator-scope}
+2.6 Auditabilidad total
+Todo fill, intento fallido, remanente y cierre de orden debe quedar persistido.
 
-\subsubsection{Incluido}
-\begin{itemize}
-    \item Simulación de fills completos y parciales.
-    \item Control de capacidad diaria por símbolo y fecha.
-    \item Reglas explícitas de asignación cuando varias órdenes compiten por capacidad limitada.
-    \item Precio de fill dependiente de modelo de ejecución, dirección y deterioro microestructural.
-    \item Gestión de remanentes, expiración y cancelación.
-    \item Generación de trazas auditables para consumo downstream.
-\end{itemize}
+3. Qué hace y qué no hace
 
-\subsubsection{No incluido}
-\begin{itemize}
-    \item Envío real a broker o exchange.
-    \item Smart order routing multi-venue.
-    \item Modelado intradía tick-by-tick de cola de órdenes.
-    \item Negociación bilateral de liquidez o internalización de flujo.
-\end{itemize}
+3.1 Qué hace
+- toma órdenes admitidas;
+- calcula capacidad diaria por símbolo;
+- resuelve competencia entre órdenes;
+- genera fills completos o parciales;
+- imputa precio de fill coherente con la política;
+- gestiona remanentes y expiración;
+- produce estados finales auditables.
 
-La intención es construir una capa de \textit{virtual execution} suficientemente realista para research de cartera, sin fingir granularidad microestructural que el resto del stack no puede sostener.
+3.2 Qué no hace
+- no decide admisión de órdenes;
+- no negocia con broker;
+- no simula order book completo;
+- no optimiza scheduling intradía;
+- no sustituye a impact_model ni cost_model.
 
-\subsection{Relación con otros módulos}
-\label{sec:fills-simulator-relations}
+4. Relación con el stack
 
-\subsubsection{Inputs upstream}
-\begin{itemize}
-    \item \texttt{portfolio/rebalance}: órdenes teóricas.
-    \item \texttt{execution/borrow\_execution}: órdenes ya ajustadas por restricciones de short cuando aplique.
-    \item \texttt{data/price}: \texttt{open}, \texttt{high}, \texttt{low}, \texttt{close}, \texttt{vwap} o proxies equivalentes.
-    \item \texttt{data/liquidity}: \texttt{ADV}, spread proxy, buckets de liquidez y flags de calidad.
-    \item \texttt{execution/impact\_model}: impacto por orden o por fill si la arquitectura externa así lo define.
-\end{itemize}
+Entradas naturales:
+- rebalance / borrow_execution -> órdenes admitidas
+- data/price -> open, high, low, close, vwap/proxy
+- data/liquidity -> ADV, spread proxy, buckets
+- impact_model -> deterioro de precio si existe externamente
 
-\subsubsection{Outputs downstream}
-\begin{itemize}
-    \item \texttt{execution/cost\_model}: usa \texttt{fills.parquet} como fuente de verdad para coste de ejecución.
-    \item \texttt{backtest/engine}: actualiza posiciones, cash y P\&L realizado.
-    \item \texttt{reports/execution\_quality}: métricas de fill rate, carry, cancelaciones y deterioro de ejecución.
-    \item \texttt{validation}: reconciliación de shares, eventos y consistencia temporal.
-\end{itemize}
+Salidas naturales:
+- cost_model -> usa fills como fuente de verdad
+- backtest engine -> actualiza posiciones y cash
+- validation / reports -> reconciliación y métricas de calidad de ejecución
 
-\subsection{Semántica temporal obligatoria}
-\label{sec:fills-simulator-time-semantics}
+5. Contrato de entrada
 
-Este módulo debe imponer una cronología inequívoca. Para cada orden con fecha de decisión \( t \):
+5.1 Órdenes
+Campos mínimos:
+- date
+- symbol
+- order_id
+- side
+- delta_shares
+- tif
+- priority
+- admitted_flag o equivalente
 
-\begin{enumerate}
-    \item La orden queda registrada en \( t \) como intención admitida.
-    \item La ejecución se intenta en la primera fecha elegible según la política configurada:
-    \begin{itemize}
-        \item \texttt{next\_open},
-        \item \texttt{same\_day\_vwap\_proxy},
-        \item \texttt{next\_day\_vwap\_proxy},
-        \item u otra convención explícita.
-    \end{itemize}
-    \item Si no se ejecuta completamente, el remanente pasa a estado \texttt{pending} o \texttt{cancelled} según TIF y política de carry.
-    \item Cada intento de ejecución consume capacidad del símbolo en esa fecha.
-    \item El resultado económico solo nace en el instante del fill, nunca en la fecha original de decisión si no hubo ejecución.
-\end{enumerate}
+5.2 Market data
+Campos mínimos:
+- date
+- symbol
+- open
+- high
+- low
+- close
+- vwap o proxy
+- adv
+- spread_proxy_bps
+- halt_flag
+- data_quality_flag
+
+5.3 Configuración
+- exec_policy
+- capacity_policy
+- priority_policy
+- carry_unfilled_to_next_day
+- max_carry_days
+- min_fill_lot
+- range_validation_policy
+- price_benchmark_policy
+- fallback_policy
+- policy_version
+
+6. Semántica temporal obligatoria
+
+Para una orden decidida en t:
+
+1. la orden queda registrada como admitida en t
+2. la ejecución se intenta en la primera fecha elegible según exec_policy
+3. si el fill es parcial, el remanente puede pasar a pendiente
+4. cada nuevo intento consume capacidad del símbolo en esa fecha
+5. el resultado económico solo nace en fill_date
 
 Por tanto:
 
-\[
-\text{order date}
-\neq
-\text{attempt date}
-\neq
-\text{fill date}
-\neq
-\text{completion date}.
-\]
+order_date != attempt_date != fill_date != completion_date
 
-Esta separación es obligatoria para que el sistema soporte órdenes multifill y ejecución multiday sin contaminar el P\&L temporal.
+Esto no es opcional.
+Es el corazón semántico del módulo.
 
-\subsection{Contrato de entrada}
-\label{sec:fills-simulator-inputs}
+7. Definiciones formales
 
-\subsubsection{Rutas mínimas}
-\begin{itemize}
-    \item \texttt{orders\_path}
-    \item \texttt{market\_data\_path}
-    \item \texttt{fills\_config\_path}
-    \item \texttt{run\_id}
-\end{itemize}
+Para símbolo i, orden j, fecha de intento t:
 
-\subsubsection{Rutas opcionales}
-\begin{itemize}
-    \item \texttt{impact\_path}
-    \item \texttt{borrow\_adjusted\_orders\_path}
-    \item \texttt{liquidity\_metadata\_path}
-\end{itemize}
+- q_req_jit: tamaño pendiente al inicio del intento
+- ADV_it: volumen medio diario
+- phi_it in (0,1]: fracción máxima participable del ADV
+- Q_daycap_it = phi_it * ADV_it: capacidad total del símbolo en el día
+- Q_alloc_jit: capacidad asignada a la orden j
+- q_fill_jit: tamaño efectivamente ejecutado
+- q_rem_jit = q_req_jit - q_fill_jit: remanente tras el intento
 
-\subsubsection{Campos mínimos de órdenes}
-\begin{itemize}
-    \item \texttt{date}
-    \item \texttt{symbol}
-    \item \texttt{order\_id}
-    \item \texttt{side}
-    \item \texttt{delta\_shares}
-    \item \texttt{tif} (si la arquitectura soporta expiración)
-    \item \texttt{priority} (si la capacidad es compartida)
-\end{itemize}
+La restricción básica del fill es:
 
-\subsubsection{Campos mínimos de market data}
-\begin{itemize}
-    \item \texttt{date}
-    \item \texttt{symbol}
-    \item \texttt{open}
-    \item \texttt{high}
-    \item \texttt{low}
-    \item \texttt{close}
-    \item \texttt{vwap} o proxy equivalente
-    \item \texttt{adv}
-    \item \texttt{spread\_proxy\_bps}
-    \item \texttt{halt\_flag}
-    \item \texttt{data\_quality\_flag}
-\end{itemize}
+0 <= q_fill_jit <= min(q_req_jit, Q_alloc_jit)
 
-\subsubsection{Invariantes de entrada}
-\begin{itemize}
-    \item \texttt{abs(delta\_shares) > 0}.
-    \item \texttt{adv > 0} para todo intento de ejecución estándar.
-    \item \texttt{open, high, low, close > 0} cuando la política de precio los requiera.
-    \item \texttt{low \le open, close, vwap \le high} salvo que se marque inconsistencia de datos.
-    \item Unicidad de \texttt{(order\_id)} en el universo de órdenes de entrada.
-\end{itemize}
+8. Capacidad diaria por símbolo
 
-\subsection{Contrato de salida}
-\label{sec:fills-simulator-outputs}
+La versión canónica debe definir:
 
-El módulo debe generar, por \texttt{run\_id}:
-
-\begin{itemize}
-    \item \texttt{execution/fills/\{run\_id\}/fills.parquet}
-    \item \texttt{execution/fills/\{run\_id\}/order\_states.parquet}
-    \item \texttt{execution/fills/\{run\_id\}/unfilled\_orders.parquet}
-    \item \texttt{execution/fills/\{run\_id\}/fills\_summary.json}
-    \item \texttt{execution/fills/\{run\_id\}/manifest.json}
-\end{itemize}
-
-\subsubsection{Campos mínimos de fills}
-\begin{itemize}
-    \item \texttt{attempt\_date}
-    \item \texttt{fill\_date}
-    \item \texttt{symbol}
-    \item \texttt{order\_id}
-    \item \texttt{fill\_id}
-    \item \texttt{fill\_shares}
-    \item \texttt{fill\_price}
-    \item \texttt{fill\_notional}
-    \item \texttt{fill\_ratio\_vs\_attempted}
-    \item \texttt{remaining\_shares\_after\_fill}
-    \item \texttt{fill\_status}
-    \item \texttt{exec\_model}
-    \item \texttt{capacity\_bucket\_used}
-    \item \texttt{policy\_version}
-\end{itemize}
-
-\subsubsection{Campos mínimos de estados de orden}
-\begin{itemize}
-    \item \texttt{order\_id}
-    \item \texttt{date\_start}
-    \item \texttt{date\_end}
-    \item \texttt{symbol}
-    \item \texttt{requested\_shares}
-    \item \texttt{filled\_shares\_cum}
-    \item \texttt{remaining\_shares}
-    \item \texttt{order\_state} \; (\texttt{full}, \texttt{partial}, \texttt{pending}, \texttt{cancelled}, \texttt{expired}, \texttt{rejected})
-    \item \texttt{close\_reason}
-\end{itemize}
-
-\subsection{Definiciones formales}
-\label{sec:fills-simulator-definitions}
-
-Para una orden \( j \) del símbolo \( i \) en la fecha de intento \( t \):
-
-\begin{itemize}
-    \item \( q_{jit}^{\mathrm{req}} \): tamaño pendiente a ejecutar al inicio del intento.
-    \item \( V_{it}^{\mathrm{ADV}} \): volumen medio diario.
-    \item \( \phi_{it} \in (0,1] \): participación máxima permitida por configuración para ese símbolo-fecha.
-    \item \( Q_{it}^{\mathrm{daycap}} = \phi_{it} V_{it}^{\mathrm{ADV}} \): capacidad total disponible del símbolo en el día.
-    \item \( Q_{jit}^{\mathrm{alloc}} \): capacidad asignada a la orden \( j \) tras resolver competencia entre órdenes.
-    \item \( q_{jit}^{\mathrm{fill}} \): tamaño ejecutado.
-    \item \( q_{jit}^{\mathrm{rem}} = q_{jit}^{\mathrm{req}} - q_{jit}^{\mathrm{fill}} \): remanente tras el intento.
-\end{itemize}
-
-La restricción básica es:
-
-\begin{equation}
-0 \le q_{jit}^{\mathrm{fill}} \le \min\left(q_{jit}^{\mathrm{req}}, Q_{jit}^{\mathrm{alloc}}\right).
-\end{equation}
-
-\subsection{Capacidad diaria y prioridad entre órdenes}
-\label{sec:fills-simulator-capacity-priority}
-
-El error clásico de un simulador simple consiste en aplicar una capacidad máxima a cada orden de forma independiente, permitiendo implícitamente que varias órdenes consuman la misma liquidez del símbolo en el mismo día. Esta especificación prohíbe expresamente ese comportamiento.
-
-Para cada símbolo \( i \) y fecha \( t \), debe existir una capacidad agregada:
-
-\begin{equation}
-Q_{it}^{\mathrm{daycap}} = \phi_{it} V_{it}^{\mathrm{ADV}},
-\end{equation}
-
-que se reparte entre todas las órdenes activas del símbolo en esa fecha.
-
-\subsubsection{Políticas permitidas de asignación}
-\begin{itemize}
-    \item \textbf{FIFO}: primero en llegar, primero en consumir capacidad.
-    \item \textbf{Priority score}: ordenar por \texttt{priority} descendente y luego por \texttt{order\_id}.
-    \item \textbf{Pro-rata}: asignar capacidad proporcional al tamaño solicitado.
-    \item \textbf{Risk-reducing first}: prioridad a órdenes que reducen exposición antes que a las que la aumentan.
-\end{itemize}
-
-\subsubsection{Política por defecto recomendada}
-En ausencia de configuración específica, la política institucionalmente más segura para research es:
-\begin{enumerate}
-    \item ejecutar primero órdenes \textbf{risk-reducing},
-    \item después ordenar por \texttt{priority},
-    \item desempatar por \texttt{order\_id}.
-\end{enumerate}
-
-Esto evita que una orden de aumento de riesgo consuma capacidad que habría debido usarse para cerrar o reducir exposición.
-
-\subsection{Modelo de fill}
-\label{sec:fills-simulator-fill-model}
-
-Dado \( Q_{jit}^{\mathrm{alloc}} \), el fill del intento es:
-
-\begin{equation}
-q_{jit}^{\mathrm{fill}}
-=
-\min\left(q_{jit}^{\mathrm{req}}, Q_{jit}^{\mathrm{alloc}}\right),
-\end{equation}
-
-y el remanente:
-
-\begin{equation}
-q_{jit}^{\mathrm{rem}} = q_{jit}^{\mathrm{req}} - q_{jit}^{\mathrm{fill}}.
-\end{equation}
-
-El estado del intento se define como:
-
-\[
-\texttt{fill\_status} =
-\begin{cases}
-\texttt{none}, & q_{jit}^{\mathrm{fill}} = 0, \\
-\texttt{partial}, & 0 < q_{jit}^{\mathrm{fill}} < q_{jit}^{\mathrm{req}}, \\
-\texttt{full}, & q_{jit}^{\mathrm{fill}} = q_{jit}^{\mathrm{req}}.
-\end{cases}
-\]
-
-\subsection{Precio de fill y coherencia direccional}
-\label{sec:fills-simulator-price}
-
-Sea \( p_{it}^{\mathrm{ref}} \) el benchmark de ejecución elegido por la política configurada, por ejemplo \texttt{next\_open} o \texttt{vwap\_proxy}. El precio de fill debe construirse direccionalmente:
-
-\begin{equation}
-p_{jit}^{\mathrm{fill}}
-=
-p_{it}^{\mathrm{ref}}
-+
-\mathrm{sign}_{j}\cdot \Delta p_{jit}^{\mathrm{exec}},
-\end{equation}
+Q_daycap_it = phi_it * ADV_it
 
 donde:
-\begin{itemize}
-    \item \(\mathrm{sign}_{j}=+1\) para compras,
-    \item \(\mathrm{sign}_{j}=-1\) para ventas,
-    \item \(\Delta p_{jit}^{\mathrm{exec}} \ge 0\) representa el deterioro económico de ejecución.
-\end{itemize}
+- ADV_it > 0
+- phi_it viene de config o bucket de liquidez
+- la capacidad se consume de forma agregada por símbolo-fecha
 
-Una descomposición admisible es:
+Está prohibido tratar la capacidad como si cada orden la tuviera en exclusiva.
 
-\begin{equation}
-\Delta p_{jit}^{\mathrm{exec}}
+9. Políticas de prioridad
+
+El módulo debe soportar explícitamente:
+
+- FIFO
+- priority_score
+- pro_rata
+- risk_reducing_first
+
+La política por defecto recomendada es:
+
+1. risk-reducing first
+2. después priority descendente
+3. desempate por order_id
+
+Razón:
+evita que una orden de aumento de riesgo consuma capacidad que debería haberse usado para reducir exposición.
+
+10. Asignación de capacidad
+
+La política canónica debe ser determinista.
+
+Dado el conjunto de órdenes activas A(i,t) sobre el símbolo i en la fecha t:
+
+1. ordenar A(i,t) según priority_policy
+2. inicializar cap_rem = Q_daycap_it
+3. para cada orden en ese orden:
+   - Q_alloc_jit = min(q_req_jit, cap_rem)
+   - cap_rem <- cap_rem - Q_alloc_jit
+4. continuar hasta agotar órdenes o capacidad
+
+Esta semántica debe ser la base del módulo.
+
+Si se desea una variante pro-rata o estocástica, debe activarse explícitamente como modo alternativo, no contaminar el contrato base.
+
+11. Estado del fill
+
+El estado del intento debe definirse como:
+
+- none:
+  q_fill_jit = 0
+
+- partial:
+  0 < q_fill_jit < q_req_jit
+
+- full:
+  q_fill_jit = q_req_jit
+
+Y debe persistirse siempre.
+
+12. Política de precio de fill
+
+Sea p_ref_it el benchmark de ejecución según config:
+- next_open
+- same_day_vwap_proxy
+- next_day_vwap_proxy
+- close_proxy
+- etc.
+
+El precio de fill debe construirse como:
+
+p_fill_jit = p_ref_it + sign_j * Delta p_exec_jit
+
+donde:
+- sign_j = +1 para compras
+- sign_j = -1 para ventas
+- Delta p_exec_jit >= 0
+
+13. Descomposición del deterioro de ejecución
+
+La descomposición base permitida es:
+
+Delta p_exec_jit =
+    Delta p_spread_jit
+  + Delta p_slippage_jit
+  + Delta p_impact_jit
+
+Si existe impacto externo desde impact_model:
+- ese componente debe ser la fuente de verdad
+- y el residual interno debe ajustarse para no hacer doble conteo
+
+14. Regla de no doble conteo
+
+Si impact_model ya entrega un deterioro completo o suficientemente cercano a la realidad del fill:
+
+- Delta p_impact_jit interno debe desactivarse
+o
+- Delta p_slippage_jit debe reducirse a residual
+
+Nunca puede cobrarse dos veces el mismo fenómeno con etiquetas distintas.
+
+15. Compatibilidad con el rango del día
+
+Si la política usa OHLC o VWAP diario, el fill debe ser compatible con el rango del día salvo política explícita en contra.
+
+Regla recomendada:
+
+- si p_fill_jit cae ligeramente fuera de [low_it, high_it] por error numérico:
+  clip_to_range
+
+- si cae materialmente fuera del rango:
+  aplicar range_validation_policy:
+  - clip_to_range
+  - fallback_to_ref_price
+  - reject_attempt
+
+Todo fallback debe quedar registrado.
+
+16. Halt y calidad de datos
+
+16.1 Halt
+Si halt_flag = True:
+- no puede generarse fill estándar en ese símbolo-fecha
+
+La orden pasa a:
+- pending
+- cancelled
+- o expired
+según TIF y carry policy
+
+16.2 Market data inconsistente
+Si:
+- low > high
+- open <= 0
+- close <= 0
+- ADV <= 0
+- datos faltantes materiales
+
+el símbolo-fecha debe marcarse como no utilizable para ejecución estándar, salvo fallback explícito.
+
+17. Carry y expiración
+
+17.1 Política base
+Si una orden no se completa, el remanente sigue una de estas políticas:
+
+- immediate_cancel
+- carry_to_next_day
+- carry_with_max_age
+
+17.2 Regla formal
+Si la política es carry:
+
+q_req_ji,t+1 = q_rem_jit
+
+hasta que ocurra una de estas condiciones:
+- q_rem = 0
+- TIF expira
+- max_carry_days alcanzado
+- cancelación exógena
+
+17.3 Regla importante
+El remanente no puede desaparecer ni persistir implícitamente.
+Debe existir un estado y un close_reason.
+
+18. Minimum fill lot
+
+La versión seria del módulo debe cerrar mejor esta parte.
+
+Si q_fill_jit calculado es menor que min_fill_lot, debe aplicarse una política explícita:
+
+- skip_below_min_fill
+- round_down_to_valid_lot
+- force_min_fill_if_capacity_allows
+
+La versión canónica recomendada es:
+- no forzar fills artificiales,
+- sino usar skip o round_down según la política del sistema.
+
+19. Órdenes multifill y multiday
+
+El módulo debe soportar nativamente:
+
+- múltiples fills por orden
+- órdenes ejecutadas a lo largo de varios días
+- remanentes con varios intentos
+
+Invariante obligatorio:
+
+requested_shares
 =
-\Delta p_{jit}^{\mathrm{spread}}
+sum(fills of order)
 +
-\Delta p_{jit}^{\mathrm{slippage}}
-+
-\Delta p_{jit}^{\mathrm{impact}}.
-\end{equation}
+remaining_shares_final
 
-Si el impacto proviene de un módulo externo en bps:
+20. Algoritmo operativo canónico
 
-\begin{equation}
-\Delta p_{jit}^{\mathrm{impact}}
-=
-\mathrm{impact\_bps}_{jit}\cdot 10^{-4}\cdot p_{it}^{\mathrm{ref}}.
-\end{equation}
+Paso 1:
+cargar órdenes admitidas y market data
 
-\paragraph{Regla crítica de no doble conteo.}
-Si \texttt{impact\_model} ya produce una penalización completa que absorbe parte del slippage, el residual de \texttt{slippage} en este módulo debe reducirse o anularse. Este módulo no puede deteriorar el precio dos veces para representar el mismo fenómeno bajo etiquetas distintas.
+Paso 2:
+expandir órdenes activas incluyendo remanentes carry-forward
 
-\subsection{Compatibilidad con el rango de precios del día}
-\label{sec:fills-simulator-price-range}
+Paso 3:
+agrupar por (attempt_date, symbol)
 
-En políticas basadas en OHLC o VWAP diario, el precio de fill debe ser compatible con la información del día salvo que la configuración declare explícitamente un modelo fuera de rango.
+Paso 4:
+validar halt y calidad de datos
 
-La política recomendada es:
-\begin{itemize}
-    \item si \(p_{jit}^{\mathrm{fill}}\) cae fuera de \([low_{it}, high_{it}]\) por un pequeño exceso numérico, recortar a tolerancia;
-    \item si cae materialmente fuera del rango, marcar el intento como inconsistente y activar la política definida:
-    \begin{itemize}
-        \item \texttt{clip\_to\_range},
-        \item \texttt{fallback\_to\_ref\_price},
-        \item o \texttt{reject\_attempt}.
-    \end{itemize}
-\end{itemize}
+Paso 5:
+calcular Q_daycap por símbolo-fecha
 
-Esto evita generar fills económicamente imposibles bajo la propia barra de mercado utilizada.
+Paso 6:
+resolver prioridad y asignar capacidad
 
-\subsection{Carry del remanente y expiración}
-\label{sec:fills-simulator-carry}
+Paso 7:
+calcular q_fill y q_rem por orden
 
-Cuando una orden no se completa, el remanente sigue exactamente una de estas políticas:
+Paso 8:
+calcular p_fill con coherencia direccional
 
-\begin{itemize}
-    \item \textbf{Immediate cancel}: toda parte no ejecutada se cancela tras el intento.
-    \item \textbf{Carry to next day}: el remanente pasa al siguiente día hábil.
-    \item \textbf{Carry with max age}: se arrastra hasta \texttt{max\_carry\_days}; después expira.
-\end{itemize}
+Paso 9:
+validar rango de precios y aplicar fallback si procede
 
-Formalmente, si la política es \texttt{carry}:
+Paso 10:
+actualizar estados de orden y remanentes
 
-\begin{equation}
-q_{ji,t+1}^{\mathrm{req}} = q_{jit}^{\mathrm{rem}},
-\end{equation}
+Paso 11:
+persistir fills, estados y resumen
 
-hasta que ocurra una de estas condiciones de cierre:
-\begin{itemize}
-    \item \( q_{jit}^{\mathrm{rem}} = 0 \),
-    \item expiración de TIF,
-    \item \texttt{max\_carry\_days} alcanzado,
-    \item evento exógeno de cancelación.
-\end{itemize}
+21. Invariantes del módulo
 
-\subsection{Precedencia obligatoria de eventos por símbolo-fecha}
-\label{sec:fills-simulator-event-order}
+Toda ejecución válida debe cumplir:
 
-Para eliminar ambigüedad, el orden exacto de evaluación por símbolo-fecha debe ser:
+1. 0 <= fill_ratio_vs_attempted <= 1
+2. 0 <= |q_fill| <= |q_req|
+3. q_req = q_fill + q_rem
+4. sum fills on symbol-date <= Q_daycap
+5. fill_price > 0
+6. (order_id, fill_id) único
+7. consistencia de signo entre side y fill_shares
+8. toda orden cerrada tiene close_reason
+9. ningún símbolo en halt produce fill estándar
 
-\begin{enumerate}
-    \item Validación de integridad de datos de mercado.
-    \item Comprobación de \texttt{halt\_flag}.
-    \item Construcción del conjunto de órdenes activas del símbolo.
-    \item Aplicación de política de prioridad.
-    \item Asignación de capacidad diaria.
-    \item Cálculo de fills tentativos.
-    \item Cálculo del precio de fill.
-    \item Validación contra rango de precios y reglas de sanidad.
-    \item Actualización de remanentes y estados de orden.
-    \item Persistencia de eventos y métricas.
-\end{enumerate}
+22. Failure modes importantes
 
-Esta precedencia no debe alterarse sin cambiar explícitamente la versión semántica del módulo.
+22.1 Capacidad aislada por orden
+Error crítico: permitir que varias órdenes consuman la misma capacidad del día.
 
-\subsection{Casos frontera obligatorios}
-\label{sec:fills-simulator-edge-cases}
+22.2 Remanente perdido
+Error crítico: una orden parcial no puede desaparecer sin estado final.
 
-\begin{enumerate}
-    \item \textbf{Halt completo del símbolo.}  
-    No se ejecuta ningún fill. Las órdenes activas pasan a \texttt{pending} o \texttt{cancelled} según TIF y política de carry.
+22.3 Precio imposible
+Error crítico: p_fill materialmente fuera de rango sin fallback ni flag.
 
-    \item \textbf{Gap extremo en apertura.}  
-    Si la política es \texttt{next\_open}, el fill usa el precio de apertura observado, aunque el gap sea severo. El módulo no debe “suavizar” retrospectivamente el gap.
+22.4 ADV inválido
+Sin ADV o con ADV nulo no puede ejecutarse una política estándar basada en capacidad.
 
-    \item \textbf{ADV faltante o nulo.}  
-    El intento de ejecución estándar debe quedar bloqueado o pasar por fallback explícito. Nunca debe asumirse capacidad infinita ni cero silenciosamente.
+22.5 Orden risk-reducing desplazada
+Si la política dice risk-reducing first, una orden de reducción no puede quedar detrás de una de aumento sin razón explícita.
 
-    \item \textbf{OHLC inconsistente.}  
-    Si \texttt{low > high} o \texttt{open} fuera de rango sin explicación, el símbolo-fecha debe marcarse como inválido para ejecución estándar.
+23. Métricas mínimas de observabilidad
 
-    \item \textbf{Capacidad insuficiente para múltiples órdenes.}  
-    Debe resolverse exclusivamente mediante la política de prioridad configurada; no se permite asignar capacidad como si cada orden operara en aislamiento.
+El módulo debe producir al menos:
 
-    \item \textbf{Orden con tamaño menor a \texttt{min\_fill\_lot}.}  
-    Debe seguir una política explícita: \texttt{skip}, \texttt{round}, o \texttt{force\_fill} si el entorno lo justifica.
+- order_completion_rate
+- partial_fill_rate
+- avg_fill_slippage_bps
+- avg_carry_days
+- pct_orders_cancelled
+- capacity_utilization_rate
+- pct_fills_with_fallback
+- pct_orders_fully_unfilled
+- avg_remaining_ratio
 
-    \item \textbf{Orden residual vencida por TIF.}  
-    El remanente debe pasar a estado \texttt{expired} o \texttt{cancelled}, nunca quedar vivo de forma implícita.
-\end{enumerate}
+24. Tests mínimos obligatorios
 
-\subsection{Métricas de observabilidad}
-\label{sec:fills-simulator-observability}
+24.1 Shared capacity
+Dos órdenes del mismo símbolo-fecha no pueden sumar fills superiores a Q_daycap.
 
-El módulo debe producir como mínimo:
+24.2 Carry correctness
+Una orden parcial con carry debe reaparecer con tamaño exactamente igual al remanente.
 
-\begin{itemize}
-    \item \texttt{order\_completion\_rate}
-    \item \texttt{partial\_fill\_rate}
-    \item \texttt{avg\_fill\_slippage\_bps}
-    \item \texttt{avg\_carry\_days}
-    \item \texttt{pct\_orders\_cancelled}
-    \item \texttt{capacity\_utilization\_rate}
-    \item \texttt{pct\_fills\_with\_fallback}
-\end{itemize}
+24.3 Halt correctness
+Con halt_flag = True no debe existir fill estándar.
 
-Estas métricas son obligatorias para distinguir entre una estrategia que “parece buena” porque el simulador le concede ejecución fácil y una estrategia verdaderamente robusta frente a restricciones de implementación.
+24.4 Price range
+El fill debe quedar en rango o activarse fallback explícito.
 
-\subsection{Validaciones mínimas}
-\label{sec:fills-simulator-validations}
+24.5 Multifill accounting
+requested = filled_cum + remaining_final
 
-Deben cumplirse siempre:
+24.6 Cost model compatibility
+La suma de notional de fills debe reconciliar con la entrada de cost_model.
 
-\begin{equation}
-0 \le \texttt{fill\_ratio\_vs\_attempted} \le 1,
-\end{equation}
+24.7 Determinismo
+Mismas entradas + misma config => mismos fills y estados.
 
-\begin{equation}
-0 \le |q_{jit}^{\mathrm{fill}}| \le |q_{jit}^{\mathrm{req}}|,
-\end{equation}
+25. Salidas obligatorias
 
-\begin{equation}
-q_{jit}^{\mathrm{req}} = q_{jit}^{\mathrm{fill}} + q_{jit}^{\mathrm{rem}},
-\end{equation}
+25.1 fills.parquet
+- attempt_date
+- fill_date
+- symbol
+- order_id
+- fill_id
+- fill_shares
+- fill_price
+- fill_notional
+- fill_ratio_vs_attempted
+- remaining_shares_after_fill
+- fill_status
+- exec_model
+- capacity_bucket_used
+- fallback_used
+- policy_version
 
-y además:
+25.2 order_states.parquet
+- order_id
+- date_start
+- date_end
+- symbol
+- requested_shares
+- filled_shares_cum
+- remaining_shares
+- order_state
+- close_reason
+- carry_days_used
 
-\begin{itemize}
-    \item \texttt{fill\_price > 0},
-    \item unicidad de \texttt{(order\_id, fill\_id)},
-    \item consistencia de signo entre \texttt{side} y \texttt{fill\_shares},
-    \item toda orden cerrada debe tener una \texttt{close\_reason} definida.
-\end{itemize}
+25.3 unfilled_orders.parquet
+- order_id
+- symbol
+- final_remaining_shares
+- final_state
+- reason_unfilled
 
-\subsection{Algoritmo operativo recomendado}
-\label{sec:fills-simulator-algorithm}
+25.4 fills_summary.json
+- run_id
+- num_orders
+- num_fills
+- completion_rate
+- partial_fill_rate
+- avg_carry_days
+- capacity_utilization_rate
+- fallback_rate
+- reconciliation_ok
+- config_hash
 
-\begin{enumerate}
-    \item Cargar órdenes admitidas y datos de mercado.
-    \item Expandir el conjunto de órdenes activas incluyendo remanentes carry-forward.
-    \item Agrupar por \texttt{(attempt\_date, symbol)}.
-    \item Validar datos de mercado y descartar símbolos en halt según política.
-    \item Calcular capacidad diaria por símbolo.
-    \item Resolver prioridad y asignación de capacidad entre órdenes activas.
-    \item Generar fills tentativos y remanentes.
-    \item Calcular precios de fill con coherencia direccional.
-    \item Validar rango de precios y aplicar fallback si procede.
-    \item Persistir fills, estados de orden, remanentes y métricas resumen.
-\end{enumerate}
+25.5 manifest.json
+- run_id
+- inputs
+- policy_version
+- fallback_used
+- config_hash
 
-\subsection{Tests de aceptación obligatorios}
-\label{sec:fills-simulator-tests}
+26. Qué no debe hacer este módulo
 
-\subsubsection{Test A: capacidad compartida}
-Si dos órdenes del mismo símbolo compiten por una capacidad total inferior a la suma de tamaños requeridos, la suma de fills no puede exceder la capacidad del símbolo en ese día.
+La versión canónica no debe:
+- usar stochastic Beta fills como contrato base,
+- simular LOB tick-by-tick,
+- introducir Almgren-Chriss path dentro del contrato mínimo,
+- usar curvas intradía sofisticadas por defecto,
+- fingir precisión microestructural que el resto del stack no puede sostener.
 
-\subsubsection{Test B: orden parcial con carry}
-Una orden parcialmente ejecutada con \texttt{carry\_unfilled\_to\_next\_day=True} debe reaparecer al día siguiente con tamaño exactamente igual al remanente.
+27. Extensiones futuras razonables
 
-\subsubsection{Test C: halt}
-Si \texttt{halt\_flag=True}, entonces no puede existir ningún fill para ese símbolo-fecha bajo la política estándar.
+Como flags experimentales o fase 2:
+- stochastic_fill_fraction
+- intraday_capacity_curve
+- venue-aware fills
+- adaptive carry policy
+- probabilistic price deterioration
 
-\subsubsection{Test D: rango de precios}
-Todo fill basado en OHLC/VWAP debe quedar dentro del rango permitido o quedar marcado con fallback explícito.
+Pero ninguna de estas extensiones debe contaminar la semántica base.
 
-\subsubsection{Test E: multifill multiday}
-Una orden ejecutada en varios días debe satisfacer:
-\[
-\texttt{requested\_shares}
-=
-\sum_{\text{fills}} \texttt{fill\_shares}
-+
-\texttt{remaining\_shares\_final}.
-\]
+28. Interpretación correcta
 
-\subsubsection{Test F: consistencia con cost model}
-El número de fills y su notional agregado deben reconciliar exactamente con los artefactos de entrada de \texttt{execution/cost\_model}.
+La lectura correcta de fills_simulator.py no es:
+“hemos puesto un modelo bonito de fills”.
 
-\subsection{CLI sugerida}
-\label{sec:fills-simulator-cli}
+La lectura correcta es:
+“hemos impuesto una gramática estricta de ejecución: capacidad compartida, prioridad formal, fill parcial, remanente explícito, expiración controlada y precio coherente con la dirección”.
 
-\begin{verbatim}
-python -m execution.fills_simulator \
-  --orders-path portfolio/rebalance/run_latest/rebalance_orders.parquet \
-  --market-data-path data/price/adjusted/daily_market_data.parquet \
-  --impact-path execution/impact/run_latest/impact_per_order.parquet \
-  --config-path configs/execution/fills_simulator.yaml \
-  --run-id fills_20260306_001
-\end{verbatim}
+Ese es su rol real.
 
-\subsection{Conclusión}
-\label{sec:fills-simulator-conclusion}
+29. Conclusión
 
-\texttt{execution/fills\_simulator.py} debe entenderse como la frontera entre una orden económicamente deseada y una ejecución institucionalmente plausible. Su valor no reside solo en producir un \texttt{fill\_price}, sino en imponer una gramática completa de ejecución: capacidad compartida, prioridad formal, remanente explícito, expiración controlada, coherencia temporal y compatibilidad con los datos de mercado utilizados como referencia.
+execution/fills_simulator.py debe ser una pieza de infraestructura severa y creíble.
 
-En un stack cuantitativo serio, este módulo no debe regalar liquidez, ni colapsar órdenes complejas en un único fill idealizado, ni esconder el remanente bajo supuestos benignos. Debe hacer visible la fricción real de implementación. Esa disciplina es precisamente la que separa un backtest elegante de una simulación de ejecución creíble.
+Recibe órdenes admitidas.
+Aplica capacidad diaria compartida.
+Resuelve prioridad entre órdenes.
+Genera fills completos o parciales.
+Maneja remanentes, carry y expiración.
+Asigna precios con coherencia económica.
+Y persiste una traza suficiente para reconciliar posiciones, costes y PnL sin huecos.
+
+Ese es exactamente el comportamiento que debe tener una capa seria de simulación de fills en un stack cuantitativo institucional.

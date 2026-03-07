@@ -1,459 +1,482 @@
-\documentclass{article}
-\usepackage{amsmath,amssymb}
-\usepackage{parskip}
-\usepackage{enumitem}
-\usepackage{hyperref}
-\usepackage{listings}
-\lstset{language=Python, basicstyle=\ttfamily\small, columns=fullflexible, showstringspaces=false}
-
-\begin{document}
-
-\title{profitability\_curve.py --- Net Profitability Curve as a Function of AUM}
-\author{}
-\date{}
-\maketitle
-
-\section{Purpose}
+Módulo: research/capacity/profitability_curve.py
+
+1. Objetivo del módulo
 
-The purpose of \texttt{profitability\_curve.py} is to estimate how expected net performance changes as deployed capital increases. The module is not intended to produce a marketing-style ``capacity number'' from stylized assumptions; it is intended to generate an empirically grounded mapping
-\[
-A \mapsto \left(\mu_{\mathrm{net}}(A), \sigma_{\mathrm{net}}(A), SR_{\mathrm{net}}(A)\right),
-\]
-where \(A\) denotes assets under management (AUM), \(\mu_{\mathrm{net}}(A)\) is expected net return, \(\sigma_{\mathrm{net}}(A)\) is net volatility, and \(SR_{\mathrm{net}}(A)\) is net Sharpe.
+El objetivo de profitability_curve.py es estimar cómo cambia la rentabilidad neta de la
+estrategia al escalar capital desplegado desde un AUM baseline hasta niveles superiores,
+incorporando de forma explícita las restricciones reales de liquidez y los costes de
+ejecución que crecen de forma no lineal con el tamaño.
 
-Operationally, the module must answer the following questions:
+La pregunta correcta que debe responder este módulo no es “cuánto podría gestionar la
+estrategia en teoría”, sino algo mucho más operativo:
 
-\begin{enumerate}[label=\arabic*.]
-    \item At what AUM does the strategy remain economically attractive after realistic execution costs?
-    \item At what AUM does net Sharpe fall below an admissible threshold?
-    \item At what AUM does marginal scale cease to add net dollar P\&L?
-    \item How sensitive are these answers to turnover, liquidity, concentration, and execution assumptions?
-\end{enumerate}
+- a qué escala el sistema sigue siendo económicamente atractivo en neto;
+- cuándo el Sharpe neto cae por debajo del umbral aceptable;
+- cuándo aumentar AUM deja de añadir P&L neto en dólares;
+- y cuánto dependen esas conclusiones de liquidez, impacto, caps de participación
+  y truncación de alpha.
 
-This is therefore a \emph{capacity estimation} module whose outputs are consumed by portfolio sizing, capital allocation, and capacity governance.
-
-\section{Module Contract}
-
-\subsection{Required Inputs}
-
-The module assumes that all upstream data are already point-in-time safe and aligned. At minimum it requires:
+Este módulo es, por tanto, un módulo de capacity estimation y gobernanza de capital.
+Sus outputs deben servir para sizing, capital allocation, límites internos de despliegue
+y revisión de viabilidad económica de la estrategia.
 
-\begin{itemize}
-    \item \texttt{baseline\_panel}: one row per \((date, asset)\), containing realized or simulated baseline trading activity under a reference capital \(A_0\):
-    \[
-    \{\texttt{date}, \texttt{asset}, \texttt{target\_weight}, \texttt{executed\_notional},
-    \texttt{gross\_alpha\_bps}, \texttt{turnover}, \texttt{holding\_period}\}.
-    \]
-    \item \texttt{liquidity\_panel}: one row per \((date, asset)\):
-    \[
-    \{\texttt{date}, \texttt{asset}, \texttt{adv\_dollar}, \texttt{spread\_bps}, \texttt{volatility},
-    \texttt{participation\_cap}\}.
-    \]
-    \item \texttt{fills} or an equivalent execution-cost data source, if available, for calibrating temporary and permanent impact parameters.
-    \item \texttt{config}: grid of AUM values, cost assumptions, slippage model selection, and evaluation horizons.
-\end{itemize}
-
-\subsection{Outputs}
+2. Qué hace y qué no hace
 
-For each AUM level \(A\) in the grid, the module produces at minimum:
-
-\[
-\{\texttt{aum}, \texttt{gross\_return}, \texttt{net\_return}, \texttt{gross\_pnl},
-\texttt{net\_pnl}, \texttt{gross\_vol}, \texttt{net\_vol}, \texttt{gross\_sharpe},
-\texttt{net\_sharpe}, \texttt{avg\_turnover}, \texttt{avg\_participation},
-\texttt{capacity\_flag}, \texttt{binding\_constraint}\}.
-\]
-
-The results are stored in a point-in-time safe artifact such as
-
-\[
-\texttt{research/capacity\_analysis/artifacts/profitability\_curve.parquet}.
-\]
-
-\section{Conceptual Framework}
-
-Let \(A\) denote deployed capital. The central object is the \emph{net dollar P\&L} function
-\begin{equation}
-\Pi_{\mathrm{net}}(A) = \Pi_{\mathrm{gross}}(A) - C_{\mathrm{trading}}(A) - C_{\mathrm{financing}}(A) - C_{\mathrm{ops}}(A),
-\end{equation}
-with corresponding net return
-\begin{equation}
-\mu_{\mathrm{net}}(A) = \frac{\mathbb{E}[\Pi_{\mathrm{net}}(A)]}{A}.
-\end{equation}
-
-The capacity question is not answered by gross return alone. A strategy may continue to generate positive gross alpha while becoming unattractive in net terms because market impact, spread costs, and participation constraints deteriorate superlinearly with scale.
-
-\section{Scaling Logic}
-
-\subsection{Baseline-to-Scaled Mapping}
-
-Let \(A_0\) be the baseline capital at which the strategy was originally simulated or traded. For a new capital level \(A\), define the scale factor
-\begin{equation}
-s(A) = \frac{A}{A_0}.
-\end{equation}
-
-The default assumption is that \emph{desired} dollar position sizes scale linearly with capital:
-\begin{equation}
-x_{i,t}^{\star}(A) = s(A)\,x_{i,t}^{\star}(A_0).
-\end{equation}
+2.1 Qué hace
+- construye una curva AUM -> rentabilidad neta;
+- escala target positions y traded notional desde un baseline A0;
+- aplica participation caps realistas por activo y fecha;
+- modela costes de ejecución con spread, impacto temporal y, si procede, permanente;
+- estima gross return, net return, gross/net P&L, gross/net Sharpe y métricas auxiliares;
+- identifica break-even capacity en retorno;
+- identifica break-even capacity bajo restricción de Sharpe;
+- estima el AUM que maximiza net dollar P&L;
+- persiste flags de constraints binding y diagnósticos de truncación;
+- y puede incorporar bandas de incertidumbre sobre la curva de capacidad.
 
-Likewise, desired traded notional scales as
-\begin{equation}
-V_{i,t}^{\star}(A) = s(A)\,V_{i,t}^{\star}(A_0).
-\end{equation}
+2.2 Qué no hace
+- no genera alpha;
+- no sustituye execution o impact_model;
+- no decide por sí solo el AUM final de producción;
+- no debe asumir que el gross alpha permanece intacto cuando los caps empiezan a bind;
+- no debe vender un único “capacity number” mágico sin contexto;
+- no resuelve shared-liquidity capacity entre varias estrategias a la vez;
+- no debe esconder incertidumbre detrás de una curva suave pero frágil.
 
-No empirical exponent such as \(0.7\) should be hard-coded without a separately estimated and validated model. Linear scaling is the default accounting identity; any deviation from linearity must come from explicit constraints such as participation caps, crowding controls, or execution throttles.
+3. Rol dentro del stack
 
-\subsection{Participation Constraint}
+Secuencia conceptual correcta:
 
-Let \(ADV_{i,t}\) be average daily dollar volume and let \(p_{i,t}^{\max}\) be the maximum allowed participation rate. Then realizable traded notional is
-\begin{equation}
-V_{i,t}(A) = \min\left\{V_{i,t}^{\star}(A),\; p_{i,t}^{\max}\,ADV_{i,t}\right\}.
-\end{equation}
+    baseline_panel + liquidity_panel + fills / TCA
+    -> profitability_curve.py
+    -> capital allocation / portfolio governance / capacity review
+    -> validacion downstream y decision de despliegue
 
-This constraint is central. Capacity is ultimately bounded by what can actually be traded, not by unconstrained target weights.
+Interpretación correcta:
+- el módulo parte de una estrategia ya definida y un baseline de trading ya observado o simulado;
+- estima qué ocurre al escalar capital manteniendo reglas de ejecución explícitas;
+- devuelve una curva económica de viabilidad;
+- y esa curva debe consumirse después junto con crowding, turnover, execution y validación OOS.
 
-\section{Cost Model}
+4. Preguntas económicas que debe responder
 
-\subsection{Execution Cost Decomposition}
+El módulo debe responder, de forma cuantitativa y auditable, al menos a estas preguntas:
 
-For each asset \(i\) and date \(t\), let the per-trade implementation cost be
-\begin{equation}
-c_{i,t}(A) = c^{\mathrm{spread}}_{i,t}(A) + c^{\mathrm{temp}}_{i,t}(A) + c^{\mathrm{perm}}_{i,t}(A),
-\end{equation}
-so that total trading cost is
-\begin{equation}
-C_{\mathrm{trading}}(A) = \sum_{t}\sum_{i} c_{i,t}(A)\,V_{i,t}(A).
-\end{equation}
+- ¿cómo cae la rentabilidad neta al aumentar AUM?
+- ¿cómo cae el Sharpe neto al aumentar AUM?
+- ¿qué fracción del edge bruto se pierde en costes de ejecución?
+- ¿cuándo empiezan a bind de verdad los participation caps?
+- ¿cuánta parte del alpha deseado deja de capturarse por truncación de trades?
+- ¿a partir de qué AUM ya no compensa seguir escalando?
+- ¿cuánto cambian estas respuestas si los parámetros de coste se mueven razonablemente?
 
-\subsection{Spread Cost}
+Si el módulo no puede responder a estas preguntas, entonces no está estimando capacidad
+de forma seria; solo está dibujando una curva decorativa.
 
-A parsimonious spread-cost approximation is
-\begin{equation}
-c^{\mathrm{spread}}_{i,t}(A) = \frac{1}{2}\,\mathrm{spread}_{i,t},
-\end{equation}
-where \(\mathrm{spread}_{i,t}\) is expressed in return units per dollar traded. If side-dependent or fill-level estimates are available, they should replace this approximation.
+5. Inputs requeridos
 
-\subsection{Impact Cost}
+El módulo debe consumir, con alineación PIT ya garantizada upstream, al menos:
 
-A standard empirical form for temporary impact is
-\begin{equation}
-c^{\mathrm{temp}}_{i,t}(A) =
-Y_{i,t}\,\sigma_{i,t}\left(\frac{V_{i,t}(A)}{ADV_{i,t} + \varepsilon}\right)^{\delta},
-\end{equation}
-where \(\sigma_{i,t}\) is a volatility proxy, \(Y_{i,t}\) is an empirically calibrated coefficient, and \(\delta \in [0.4,0.7]\) is the impact exponent.
+- baseline_panel:
+  una fila por (date, asset) con actividad baseline a A0, incluyendo como mínimo:
+  target_weight, executed_notional, gross_alpha_dollar o equivalente,
+  turnover, holding_period.
 
-A simple permanent-impact term may be written
-\begin{equation}
-c^{\mathrm{perm}}_{i,t}(A) = \gamma_{i,t}\,V_{i,t}(A),
-\end{equation}
-or omitted if the execution framework already absorbs this component elsewhere.
+- liquidity_panel:
+  una fila por (date, asset) con al menos:
+  adv_dollar, spread_bps, volatility, participation_cap.
 
-The important point is methodological: \(Y_{i,t}\), \(\delta\), and \(\gamma_{i,t}\) are \emph{not universal constants}. They must be calibrated from internal fills, broker TCA, or a well-validated transaction-cost model, ideally by liquidity bucket, volatility bucket, and regime.
+- fills o fuente equivalente de execution cost calibration:
+  necesaria para estimar Y, delta y gamma si no vienen de otro módulo validado.
 
-\section{Net Performance Definitions}
+- config:
+  grid de AUMs, base_aum, rf_annual, sr_min, selección de cost model,
+  reglas de bucketización, bootstrap config y parámetros de sensibilidad.
 
-For each date \(t\), define gross portfolio return under capital \(A\) as \(r^{\mathrm{gross}}_t(A)\) and trading-cost drag as \(k_t(A)\). Then
-\begin{equation}
-r^{\mathrm{net}}_t(A) = r^{\mathrm{gross}}_t(A) - k_t(A) - f_t(A),
-\end{equation}
-where \(f_t(A)\) represents financing, borrow, management, or other non-trading drags if relevant.
+Todos los inputs deben ser point-in-time safe.
+No puede usarse información posterior para calibrar la curva en una fecha de corte histórica.
 
-The annualized net return is
-\begin{equation}
-\mu_{\mathrm{net}}(A) = \mathrm{AnnMean}\left(r^{\mathrm{net}}_t(A)\right),
-\end{equation}
-the annualized net volatility is
-\begin{equation}
-\sigma_{\mathrm{net}}(A) = \mathrm{AnnStd}\left(r^{\mathrm{net}}_t(A)\right),
-\end{equation}
-and the net Sharpe is
-\begin{equation}
-SR_{\mathrm{net}}(A) = \frac{\mu_{\mathrm{net}}(A) - r_f}{\sigma_{\mathrm{net}}(A) + \varepsilon}.
-\end{equation}
-
-\section{Capacity Definitions}
-
-Capacity should not be summarized by a single ambiguous number. The module reports several economically distinct thresholds.
-
-\subsection{Return Break-Even Capacity}
-
-Define
-\begin{equation}
-A_{\mathrm{BE,ret}} = \sup \left\{A : \mu_{\mathrm{net}}(A) > 0 \right\}.
-\end{equation}
-
-This is the largest AUM for which the strategy remains profitable in expected return terms.
-
-\subsection{Sharpe-Constrained Capacity}
-
-Given a minimum admissible net Sharpe \(SR_{\min}\),
-\begin{equation}
-A_{\mathrm{BE,sharpe}} = \sup \left\{A : SR_{\mathrm{net}}(A) \ge SR_{\min} \right\}.
-\end{equation}
-
-This is often more useful than simple return break-even because a strategy can remain profitable while becoming operationally unattractive.
-
-\subsection{Marginal Dollar P\&L Capacity}
-
-Define the expected annual net dollar P\&L
-\begin{equation}
-\mathcal{P}(A) = A \cdot \mu_{\mathrm{net}}(A).
-\end{equation}
-
-Then the scale that maximizes expected net dollars satisfies
-\begin{equation}
-A_{\mathrm{opt}} \in \arg\max_{A} \mathcal{P}(A).
-\end{equation}
-
-Equivalently, in the smooth case,
-\begin{equation}
-\frac{d\mathcal{P}(A)}{dA} = 0.
-\end{equation}
-
-This quantity is frequently the most relevant for firm-level capital allocation.
-
-\section{Implementation Logic}
-
-\begin{lstlisting}
-import numpy as np
-import pandas as pd
-
-EPS = 1e-12
-
-def annualized_mean(x, periods_per_year=252):
-    return periods_per_year * np.nanmean(x)
-
-def annualized_std(x, periods_per_year=252):
-    return np.sqrt(periods_per_year) * np.nanstd(x, ddof=1)
-
-def impact_cost_per_dollar(volume, adv, sigma, Y, delta):
-    part = np.maximum(volume / (adv + EPS), 0.0)
-    return Y * sigma * np.power(part, delta)
-
-def permanent_cost_per_dollar(volume, gamma):
-    return gamma * volume
-
-def scaled_trade_volume(base_volume, aum, base_aum, adv, part_cap):
-    desired = base_volume * (aum / base_aum)
-    max_realizable = part_cap * adv
-    return np.minimum(desired, max_realizable)
-
-def evaluate_aum(panel, aum, base_aum, rf_annual, sr_min):
-    df = panel.copy()
-
-    df["scaled_volume"] = scaled_trade_volume(
-        base_volume=df["executed_notional"].to_numpy(),
-        aum=aum,
-        base_aum=base_aum,
-        adv=df["adv_dollar"].to_numpy(),
-        part_cap=df["participation_cap"].to_numpy(),
-    )
-
-    df["participation"] = df["scaled_volume"] / (df["adv_dollar"] + EPS)
-
-    df["spread_cost_per_dollar"] = 0.5 * df["spread_bps"] * 1e-4
-    df["temp_cost_per_dollar"] = impact_cost_per_dollar(
-        volume=df["scaled_volume"].to_numpy(),
-        adv=df["adv_dollar"].to_numpy(),
-        sigma=df["volatility"].to_numpy(),
-        Y=df["impact_Y"].to_numpy(),
-        delta=df["impact_delta"].to_numpy(),
-    )
-    df["perm_cost_per_dollar"] = permanent_cost_per_dollar(
-        volume=df["scaled_volume"].to_numpy(),
-        gamma=df["impact_gamma"].to_numpy(),
-    )
-
-    df["cost_dollar"] = (
-        df["spread_cost_per_dollar"]
-        + df["temp_cost_per_dollar"]
-        + df["perm_cost_per_dollar"]
-    ) * df["scaled_volume"]
-
-    daily = df.groupby("date").agg(
-        gross_pnl=("gross_alpha_dollar", "sum"),
-        cost_dollar=("cost_dollar", "sum"),
-        traded_dollar=("scaled_volume", "sum"),
-        avg_participation=("participation", "mean"),
-    )
-
-    daily["gross_return"] = daily["gross_pnl"] / aum
-    daily["net_pnl"] = daily["gross_pnl"] - daily["cost_dollar"]
-    daily["net_return"] = daily["net_pnl"] / aum
-
-    gross_return = annualized_mean(daily["gross_return"])
-    net_return = annualized_mean(daily["net_return"])
-    gross_vol = annualized_std(daily["gross_return"])
-    net_vol = annualized_std(daily["net_return"])
-
-    gross_sharpe = (gross_return - rf_annual) / (gross_vol + EPS)
-    net_sharpe = (net_return - rf_annual) / (net_vol + EPS)
-
-    if net_return <= 0:
-        capacity_flag = "return_break_even_exceeded"
-    elif net_sharpe < sr_min:
-        capacity_flag = "sharpe_constraint_binding"
-    elif (daily["avg_participation"] > 0.05).mean() > 0.25:
-        capacity_flag = "liquidity_constraint_binding"
-    else:
-        capacity_flag = "admissible"
-
-    return {
-        "aum": aum,
-        "gross_return": gross_return,
-        "net_return": net_return,
-        "gross_pnl": aum * gross_return,
-        "net_pnl": aum * net_return,
-        "gross_vol": gross_vol,
-        "net_vol": net_vol,
-        "gross_sharpe": gross_sharpe,
-        "net_sharpe": net_sharpe,
-        "avg_turnover": panel.groupby("date")["turnover"].mean().mean(),
-        "avg_participation": daily["avg_participation"].mean(),
-        "capacity_flag": capacity_flag,
-    }
-
-panel = pd.read_parquet(baseline_panel_path)
-aums = np.geomspace(1e7, 2e9, 40)
-
-results = []
-for aum in aums:
-    results.append(
-        evaluate_aum(
-            panel=panel,
-            aum=aum,
-            base_aum=base_aum,
-            rf_annual=rf_annual,
-            sr_min=sr_min,
-        )
-    )
-
-curve = pd.DataFrame(results).sort_values("aum")
-curve["marginal_net_pnl"] = curve["net_pnl"].diff() / curve["aum"].diff()
-curve.to_parquet(output_path, index=False)
-\end{lstlisting}
-
-\section{Calibration Requirements}
-
-The quality of this module depends almost entirely on calibration discipline. The following rules are mandatory.
-
-\subsection{Impact Parameters}
-
-The parameters \((Y,\delta,\gamma)\) must be estimated from internal execution data whenever possible. At a minimum, they should vary across liquidity and volatility buckets:
-\[
-(Y,\delta,\gamma) = g(\text{ADV bucket}, \text{volatility bucket}, \text{spread bucket}, \text{regime}).
-\]
-
-A single constant across the entire universe is acceptable only as a temporary fallback, never as a final production assumption.
-
-\subsection{Participation Caps}
-
-Participation caps must come from execution policy, venue realities, and historical fill quality. A hard-coded value without reference to empirical fill success should be treated as provisional.
-
-\subsection{Gross Alpha Preservation}
-
-The baseline gross-alpha process cannot be assumed invariant to scale once participation constraints bind. If large-scale execution delays or truncates intended trades, then realized gross alpha itself may decay. This should be modeled by one of the following:
-
-\begin{enumerate}[label=\arabic*.]
-    \item explicit truncation of realizable target changes,
-    \item delayed execution across multiple days,
-    \item signal decay during execution lag,
-    \item crowding-conditioned alpha haircut.
-\end{enumerate}
-
-Without this adjustment, capacity will be overstated.
-
-\section{Validation Protocol}
-
-The module must be validated out-of-sample and should only be trusted if the following hold:
-
-\begin{enumerate}[label=\arabic*.]
-    \item \textbf{Face validity}: net return and net Sharpe decline monotonically, or nearly monotonically, as AUM increases.
-    \item \textbf{Cost realism}: predicted cost drag is consistent with historical implementation shortfall from fills or broker TCA.
-    \item \textbf{Constraint realism}: the fraction of orders hitting participation caps is plausible and increases with AUM.
-    \item \textbf{Stability}: the capacity curve is qualitatively stable across subperiods and liquidity regimes.
-    \item \textbf{Integration validity}: when the recommended AUM range is used in downstream backtests, realized net performance is consistent with projected ranges.
-\end{enumerate}
-
-Useful diagnostics include:
-\begin{itemize}
-    \item \(A \mapsto \mu_{\mathrm{gross}}(A)\), \(\mu_{\mathrm{net}}(A)\), \(SR_{\mathrm{net}}(A)\),
-    \item AUM versus average participation,
-    \item AUM versus fraction of trades truncated by participation caps,
-    \item AUM versus estimated implementation shortfall,
-    \item regime-sliced capacity curves.
-\end{itemize}
-
-\section{Integration With the Rest of the System}
-
-This module must not sit in isolation. It should interact explicitly with:
-
-\begin{itemize}
-    \item \textbf{execution / impact\_model}: source of calibrated cost parameters and participation limits.
-    \item \textbf{rebalance}: source of actual or simulated trade schedules under scaling.
-    \item \textbf{portfolio}: consumer of admissible AUM ranges and capital-allocation recommendations.
-    \item \textbf{crowding\_detector}: source of crowding-conditioned haircuts or tighter participation assumptions.
-    \item \textbf{turnover\_vs\_edge}: complementary view linking capital scale to turnover-induced edge erosion.
-    \item \textbf{validation}: verifies that recommended capacity survives realistic out-of-sample testing.
-\end{itemize}
-
-\section{Edge Cases and Failure Modes}
-
-The implementation must handle the following cases explicitly:
-
-\begin{enumerate}[label=\arabic*.]
-    \item \textbf{ADV missing or stale}: liquidity inputs must be filtered, imputed conservatively, or the affected names excluded.
-    \item \textbf{Sparse fills}: if cost calibration data are too sparse, parameter uncertainty must be reported rather than hidden.
-    \item \textbf{Concentrated books}: AUM capacity may be governed by a handful of illiquid names rather than the median name; reporting should include concentration diagnostics.
-    \item \textbf{Regime shifts}: liquidity crises invalidate calm-period cost estimates; scenario overlays should stress wider spreads, lower ADV, and larger impact coefficients.
-    \item \textbf{Target truncation}: when desired trades exceed feasible participation, both costs and alpha capture must be recomputed, not only costs.
-\end{enumerate}
-
-\section{What This Module Is Not}
-
-This module should not contain unsupported claims such as ``+35\% annual P\&L'' or stylized baseline performance numbers presented as if they were empirical facts. Those belong to downstream research results, not to a module specification.
-
-The responsibility of \texttt{profitability\_curve.py} is narrower and more important: to estimate the economic viability of scaling capital using assumptions that are explicit, calibratable, and falsifiable.
-
-\section{Extensions}
-
-Once the core version is validated, the following extensions are legitimate:
-
-\begin{enumerate}[label=\arabic*.]
-    \item uncertainty bands for the capacity curve via block bootstrap,
-    \item regime-conditional capacity surfaces,
-    \item crowding-conditioned impact multipliers,
-    \item delayed execution schedules with signal decay,
-    \item portfolio-level capital allocation across multiple strategies under shared liquidity constraints.
-\end{enumerate}
-
-These are extensions, not substitutes for a clean core specification.
-
-\section{References}
-
-\begin{thebibliography}{9}
-
-\bibitem{almgren}
-Almgren, R. and Chriss, N.
-\textit{Optimal Execution of Portfolio Transactions}.
-Journal of Risk, 3(2), 2001.
-
-\bibitem{grinold}
-Grinold, R. C. and Kahn, R. N.
-\textit{Active Portfolio Management}.
-2nd ed., McGraw--Hill, 2000.
-
-\bibitem{kissell}
-Kissell, R.
-\textit{The Science of Algorithmic Trading and Portfolio Management}.
-Academic Press, 2013.
-
-\bibitem{lodp}
-López de Prado, M.
-\textit{Advances in Financial Machine Learning}.
-Wiley, 2018.
-
-\end{thebibliography}
-
-\end{document}
+6. Objeto económico central
+
+Sea A el capital desplegado.
+El objeto central del módulo es el P&L neto en dólares:
+
+    Pi_net(A) = Pi_gross(A) - C_trading(A) - C_financing(A) - C_ops(A)
+
+y su versión en retorno sobre capital:
+
+    mu_net(A) = E[Pi_net(A)] / A
+
+La cuestión de capacidad no debe responderse con gross alpha aislado.
+Una estrategia puede mantener alpha bruto positivo y, aun así, dejar de ser atractiva
+cuando los costes de ejecución y las restricciones de liquidez erosionan el neto.
+
+7. Lógica de escalado
+
+7.1 Baseline capital
+Sea A0 el capital baseline sobre el que se observó o simuló el trading original.
+
+7.2 Factor de escala
+Para un nuevo nivel de capital A, se define:
+
+    s(A) = A / A0
+
+7.3 Escalado deseado
+Por defecto, las posiciones y el traded notional deseado escalan linealmente:
+
+    x*_i,t(A) = s(A) * x*_i,t(A0)
+    V*_i,t(A) = s(A) * V*_i,t(A0)
+
+Esta linealidad no es una hipótesis de mercado sofisticada; es la identidad contable base.
+Cualquier desviación debe venir de restricciones explícitas, no de exponentes arbitrarios
+hardcodeados sin modelo validado.
+
+8. Participation caps y trading realizable
+
+El tamaño deseado no siempre es realizable.
+
+Sea ADV_i,t el average daily dollar volume y p_max_i,t la participación máxima permitida.
+Entonces el traded notional realizable es:
+
+    V_i,t(A) = min( V*_i,t(A), p_max_i,t * ADV_i,t )
+
+Esta restricción es central.
+La capacidad real está acotada por lo que puede ejecutarse de forma razonable,
+no por lo que el target teórico desearía.
+
+El módulo debe registrar explícitamente:
+- avg_participation;
+- frac_truncated_trades;
+- binding_constraint;
+- y métricas agregadas de truncación por AUM.
+
+9. Modelo de costes
+
+9.1 Descomposición básica
+Para cada activo i y fecha t, el coste por dólar transado puede escribirse como:
+
+    c_i,t(A) = c_spread_i,t(A) + c_temp_i,t(A) + c_perm_i,t(A)
+
+y el coste total de trading como:
+
+    C_trading(A) = sum_t sum_i c_i,t(A) * V_i,t(A)
+
+9.2 Spread cost
+La aproximación base razonable es:
+
+    c_spread_i,t(A) = 0.5 * spread_i,t
+
+expresado en unidades de retorno por dólar transado.
+Si existen estimaciones más finas a nivel de fills, deben preferirse.
+
+9.3 Temporary impact
+La forma empírica recomendada es:
+
+    c_temp_i,t(A) = Y_i,t * sigma_i,t * ( V_i,t(A) / (ADV_i,t + eps) )^delta_i,t
+
+donde:
+- sigma_i,t es una proxy de volatilidad;
+- Y_i,t es el coeficiente de impacto;
+- delta_i,t es el exponente de no linealidad.
+
+9.4 Permanent impact
+Cuando proceda, puede añadirse:
+
+    c_perm_i,t(A) = gamma_i,t * V_i,t(A)
+
+Si otro módulo ya absorbe esta pieza o su contribución es despreciable, puede omitirse,
+pero la política debe ser explícita.
+
+10. Parámetros de coste
+
+Uno de los principios no negociables de este módulo es que:
+
+- Y, delta y gamma no son constantes universales.
+
+Deben calibrarse con disciplina, idealmente a partir de fills internos o TCA,
+y como mínimo variar por buckets de:
+
+- liquidez;
+- volatilidad;
+- spread;
+- y, si es posible, régimen.
+
+Forma recomendada:
+
+    (Y, delta, gamma) = g(liq_bucket, vol_bucket, spread_bucket, regime_bucket)
+
+Un único parámetro global para todo el universo puede servir como fallback provisional,
+pero no debe tratarse como especificación final de producción.
+
+11. Definición de rendimiento neto
+
+Para cada fecha t, el retorno neto del portfolio escalado debe definirse como:
+
+    r_net_t(A) = r_gross_t(A) - k_t(A) - f_t(A)
+
+donde:
+- r_gross_t(A) es el retorno bruto del portfolio a escala A;
+- k_t(A) es el drag por trading costs;
+- f_t(A) recoge financiación, borrow y otros drags si aplican.
+
+A partir de esa serie temporal:
+
+    mu_net(A)    = AnnMean(r_net_t(A))
+    sigma_net(A) = AnnStd(r_net_t(A))
+    SR_net(A)    = (mu_net(A) - rf) / (sigma_net(A) + eps)
+
+y análogamente para las métricas gross.
+
+12. Definiciones de capacidad
+
+El módulo no debe colapsar toda la capacidad en un único número ambiguo.
+Debe reportar al menos tres nociones distintas.
+
+12.1 Return break-even capacity
+
+    A_BE_ret = sup { A : mu_net(A) > 0 }
+
+Es el mayor AUM para el que la estrategia sigue siendo rentable en términos de retorno esperado.
+
+12.2 Sharpe-constrained capacity
+
+    A_BE_sharpe = sup { A : SR_net(A) >= SR_min }
+
+Es el mayor AUM para el que la estrategia sigue siendo atractiva bajo un umbral mínimo
+de Sharpe neto.
+
+12.3 Dollar-P&L optimal capacity
+
+Sea:
+
+    P(A) = A * mu_net(A)
+
+Entonces:
+
+    A_opt = argmax_A P(A)
+
+Este suele ser el punto más relevante para asignación de capital a nivel firma:
+el AUM a partir del cual seguir escalando ya no añade net dollar P&L.
+
+13. Truncación de alpha
+
+Uno de los riesgos más importantes del módulo es sobreestimar capacidad asumiendo que
+el gross alpha baseline permanece intacto incluso cuando los participation caps bind.
+
+Eso no es inocuo.
+Si el trade deseado no puede ejecutarse completo, no solo bajan los costes potenciales:
+también cae el alpha capturado.
+
+Por ello, el módulo debería cuantificar:
+
+    alpha_truncation_pct(A)
+
+como porcentaje del alpha deseado que deja de capturarse por límites de participación
+o por recorte de trading realizable.
+
+Diagnóstico mínimo recomendado:
+- % de notional truncado;
+- % de alpha truncado;
+- relación entre truncation y AUM;
+- warning cuando la truncación supera niveles materialmente incompatibles con la
+  hipótesis de gross alpha invariant.
+
+14. Bandas de incertidumbre
+
+La curva de capacidad no debe presentarse como si fuera exacta.
+Debe poder acompañarse de bandas de incertidumbre para al menos:
+
+- mu_net(A)
+- SR_net(A)
+- A_BE_ret
+- A_BE_sharpe
+- A_opt
+
+La forma correcta de hacerlo en este contexto es block bootstrap temporal,
+no remuestreo iid de trades, porque:
+- retornos, liquidez y costes tienen dependencia temporal;
+- la varianza real de capacidad no viene de trades iid;
+- y una curva sin incertidumbre suele transmitir falsa precisión.
+
+Especificación razonable:
+- dividir el historial en bloques temporales;
+- remuestrear bloques con reemplazo;
+- recomputar la curva completa en cada réplica;
+- obtener intervalos percentiles por cada nivel de AUM.
+
+15. Sensitivity analysis
+
+El módulo debe soportar análisis de sensibilidad simple sobre supuestos clave.
+
+Parámetros mínimos a tensionar:
+- Y
+- delta
+- gamma
+- participation caps
+- escenarios de ADV
+- widening de spreads
+
+Ejemplos razonables:
+- Y ± 20%
+- delta ± 0.1
+- p_max ± 10%
+- ADV haircut en régimen de estrés
+
+El objetivo no es generar una malla infinita de escenarios,
+sino saber qué supuesto mueve más la capacidad estimada y cuánto.
+
+16. Estabilidad temporal de la curva
+
+La curva de capacidad no debería validarse solo en el agregado total.
+Debe revisarse también por subperiodos o regímenes de liquidez.
+
+Ejemplos útiles:
+- high-vol vs low-vol regimes;
+- subperiodos temporales relevantes;
+- periodos calm vs stressed;
+- cortes por crowding state si existe integración con crowding_detector.
+
+Una curva aparentemente razonable en agregado puede esconder que la capacidad real
+se colapsa en entornos de estrés, que son precisamente los que más importan.
+
+17. Integración con otros módulos
+
+17.1 execution / impact_model
+Debe ser la fuente natural de:
+- parámetros de coste calibrados;
+- participation limits;
+- y supuestos de fill realism.
+
+17.2 rebalance
+Debe aportar:
+- trading schedules;
+- turnover realista;
+- y mecánica de ejecución al escalar.
+
+17.3 crowding_detector
+Puede endurecer:
+- participation assumptions;
+- impact multipliers;
+- o escenarios de haircut cuando el libro está crowding-stressed.
+
+17.4 turnover_vs_edge
+Aporta una visión complementaria:
+cómo el edge se erosiona al aumentar turnover o fricción de implementación.
+
+17.5 validation
+Debe comprobar que los rangos de AUM recomendados sobreviven en pruebas OOS realistas.
+
+18. Contrato de salida
+
+La salida canónica debe contener, para cada nivel de AUM del grid, al menos:
+
+- aum
+- gross_return
+- net_return
+- gross_pnl
+- net_pnl
+- gross_vol
+- net_vol
+- gross_sharpe
+- net_sharpe
+- avg_turnover
+- avg_participation
+- frac_truncated_trades
+- alpha_truncation_pct
+- capacity_flag
+- binding_constraint
+- marginal_net_pnl
+- ci_mu_net_low              # si bootstrap.enabled
+- ci_mu_net_high             # si bootstrap.enabled
+- ci_sr_net_low              # si bootstrap.enabled
+- ci_sr_net_high             # si bootstrap.enabled
+- sensitivity_summary_json   # si sensitivity enabled
+- notes
+
+Ruta típica de persistencia:
+
+    research/capacity_analysis/artifacts/profitability_curve.parquet
+
+19. Flags y lógica de gobernanza
+
+La salida debe marcar de forma explícita cuándo un AUM entra en zona problemática.
+
+Flags razonables:
+- admissible
+- liquidity_constraint_binding
+- return_break_even_exceeded
+- sharpe_constraint_binding
+- alpha_truncation_material
+- stressed_capacity_only
+
+La lógica exacta debe ser configurable, pero siempre transparente y auditable.
+
+20. Invariantes
+
+Los invariantes obligatorios son:
+
+- la calibración de costes debe usar solo historia disponible hasta la fecha de corte;
+- los participation caps nunca deben relajarse endógenamente al subir AUM;
+- la curva debe construirse sobre baseline PIT-safe;
+- al bindear caps, deben revisarse tanto costes como alpha capturado;
+- los intervalos de confianza deben usar block bootstrap, no naive resampling;
+- cualquier cambio en bucketización o parámetros debe quedar versionado;
+- la curva debe seguir siendo interpretable, no solo suave visualmente.
+
+21. Edge cases y failure modes
+
+Los fallos más peligrosos del módulo son:
+
+- usar parámetros de coste globales en un universo con heterogeneidad brutal de liquidez;
+- asumir que truncar trades solo baja coste pero no destruye alpha;
+- usar ADV stale o mal alineado;
+- extrapolar costes de periodos calm a regímenes de crisis;
+- presentar A_opt como “óptimo estable” sin bandas de incertidumbre;
+- ignorar que unos pocos nombres ilíquidos pueden dominar la capacidad total;
+- y usar una curva agregada que esconde colapsos severos por subperiodo.
+
+22. Criterios de aceptación
+
+El módulo solo debe considerarse listo si cumple:
+
+- plausibilidad económica:
+  net return y net Sharpe caen de forma razonable al aumentar AUM;
+
+- realismo de costes:
+  el drag estimado es consistente con fills históricos o TCA defendible;
+
+- realismo de constraints:
+  la fracción de trades truncados y la participación media crecen con AUM de forma creíble;
+
+- estabilidad:
+  la curva es razonablemente estable por subperiodos o, si no lo es, eso queda explícito;
+
+- incertidumbre:
+  los rangos recomendados de capacidad incluyen bandas y no solo puntos;
+
+- integración:
+  los outputs pueden ser usados por capital allocation y validation downstream.
+
+23. Qué no debe afirmarse
+
+profitability_curve.py no debe usarse para vender afirmaciones del tipo:
+- “la estrategia soporta X millones” como cifra absoluta y exacta;
+- “el capacity number es definitivo”;
+- o “la curva demuestra que se puede escalar sin pérdida de edge”.
+
+La responsabilidad correcta del módulo es más estrecha y más valiosa:
+estimar, con hipótesis explícitas y falsables, cómo se degrada la economía neta de la
+estrategia al escalar capital y dónde dejan de compensar los costes, la liquidez y la
+truncación de alpha.
+
+24. Conclusión
+
+profitability_curve.py debe existir para responder una pregunta central de gobernanza
+económica de la estrategia:
+
+- cuánto capital puede absorber el sistema antes de dejar de ser atractivo en neto;
+- cuándo el Sharpe deja de justificar el despliegue;
+- y a qué escala el incremento de capital deja de añadir P&L neto útil.
+
+Ese es el estándar correcto de una profitability curve seria en una pipeline profesional
+de small-cap swing trading.

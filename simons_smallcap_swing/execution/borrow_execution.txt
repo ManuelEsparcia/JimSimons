@@ -1,456 +1,496 @@
-\section{Módulo: execution/borrow\_execution.py}
-
-\subsection{Contexto: short selling realista, lending frictions y asimetría operacional}
-\label{sec:borrow-execution-context}
-
-En un sistema cuantitativo institucional, la venta en corto no puede modelarse como la simple imagen especular de una posición larga. La capacidad de establecer y mantener un short depende de una infraestructura de \textit{securities lending} caracterizada por fricciones de inventario, costes de préstamo, riesgo de retirada del inventario prestado (\textit{recall}), variabilidad temporal de la disponibilidad y discontinuidades operativas en episodios de estrés de liquidez.
-
-En consecuencia, una simulación de ejecución que permita posiciones cortas sin incorporar restricciones de \textit{locate}, límites de disponibilidad, \textit{borrow fees} y eventos de \textit{forced cover} tiende a sobreestimar de forma sistemática tanto la capacidad implementable como el P\&L neto. Este sesgo no es periférico: en universos de small caps y nombres \textit{hard-to-borrow}, puede alterar de forma material la distribución de retornos, el perfil de riesgo, la persistencia del alpha y la verdadera escalabilidad de la estrategia.
-
-Este módulo formaliza esa capa de realidad operacional. Su propósito no es predecir el mercado de préstamo con máxima granularidad microestructural, sino imponer una semántica de ejecución de shorts suficientemente estricta, auditable y coherente con la práctica institucional como para impedir que el backtest capture beneficios que, en producción, estarían bloqueados por restricciones de inventario, por costes de financiación o por cierres forzosos.
-
-\subsection{Objetivo del módulo}
-\label{sec:borrow-execution-objective}
-
-El objetivo de \texttt{execution/borrow\_execution.py} es transformar órdenes teóricas de rebalance con exposición corta deseada en órdenes ejecutables bajo restricciones realistas de préstamo de valores, preservando trazabilidad completa entre:
-
-\begin{itemize}
-    \item la intención original del rebalance,
-    \item la capacidad efectiva de apertura o mantenimiento del short,
-    \item el coste diario asociado a la posición prestada,
-    \item y los eventos exógenos que obligan a reducir o cerrar la posición.
-\end{itemize}
-
-De manera más precisa, el módulo debe:
-
-\begin{enumerate}
-    \item Determinar si una orden corta es \textbf{admisible} en la fecha de decisión y/o ejecución.
-    \item Calcular el \textbf{máximo tamaño short implementable} dado el inventario disponible y la política de capacidad.
-    \item Reconciliar la \textbf{intención de posición} con la \textbf{capacidad short efectiva}, generando una orden ajustada.
-    \item Devengar diariamente el \textbf{coste de borrow} sobre la posición corta realmente abierta, nunca sobre la teórica no ejecutada.
-    \item Simular \textbf{recalls} y traducirlos en reducciones obligatorias o cierres totales bajo una política explícita y determinista.
-    \item Emitir artefactos de salida con semántica inequívoca para su consumo por \texttt{fills\_simulator}, \texttt{cost\_model}, \texttt{backtest/engine} y \texttt{validation}.
-\end{enumerate}
-
-\subsection{Principio de diseño}
-\label{sec:borrow-execution-design-principle}
-
-La filosofía del módulo es:
-
-\begin{quote}
-\textit{una posición corta solo existe, persiste y genera P\&L neto si existe capacidad prestable suficiente para abrirla y mantenerla; en ausencia de esa capacidad, el sistema debe degradar la posición de forma explícita, no implícita.}
-\end{quote}
-
-Esto implica dos principios de implementación:
-
-\begin{itemize}
-    \item \textbf{No simular exposición short ficticia.} La parte no localizada o no disponible de una orden corta debe quedar rechazada o recortada antes de que el motor la trate como exposición efectiva.
-    \item \textbf{Aplicar costes y recalls sobre estado realizado.} Los fees y eventos de recall operan sobre la posición corta viva en libro, no sobre la señal objetivo ni sobre órdenes no llenadas.
-\end{itemize}
-
-\subsection{Alcance y límites del módulo}
-\label{sec:borrow-execution-scope}
-
-\subsubsection{Incluido}
-\begin{itemize}
-    \item Elegibilidad short a nivel símbolo-fecha.
-    \item Cálculo de capacidad máxima short admisible.
-    \item Recorte o rechazo de órdenes cortas por falta de disponibilidad.
-    \item Devengo diario de borrow fees sobre la posición abierta.
-    \item Simulación de recalls bajo una política parametrizable.
-    \item Generación de órdenes ajustadas, eventos y costes para consumo downstream.
-\end{itemize}
-
-\subsubsection{No incluido}
-\begin{itemize}
-    \item Estimación primaria del inventario lendable o de la tasa de borrow: eso pertenece a \texttt{data/borrow}.
-    \item Simulación de la dinámica intradía de ejecución del child order: eso pertenece a \texttt{execution/fills\_simulator}.
-    \item Enrutamiento, \textit{broker selection}, negociación bilateral de inventario o smart order routing.
-    \item Optimización de la cartera condicionada a borrow scarcity: eso pertenece a \texttt{portfolio construction} o \texttt{turnover/control} si se decide internalizarlo aguas arriba.
-\end{itemize}
-
-La separación es deliberada. Este módulo no decide \emph{qué} se quiere shortear; decide \emph{cuánto de lo que se quiere shortear es realmente sostenible en ejecución}.
-
-\subsection{Relación con el resto del sistema}
-\label{sec:borrow-execution-system-relations}
-
-\subsubsection{Inputs upstream}
-\begin{itemize}
-    \item \texttt{rebalance/orders}: intención de trading, típicamente expresada como \texttt{delta\_shares} o \texttt{target\_shares}.
-    \item \texttt{data/borrow}: elegibilidad, disponibilidad, borrow fee proxy, métricas auxiliares de escasez.
-    \item \texttt{config/execution/borrow}: política operacional del módulo.
-    \item \texttt{market data}: precios necesarios para valoración nocional y devengo de fees.
-\end{itemize}
-
-\subsubsection{Outputs downstream}
-\begin{itemize}
-    \item \texttt{execution/fills\_simulator}: recibe órdenes ya depuradas por restricciones de borrow.
-    \item \texttt{execution/cost\_model}: recibe borrow costs realizados y/o programados, evitando doble conteo con otros componentes.
-    \item \texttt{backtest/engine}: actualiza posiciones, cash y eventos de forced cover.
-    \item \texttt{validation/capacity\_sanity}: verifica consistencia de capacidad y estabilidad operativa.
-\end{itemize}
-
-\subsection{Semántica temporal obligatoria}
-\label{sec:borrow-execution-time-semantics}
-
-Una fuente habitual de errores en backtesting institucional es mezclar tiempos de decisión, admisión, ejecución y devengo de costes. Este módulo adopta la siguiente semántica temporal obligatoria:
-
-\begin{itemize}
-    \item En fecha \( t \), el rebalance genera una intención de orden.
-    \item La elegibilidad short y la disponibilidad observables en \( t \) se usan para determinar la parte \textbf{admisible} de la orden.
-    \item La ejecución material de la orden ajustada ocurre según la convención temporal del \texttt{fills\_simulator} (por ejemplo, \( t+1 \) open, VWAP diario, etc.).
-    \item El \textbf{borrow fee} se devenga únicamente sobre la posición corta efectivamente abierta tras ejecución.
-    \item Un \textbf{recall} detectado en \( t \) genera una orden obligatoria de cobertura cuya ejecución sigue la misma semántica que el resto de órdenes forzadas del sistema.
-\end{itemize}
-
-Por tanto, este módulo distingue explícitamente entre:
-
-\[
-\text{desired short} \;\neq\; \text{admitted short} \;\neq\; \text{filled short} \;\neq\; \text{live short exposure}.
-\]
-
-Toda implementación que colapse esas cuatro nociones en una sola variable tiende a introducir errores materiales de P\&L y de capacidad.
-
-\subsection{Contrato de entrada}
-\label{sec:borrow-execution-inputs}
-
-\subsubsection{Rutas mínimas}
-\begin{itemize}
-    \item \texttt{orders\_path}
-    \item \texttt{locate\_path}
-    \item \texttt{borrow\_proxy\_path}
-    \item \texttt{prices\_path}
-    \item \texttt{borrow\_execution\_config\_path}
-    \item \texttt{run\_id}
-\end{itemize}
-
-\subsubsection{Campos mínimos de órdenes}
-\begin{itemize}
-    \item \texttt{date}
-    \item \texttt{symbol}
-    \item \texttt{order\_id}
-    \item \texttt{side}
-    \item \texttt{delta\_shares}
-    \item \texttt{target\_shares} \; (si la arquitectura del rebalance opera por target)
-    \item \texttt{current\_shares} \; (necesario para distinguir apertura neta de short frente a simple reducción de long)
-\end{itemize}
-
-\subsubsection{Campos mínimos de borrow}
-\begin{itemize}
-    \item \texttt{short\_eligible\_flag}
-    \item \texttt{availability\_score}
-    \item \texttt{borrow\_fee\_proxy\_daily}
-    \item \texttt{borrow\_data\_quality\_flag}
-\end{itemize}
-
-\subsubsection{Campos mínimos de precios}
-\begin{itemize}
-    \item \texttt{close} o el precio de referencia definido por la convención del engine
-\end{itemize}
-
-\subsubsection{Invariantes de entrada}
-\begin{itemize}
-    \item \texttt{availability\_score} debe pertenecer a \([0,1]\) tras normalización interna.
-    \item \texttt{borrow\_fee\_proxy\_daily} debe estar expresado en decimal diario, no anual, salvo que el config fuerce conversión.
-    \item No puede haber duplicados en la clave \texttt{(date, symbol)} en los datos de borrow una vez resueltas prioridades de proveedor.
-    \item Toda orden con \texttt{side = short} o con cruce neto a posición negativa debe disponer de información de borrow válida o ser tratada con política explícita de \texttt{fail-closed}.
-\end{itemize}
-
-\subsection{Definiciones formales}
-\label{sec:borrow-execution-formal-definitions}
-
-Para cada símbolo \( i \) y fecha \( t \), definimos:
-
-\begin{itemize}
-    \item \( q_{it}^{\mathrm{cur}} \): posición actual antes del rebalance.
-    \item \( q_{it}^{\mathrm{des}} \): posición deseada tras rebalance.
-    \item \( \Delta q_{it}^{\mathrm{req}} = q_{it}^{\mathrm{des}} - q_{it}^{\mathrm{cur}} \): cambio de posición solicitado.
-    \item \( \bar{q}_{it}^{\mathrm{short,des}} = \max(0,-q_{it}^{\mathrm{des}}) \): tamaño short deseado absoluto.
-    \item \( \bar{q}_{it}^{\mathrm{short,cur}} = \max(0,-q_{it}^{\mathrm{cur}}) \): tamaño short actual absoluto.
-    \item \( \Delta \bar{q}_{it}^{\mathrm{open}} = \max\bigl(0,\bar{q}_{it}^{\mathrm{short,des}}-\bar{q}_{it}^{\mathrm{short,cur}}\bigr) \): incremento neto de short que requiere capacidad nueva.
-    \item \( e_{it} \in \{0,1\} \): indicador de elegibilidad short.
-    \item \( a_{it} \in [0,1] \): disponibilidad normalizada.
-    \item \( Q_{it}^{\max} \ge 0 \): capacidad nominal máxima short del símbolo.
-    \item \( B_{it} = a_{it} Q_{it}^{\max} \): capacidad efectiva disponible para el short.
-    \item \( f_{it} \ge 0 \): borrow fee diaria.
-\end{itemize}
-
-\subsection{Regla exacta de admisión}
-\label{sec:borrow-execution-admission-rule}
-
-La lógica correcta no debe actuar sobre toda orden negativa de manera indiscriminada, sino sobre el \textbf{incremento neto de exposición short}. Esto evita penalizar erróneamente reducciones de un short existente.
-
-Definimos el incremento de short admisible como:
-
-\begin{equation}
-\Delta \bar{q}_{it}^{\mathrm{adm}} =
-\begin{cases}
-0, & \text{si } e_{it}=0, \\
-\min\left(\Delta \bar{q}_{it}^{\mathrm{open}},\, B_{it}^{\mathrm{free}}\right), & \text{si } e_{it}=1,
-\end{cases}
-\end{equation}
-
-donde \( B_{it}^{\mathrm{free}} \) representa la capacidad disponible para nueva apertura, neta de la ya consumida por la posición corta existente si el modelo así lo requiere.
-
-La nueva posición short admitida será entonces:
-
-\begin{equation}
-\bar{q}_{it}^{\mathrm{short,adm}}
-=
-\bar{q}_{it}^{\mathrm{short,cur}}
-+
-\Delta \bar{q}_{it}^{\mathrm{adm}},
-\end{equation}
-
-y la posición final admitida:
-
-\begin{equation}
-q_{it}^{\mathrm{adm}} =
-\begin{cases}
--\bar{q}_{it}^{\mathrm{short,adm}}, & \text{si } q_{it}^{\mathrm{des}} < 0, \\
-q_{it}^{\mathrm{des}}, & \text{si } q_{it}^{\mathrm{des}} \ge 0.
-\end{cases}
-\end{equation}
-
-Esta formulación evita el error común de aplicar la restricción de borrow a transacciones que en realidad \textbf{cierran riesgo} en lugar de abrirlo.
-
-\subsection{Precedencia obligatoria de reglas}
-\label{sec:borrow-execution-precedence}
-
-Para eliminar ambigüedad, la precedencia del módulo debe ser exactamente la siguiente:
-
-\begin{enumerate}
-    \item \textbf{Validación de integridad de inputs.}
-    \item \textbf{Determinación de transición de signo} (long a flat, flat a short, short a más short, short a menos short, short a long).
-    \item \textbf{Cálculo del incremento neto de short que requiere capacidad nueva.}
-    \item \textbf{Chequeo de elegibilidad.}
-    \item \textbf{Aplicación de capacidad disponible.}
-    \item \textbf{Generación de orden ajustada admitida.}
-    \item \textbf{Persistencia del motivo de recorte/rechazo.}
-    \item \textbf{Devengo de fees únicamente sobre posición short viva.}
-    \item \textbf{Procesamiento de recalls sobre posición realizada, nunca sobre intención teórica.}
-\end{enumerate}
-
-Cualquier implementación distinta debe considerarse semánticamente incompatible con la especificación.
-
-\subsection{Modelo de borrow fee}
-\label{sec:borrow-execution-fee-model}
-
-El fee diario realizado del símbolo \( i \) en la fecha \( t \) se calcula sobre la exposición corta viva, no sobre el objetivo ni sobre el volumen operado:
-
-\begin{equation}
-C_{it}^{\mathrm{borrow}}
-=
-f_{it}\cdot \left|\; q_{it}^{\mathrm{live,short}} \;\right|\cdot P_{it}^{\mathrm{ref}},
-\end{equation}
-
-donde \( q_{it}^{\mathrm{live,short}} = \max(0,-q_{it}^{\mathrm{live}}) \) y \( P_{it}^{\mathrm{ref}} \) es el precio de referencia de devengo definido por configuración.
-
-El coste acumulado entre \( t_0 \) y \( t_1 \) es:
-
-\begin{equation}
-C_{i,[t_0,t_1]}^{\mathrm{borrow}}
-=
-\sum_{t=t_0}^{t_1} C_{it}^{\mathrm{borrow}}.
-\end{equation}
-
-\paragraph{Regla de no doble conteo.}
-El \texttt{borrow\_execution} solo produce el componente de coste asociado al préstamo de inventario. No debe incorporar:
-\begin{itemize}
-    \item spread crossing,
-    \item market impact,
-    \item commissions,
-    \item exchange fees,
-    \item slippage de ejecución.
-\end{itemize}
-Esos componentes pertenecen a otras capas. Esta separación es obligatoria para que \texttt{cost\_model} pueda reconciliar costes sin solapamiento semántico.
-
-\subsection{Modelo de recall}
-\label{sec:borrow-execution-recall-model}
-
-El recall no debe modelarse como una nota conceptual vaga, sino como una transformación explícita de la posición máxima sostenible.
-
-Sea \( \bar{q}_{it}^{\mathrm{live,short}} \) la posición corta viva antes del evento y \( \bar{q}_{it}^{\mathrm{cap,new}} \) la nueva capacidad short sostenible tras el deterioro de disponibilidad. Entonces el tamaño de cobertura forzosa viene dado por:
-
-\begin{equation}
-\Delta \bar{q}_{it}^{\mathrm{forced\_cover}}
-=
-\max\left(0,\bar{q}_{it}^{\mathrm{live,short}}-\bar{q}_{it}^{\mathrm{cap,new}}\right).
-\end{equation}
-
-\subsubsection{Políticas permitidas}
-\begin{itemize}
-    \item \textbf{Full recall}: si hay evento, \(\bar{q}_{it}^{\mathrm{cap,new}}=0\).
-    \item \textbf{Partial recall}: la capacidad cae a un nuevo nivel positivo y se cubre solo el exceso.
-    \item \textbf{Deterministic threshold recall}: si \texttt{availability\_score} cae por debajo de umbral, se activa cobertura.
-    \item \textbf{Stochastic recall}: un generador exógeno produce el evento según un hazard parametrizado.
-\end{itemize}
-
-\subsubsection{Regla operativa obligatoria}
-Un recall nunca modifica retrospectivamente fills pasados. Produce una \textbf{nueva orden obligatoria de compra para cubrir} que entra en el motor a partir de la fecha del evento, con su propia trazabilidad, sus propios costes de ejecución y su propio impacto.
-
-\subsection{Casos frontera que deben resolverse sin ambigüedad}
-\label{sec:borrow-execution-edge-cases}
-
-\begin{enumerate}
-    \item \textbf{Símbolo no elegible pero con short ya abierto.}  
-    No se permite aumentar la posición. La política por defecto debe ser \texttt{freeze-and-manage}: mantener mientras no haya recall, pero bloquear cualquier incremento adicional.
-
-    \item \textbf{Orden que reduce un short existente.}  
-    Debe permitirse íntegramente aunque \texttt{short\_eligible\_flag = False}, porque reduce riesgo y consumo de inventario.
-
-    \item \textbf{Cruce long \(\rightarrow\) short en una sola orden.}  
-    La parte que cierra el long es libre; la parte que abre el short requiere chequeo de borrow.
-
-    \item \textbf{Datos de borrow ausentes.}  
-    La política por defecto recomendada es \texttt{fail-closed} para nueva apertura short y \texttt{allow-reduction} para reducción/cierre de short existente.
-
-    \item \textbf{Borrow fee extremo.}  
-    Si \( f_{it} \) supera un umbral de sanidad, el sistema no debe truncarlo silenciosamente. Debe marcar el evento y aplicar la política configurada: aceptar, capear o rechazar.
-
-    \item \textbf{Availability intraperiodo incompatible con la posición viva.}  
-    Debe generar un evento de recorte de capacidad y, si procede, una orden de forced cover.
-
-    \item \textbf{Recall y rebalance ordinario en la misma fecha.}  
-    La precedencia debe ser: primero imponer la restricción exógena de recall, después netear con la intención del rebalance si la arquitectura del engine lo permite; en caso contrario, prevalece la cobertura forzosa.
-\end{enumerate}
-
-\subsection{Contrato de salida}
-\label{sec:borrow-execution-outputs}
-
-Para cada \texttt{run\_id}, el módulo debe producir:
-
-\begin{itemize}
-    \item \texttt{borrow\_adjusted\_orders.parquet}
-    \item \texttt{borrow\_costs\_daily.parquet}
-    \item \texttt{borrow\_events.parquet}
-    \item \texttt{manifest.json}
-\end{itemize}
-
-\subsubsection{Campos mínimos de órdenes ajustadas}
-\begin{itemize}
-    \item \texttt{date}
-    \item \texttt{symbol}
-    \item \texttt{order\_id}
-    \item \texttt{requested\_shares}
-    \item \texttt{admitted\_shares}
-    \item \texttt{requested\_short\_open\_shares}
-    \item \texttt{admitted\_short\_open\_shares}
-    \item \texttt{short\_allowed\_flag}
-    \item \texttt{borrow\_reject\_reason}
-    \item \texttt{availability\_score\_used}
-    \item \texttt{borrow\_fee\_used}
-    \item \texttt{policy\_version}
-\end{itemize}
-
-\subsubsection{Campos mínimos de costes diarios}
-\begin{itemize}
-    \item \texttt{date}
-    \item \texttt{symbol}
-    \item \texttt{live\_short\_shares}
-    \item \texttt{reference\_price}
-    \item \texttt{borrow\_fee\_daily}
-    \item \texttt{borrow\_cost\_amount}
-\end{itemize}
-
-\subsubsection{Campos mínimos de eventos}
-\begin{itemize}
-    \item \texttt{date}
-    \item \texttt{symbol}
-    \item \texttt{event\_type}
-    \item \texttt{pre\_event\_short\_shares}
-    \item \texttt{post\_event\_capacity}
-    \item \texttt{forced\_cover\_shares}
-    \item \texttt{event\_reason}
-\end{itemize}
-
-\subsection{Invariantes de salida}
-\label{sec:borrow-execution-output-invariants}
-
-Deben cumplirse siempre:
-
-\begin{equation}
-\left|\texttt{admitted\_shares}\right|
-\le
-\left|\texttt{requested\_shares}\right|
-\quad \text{en la parte que implique apertura neta de short,}
-\end{equation}
-
-\begin{equation}
-\texttt{borrow\_cost\_amount} \ge 0,
-\end{equation}
-
-y además:
-
-\begin{itemize}
-    \item nunca puede existir \texttt{admitted\_short\_open\_shares > 0} si \texttt{short\_allowed\_flag = False},
-    \item una reducción de short nunca debe ser bloqueada por falta de elegibilidad,
-    \item todo \texttt{forced\_cover\_shares} debe estar respaldado por un evento identificable en \texttt{borrow\_events.parquet}.
-\end{itemize}
-
-\subsection{Algoritmo operativo recomendado}
-\label{sec:borrow-execution-algorithm}
-
-\begin{enumerate}
-    \item Cargar órdenes, estado actual de posiciones, datos de borrow y precios.
-    \item Resolver unicidad y calidad del dataset de borrow para cada \texttt{(date, symbol)}.
-    \item Descomponer cada transición de posición en:
-    \begin{itemize}
-        \item cierre/reducción de long,
-        \item apertura/incremento de short,
-        \item reducción/cierre de short.
-    \end{itemize}
-    \item Aplicar elegibilidad y capacidad solo a la componente de apertura neta de short.
-    \item Reconstruir la orden admitida final.
-    \item Persistir razones de recorte/rechazo sin pérdida de información.
-    \item Una vez recibidos fills del simulador, computar el borrow cost diario sobre posición viva.
-    \item Evaluar recalls y, si procede, emitir órdenes forzadas de cobertura para el siguiente ciclo del engine.
-\end{enumerate}
-
-\subsection{Validaciones mínimas y tests de aceptación}
-\label{sec:borrow-execution-validations}
-
-Además de validaciones unitarias convencionales, este módulo debe superar como mínimo los siguientes tests de aceptación:
-
-\subsubsection{Test A: símbolo no elegible}
-Dada una orden que abre short en un símbolo con \texttt{short\_eligible\_flag = False}, entonces:
-\begin{itemize}
-    \item la apertura short admitida debe ser cero,
-    \item la parte de la orden que cierre un long previo sí puede ejecutarse,
-    \item debe persistirse \texttt{borrow\_reject\_reason = not\_eligible}.
-\end{itemize}
-
-\subsubsection{Test B: reducción de short existente}
-Dada una posición short viva y una orden que la reduce en magnitud, el módulo debe permitir esa reducción incluso si el símbolo pasa a no elegible.
-
-\subsubsection{Test C: recorte por disponibilidad}
-Si la apertura short solicitada excede la capacidad efectiva, la orden admitida debe coincidir exactamente con esa capacidad y la diferencia debe quedar registrada como no admitida.
-
-\subsubsection{Test D: fees sobre posición viva}
-El borrow cost diario debe calcularse sobre la posición efectivamente abierta tras fills, no sobre la orden solicitada.
-
-\subsubsection{Test E: forced cover por recall}
-Ante un recall que reduce la capacidad por debajo de la posición viva, el sistema debe emitir una cobertura forzosa exactamente igual al exceso.
-
-\subsubsection{Test F: no doble conteo de costes}
-La suma de costes del módulo no debe contener componentes de spread, slippage o impacto.
-
-\subsection{CLI de ejemplo}
-\label{sec:borrow-execution-cli}
-
-\begin{verbatim}
-python -m execution.borrow_execution \
-  --orders-path portfolio/rebalance/run_latest/rebalance_orders.parquet \
-  --locate-path data/borrow/locate/locate_snapshot.parquet \
-  --borrow-proxy-path data/borrow/proxy/borrow_proxy.parquet \
-  --prices-path data/price/daily_equities.parquet \
-  --borrow-execution-config-path config/execution/borrow_execution.yaml \
-  --run-id simons_smallcap_swing_2026_03_06
-\end{verbatim}
-
-\subsection{Conclusión}
-\label{sec:borrow-execution-conclusion}
-
-\texttt{execution/borrow\_execution.py} no debe entenderse como un detalle administrativo del short selling, sino como una capa de control de realidad económica. Su función es impedir que la estrategia monetice alpha sobre inventario inexistente, ignore costes de financiación materialmente relevantes o mantenga posiciones que, bajo una mecánica plausible de préstamo de valores, habrían sido recortadas o cerradas.
-
-En términos de arquitectura, el módulo cumple una función crítica de frontera entre \textit{portfolio intent} y \textit{implementable short exposure}. En términos de modelización, su valor reside menos en la sofisticación estética de una fórmula aislada y más en imponer una disciplina semántica fuerte: separar deseo, admisión, fill, posición viva, coste devengado y cobertura forzosa. Esa separación es precisamente la que convierte un backtest elegante en una simulación institucionalmente creíble.
+Especificación Cuantitativa: execution/borrow_execution.py
+
+1. Propósito del módulo
+
+El objetivo de execution/borrow_execution.py es transformar órdenes teóricas con componente short en órdenes ejecutables bajo restricciones realistas de préstamo de valores.
+
+La función exacta del módulo no es “predecir el mercado de lending”, sino imponer una capa de realidad operacional sobre la exposición corta deseada. En concreto, debe decidir:
+
+- qué parte del short deseado puede abrirse realmente,
+- qué parte debe recortarse o rechazarse,
+- qué coste de borrow se devenga sobre la posición viva,
+- y qué coberturas forzosas deben emitirse cuando la capacidad cae.
+
+La pregunta correcta del módulo es:
+
+“Dada una intención de cartera con exposición corta, ¿cuánta de esa exposición es operativamente admisible y sostenible bajo las restricciones de borrow observables hoy?”
+
+2. Principios no negociables
+
+2.1 Contrato determinista base
+La versión canónica del módulo debe ser determinista y auditable.
+Si la disponibilidad observada no soporta una apertura short, esa parte se recorta o se rechaza. No se simula exposición short ficticia.
+
+2.2 Separación semántica obligatoria
+El módulo debe distinguir siempre entre:
+
+- desired short
+- admitted short
+- filled short
+- live short
+
+Estas cuatro magnitudes no pueden colapsarse en una sola variable.
+
+2.3 Coste sobre estado realizado
+El borrow fee solo se devenga sobre la posición corta viva, nunca sobre la orden deseada ni sobre tamaño no admitido.
+
+2.4 Recall como evento exógeno
+Un recall nunca reescribe retrospectivamente la historia de fills. Produce una nueva orden forzosa de cobertura.
+
+2.5 No bloqueo de reducción de riesgo
+Reducir o cerrar un short existente debe estar permitido incluso si el símbolo ya no es elegible para nuevas aperturas.
+
+2.6 Point-in-time estricto
+Elegibilidad, disponibilidad, fees y precios de referencia deben corresponder a la fecha efectiva de decisión o devengo según la semántica temporal configurada.
+
+3. Qué hace y qué no hace
+
+3.1 Qué hace
+- valida elegibilidad short por símbolo y fecha;
+- calcula capacidad máxima short disponible;
+- determina la parte admisible del incremento neto de short;
+- ajusta órdenes antes de fills;
+- calcula borrow cost diario sobre posición viva;
+- procesa recalls como recortes de capacidad;
+- emite órdenes de forced cover cuando procede;
+- y persiste trazabilidad completa.
+
+3.2 Qué no hace
+- no estima inventario lendable desde cero;
+- no negocia con brokers;
+- no modela fills intradía;
+- no optimiza asignación global de shorts;
+- no sustituye a data/borrow;
+- no sustituye a fills_simulator.
+
+4. Entradas obligatorias
+
+4.1 Órdenes / intención de rebalance
+- date
+- symbol
+- order_id
+- current_shares
+- target_shares o delta_shares
+- side si existe
+- cualquier metadata de prioridad operativa
+
+4.2 Datos de borrow
+- short_eligible_flag
+- availability_score
+- borrow_fee_proxy_daily
+- borrow_data_quality_flag
+- capacity_max_short si existe directamente
+- locate_flag o locate_status si el proveedor lo ofrece
+
+4.3 Precios
+- reference_price
+o la convención explícita equivalente
+
+4.4 Configuración
+- fail_closed_on_missing_borrow
+- allow_short_reduction_when_not_eligible
+- capacity_policy
+- recall_policy
+- fee_daycount
+- price_reference_convention
+- event_priority
+- data_quality_thresholds
+
+5. Salidas obligatorias
+
+El módulo debe persistir:
+
+1. borrow_adjusted_orders.parquet
+2. borrow_costs_daily.parquet
+3. borrow_events.parquet
+4. manifest.json
+
+y devolver un estado agregable por run.
+
+6. Semántica temporal obligatoria
+
+La secuencia correcta es:
+
+1. en t se genera una intención de orden
+2. en t se consulta elegibilidad y disponibilidad observables
+3. se determina la parte admitida de la apertura short
+4. el fills_simulator ejecuta la orden admitida según su propia convención temporal
+5. el borrow fee se devenga sobre la posición corta viva
+6. si en una fecha posterior la capacidad cae, se genera forced cover
+
+Por tanto:
+
+desired != admitted != filled != live
+
+Esta separación es obligatoria.
+
+7. Definiciones formales
+
+Para símbolo i y fecha t:
+
+- q_cur_it: posición actual antes de rebalance
+- q_des_it: posición deseada tras rebalance
+- Delta q_req_it = q_des_it - q_cur_it
+
+Short deseado absoluto:
+    qbar_short_des_it = max(0, -q_des_it)
+
+Short actual absoluto:
+    qbar_short_cur_it = max(0, -q_cur_it)
+
+Incremento neto de short que requiere inventario nuevo:
+    Delta qbar_open_it =
+        max(0, qbar_short_des_it - qbar_short_cur_it)
+
+Elegibilidad:
+    e_it in {0,1}
+
+Disponibilidad normalizada:
+    a_it in [0,1]
+
+Capacidad nominal máxima:
+    Qmax_it >= 0
+
+Capacidad efectiva:
+    B_it = a_it * Qmax_it
+
+8. Capacidad libre
+
+Aquí conviene cerrar mejor la semántica.
+
+El módulo debe distinguir entre:
+
+- capacidad total observable:
+    B_it
+
+- capacidad libre para nuevas aperturas:
+    Bfree_it
+
+La definición exacta de Bfree_it depende del proveedor y de la política del sistema, pero la versión canónica debe permitir:
+
+Caso A:
+si B_it ya representa capacidad neta todavía libre:
+    Bfree_it = B_it
+
+Caso B:
+si B_it representa capacidad total y existe short vivo ya consumiendo inventario:
+    Bfree_it = max(0, B_it - qbar_short_cur_it)
+
+La política usada debe quedar explícitamente registrada.
+
+9. Regla exacta de admisión
+
+La restricción de borrow solo debe aplicarse sobre la parte que abre short nuevo.
+
+Definición:
+
+si e_it = 0:
+    Delta qbar_adm_it = 0
+
+si e_it = 1:
+    Delta qbar_adm_it = min(Delta qbar_open_it, Bfree_it)
+
+Nueva posición short admitida:
+    qbar_short_adm_it =
+        qbar_short_cur_it + Delta qbar_adm_it
+
+Posición final admitida:
+    q_adm_it =
+        -qbar_short_adm_it   si q_des_it < 0
+         q_des_it            si q_des_it >= 0
+
+Esta es la semántica base del módulo.
+
+10. Reglas operativas críticas
+
+10.1 Símbolo no elegible
+Si short_eligible_flag = False:
+- no puede abrirse short nuevo,
+- pero sí puede reducirse o cerrarse short existente.
+
+10.2 Cruce long -> short
+La parte que cierra long es libre.
+Solo la parte que pasa a exposición short nueva requiere inventario.
+
+10.3 Incremento de short existente
+Solo el incremento adicional sobre el short vivo consume capacidad nueva.
+
+10.4 Reducción de short existente
+Debe permitirse íntegramente aunque el activo pase a no elegible.
+
+11. Política de datos faltantes
+
+La política canónica recomendada es:
+
+11.1 Para nueva apertura short
+si faltan datos de borrow materiales:
+    fail_closed
+
+Es decir:
+- no admitir apertura short nueva
+- registrar reason = missing_borrow_data
+
+11.2 Para reducción o cierre de short
+si faltan datos de borrow:
+    allow_reduction
+
+Porque reduce riesgo e inventario utilizado.
+
+12. Borrow fee
+
+12.1 Definición base
+El borrow cost diario del símbolo i en t es:
+
+    C_borrow_it =
+        f_it * |q_live_short_it| * P_ref_it
+
+donde:
+- f_it es el borrow fee diario
+- q_live_short_it = max(0, -q_live_it)
+- P_ref_it es el precio de referencia de devengo
+
+12.2 Regla obligatoria
+El fee se calcula sobre posición viva, no sobre:
+- short deseado,
+- short admitido no ejecutado,
+- o short teórico del modelo.
+
+12.3 No doble conteo
+Este módulo solo produce el coste de préstamo.
+No incluye:
+- spread
+- slippage
+- market impact
+- fees de broker
+- exchange fees
+
+13. Recalls
+
+13.1 Definición operativa
+Si la capacidad sostenible de un short vivo cae a un nuevo nivel:
+
+    qbar_cap_new_it
+
+entonces la cobertura forzosa es:
+
+    Delta qbar_forced_cover_it =
+        max(0, qbar_live_short_it - qbar_cap_new_it)
+
+13.2 Semántica
+El recall:
+- no modifica fills pasados,
+- no borra la historia,
+- no “teletransporta” la posición a cero.
+
+Produce una nueva orden obligatoria de compra para cubrir.
+
+13.3 Políticas permitidas
+La versión base puede soportar:
+
+- full recall:
+  qbar_cap_new_it = 0
+
+- partial recall:
+  qbar_cap_new_it > 0 y menor que la posición viva
+
+- threshold recall:
+  si availability cae por debajo de umbral
+
+El contrato base no necesita hazard estocástico.
+
+14. Política de eventos
+
+La precedencia correcta debe ser:
+
+1. validación de integridad de datos
+2. detección del tipo de transición de posición
+3. chequeo de elegibilidad
+4. chequeo de capacidad libre
+5. generación de orden admitida
+6. persistencia de recorte o rechazo
+7. devengo de fees sobre posición viva
+8. procesamiento de recalls y forced cover
+
+Si recall y rebalance ordinario ocurren el mismo día, debe prevalecer la lógica exógena de reducción obligatoria o, como mínimo, quedar neteada de forma explícita y auditable.
+
+15. Taxonomía mínima de reject / adjust reason
+
+El módulo debe usar vocabulario controlado, por ejemplo:
+
+- not_eligible
+- missing_borrow_data
+- no_capacity
+- truncated_by_capacity
+- allow_reduction_only
+- recall_forced_cover
+- fee_missing_but_position_live
+- data_quality_fail
+
+No deben aparecer motivos libres no normalizados en la salida principal.
+
+16. Algoritmo operativo
+
+Paso 1:
+cargar órdenes, posiciones vivas, borrow y precios
+
+Paso 2:
+resolver unicidad de borrow por (date, symbol)
+
+Paso 3:
+clasificar la transición:
+- long reduction
+- long to short
+- flat to short
+- short to more short
+- short reduction
+- short close
+
+Paso 4:
+calcular Delta qbar_open
+
+Paso 5:
+aplicar elegibilidad y capacidad libre
+
+Paso 6:
+reconstruir q_adm y la orden admitida
+
+Paso 7:
+persistir razones de ajuste o rechazo
+
+Paso 8:
+tras fills, calcular borrow fee sobre live short
+
+Paso 9:
+procesar recalls sobre estado realizado y emitir forced covers si procede
+
+17. Invariantes del módulo
+
+Toda salida válida debe cumplir:
+
+1. admitted_short_open <= requested_short_open
+2. borrow_cost_amount >= 0
+3. no puede existir apertura short admitida si short_allowed_flag = False
+4. reducción de short nunca debe bloquearse por elegibilidad
+5. todo forced_cover debe corresponder a un evento persistido
+6. los costes se devengan sobre live_short, no sobre desired_short
+
+18. Failure modes importantes
+
+18.1 Borrow duplicado
+Si hay múltiples registros de borrow para un símbolo-fecha y no se resuelve la prioridad, el módulo es semánticamente ambiguo.
+
+18.2 live > capacity sin evento
+Si la posición viva supera la nueva capacidad y no se emite forced cover, el motor queda inconsistente.
+
+18.3 Fee extremo
+Un borrow fee anómalo no debe truncarse silenciosamente; debe registrarse y seguir policy explícita.
+
+18.4 Missing borrow en apertura
+No se puede abrir short nuevo sobre datos ausentes sin asumir riesgo de sobreestimar implementabilidad.
+
+19. Tests mínimos obligatorios
+
+19.1 No elegible
+Nueva apertura short en nombre no elegible:
+- admitted_short_open = 0
+- reason = not_eligible
+
+19.2 Reducción de short
+Una orden que reduce short debe admitirse aunque el activo no sea elegible para nuevas aperturas.
+
+19.3 Truncation
+Si la capacidad libre es menor que la apertura deseada:
+- la admisión debe igualar exactamente esa capacidad
+
+19.4 Fee sobre vivo
+El coste debe calcularse sobre la posición short viva tras fills.
+
+19.5 Forced cover
+Si la capacidad nueva cae por debajo del short vivo:
+- forced_cover = exceso exacto
+
+19.6 No doble conteo
+La salida del módulo no puede contener costes de spread, slippage o impacto.
+
+20. Campos mínimos de salida
+
+20.1 borrow_adjusted_orders.parquet
+- date
+- symbol
+- order_id
+- requested_shares
+- admitted_shares
+- requested_short_open_shares
+- admitted_short_open_shares
+- short_allowed_flag
+- borrow_reject_reason
+- availability_score_used
+- borrow_fee_used
+- policy_version
+
+20.2 borrow_costs_daily.parquet
+- date
+- symbol
+- live_short_shares
+- reference_price
+- borrow_fee_daily
+- borrow_cost_amount
+
+20.3 borrow_events.parquet
+- date
+- symbol
+- event_type
+- pre_event_short_shares
+- post_event_capacity
+- forced_cover_shares
+- event_reason
+
+20.4 manifest.json
+- run_id
+- input hashes
+- policy flags
+- fallback_used
+- config_hash
+
+21. Qué no debe hacer este módulo
+
+La versión canónica no debe:
+- usar Beta availability como contrato base,
+- simular recalls estocásticos por defecto,
+- modelar AR(1) fees como semántica oficial,
+- optimizar asignación de inventario entre nombres,
+- ni fingir precisión donde solo hay gating operacional.
+
+22. Extensiones futuras razonables
+
+Como flags experimentales o research:
+- probabilistic availability
+- fee persistence
+- recall hazard
+- capacity linked to float / crowding
+- broker-specific inventory layers
+
+Pero ninguna de estas extensiones debe contaminar la semántica base.
+
+23. Interpretación correcta
+
+La lectura correcta de borrow_execution.py no es:
+“estimamos un modelo elegante del mercado de préstamo”.
+
+La lectura correcta es:
+“imponemos una capa de realidad operacional sobre la exposición short, separando deseo, admisión, fill, posición viva, coste y cobertura forzosa.”
+
+Ese es su rol real.
+
+24. Conclusión
+
+execution/borrow_execution.py debe ser una pieza de infraestructura severa y auditable.
+
+Recibe intención de rebalance y datos de borrow.
+Aísla la parte de apertura neta de short.
+Aplica elegibilidad y capacidad libre.
+Devuelve órdenes admitidas realistas.
+Devenga fees sobre posición viva.
+Y genera forced covers cuando la capacidad cae.
+
+Ese es exactamente el comportamiento que debe tener una capa seria de borrow execution en un stack cuantitativo institucional.

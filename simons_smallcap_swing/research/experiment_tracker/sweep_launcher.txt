@@ -1,829 +1,555 @@
-\documentclass[12pt,a4paper]{article}
+Módulo: research/sweeps/sweep_launcher.py
 
-\usepackage[spanish]{babel}
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
-\usepackage{lmodern}
-\usepackage{geometry}
-\usepackage{amsmath,amssymb,amsfonts}
-\usepackage{booktabs}
-\usepackage{array}
-\usepackage{hyperref}
-\usepackage{graphicx}
-\usepackage{listings}
-\usepackage{xcolor}
-\usepackage{enumitem}
+1. Objetivo del módulo
 
-\geometry{margin=2.5cm}
-\hypersetup{
-    colorlinks=true,
-    linkcolor=blue,
-    urlcolor=blue,
-    citecolor=blue
-}
+El objetivo de sweep_launcher.py es convertir una especificación de búsqueda de
+hiperparámetros en una secuencia reproducible, gobernada y auditable de trials,
+manteniendo fijo el criterio de optimización, respetando un presupuesto explícito
+y dejando trazabilidad completa de qué configuraciones se propusieron, en qué orden,
+con qué resultado y con qué criterio de selección final.
 
-\lstset{
-    basicstyle=\ttfamily\small,
-    breaklines=true,
-    frame=single,
-    columns=fullflexible
-}
+Este módulo no entrena modelos por sí mismo, no redefine la lógica científica del
+trial runner y no sustituye a la fase de validación estadística posterior. Su papel
+correcto es más estrecho y más importante:
 
-\title{\textbf{Especificación Formal de \texttt{sweep\_launcher.py}}\\
-Lanzamiento Reproducible de Barridos de Hiperparámetros para \textit{Small-Cap Swing Trading}}
-\author{Research Specification}
-\date{Marzo 2026}
+- transformar un espacio de búsqueda y una política de exploración en un experimento operativo;
+- controlar presupuesto, paralelismo, duplicados, timeouts y retries;
+- consolidar resultados comparables bajo una métrica primaria ex-ante;
+- y exportar un conjunto de candidatos defendibles para evaluación posterior.
 
-\begin{document}
+La pregunta correcta que debe responder no es “qué trial quedó primero en un leaderboard”
+como si eso bastara, sino algo más serio:
 
-\maketitle
+- qué configuraciones fueron exploradas de forma reproducible;
+- bajo qué presupuesto y política de propuesta;
+- con qué criterio fijo de ranking;
+- y qué candidatos merecen pasar a una fase confirmatoria posterior.
 
-\section{Propósito del módulo}
+2. Qué hace y qué no hace
 
-El módulo \texttt{sweep\_launcher.py} orquesta barridos de hiperparámetros sobre un espacio de búsqueda finito o acotado, ejecuta \textit{trials} bajo un presupuesto explícito y produce una traza completa de qué configuraciones se evaluaron, con qué orden, bajo qué semilla, con qué resultado y con qué criterio de selección final.
+2.1 Qué hace
+- valida la configuración global del sweep;
+- valida el espacio de búsqueda;
+- resuelve la política de propuesta;
+- genera propuestas válidas dentro de Theta;
+- asigna proposal_index y orden lógico estable;
+- lanza trials hijos colgados de un parent run;
+- controla max_trials, max_parallel_trials, timeout y reintentos;
+- deduplica por params_hash cuando corresponde;
+- registra éxito, fallo, timeout, cancelación o invalidez;
+- construye trials.parquet append-only;
+- consolida leaderboard bajo una policy ex-ante;
+- exporta top-K candidatos con suficiente contexto para evaluación posterior;
+- y persiste un summary completo del sweep.
 
-Su responsabilidad no es entrenar modelos ni definir la lógica científica interna de cada \textit{trial}. Su función es más estrecha y más importante: \emph{convertir una política de exploración de hiperparámetros en una secuencia reproducible, gobernada y auditable de ejecuciones}.
+2.2 Qué no hace
+- no entrena modelos directamente;
+- no calcula features ni labels;
+- no redefine la métrica primaria a mitad del sweep;
+- no decide por sí solo que el mejor trial sea estadísticamente superior;
+- no sustituye validación OOS fuerte ni confirmatory testing;
+- no debe ocultar trials fallidos;
+- no debe reranquear candidatos con criterios post-hoc no declarados ex-ante.
 
-Formalmente, el módulo debe implementar una aplicación
+3. Rol dentro del stack
 
-\[
-\mathcal{L} : (\Theta, \Pi, B, \mathcal{E}) \longrightarrow \mathcal{R}
-\]
+Secuencia conceptual correcta:
 
-donde:
+    search_space + proposal_policy + budget + evaluation_protocol
+    -> sweep_launcher.py
+    -> trial_runner / child runs
+    -> leaderboard + candidate export
+    -> confirmatory validation downstream
 
-\begin{itemize}
-    \item \(\Theta\) es el espacio de búsqueda;
-    \item \(\Pi\) es la política de propuesta;
-    \item \(B\) es el presupuesto computacional;
-    \item \(\mathcal{E}\) es el protocolo de evaluación;
-    \item \(\mathcal{R}\) es el conjunto de resultados persistidos del sweep.
-\end{itemize}
+Interpretación correcta:
+- el launcher no “descubre verdad científica”;
+- organiza exploración reproducible de configuraciones;
+- produce un conjunto de candidatos ordenados;
+- y deja a otra capa la validación confirmatoria de robustez.
 
-\section{Problema que resuelve}
+4. Problema formal que resuelve
 
-Dado un espacio de hiperparámetros \(\Theta\), un criterio de evaluación fijado \emph{antes} del barrido y un presupuesto limitado, el módulo debe:
+El módulo puede entenderse como una aplicación operacional:
 
-\begin{enumerate}
-    \item generar propuestas válidas \(\theta_k \in \Theta\);
-    \item lanzar cada \textit{trial} bajo un contexto hijo ligado a un \textit{parent run};
-    \item registrar éxito, fallo, timeout o cancelación;
-    \item consolidar resultados comparables bajo una métrica primaria común;
-    \item producir un \texttt{leaderboard} auditable y una lista de candidatos finales.
-\end{enumerate}
-
-En notación compacta, si \(J(\theta)\) es la función objetivo observada bajo evaluación OOS, el sweep busca una aproximación a
-
-\[
-\theta^\star \in \arg\max_{\theta \in \Theta} J(\theta)
-\]
-
-sujeta a restricciones reales de presupuesto:
-
-\[
-\texttt{n\_trials} \le N_{\max}, \qquad
-\texttt{parallelism} \le P_{\max}, \qquad
-\sum_{k=1}^{n} t_k \le T_{\max}.
-\]
-
-\section{Principios de diseño}
-
-El módulo debe obedecer los siguientes principios:
-
-\begin{enumerate}[label=\textbf{P\arabic*.}]
-    \item \textbf{Objetivo ex-ante}: la métrica de optimización debe quedar fijada antes del primer \textit{trial}.
-    \item \textbf{Presupuesto explícito}: ni número de \textit{trials}, ni tiempo, ni paralelismo pueden quedar implícitos.
-    \item \textbf{Reproducibilidad operacional}: una misma semilla y un mismo orden lógico deben reproducir la misma secuencia de propuestas, salvo fallos externos.
-    \item \textbf{Separación entre exploración y evaluación}: el launcher propone y orquesta; el \textit{trial runner} entrena y devuelve métricas.
-    \item \textbf{Auditoría completa}: toda propuesta, incluso fallida, debe quedar registrada.
-    \item \textbf{Sobriedad estadística}: el \textit{leaderboard} no debe confundirse con evidencia concluyente de robustez fuera de muestra.
-\end{enumerate}
-
-\section{Alcance y no-alcance}
-
-\subsection{Alcance}
-
-\texttt{sweep\_launcher.py} cubre:
-
-\begin{itemize}
-    \item validación del espacio de búsqueda;
-    \item generación secuencial o por lotes de propuestas;
-    \item lanzamiento de \textit{trials} hijos;
-    \item control de presupuesto, timeout y reintentos;
-    \item consolidación de métricas de cada \textit{trial};
-    \item persistencia de \texttt{trials.parquet}, \texttt{leaderboard.parquet} y \texttt{best\_candidates.json}.
-\end{itemize}
-
-\subsection{No-alcance}
-
-No corresponde a este módulo:
-
-\begin{itemize}
-    \item entrenar modelos;
-    \item calcular features o labels;
-    \item registrar artefactos pesados de cada \textit{trial};
-    \item redefinir la métrica objetivo durante el sweep;
-    \item proclamar validez estadística que no ha sido verificada en una etapa posterior.
-\end{itemize}
-
-\section{Modelo de entrada}
-
-Definimos la entrada como
-
-\[
-\mathcal{I} = (\mathcal{C}, \Theta, \Pi, B, \mathcal{E})
-\]
+    L : (Theta, Pi, B, E) -> R
 
 donde:
+- Theta es el espacio de búsqueda;
+- Pi es la política de propuesta;
+- B es el presupuesto computacional;
+- E es el protocolo de evaluación de cada trial;
+- R es el conjunto de resultados persistidos del sweep.
 
-\begin{itemize}
-    \item \(\mathcal{C}\): configuración general del sweep;
-    \item \(\Theta\): espacio de búsqueda;
-    \item \(\Pi\): política de propuesta;
-    \item \(B\): presupuesto;
-    \item \(\mathcal{E}\): protocolo de evaluación de cada \textit{trial}.
-\end{itemize}
+Dado un espacio Theta y una función objetivo observada J(theta), el sweep busca aproximar:
 
-\subsection{Configuración general \(\mathcal{C}\)}
+    theta* in argmax_{theta in Theta} J(theta)
 
-Debe incluir al menos:
+o el análogo de minimización, siempre sujeto a:
+- máximo número de trials;
+- máximo paralelismo;
+- límite temporal;
+- y política explícita de terminación.
 
-\begin{center}
-\begin{tabular}{>{\ttfamily}p{4.2cm} p{8.8cm}}
-\toprule
-sweep\_id & Identidad única del sweep \\
-parent\_run\_id & Run padre al que se vinculan los hijos \\
-objective\_metric & Métrica primaria de optimización \\
-objective\_direction & \texttt{maximize} o \texttt{minimize} \\
-random\_seed & Semilla maestra del barrido \\
-max\_trials & Límite máximo de trials \\
-max\_parallel\_trials & Límite de concurrencia \\
-trial\_timeout\_seconds & Timeout por trial \\
-max\_retries & Reintentos transitorios permitidos \\
-selection\_policy & Regla de ranking final \\
-\bottomrule
-\end{tabular}
-\end{center}
+La clave aquí es “aproximar bajo presupuesto”.
+El módulo no promete óptimo global abstracto.
+Promete una exploración gobernada y auditable del presupuesto disponible.
 
-\subsection{Espacio de búsqueda \(\Theta\)}
+5. Espacio de búsqueda
 
-El espacio debe ser cerrado, tipado y validable. Una representación útil es:
+El espacio de búsqueda debe ser cerrado, tipado y validable.
+La representación conceptual correcta es:
 
-\[
-\Theta = \Theta_1 \times \Theta_2 \times \cdots \times \Theta_d
-\]
+    Theta = Theta_1 x Theta_2 x ... x Theta_d
 
-donde cada dimensión \(\Theta_j\) pertenece a una de las clases:
+donde cada dimensión puede ser:
+- continua acotada;
+- entera acotada;
+- categórica finita;
+- booleana.
 
-\begin{itemize}
-    \item continua acotada;
-    \item entera acotada;
-    \item categórica finita;
-    \item booleana.
-\end{itemize}
+Para cada parámetro deben existir, como mínimo:
+- nombre;
+- tipo;
+- dominio;
+- regla de muestreo o discretización;
+- y, cuando aplique, transformaciones internas explícitas.
 
-Para cada parámetro deben existir:
+El launcher no debe aceptar parámetros “implícitamente libres”.
+Si un método requiere dominio acotado, ese dominio debe existir en la especificación.
 
-\begin{itemize}
-    \item dominio;
-    \item tipo;
-    \item regla de muestreo;
-    \item opcionalmente, transformación interna.
-\end{itemize}
+6. Objetivo y gobernanza de la métrica
 
-Ningún parámetro puede quedar “libre” o sin cota si el método de búsqueda depende de un dominio acotado.
+Debe existir una métrica primaria única fijada antes del primer trial:
 
-\section{Contrato de evaluación}
+    J(theta) = m_primary(theta)
 
-El launcher no debe optimizar una colección difusa de métricas. Debe existir una métrica primaria única:
-
-\[
-J(\theta) = m_{\mathrm{primary}}(\theta)
-\]
-
-y, si procede, una política de desempate estrictamente ordenada. Por ejemplo,
-
-\[
-\texttt{selection\_policy} =
-\bigl(
-m_{\mathrm{primary}},
-m_{\mathrm{secondary}},
-m_{\mathrm{tertiary}}
-\bigr)
-\]
+y, cuando haga falta, una política de desempate declarada ex-ante, por ejemplo:
+- primary_metric;
+- secondary_metric;
+- tertiary_metric;
 
 con comparación lexicográfica.
 
-\subsection{Regla de gobernanza}
+La regla central de gobernanza es:
+- objective_metric y objective_direction son inmutables durante el sweep.
 
-La métrica primaria, su dirección y los desempates deben fijarse antes del primer \textit{trial}. Queda prohibido:
+Queda prohibido:
+- cambiar la métrica objetivo a mitad;
+- reranquear con una métrica nueva no declarada;
+- o seleccionar “el mejor” según una mezcla improvisada de outputs.
 
-\begin{itemize}
-    \item cambiar la métrica objetivo a mitad del sweep;
-    \item reranquear candidatos con otra métrica no declarada ex-ante;
-    \item seleccionar “el mejor” según una combinación improvisada de outputs.
-\end{itemize}
+7. Restricciones y veto metrics
 
-\subsection{Métricas múltiples}
-
-Si cada trial devuelve un vector de métricas
-
-\[
-\mathbf{m}(\theta) =
-(m_1(\theta), \dots, m_q(\theta)),
-\]
-
-entonces el launcher debe distinguir entre:
-
-\begin{itemize}
-    \item \textbf{métrica primaria}: la que gobierna la búsqueda y el ranking;
-    \item \textbf{métricas auxiliares}: las que se registran pero no alteran la política de propuesta;
-    \item \textbf{métricas de veto}: restricciones duras, por ejemplo drawdown máximo permitido.
-\end{itemize}
+Cuando existen restricciones duras, el módulo debe distinguir entre:
+- métricas primarias;
+- métricas auxiliares;
+- y métricas de veto.
 
 Una formulación útil es:
 
-\[
-J(\theta)=
-\begin{cases}
-m_{\mathrm{primary}}(\theta), & \text{si } c_r(\theta)\le 0 \ \forall r \\
--\infty, & \text{en caso contrario}
-\end{cases}
-\]
+    J(theta) = m_primary(theta)     si c_r(theta) <= 0 para todo r
+             = -inf                 en caso contrario
 
-para problemas de maximización con restricciones.
+para problemas de maximización.
 
-\section{Presupuesto computacional}
+Esto evita contaminar el ranking con candidatos que:
+- mejoran marginalmente la métrica principal;
+- pero violan constraints operativos, drawdown máximo u otras reglas duras.
 
-El presupuesto debe modelarse explícitamente como
+8. Presupuesto computacional
 
-\[
-B = (N_{\max}, P_{\max}, T_{\max}, R_{\max})
-\]
+El presupuesto debe expresarse de forma explícita como:
+
+    B = (N_max, P_max, T_max, R_max)
 
 donde:
+- N_max  = máximo número de trials;
+- P_max  = máximo paralelismo;
+- T_max  = presupuesto temporal total o por trial, según especificación;
+- R_max  = máximo número de reintentos transitorios.
 
-\begin{itemize}
-    \item \(N_{\max}\): máximo número de trials;
-    \item \(P_{\max}\): máximo paralelismo;
-    \item \(T_{\max}\): tiempo total o por trial;
-    \item \(R_{\max}\): máximo número de reintentos transitorios.
-\end{itemize}
+Esto es importante porque un sweep serio no termina por intuición del operador.
+Termina por reglas declaradas:
+- agotamiento de trials;
+- agotamiento temporal;
+- agotamiento del espacio;
+- o early stopping declarado ex-ante.
 
-Este contrato elimina ambigüedades del tipo “seguir mientras mejore”. Un sweep serio termina por criterio definido, no por intuición del operador.
+9. Políticas de propuesta
 
-\section{Políticas de propuesta}
+El módulo puede soportar varias políticas Pi, pero todas deben obedecer
+el mismo contrato operacional.
 
-El módulo puede soportar varias políticas \(\Pi\), pero cada una debe verse como un generador de propuestas bajo el mismo contrato operacional.
+9.1 Grid
+Enumera exhaustivamente una rejilla finita y determinista.
+Fortaleza:
+- reproducibilidad total;
+- cobertura exhaustiva sobre el dominio discretizado.
+Limitación:
+- escala mal con la dimensión.
 
-\subsection{Grid}
+9.2 Random
+Muestra propuestas desde una distribución sobre Theta bajo semilla fija.
+Fortaleza:
+- simplicidad;
+- buena cobertura práctica en espacios grandes y heterogéneos.
+Limitación:
+- no es exhaustivo;
+- la calidad depende del presupuesto y de la distribución de muestreo.
 
-\[
-\Pi_{\mathrm{grid}} : \varnothing \mapsto \{\theta_1, \dots, \theta_n\}
-\]
+9.3 Adaptive / Bayesian
+Usa el histórico cerrado de evaluaciones previas para decidir la siguiente propuesta.
+Fortaleza:
+- puede concentrar presupuesto donde la función objetivo parece prometedora.
+Limitación:
+- la reproducibilidad requiere persistir o reconstruir el estado del estudio;
+- y el contrato con el paralelismo debe estar especialmente bien definido.
 
-con enumeración determinista completa de una rejilla finita. Es exhaustivo en el dominio discretizado, pero no escalable.
+El launcher no debe prometer más sofisticación de la que realmente implementa.
+Si la política adaptativa no es estable y reconstruible, no debe venderse como feature robusta.
 
-\subsection{Random}
+10. Proposal order y reproducibilidad
 
-\[
-\theta_k \sim \mathbb{P}_{\Theta}
-\]
+En cualquier sweep serio, el orden lógico de propuestas importa.
 
-con muestreo pseudoaleatorio reproducible mediante semilla maestra y subsemillas derivadas por trial.
+Cada trial debe recibir un:
 
-\subsection{Bayesiano / adaptativo}
+    proposal_index
 
-Una política adaptativa utiliza el histórico
+que sea:
+- inmutable;
+- único dentro del sweep;
+- y estable independientemente de la latencia real de los workers.
 
-\[
-D_{k-1} = \{(\theta_i, J(\theta_i))\}_{i=1}^{k-1}
-\]
+Esto es especialmente importante bajo paralelismo:
+el orden de terminación no debe alterar la identidad lógica del experimento.
 
-para proponer el siguiente punto según una regla de adquisición:
+Regla recomendada:
+- generación determinista por lotes;
+- commit y persistencia coherentes con proposal_index;
+- separación entre orden lógico y orden físico de finalización.
 
-\[
-\theta_k \in \arg\max_{\theta \in \Theta} a(\theta \mid D_{k-1}).
-\]
+11. Paralelismo
 
-Para este módulo importa menos la forma exacta del surrogate que el contrato operacional:
+El paralelismo debe estar gobernado, no improvisado.
 
-\begin{itemize}
-    \item la propuesta debe depender solo de \(D_{k-1}\) y de la semilla declarada;
-    \item el estado del estudio debe persistirse o reconstruirse determinísticamente;
-    \item el orden lógico de incorporación de resultados debe quedar fijado.
-\end{itemize}
+El módulo debe soportar una de estas semánticas explícitas:
+- secuencial estricta;
+- batch adaptativa;
+- asíncrona con estado suficientemente persistido.
 
-El launcher no debe prometer una implementación concreta de GP, TPE u otro método si no forma parte del contrato estable del repositorio.
+La opción por defecto más robusta para este stack es:
+- propuesta en lotes;
+- tamaño de lote <= P_max;
+- actualización de study_state solo con trials ya comprometidos;
+- y persistencia consistente del orden lógico.
 
-\section{Paralelismo y reproducibilidad}
+Esto evita que el resultado dependa arbitrariamente del jitter de latencia entre workers.
 
-Aquí está una de las fuentes clásicas de ambigüedad. En búsqueda adaptativa, el paralelismo altera la secuencia de propuestas si no se gobierna correctamente.
+12. Parent-child lineage
 
-\subsection{Orden lógico}
+Todo sweep debe colgar de un parent run identificado.
+Cada trial hijo debe quedar ligado a ese parent con al menos:
+- sweep_id;
+- parent_run_id;
+- trial_id;
+- child_run_id;
+- proposal_index;
+- params_hash;
+- seed_child;
+- status.
 
-Definimos un índice lógico de trial \(k = 1,\dots,n\). Toda propuesta recibe un \texttt{proposal\_index} inmutable, independientemente de cuándo termine su ejecución.
+Esta jerarquía no es cosmética.
+Es la base para:
+- reconstruir el barrido completo;
+- distinguir exploración intermedia de candidatos finales;
+- y auditar después cómo se llegó a un modelo concreto.
 
-\subsection{Regla de propuestas por lotes}
+13. Validez de una propuesta
 
-Si el método admite paralelismo, el launcher debe operar en lotes:
+Una propuesta theta solo puede lanzarse si:
+- pertenece a Theta;
+- respeta tipos y dominios;
+- satisface restricciones cruzadas;
+- y no incurre en duplicidad no deseada.
 
-\[
-\mathcal{B}_t = \{\theta_{t,1}, \dots, \theta_{t,b_t}\},
-\qquad b_t \le P_{\max}
-\]
+Cuando existan restricciones internas entre parámetros, debe existir una función explícita
+de validez, por ejemplo:
 
-y la siguiente tanda de propuestas solo debe generarse con una política explícita:
+    g(theta) in {0,1}
 
-\begin{itemize}
-    \item \textbf{secuencial estricta}: esperar a cerrar todas las propuestas previas;
-    \item \textbf{batch adaptativa}: generar un lote a partir del histórico cerrado hasta ese punto;
-    \item \textbf{asíncrona}: permitida solo si el estudio persiste suficiente estado para reproducir el orden lógico.
-\end{itemize}
+y solo deben proponerse configuraciones con g(theta)=1.
 
-\subsection{Regla práctica}
+No debe delegarse esta lógica a fallos silenciosos del trial runner.
 
-La opción por defecto recomendable es:
+14. Deduplicación, replay y repeticiones intencionales
 
-\begin{quote}
-\textbf{generación determinista por lotes y commit ordenado por \texttt{proposal\_index}}.
-\end{quote}
+El módulo debe distinguir tres casos:
 
-Esto evita que el resultado dependa del azar de la latencia entre workers.
+14.1 Replay idempotente
+Misma propuesta, mismo contexto lógico, mismo params_hash.
+Debe resolverse sin inflar el sweep.
 
-\section{Parent/child lineage}
+14.2 Duplicado accidental
+La misma configuración aparece dos veces sin intención declarada.
+Debe rechazarse o marcarse como duplicate según política.
 
-Todo sweep debe abrir un \textit{parent run} \(r_{\mathrm{parent}}\). Cada trial hijo \(r_k\) debe heredar:
+14.3 Repetición intencional
+La misma configuración se reejecuta deliberadamente para estimar varianza o robustez.
+Debe quedar marcada explícitamente como tal.
 
-\begin{itemize}
-    \item \texttt{sweep\_id};
-    \item \texttt{parent\_run\_id};
-    \item \texttt{proposal\_index};
-    \item \texttt{params\_hash};
-    \item \texttt{random\_seed\_child};
-    \item \texttt{status}.
-\end{itemize}
+Una clave razonable para identidad de propuesta es:
 
-La relación jerárquica no es decorativa: permite reconstruir todo el barrido y distinguir entre candidato final y mero experimento intermedio.
+    K(theta) = (sweep_id, params_hash, evaluation_protocol_hash)
 
-\section{Validez de una propuesta}
+Esto permite separar bien:
+- mismo vector de hiperparámetros;
+- mismo protocolo de evaluación;
+- y mismo sweep lógico.
 
-Una propuesta \(\theta\) solo puede lanzarse si cumple:
-
-\[
-\theta \in \Theta
-\]
-
-y además satisface:
-
-\begin{itemize}
-    \item tipos correctos;
-    \item cotas válidas;
-    \item dependencias internas satisfechas;
-    \item no duplicidad no deseada respecto a trials anteriores.
-\end{itemize}
-
-Si el espacio contiene restricciones cruzadas, debe existir una función explícita
-
-\[
-g(\theta) \in \{0,1\}
-\]
-
-y solo se aceptan propuestas con \(g(\theta)=1\).
-
-\section{Deduplicación y colisiones}
-
-El launcher debe distinguir entre:
-
-\begin{itemize}
-    \item \textbf{replay idempotente}: misma propuesta, misma clave lógica, mismo contexto;
-    \item \textbf{duplicado accidental}: mismos parámetros generados dos veces;
-    \item \textbf{repetición intencional}: misma configuración reejecutada para estimar varianza.
-\end{itemize}
-
-La clave de propuesta recomendable es
-
-\[
-K(\theta)=
-(\texttt{sweep\_id}, \texttt{params\_hash}, \texttt{evaluation\_protocol\_hash})
-\]
-
-El comportamiento por defecto debe ser:
-
-\begin{itemize}
-    \item rechazar duplicados accidentales;
-    \item permitir repeticiones intencionales solo si están declaradas;
-    \item tratar replays como no destructivos.
-\end{itemize}
-
-\section{Semántica de éxito y fallo}
+15. Trial states y semántica de fallo
 
 Cada trial debe terminar en un estado de un conjunto cerrado:
 
-\[
-\{\texttt{completed},\texttt{failed},\texttt{timeout},\texttt{cancelled},\texttt{invalid}\}
-\]
+- completed
+- failed
+- timeout
+- cancelled
+- invalid
 
-\subsection{Trial completado}
+Regla crítica:
+todo trial propuesto debe persistirse en trials.parquet, incluso si falla.
 
-Un trial es \texttt{completed} solo si:
+Un trial sólo es completed si:
+- el runner devuelve éxito;
+- la métrica primaria existe;
+- la métrica primaria es finita;
+- y el conjunto mínimo de metadatos ha quedado persistido.
 
-\begin{enumerate}
-    \item el runner devuelve código de éxito;
-    \item la métrica primaria existe y es finita;
-    \item el conjunto mínimo de metadatos ha quedado persistido.
-\end{enumerate}
+Si hay fallo, deben quedar al menos:
+- failure_reason;
+- retry_count;
+- elapsed_seconds;
+- status.
 
-\subsection{Trial fallido}
-
-Si hay excepción, timeout o output incompleto, el trial debe registrarse igualmente con:
-
-\begin{itemize}
-    \item \texttt{failure\_reason};
-    \item \texttt{retry\_count};
-    \item \texttt{elapsed\_seconds};
-    \item \texttt{status}.
-\end{itemize}
-
-Un fallo no debe desaparecer del historial. En optimización real, saber qué configuraciones rompen el sistema es información útil.
-
-\section{Reintentos}
-
-Los reintentos deben aplicarse solo a errores transitorios. Denotemos por \(\mathcal{E}_T\) el conjunto de errores transitorios y por \(\mathcal{E}_P\) el de permanentes. Entonces
-
-\[
-\mathcal{E} = \mathcal{E}_T \cup \mathcal{E}_P,
-\qquad
-\mathcal{E}_T \cap \mathcal{E}_P = \varnothing.
-\]
-
-\begin{itemize}
-    \item Si \(e \in \mathcal{E}_T\), el launcher puede reintentar hasta \(R_{\max}\).
-    \item Si \(e \in \mathcal{E}_P\), el trial se marca como fallo definitivo.
-\end{itemize}
-
-La política de reintentos debe ser explícita y finita. No debe cambiar el \texttt{proposal\_index} ni el \texttt{params\_hash} del trial.
-
-\section{Early stopping del sweep}
-
-El archivo original apuntaba esta idea, pero debe cerrarse bien. El launcher puede soportar \textbf{stopping del sweep}, no “cambiar de opinión” sobre trials ya hechos.
-
-Una política válida es detener el sweep si se cumple una condición declarada, por ejemplo:
-
-\[
-\Delta_t =
-\max_{1 \le i \le t} J(\theta_i)
--
-\max_{1 \le i \le t-p} J(\theta_i)
-< \varepsilon
-\]
-
-durante una paciencia \(p\) predefinida.
-
-Pero esta regla solo es aceptable si:
-
-\begin{itemize}
-    \item está declarada ex-ante;
-    \item no invalida la comparabilidad de los resultados;
-    \item su activación queda persistida en el resumen final.
-\end{itemize}
-
-\section{Multiple testing y selección final}
-
-Un leaderboard ordenado no equivale a una prueba robusta de superioridad. El módulo debe reconocerlo en su propio contrato.
-
-\subsection{Qué sí debe hacer}
-
-\begin{itemize}
-    \item fijar la métrica primaria ex-ante;
-    \item registrar el número total de trials válidos;
-    \item exportar resultados completos, no solo top-k;
-    \item dejar preparado un conjunto de candidatos para validación posterior.
-\end{itemize}
-
-\subsection{Qué no debe fingir}
-
-No corresponde a este módulo declarar que el mejor trial es estadísticamente superior en sentido fuerte. Esa conclusión requiere una etapa separada de validación o testing confirmatorio.
-
-\subsection{Regla operativa sensata}
-
-El sweep produce \textbf{candidatos}, no verdades finales. Una política razonable es exportar
-
-\[
-\mathcal{C}_{\mathrm{best}} = \{\theta_{(1)},\dots,\theta_{(K)}\}
-\]
-
-donde \(\theta_{(j)}\) denota el \(j\)-ésimo mejor trial según la política de selección fijada. La corrección por \textit{multiple testing} no debe resolverse con una mención ornamental en el texto; debe quedar como responsabilidad explícita de la fase de validación posterior.
-
-\section{Contrato de salida}
-
-El módulo debe producir como mínimo:
-
-\begin{enumerate}
-    \item \texttt{trials.parquet}
-    \item \texttt{leaderboard.parquet}
-    \item \texttt{best\_candidates.json}
-    \item \texttt{sweep\_summary.json}
-\end{enumerate}
-
-\subsection{\texttt{trials.parquet}}
-
-Tabla \emph{append-only} con una fila por trial propuesto. Columnas mínimas:
-
-\begin{center}
-\begin{tabular}{>{\ttfamily}p{3.0cm} >{\ttfamily}p{2.8cm} >{\ttfamily}p{2.8cm} >{\ttfamily}p{2.8cm}}
-\toprule
-trial\_id & proposal\_index & parent\_run\_id & child\_run\_id \\
-params\_json & params\_hash & seed\_child & status \\
-objective\_metric & objective\_value & elapsed\_seconds & retry\_count \\
-failure\_reason & started\_at & finished\_at & batch\_id \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\subsection{\texttt{leaderboard.parquet}}
-
-Debe contener solo trials comparables y válidos, ordenados según la política ex-ante. Columnas mínimas:
-
-\begin{itemize}
-    \item \texttt{rank}
-    \item \texttt{trial\_id}
-    \item \texttt{proposal\_index}
-    \item \texttt{objective\_value}
-    \item \texttt{params\_hash}
-    \item \texttt{selection\_policy\_version}
-\end{itemize}
-
-\subsection{\texttt{best\_candidates.json}}
-
-Lista de los \(K\) mejores candidatos con suficiente contexto para relanzar validación posterior.
-
-\subsection{\texttt{sweep\_summary.json}}
-
-Debe incluir:
-
-\begin{itemize}
-    \item \texttt{sweep\_id}
-    \item \texttt{objective\_metric}
-    \item \texttt{objective\_direction}
-    \item \texttt{n\_proposed}
-    \item \texttt{n\_completed}
-    \item \texttt{n\_failed}
-    \item \texttt{n\_timeouts}
-    \item \texttt{n\_invalid}
-    \item \texttt{best\_objective\_value}
-    \item \texttt{terminated\_by}
-\end{itemize}
-
-\section{Invariantes}
-
-El valor de un launcher serio está en mantener invariantes fuertes.
-
-\subsection{Invariante de propuesta única}
-
-Dos filas distintas no pueden compartir simultáneamente
-
-\[
-(\texttt{sweep\_id}, \texttt{proposal\_index})
-\]
-
-\subsection{Invariante de identidad del trial}
-
-Si dos filas comparten \texttt{trial\_id}, deben corresponder al mismo intento lógico de la misma propuesta.
-
-\subsection{Invariante de orden}
-
-El \texttt{leaderboard} no puede alterar el \texttt{proposal\_index}; solo añadir ranking.
-
-\subsection{Invariante de completitud}
-
-Todo trial propuesto debe aparecer en \texttt{trials.parquet}, incluso si falla.
-
-\subsection{Invariante de objetivo fijo}
-
-Durante un sweep dado, \texttt{objective\_metric} y \texttt{objective\_direction} son inmutables.
-
-\section{Observabilidad}
-
-Cada evento relevante debe quedar logueado de forma estructurada con:
-
-\begin{itemize}
-    \item \texttt{sweep\_id}
-    \item \texttt{trial\_id}
-    \item \texttt{proposal\_index}
-    \item \texttt{batch\_id}
-    \item \texttt{status}
-    \item \texttt{elapsed\_seconds}
-    \item \texttt{retry\_count}
-    \item \texttt{worker\_id} o equivalente
-\end{itemize}
-
-Métricas agregadas útiles:
-
-\[
-n_{\mathrm{completed}},\quad
-n_{\mathrm{failed}},\quad
-n_{\mathrm{timeout}},\quad
-\frac{n_{\mathrm{completed}}}{n_{\mathrm{proposed}}},\quad
-\texttt{latency}_{p50},\quad
-\texttt{latency}_{p95}
-\]
-
-No hace falta inflar el texto con terminología “industrial”; basta con que el sistema deje trazabilidad operativa real.
-
-\section{Interfaz propuesta}
-
-La interfaz debe ser estrecha. Un diseño razonable es:
-
-\begin{lstlisting}[language=Python]
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Literal, Optional
-
-SearchMethod = Literal["grid", "random", "adaptive"]
-ObjectiveDirection = Literal["maximize", "minimize"]
-
-@dataclass(frozen=True)
-class SweepConfig:
-    sweep_id: str
-    parent_run_id: str
-    objective_metric: str
-    objective_direction: ObjectiveDirection
-    method: SearchMethod
-    random_seed: int
-    max_trials: int
-    max_parallel_trials: int
-    trial_timeout_seconds: int
-    max_retries: int
-    top_k: int
-
-@dataclass(frozen=True)
-class SweepResult:
-    sweep_id: str
-    n_proposed: int
-    n_completed: int
-    n_failed: int
-    n_timeouts: int
-    best_trial_id: Optional[str]
-    best_objective_value: Optional[float]
-    trials_path: Path
-    leaderboard_path: Path
-    candidates_path: Path
-    summary_path: Path
-
-def run_sweep(
-    config: SweepConfig,
-    search_space: dict,
-    evaluation_protocol: dict,
-    output_dir: Path,
-) -> SweepResult:
-    ...
-\end{lstlisting}
-
-\section{Pseudocódigo operacional}
-
-\begin{lstlisting}[language=Python]
-def run_sweep(config, search_space, evaluation_protocol, output_dir):
-    validate_config(config)
-    validate_search_space(search_space)
-    validate_evaluation_protocol(evaluation_protocol)
-
-    parent = resolve_parent_run(config.parent_run_id)
-    rng = make_master_rng(config.random_seed)
-
-    study_state = initialize_study_state(
-        method=config.method,
-        search_space=search_space,
-        seed=config.random_seed,
-    )
-
-    proposed = []
-    completed = []
-
-    batch_id = 0
-    while budget_remaining(config, proposed, completed):
-        batch = propose_batch(
-            study_state=study_state,
-            batch_size=config.max_parallel_trials,
-            search_space=search_space,
-            seen_hashes={t.params_hash for t in proposed},
-            rng=rng,
-        )
-
-        if not batch:
-            break
-
-        for proposal_index, params in enumerate_batch(batch, proposed):
-            proposed.append(register_proposal(
-                config=config,
-                parent_run=parent,
-                params=params,
-                proposal_index=proposal_index,
-                evaluation_protocol=evaluation_protocol,
-                batch_id=batch_id,
-            ))
-
-        batch_results = execute_batch(
-            proposals=batch,
-            timeout_seconds=config.trial_timeout_seconds,
-            max_retries=config.max_retries,
-        )
-
-        committed = commit_batch_results(
-            proposed=proposed,
-            batch_results=batch_results,
-            objective_metric=config.objective_metric,
-            objective_direction=config.objective_direction,
-        )
-
-        completed.extend(committed)
-        update_study_state(study_state, committed)
-        persist_trials_table(output_dir, proposed)
-        batch_id += 1
-
-        if should_stop_early(config, completed):
-            break
-
-    leaderboard = build_leaderboard(
-        trials=completed,
-        objective_metric=config.objective_metric,
-        objective_direction=config.objective_direction,
-    )
-
-    candidates = export_top_k(leaderboard, k=config.top_k)
-    summary = build_sweep_summary(config, proposed, completed, leaderboard)
-
-    write_parquet_atomic(output_dir / "trials.parquet", proposed)
-    write_parquet_atomic(output_dir / "leaderboard.parquet", leaderboard)
-    write_json_atomic(output_dir / "best_candidates.json", candidates)
-    write_json_atomic(output_dir / "sweep_summary.json", summary)
-
-    return materialize_result(...)
-\end{lstlisting}
-
-\section{Pruebas mínimas obligatorias}
-
-Un launcher de sweeps no se valida con un ejemplo feliz. Debe probarse contra rutas de fallo y de reproducibilidad.
-
-\begin{enumerate}
-    \item espacio de búsqueda inválido;
-    \item objetivo no declarado;
-    \item trial completado con métrica NaN;
-    \item timeout de trial;
-    \item error transitorio con reintento y éxito posterior;
-    \item error permanente sin reintento;
-    \item duplicado accidental de parámetros;
-    \item replay idempotente del sweep;
-    \item igualdad de ranking bajo semilla fija;
-    \item concurrencia con orden lógico estable;
-    \item early stopping declarado y activado;
-    \item exportación correcta de top-k;
-    \item ausencia de trials completados;
-    \item inconsistencia entre \texttt{trials.parquet} y \texttt{leaderboard.parquet}.
-\end{enumerate}
-
-\section{Errores y semántica de fallo}
-
-Las excepciones deben ser tipadas. Un conjunto suficiente sería:
-
-\begin{itemize}
-    \item \texttt{SearchSpaceError}
-    \item \texttt{ObjectiveSpecError}
-    \item \texttt{ProposalGenerationError}
-    \item \texttt{TrialLaunchError}
-    \item \texttt{TrialTimeoutError}
-    \item \texttt{ResultCommitError}
-    \item \texttt{SweepRecoveryError}
-\end{itemize}
-
-Semántica correcta:
-
-\begin{itemize}
-    \item los errores de validación son fallos permanentes;
-    \item los fallos transitorios pueden reintentarse;
-    \item un timeout no debe borrar la propuesta del historial;
-    \item el sweep puede terminar con éxito parcial si así lo permite la política declarada.
-\end{itemize}
-
-\section{Conclusión}
-
-\texttt{sweep\_launcher.py} no debe presentarse como “optimización bayesiana industrial” ni como escaparate de librerías. Debe resolver con precisión un problema mucho más concreto y mucho más exigente:
-
-\begin{quote}
-¿Cómo convertir un espacio de búsqueda, una política de propuesta y un presupuesto limitado en una secuencia reproducible de trials comparables, con ranking final auditable y sin ambigüedad estadística ni operacional?
-\end{quote}
-
-La respuesta correcta exige cerrar explícitamente:
-
-\begin{itemize}
-    \item la métrica primaria y su gobernanza;
-    \item la política de propuestas;
-    \item el contrato entre paralelismo y reproducibilidad;
-    \item la semántica de duplicados, fallos y reintentos;
-    \item la diferencia entre leaderboard y validación final;
-    \item los outputs necesarios para reconstruir el sweep completo.
-\end{itemize}
-
-Si el módulo respeta esos invariantes, entonces el barrido de hiperparámetros deja de ser una colección opaca de ejecuciones y pasa a ser un procedimiento experimental serio. Esa es la propiedad que importa.
-
-\end{document}
+16. Reintentos
+
+Los reintentos solo deben aplicarse a errores transitorios.
+
+Clasificación mínima razonable:
+- transitorios:
+  timeout recuperable, caída puntual de red, error efímero de infraestructura;
+- permanentes:
+  config inválida, espacio inválido, excepción estructural del trial, output imposible.
+
+Regla correcta:
+- retry solo para errores transitorios;
+- número finito de reintentos;
+- sin cambiar proposal_index ni params_hash;
+- registrando siempre retry_count real.
+
+17. Early stopping del sweep
+
+El sweep puede terminar antes de agotar presupuesto, pero solo por una regla declarada ex-ante.
+
+Una forma razonable es detener cuando la mejora en la mejor métrica observada cae
+por debajo de epsilon durante una paciencia p:
+
+    Delta_t = max_{1<=i<=t} J(theta_i) - max_{1<=i<=t-p} J(theta_i) < epsilon
+
+Interpretación correcta:
+- esto es sweep-level stopping;
+- no una excusa para reescribir retrospectivamente qué trials “contaban”.
+
+Si la regla se activa, debe persistirse explícitamente en el summary:
+- terminated_by = early_stop
+- con epsilon y patience versionados.
+
+18. Leaderboard
+
+El leaderboard debe entenderse como una tabla de priorización operativa,
+no como un certificado de superioridad estadística.
+
+Debe incluir sólo trials válidos y comparables, ordenados según la policy ex-ante.
+Columnas mínimas recomendadas:
+- rank
+- trial_id
+- proposal_index
+- objective_value
+- params_hash
+- selection_policy_version
+
+La salida correcta del launcher es:
+- candidatos ordenados;
+- no afirmaciones concluyentes de “mejor modelo” en sentido inferencial fuerte.
+
+19. Multiple testing y estadística del leaderboard
+
+Aquí conviene ser muy preciso.
+
+El módulo debe reconocer explícitamente que:
+- un leaderboard con muchos trials aumenta el riesgo de seleccionar ruido;
+- pero la corrección formal de multiple testing y la validación confirmatoria pertenecen,
+  en sentido fuerte, a la fase posterior de evaluación.
+
+Por tanto, la política correcta del launcher es:
+- fijar objetivo ex-ante;
+- persistir número total de trials válidos;
+- exportar top-K candidatos;
+- y dejar trazabilidad suficiente para confirmatory testing posterior.
+
+Puede reportar advertencias o metadata útil para esa fase,
+pero no debe fingir que el ranking del sweep ya es evidencia final robusta.
+
+20. Repeated trials y estimación de varianza
+
+Cuando se quiera estimar la variabilidad de J(theta), eso debe aparecer como una
+política declarada, no como una consecuencia accidental del launcher.
+
+La repetición intencional de top-K candidatos puede ser útil para:
+- estimar dispersión de la métrica;
+- estabilizar rankings muy cercanos;
+- y preparar la fase confirmatoria.
+
+Pero debe quedar claro que:
+- no es el comportamiento base de todo sweep;
+- y no debe mezclarse con deduplicación accidental.
+
+21. Outputs obligatorios
+
+El módulo debe producir, como mínimo:
+
+- trials.parquet
+- leaderboard.parquet
+- best_candidates.json
+- sweep_summary.json
+
+21.1 trials.parquet
+Append-only, una fila por trial propuesto.
+Columnas mínimas:
+- trial_id
+- proposal_index
+- parent_run_id
+- child_run_id
+- params_json
+- params_hash
+- seed_child
+- status
+- objective_metric
+- objective_value
+- elapsed_seconds
+- retry_count
+- failure_reason
+- started_at
+- finished_at
+- batch_id
+
+21.2 leaderboard.parquet
+Sólo trials comparables y válidos, ordenados por policy ex-ante.
+
+21.3 best_candidates.json
+Debe incluir el top-K exportado con suficiente contexto para relanzar validación posterior.
+
+21.4 sweep_summary.json
+Debe incluir, al menos:
+- sweep_id
+- objective_metric
+- objective_direction
+- n_proposed
+- n_completed
+- n_failed
+- n_timeouts
+- n_invalid
+- best_objective_value
+- terminated_by
+
+22. Observabilidad
+
+Los eventos relevantes deben registrarse con, al menos:
+- sweep_id
+- trial_id
+- proposal_index
+- batch_id
+- worker_id si existe
+- status
+- elapsed_seconds
+- retry_count
+
+Métricas agregadas mínimas útiles:
+- completion_rate
+- failure_rate
+- timeout_rate
+- latency_p50
+- latency_p95
+
+Esto no es relleno “industrial”.
+Es lo mínimo para entender si el barrido fue científicamente interpretable y operacionalmente sano.
+
+23. Invariantes
+
+Los invariantes obligatorios son:
+
+- no puede haber dos propuestas con el mismo (sweep_id, proposal_index);
+- trial_id identifica un intento lógico único;
+- objective_metric y objective_direction son inmutables dentro del sweep;
+- todo trial propuesto aparece en trials.parquet;
+- leaderboard no altera proposal_index, solo añade ranking;
+- params_hash debe ser estable y determinista para la misma configuración;
+- la selección final debe reflejar exactamente la selection_policy versionada.
+
+24. Edge cases y failure modes
+
+Los fallos más peligrosos del módulo son:
+
+- cambiar la métrica objetivo a mitad del barrido;
+- aceptar propuestas inválidas y dejar que “fallen dentro” del runner;
+- mezclar duplicados accidentales con repeticiones intencionales;
+- dejar que el paralelismo altere silenciosamente la secuencia lógica de propuestas;
+- ocultar trials fallidos del historial;
+- tratar el leaderboard como si fuese validación confirmatoria;
+- y exportar top-K sin contexto suficiente para relanzar evaluación posterior.
+
+25. Criterios de aceptación
+
+El módulo solo debe considerarse listo si cumple:
+
+- reproducibilidad:
+  misma seed, mismo search space y misma policy -> misma secuencia lógica de propuestas;
+
+- gobernanza:
+  objective_metric y selection_policy quedan fijadas ex-ante;
+
+- completitud:
+  todo trial propuesto queda persistido con estado final interpretable;
+
+- robustez operacional:
+  timeout, retry y fallo permanente quedan registrados sin romper el sweep;
+
+- trazabilidad:
+  parent-child lineage y outputs finales permiten reconstruir el barrido completo;
+
+- deployability:
+  best_candidates.json contiene suficiente información para lanzar validación posterior sin ambigüedad.
+
+26. Qué no debe afirmarse
+
+sweep_launcher.py no debe venderse como:
+- módulo que “demuestra” cuál es el mejor modelo;
+- sustituto de confirmatory validation;
+- garantía de óptimo global real;
+- ni prueba estadística concluyente contra p-hacking por sí solo.
+
+Su responsabilidad correcta es más concreta y más útil:
+orquestar un barrido reproducible, auditable y gobernado, producir un ranking operativo
+bajo una métrica ex-ante fija y exportar candidatos serios para validación posterior.
+
+27. Conclusión
+
+sweep_launcher.py debe existir para responder una pregunta central de exploración cuantitativa:
+
+- cómo convertir un espacio de búsqueda, una política de propuesta y un presupuesto limitado
+  en una secuencia de trials comparables, reproducibles y auditables.
+
+Si esa propiedad se cumple, el sweep deja de ser una colección opaca de ejecuciones
+y pasa a ser un procedimiento experimental serio dentro de una pipeline profesional
+de small-cap swing trading.

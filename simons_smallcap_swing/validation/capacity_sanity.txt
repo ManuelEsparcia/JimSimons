@@ -1,410 +1,382 @@
-% Copiar y pegar en LaTeX (guarda como .txt)
-\documentclass{article}
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
-\usepackage{amsmath, amssymb}
-\usepackage{booktabs}
-\usepackage{hyperref}
-\usepackage{enumitem}
+Especificación Cuantitativa: validation/capacity_sanity.py
 
-\title{Especificaci\'on Cuantitativa: validation/capacity\_sanity.py}
-\author{JimSimons Small Cap Swing --- Validation Research Note}
-\date{Marzo 2026}
+1. Propósito del módulo
 
-\begin{document}
-\maketitle
+Este módulo evalúa la capacidad operacional de una estrategia ya definida cuando el AUM se escala por un factor alpha > 0, manteniendo fijos:
+- el universo elegible,
+- la lógica de señales,
+- la construcción de cartera,
+- la frecuencia de rebalanceo,
+- la política de riesgo,
+- y la convención temporal de ejecución.
 
-\section{Prop\'osito del m\'odulo}
+Su función no es estimar “capacidad comercial” ni producir una cifra de marketing, sino responder a una pregunta concreta:
 
-Este m\'odulo no estima ``retornos institucionales'' ni pretende demostrar ventaja estad\'istica.
-Su funci\'on es mucho m\'as austera y operativa: determinar si una estrategia que parece
-v\'alida en backtest sigue siendo ejecutable cuando el capital gestionado aumenta y los costes
-de liquidez dejan de ser despreciables.
+“¿Hasta qué nivel de escala puede aumentarse la estrategia sin violar restricciones internas de liquidez, tiempo de liquidación y degradación neta aceptable del rendimiento?”
 
-La pregunta formal es la siguiente: dado un proceso de se\~nales, construcci\'on de cartera y
-ejecuci\'on ya fijado, \emph{\`hasta qu\'e escala de AUM puede aumentarse la estrategia sin violar
-restricciones de participaci\'on, tiempo de liquidaci\'on, concentraci\'on y degradaci\'on aceptable
-del rendimiento neto?}
+La capacidad debe tratarse como una restricción de factibilidad, no como una proyección optimista de crecimiento.
 
-Por tanto, \texttt{capacity\_sanity.py} debe tratar la capacidad como una \textbf{restricci\'on de
-factibilidad} y no como un argumento comercial.
+2. Alcance y no-objetivos
 
-\section{Definiciones y notaci\'on}
+2.1 Alcance
+El módulo:
+- reescala trades y holdings del backtest base;
+- recomputa métricas de liquidez y coste;
+- reestima el PnL neto bajo escala;
+- evalúa restricciones de participación, DTL, retención de alpha, Sharpe neto y drawdown;
+- devuelve la escala máxima factible bajo varios escenarios de coste.
 
-Sea $i \in \{1,\dots,N_t\}$ un activo elegible en la fecha $t$ y sea $\alpha > 0$ un factor de
-escalado del AUM respecto al backtest base. Si el portafolio base opera con AUM $A_0$, entonces
-el escenario evaluado opera con
-\[
-A(\alpha) = \alpha A_0.
-\]
+2.2 Fuera de alcance
+El módulo no:
+- reoptimiza señales ni pesos,
+- resuelve optimal execution intradía,
+- calibra microestructura tick-by-tick,
+- reemplaza al motor de ejecución,
+- ni estima capacidad “institucional” como argumento comercial.
 
-Denotamos:
-\begin{itemize}[leftmargin=2em]
-    \item $q_{i,t}^{(1)}$: n\'umero de acciones compradas o vendidas en el backtest base;
-    \item $h_{i,t}^{(1)}$: posici\'on mantenida al cierre en el backtest base;
-    \item $P_{i,t}$: precio de ejecuci\'on o precio de referencia;
-    \item $\mathrm{ADV}_{i,t}$: volumen diario medio monetario o en acciones, medido con ventana fija;
-    \item $\rho \in (0,1]$: haircut de liquidez para descontar volumen no realmente accesible;
-    \item $\mathrm{ADV}^{\mathrm{eff}}_{i,t} = \rho \, \mathrm{ADV}_{i,t}$: volumen efectivo utilizable;
-    \item $\sigma_{i,t}$: volatilidad diaria estimada;
-    \item $s_{i,t}$: spread bid-ask estimado;
-    \item $\eta \in (0,1)$: fracci\'on m\'axima del volumen efectivo que el sistema asume poder ejecutar por d\'ia.
-\end{itemize}
+3. Notación y objetos de entrada
 
-Bajo un test de capacidad puro, las decisiones de se\~nal no se reoptimizan. Se reescala
-la estrategia ya existente:
-\[
-q_{i,t}(\alpha) = \alpha q_{i,t}^{(1)},
-\qquad
-h_{i,t}(\alpha) = \alpha h_{i,t}^{(1)}.
-\]
-Esto es importante: el m\'odulo debe medir \emph{robustez de ejecuci\'on bajo escala}, no
-ventaja espuria obtenida al cambiar simult\'aneamente la l\'ogica de inversi\'on.
+Sea t = 1, ..., T el índice temporal del backtest y I_t el conjunto de activos operados o mantenidos en t.
 
-\section{M\'etricas nucleares de capacidad}
+Para cada activo i en t, se dispone del escenario base alpha = 1:
 
-\subsection{Participaci\'on en volumen}
+- q_{i,t}^{(1)}: tamaño de orden del backtest base.
+- h_{i,t}^{(1)}: posición al cierre del backtest base.
+- P_{i,t}: precio de referencia o precio de ejecución.
+- ADV_{i,t}: volumen diario medio sobre una ventana fija de N días.
+- s_{i,t}: spread estimado.
+- sigma_{i,t}: volatilidad diaria estimada.
+- pnl_gross_t^{(1)}: PnL bruto diario del backtest base.
 
-La m\'etrica elemental de presi\'on de ejecuci\'on es la participaci\'on:
-\[
-\pi_{i,t}(\alpha) =
-\frac{|q_{i,t}(\alpha)|}{\mathrm{ADV}^{\mathrm{eff}}_{i,t}}.
-\]
+Parámetros globales:
 
-No interesa solo el promedio. En small caps la cola derecha importa mucho m\'as que la media.
-Por ello, el m\'odulo debe reportar al menos:
-\[
-Q_{0.50}(\pi), \qquad Q_{0.95}(\pi), \qquad Q_{0.99}(\pi),
-\]
-as\'i como el m\'aximo por activo y por rebalanceo.
+- A_0: AUM base del backtest.
+- rho in (0,1]: haircut de liquidez.
+- eta in (0,1): fracción máxima del volumen efectivo utilizable por día.
+- pi_max: umbral máximo tolerable para Q_0.95 de participación.
+- dtl_max: umbral máximo tolerable para Q_0.95 de días para liquidar.
+- r_min: retención mínima de alpha.
+- S_min: Sharpe neto mínimo.
+- DD_extra_max: degradación máxima tolerable del drawdown.
+- alpha_grid: rejilla creciente de escalado.
+- scenario_set: conjunto de escenarios de coste, al menos {base, adverse, stressed}.
 
-\subsection{D\'ias para liquidar}
+4. Escalado de la estrategia
 
-La capacidad tambi\'en debe medirse sobre el inventario, no solo sobre los flujos de orden.
-Definimos los d\'ias para liquidar de una posici\'on como
-\[
-\mathrm{DTL}_{i,t}(\alpha)
-=
-\frac{|h_{i,t}(\alpha)|}{\eta \, \mathrm{ADV}^{\mathrm{eff}}_{i,t}}.
-\]
+Para un factor de escala alpha > 0:
 
-Esta cantidad aproxima cu\'antos d\'ias de volumen accesible se necesitar\'ian para deshacer la
-posici\'on sin exceder el ritmo de participaci\'on permitido por el sistema. Igual que antes,
-deben reportarse cuantiles y colas:
-\[
-Q_{0.50}(\mathrm{DTL}), \qquad Q_{0.95}(\mathrm{DTL}), \qquad Q_{0.99}(\mathrm{DTL}).
-\]
+A(alpha) = alpha * A_0
 
-\subsection{Coste de ejecuci\'on}
+q_{i,t}(alpha) = alpha * q_{i,t}^{(1)}
+h_{i,t}(alpha) = alpha * h_{i,t}^{(1)}
 
-El coste total de trading debe descomponerse en t\'erminos con significado econ\'omico.
-Una parametrizaci\'on suficientemente general para validaci\'on es:
-\[
-c^{\mathrm{bps}}_{i,t}(\alpha)
-=
-c^{\mathrm{fees}}_{i,t}
-+
-c^{\mathrm{spread}}_{i,t}
-+
-c^{\mathrm{impact}}_{i,t}(\alpha),
-\]
-donde
-\[
-c^{\mathrm{spread}}_{i,t} \approx \frac{1}{2}s_{i,t},
-\qquad
-c^{\mathrm{impact}}_{i,t}(\alpha)
-=
-\lambda_{i,t}
-\left(
-\pi_{i,t}(\alpha)
-\right)^\beta,
-\qquad \beta \in [1,2].
-\]
+El principio central del módulo es la invariancia estructural:
+si al aumentar alpha se modifica la lógica de señales, el rebalanceo o la construcción de cartera, entonces ya no se está midiendo capacidad de la misma estrategia.
 
-Aqu\'i $\lambda_{i,t}$ y $\beta$ no deben fijarse por narrativa sino por calibraci\'on a datos
-de ejecuci\'on o, en su defecto, por escenarios conservadores definidos a nivel de sistema.
-El coste monetario por trade queda:
-\[
-\mathrm{TC}_{i,t}(\alpha)
-=
-\frac{c^{\mathrm{bps}}_{i,t}(\alpha)}{10^4}
-\, |q_{i,t}(\alpha)| P_{i,t}.
-\]
+5. Volumen efectivo y métricas de liquidez
 
-\subsection{Rendimiento neto bajo escala}
+5.1 Volumen efectivo
+ADV_eff_{i,t} = rho * ADV_{i,t}
 
-Sea $\mathrm{PnL}^{\mathrm{gross}}_t(\alpha)$ el PnL bruto del backtest reescalado y
-$\mathrm{TC}_t(\alpha)$ el coste agregado de ejecuci\'on. Entonces:
-\[
-\mathrm{PnL}^{\mathrm{net}}_t(\alpha)
-=
-\mathrm{PnL}^{\mathrm{gross}}_t(\alpha)
--
-\mathrm{TC}_t(\alpha).
-\]
+ADV debe calcularse con una convención fija y documentada:
+- misma ventana N para todo el análisis,
+- misma definición (acciones o volumen monetario),
+- y mismo alineamiento temporal.
 
-A partir de esta serie se recomputan, como m\'inimo:
-\begin{itemize}[leftmargin=2em]
-    \item retorno anualizado neto,
-    \item volatilidad anualizada,
-    \item Sharpe neto,
-    \item turnover neto de costes,
-    \item drawdown m\'aximo,
-    \item ratio de retenci\'on de alpha:
-    \[
-    \mathrm{Retention}(\alpha)
-    =
-    \frac{\mathbb{E}[\mathrm{PnL}^{\mathrm{net}}(\alpha)]}
-         {\mathbb{E}[\mathrm{PnL}^{\mathrm{gross}}(\alpha)]}.
-    \]
-\end{itemize}
+5.2 Participación
+pi_{i,t}(alpha) = |q_{i,t}(alpha)| / ADV_eff_{i,t}
 
-\section{Definici\'on formal de capacidad}
+La participación debe resumirse al menos mediante:
+- Q_0.50(pi(alpha))
+- Q_0.95(pi(alpha))
+- Q_0.99(pi(alpha))
+- máximo por activo
+- máximo por fecha
+- cuantiles por bucket de liquidez, si están disponibles
 
-La capacidad no debe devolverse como una cifra aislada sin contexto. El objeto correcto es
-un \textbf{escenario m\'aximo factible}:
-\[
-\alpha^\star
-=
-\sup \left\{
-\alpha > 0 :
-\begin{array}{l}
-Q_{0.95}(\pi(\alpha)) \le \pi_{\max},\\
-Q_{0.95}(\mathrm{DTL}(\alpha)) \le \mathrm{DTL}_{\max},\\
-\mathrm{Retention}(\alpha) \ge r_{\min},\\
-\mathrm{Sharpe}^{\mathrm{net}}(\alpha) \ge S_{\min},\\
-\Delta \mathrm{DD}(\alpha) \le \mathrm{DD}_{\max}^{\mathrm{extra}}
-\end{array}
-\right\}.
-\]
+En small caps, las colas importan más que la media.
 
-La salida econ\'omicamente interpretable es
-\[
-A^\star = \alpha^\star A_0.
-\]
+5.3 Días para liquidar
+DTL_{i,t}(alpha) = |h_{i,t}(alpha)| / (eta * ADV_eff_{i,t})
 
-Esta formulaci\'on deja claro que la capacidad depende de restricciones elegidas ex ante y no
-de una cifra ornamental puesta a posteriori.
+También deben reportarse:
+- Q_0.50(DTL(alpha))
+- Q_0.95(DTL(alpha))
+- Q_0.99(DTL(alpha))
+- máximo por activo
+- máximo por fecha
 
-\section{Protocolo correcto de evaluaci\'on}
+Observación importante:
+si ADV_eff no se reestima al escalar, tanto pi como DTL escalan linealmente con alpha.
+Eso permite precomputar pi(alpha=1) y DTL(alpha=1) y escalar por alpha en lugar de recomputar desde cero.
 
-\subsection{Principio de invariancia}
+6. Modelo de costes
 
-Para que el test sea interpretable, deben mantenerse fijos:
-\begin{itemize}[leftmargin=2em]
-    \item universo elegible,
-    \item se\~nales y ranking,
-    \item reglas de construcci\'on de cartera,
-    \item frecuencia de rebalanceo,
-    \item l\'ogica de riesgo,
-    \item definici\'on temporal de ADV, spreads y volatilidad.
-\end{itemize}
+6.1 Coste unitario
+El coste total por trade debe descomponerse en términos con significado económico:
 
-Si estos componentes cambian con $\alpha$, entonces ya no se est\'a midiendo capacidad del
-mismo proceso, sino una estrategia distinta.
+c_bps_{i,t}(alpha; s) =
+    c_fees_{i,t}(s)
+  + c_spread_{i,t}(s)
+  + c_impact_{i,t}(alpha; s)
 
-\subsection{Grid de escalado}
+con:
 
-El m\'odulo debe evaluar una rejilla creciente
-\[
-\alpha \in \{\alpha_1,\dots,\alpha_K\},
-\qquad
-1 = \alpha_1 < \alpha_2 < \cdots < \alpha_K,
-\]
-por ejemplo geom\'etrica o cuasi-lineal. Para cada $\alpha$ se recalculan:
+c_spread_{i,t}(s) ≈ 0.5 * s_{i,t}(s)
 
-\begin{enumerate}[leftmargin=2em]
-    \item tama\~nos de orden y posiciones;
-    \item participaci\'on por activo y fecha;
-    \item DTL por activo y fecha;
-    \item coste de ejecuci\'on por trade;
-    \item PnL neto agregado;
-    \item m\'etricas de cola y degradaci\'on relativa frente al escenario base.
-\end{enumerate}
+c_impact_{i,t}(alpha; s) =
+    lambda_{i,t}(s) * [pi_{i,t}(alpha)]^beta(s)
 
-La capacidad final no debe tomarse del primer punto que ``parece malo'' visualmente, sino del
-mayor $\alpha$ que satisface simult\'aneamente todas las restricciones.
+donde beta debe fijarse de forma conservadora y justificada.
+En el MVP, beta puede parametrizarse por escenario o bucket de liquidez.
+En versión avanzada, lambda y beta deben venir de un módulo de calibración externo coherente con cost_model/execution.
 
-\subsection{Escenarios de calibraci\'on}
+6.2 Coste monetario
+TC_{i,t}(alpha; s) =
+    c_bps_{i,t}(alpha; s) / 10^4 * |q_{i,t}(alpha)| * P_{i,t}
 
-Es recomendable evaluar al menos tres escenarios de coste:
-\begin{itemize}[leftmargin=2em]
-    \item \textbf{Base}: par\'ametros calibrados centrales;
-    \item \textbf{Adverso}: haircut de volumen m\'as severo, spread m\'as alto, impacto mayor;
-    \item \textbf{Estresado}: combinaci\'on conservadora para ventanas de liquidez deteriorada.
-\end{itemize}
+TC_t(alpha; s) = sum_i TC_{i,t}(alpha; s)
 
-La cifra reportable de capacidad debe ser la m\'inima entre escenarios o, como m\'inimo, debe
-informarse expl\'icitamente de qu\'e escenario produce la restricci\'on vinculante.
+6.3 Escenarios
+Cada escenario s define, como mínimo, una combinación distinta de:
+- rho_s
+- spreads efectivos
+- lambda_s
+- beta_s
+- y, opcionalmente, eta_s
 
-\section{Gates y gobernanza}
+Escenarios mínimos:
+- base: calibración central
+- adverse: menor liquidez y mayor coste
+- stressed: combinación conservadora de baja liquidez, spreads altos e impacto alto
 
-\subsection{Filosof\'ia de gates}
+7. PnL neto bajo escala
 
-En validaci\'on, un gate no debe ser una decoraci\'on narrativa sino una decisi\'on operacional.
-La salida recomendada es \texttt{PASS/WARN/FAIL}, pero el criterio debe ser transparente.
+PnL_gross_t(alpha) = alpha * PnL_gross_t(1)
 
-\subsection{Estructura recomendada}
+PnL_net_t(alpha; s) =
+    PnL_gross_t(alpha) - TC_t(alpha; s)
 
-Para un escenario $\alpha$, def\'inanse:
-\[
-g_1(\alpha) = \frac{Q_{0.95}(\pi(\alpha))}{\pi_{\max}},
-\qquad
-g_2(\alpha) = \frac{Q_{0.95}(\mathrm{DTL}(\alpha))}{\mathrm{DTL}_{\max}},
-\]
-\[
-g_3(\alpha) = \frac{r_{\min}}{\max(\mathrm{Retention}(\alpha),\varepsilon)},
-\qquad
-g_4(\alpha) = \frac{S_{\min}}{\max(\mathrm{Sharpe}^{\mathrm{net}}(\alpha),\varepsilon)}.
-\]
+A partir de la serie {PnL_net_t(alpha; s)} se calculan:
 
-Con $\varepsilon > 0$ peque\~no para evitar divisiones inestables. Una gobernanza simple y robusta es:
-\begin{itemize}[leftmargin=2em]
-    \item \texttt{PASS} si $\max_j g_j(\alpha) \le 1$;
-    \item \texttt{WARN} si hay una \'unica restricci\'on marginalmente vulnerada pero las colas extremas siguen controladas;
-    \item \texttt{FAIL} si cualquier restricci\'on cr\'itica se viola de forma material o si
-    $Q_{0.99}(\pi)$ o $Q_{0.99}(\mathrm{DTL})$ muestran concentraci\'on no tolerable.
-\end{itemize}
+- retorno anualizado neto,
+- volatilidad anualizada neta,
+- Sharpe neto S_net(alpha; s),
+- drawdown máximo DD(alpha; s),
+- degradación de drawdown:
+  Delta_DD(alpha; s) = DD(alpha; s) - DD(alpha=1; base)
 
-\subsection{Sobre los umbrales}
+Definimos además la retención de alpha:
 
-Los umbrales no deben presentarse como universales. Deben ser calibrados por:
-\begin{itemize}[leftmargin=2em]
-    \item tama\~no medio de capitalizaci\'on del universo,
-    \item frecuencia de rebalanceo,
-    \item agresividad permitida de ejecuci\'on,
-    \item restricciones internas del mandato,
-    \item evidencia hist\'orica del propio sistema.
-\end{itemize}
+Retention(alpha; s) =
+    mean_t[PnL_net_t(alpha; s)] /
+    mean_t[PnL_gross_t(alpha)]
 
-A falta de calibraci\'on espec\'ifica, el documento puede incluir \emph{defaults operativos}
-expl\'icitamente marcados como provisionales, por ejemplo:
-\[
-\pi_{\max} \in [3\%, 5\%], \qquad
-\mathrm{DTL}_{\max} \in [3,5]\ \text{d\'ias}, \qquad
-r_{\min} \in [0.65,0.80].
-\]
-Pero nunca deben venderse como constantes de la naturaleza.
+La convención temporal usada para medias, volatilidad y anualización debe quedar fijada y documentada.
 
-\section{Casos l\'imite y fuentes de error}
+8. Definición formal de capacidad
 
-El m\'odulo debe endurecerse frente a varios edge cases que en small caps son frecuentes:
+Para cada escenario s, definir:
 
-\begin{enumerate}[leftmargin=2em]
-    \item \textbf{ADV espurio o desactualizado.} Si el volumen reciente cae bruscamente respecto a la
-    ventana de c\'alculo, el test debe aplicar haircut adicional o marcar observaci\'on inv\'alida.
-    \item \textbf{Activos con trading discontinuo.} Si existen sesiones con volumen casi nulo,
-    el DTL debe crecer dr\'asticamente o declararse no fiable.
-    \item \textbf{Halts, limit moves o gaps extremos.} No pueden tratarse como d\'ias ordinarios de liquidez.
-    \item \textbf{Concentraci\'on por nombre.} Un promedio aceptable puede ocultar uno o dos activos imposibles
-    de ejecutar; por eso el m\'aximo y el cuantil 99\% son obligatorios.
-    \item \textbf{Microcaps arrastrando la capacidad.} Debe informarse qu\'e porcentaje del universo es vinculante
-    para la restricci\'on.
-    \item \textbf{Se\~nales que cambian el turnover al escalar.} Si la cartera requiere truncamiento o clipping
-    adicional, esto debe registrarse como cambio de estrategia y no como capacidad del dise\~no original.
-\end{enumerate}
+alpha_star_s =
+    sup { alpha > 0 :
+          Q_0.95(pi(alpha; s)) <= pi_max
+          and Q_0.95(DTL(alpha; s)) <= dtl_max
+          and Retention(alpha; s) >= r_min
+          and S_net(alpha; s) >= S_min
+          and Delta_DD(alpha; s) <= DD_extra_max }
 
-\section{Invariantes de implementaci\'on}
+La salida conservadora principal del módulo será:
 
-El c\'odigo debe respetar al menos estos invariantes:
+alpha_star = min_s alpha_star_s
+A_star = alpha_star * A_0
 
-\begin{itemize}[leftmargin=2em]
-    \item ninguna capacidad reportada puede exceder la de un escenario m\'as adverso;
-    \item el coste total debe ser no decreciente en $\alpha$;
-    \item $Q_{0.95}(\pi)$ y $Q_{0.95}(\mathrm{DTL})$ deben ser no decrecientes salvo peque\~nas irregularidades num\'ericas;
-    \item si el universo, la se\~nal o el rebalanceo cambian, debe emitirse advertencia de comparabilidad;
-    \item la salida debe identificar qu\'e restricci\'on fue vinculante en $A^\star$.
-\end{itemize}
+Además, el módulo debe identificar:
+- escenario vinculante,
+- restricción vinculante,
+- primer alpha fallido,
+- y trayectoria completa por la rejilla.
 
-\section{Salida recomendada del m\'odulo}
+9. Agregación temporal y estabilidad
 
-La funci\'on principal no deber\'ia devolver una sola cifra, sino una estructura auditable del tipo:
+9.1 Agregación mínima obligatoria
+Las métricas de cola deben definirse explícitamente sobre el conjunto de observaciones del backtest:
+- trades para participación,
+- holdings para DTL,
+- días de PnL para métricas de rendimiento.
 
-\begin{verbatim}
+La convención elegida debe mantenerse fija.
+
+9.2 Estabilidad temporal
+La capacidad no debe depender solo de un subperiodo excepcionalmente benigno.
+Por ello, el módulo debe repetir el análisis al menos sobre subperiodos amplios no solapados, por ejemplo:
+- primera mitad / segunda mitad,
+- tercios temporales,
+- o bloques rolling grandes.
+
+La salida debe incluir:
+- alpha_star por subperiodo,
+- dispersión entre subperiodos,
+- y un flag de estabilidad.
+
+Regla práctica:
+si alpha_star cae materialmente en subperiodos débiles de liquidez, la cifra reportable debe degradarse o marcarse como inestable.
+
+10. Protocolo de evaluación
+
+10.1 Rejilla de alpha
+Usar una rejilla creciente:
+alpha_1 = 1 < alpha_2 < ... < alpha_K
+
+Se recomienda rejilla geométrica para cubrir varios órdenes de magnitud sin exceso de cómputo.
+
+10.2 Evaluación por alpha y escenario
+Para cada escenario s y cada alpha_k:
+1. escalar trades y holdings,
+2. computar pi y DTL,
+3. computar costes,
+4. recomputar PnL neto,
+5. resumir métricas de liquidez y rendimiento,
+6. aplicar gates.
+
+10.3 Búsqueda
+MVP:
+- usar siempre rejilla creciente.
+
+Versión avanzada:
+- se puede usar bisección solo si se verifica empíricamente cuasimonotonicidad suficiente en:
+  - Q_0.95(pi(alpha)),
+  - Q_0.95(DTL(alpha)),
+  - costes totales,
+  - y degradación neta.
+
+Si la monotonicidad falla, se vuelve automáticamente a rejilla.
+
+11. Gates y gobernanza
+
+Definir funciones normalizadas:
+
+g_1(alpha; s) = Q_0.95(pi(alpha; s)) / pi_max
+g_2(alpha; s) = Q_0.95(DTL(alpha; s)) / dtl_max
+g_3(alpha; s) = r_min / max(Retention(alpha; s), eps)
+g_4(alpha; s) = S_min / max(S_net(alpha; s), eps)
+g_5(alpha; s) = Delta_DD(alpha; s) / DD_extra_max
+
+donde eps > 0 evita inestabilidades numéricas.
+
+Decisión operativa:
+
+- PASS:
+  max_j g_j(alpha; s) <= 1
+  y Q_0.99(pi), Q_0.99(DTL) no muestran concentración extrema intolerable.
+
+- WARN:
+  existe una única restricción marginalmente cerca del límite,
+  pero la estrategia sigue siendo usable con monitorización.
+
+- FAIL:
+  una restricción crítica se viola materialmente,
+  o la cola extrema de participación / DTL revela imposibilidad operacional por concentración.
+
+La capacidad final reportable debe basarse en PASS, no en WARN.
+
+12. Invariantes del módulo
+
+12.1 Invariantes internos por escenario
+- TC_t(alpha_2; s) >= TC_t(alpha_1; s) para alpha_2 > alpha_1, salvo error numérico menor.
+- Q_0.95(pi(alpha; s)) no debe decrecer materialmente con alpha.
+- Q_0.95(DTL(alpha; s)) no debe decrecer materialmente con alpha.
+- Si ADV efectivo cae a niveles incompatibles con ejecución, el activo debe marcarse como no fiable o no ejecutable.
+
+12.2 Invariantes entre escenarios
+- alpha_star_stressed <= alpha_star_adverse <= alpha_star_base
+- A igualdad de alpha, el escenario stressed no puede producir menor coste agregado que base salvo error de parametrización.
+
+13. Edge cases y failure modes
+
+El módulo debe manejar explícitamente:
+
+- ADV espurio o desactualizado.
+  Si el volumen reciente cae de forma abrupta frente a la ventana histórica, aplicar haircut adicional o marcar la observación como no fiable.
+
+- Trading discontinuo.
+  Si existen múltiples sesiones con volumen casi nulo, DTL debe explotar o el activo debe declararse no ejecutable.
+
+- Halts y eventos extremos.
+  No deben tratarse como días ordinarios de liquidez.
+
+- Concentración por nombre.
+  Una media razonable no compensa uno o dos activos imposibles de mover.
+
+- Universo contaminado por survivorship.
+  ADV y liquidez deben medirse sobre universo PIT correcto.
+
+- Endogeneidad de liquidez.
+  Para escalas muy altas, asumir ADV completamente exógeno puede sobreestimar capacidad.
+  En el MVP esto se absorbe vía rho y escenarios conservadores; no se modela profundidad endógena completa.
+
+14. Salidas del módulo
+
+La función principal debe devolver una estructura auditable del tipo:
+
 {
   "aum_base": ...,
   "alpha_star": ...,
   "aum_star": ...,
   "binding_constraint": "...",
-  "scenario": "base|adverse|stressed",
-  "grid_results": [...],
-  "p95_participation": ...,
-  "p95_dtl": ...,
-  "retention": ...,
-  "net_sharpe": ...,
+  "binding_scenario": "...",
+  "scenario_results": [...],
+  "subperiod_results": [...],
+  "stability_flag": "...",
   "gate": "PASS|WARN|FAIL"
 }
-\end{verbatim}
 
-Esto facilita integraci\'on con \texttt{validation\_suite.py} y evita informes ambiguos.
+Cada elemento de scenario_results debe incluir, por alpha:
+- p50/p95/p99 de participación,
+- p50/p95/p99 de DTL,
+- retención,
+- Sharpe neto,
+- drawdown,
+- gate,
+- restricción vinculante.
 
-\section{Esqueleto de implementaci\'on}
+15. MVP vs versión avanzada
 
-La b\'usqueda de $\alpha^\star$ puede hacerse por rejilla creciente o por bisecci\'on si las
-restricciones son suficientemente mon\'otonas. Un boceto razonable es:
+15.1 MVP
+- ventana fija de ADV/spread/volatilidad,
+- grid discreta de alpha,
+- tres escenarios simples,
+- cuantiles estándar,
+- estabilidad temporal por 2 o 3 subperiodos,
+- sin bootstrap,
+- sin solver de optimal execution.
 
-\begin{verbatim}
-def evaluate_capacity(alpha, trades, holdings, market_data, cost_model, limits):
-    scaled_trades = scale_trades(trades, alpha)
-    scaled_holdings = scale_holdings(holdings, alpha)
+15.2 Versión avanzada
+- cuantiles robustos,
+- análisis de sensibilidad a rho, eta, lambda, beta,
+- escenarios históricos condicionados de estrés,
+- activación opcional de bisección,
+- integración con calibración externa de impacto,
+- capacidad conservadora ajustada por estabilidad inter-subperiodos.
 
-    participation = compute_participation(scaled_trades, market_data)
-    dtl = compute_dtl(scaled_holdings, market_data, limits.max_daily_fraction)
+16. Interpretación correcta
 
-    tc = compute_execution_costs(
-        scaled_trades,
-        market_data,
-        cost_model
-    )
+La lectura correcta del módulo es:
 
-    pnl_net = recompute_net_pnl(scaled_trades, scaled_holdings, tc, market_data)
-    metrics = summarize_capacity_metrics(participation, dtl, pnl_net)
+“Dada esta estrategia, esta cartera y este modelo de costes, la escala máxima compatible con nuestras restricciones de liquidez y degradación neta es A_star. Por encima de ese punto, la estrategia deja de ser operacionalmente equivalente a sí misma.”
 
-    gate, binding_constraint = apply_capacity_gates(metrics, limits)
-    return metrics, gate, binding_constraint
+17. Referencias orientativas
 
+- Almgren, R. y Chriss, N. (2000): framework clásico de coste e impacto.
+- Kyle, A. (1985): intuición estructural de profundidad e impacto.
+- Gatheral, J. (2009): restricciones de consistencia para impacto.
+- Kissell, R.: práctica estándar de costes y liquidez.
+- López de Prado, M. (2018): robustez y validación bajo fragilidad de mercado.
 
-def find_capacity_limit(alpha_grid, *args, **kwargs):
-    last_pass = None
-    history = []
+18. Conclusión
 
-    for alpha in alpha_grid:
-        metrics, gate, binding = evaluate_capacity(alpha, *args, **kwargs)
-        history.append((alpha, metrics, gate, binding))
-        if gate == "PASS":
-            last_pass = (alpha, binding)
-        else:
-            break
-
-    return last_pass, history
-\end{verbatim}
-
-\section{Interpretaci\'on correcta}
-
-La lectura correcta del m\'odulo es:
-\begin{quote}
-``Dada esta estrategia, este universo y este modelo de ejecuci\'on, la escala m\'axima compatible
-con nuestras restricciones internas de liquidez y degradaci\'on neta es $A^\star$. Por encima de
-ese nivel, la estrategia deja de ser operacionalmente equivalente a s\'i misma.''
-\end{quote}
-
-Eso es mucho m\'as \'util que cualquier tabla adornada con Sharpe elevados, porque define
-cu\'ando el sistema sigue siendo ejecutable y cu\'ando ya no lo es.
-
-\section{Referencias orientativas}
-
-\begin{itemize}[leftmargin=2em]
-    \item Almgren, R. y Chriss, N. (2000). Optimal execution with temporary and permanent impact.
-    \item Kyle, A. S. (1985). Continuous auctions and insider trading.
-    \item Kissell, R. (distintas ediciones). Market microstructure and trading cost models.
-    \item L\'opez de Prado, M. (2018). \emph{Advances in Financial Machine Learning}.
-\end{itemize}
-
-\section{Conclusi\'on}
-
-Un m\'odulo serio de capacidad no promete ``Sharpe institucional'' ni presenta un AUM m\'agico
-como argumento de venta. Su responsabilidad es m\'as simple y m\'as exigente: mostrar, con una
-definici\'on reproducible y restricciones expl\'icitas, cu\'ando una estrategia deja de escalar de
-forma econ\'omicamente consistente.
-
-\end{document}
+capacity_sanity.py no estima una capacidad “bonita”, sino una cota de escalabilidad operacional bajo restricciones explícitas y reproducibles.
+Su diseño debe ser conservador, interpretable y auditable.
+Si se vuelve demasiado sofisticado, deja de ser un sanity check.
+Si se vuelve demasiado simple, sobreestima capacidad.
+El objetivo correcto es un punto intermedio: rigor cuantitativo suficiente para no autoengañarse, sin invadir módulos de ejecución avanzada.

@@ -1,415 +1,665 @@
-\section{Hidden Markov Model (HMM) para detección operativa de regímenes en swing trading}
+Especificación Cuantitativa: models/regimes/hmm.py
 
-\subsection{Objetivo del módulo}
+1. Propósito del módulo
 
-El módulo \texttt{models/regimes/hmm.py} implementa una capa de inferencia de \emph{market regimes} basada en \textbf{Hidden Markov Models gaussianos} aplicada sobre el vector temporal de \texttt{regime\_features}. Su función no es producir una taxonomía descriptiva de mercado, sino una \textbf{representación latente, estable y utilizable operativamente} del entorno de riesgo, de modo que los módulos downstream puedan condicionar selección de modelos, exposición, gross/net, turnover y permisividad de ejecución en función del estado estimado del mercado.
+El objetivo de models/regimes/hmm.py es inferir un estado latente discreto del mercado a partir de un vector temporal de regime features point-in-time, de forma que el sistema downstream pueda condicionar su comportamiento a un entorno de riesgo, liquidez, correlación o amplitud distinto.
 
-Sea \(\mathbf{X}_t \in \mathbb{R}^d\) el vector observable de \texttt{regime\_features} en la fecha \(t\), ya construido bajo reglas estrictas point-in-time. Sea \(S_t \in \{0,1,\dots,K-1\}\) una variable latente discreta que representa el régimen de mercado vigente. El HMM gaussiano supone:
-\begin{equation}
-\mathbb{P}(S_1 = k) = \pi_k,
-\end{equation}
-\begin{equation}
-\mathbb{P}(S_t = j \mid S_{t-1} = i) = A_{ij},
-\end{equation}
-\begin{equation}
-\mathbf{X}_t \mid S_t = k \sim \mathcal{N}(\boldsymbol{\mu}_k, \boldsymbol{\Sigma}_k),
-\end{equation}
-donde \(\boldsymbol{\pi}\) es el vector de probabilidades iniciales, \(\mathbf{A}\) la matriz de transición y \(\{\boldsymbol{\mu}_k,\boldsymbol{\Sigma}_k\}_{k=0}^{K-1}\) la familia de emisiones gaussianas.
+La función correcta del módulo no es “predecir retornos” ni “etiquetar bull/bear de forma narrativa”, sino estimar una estructura latente persistente y usable operativamente mediante probabilidades filtradas y estados dominantes.
 
-La interpretación económica del módulo es la siguiente: el mercado no se modela como una secuencia IID de observaciones, sino como un proceso con \textbf{persistencia de estado}, \textbf{transiciones discretas} y \textbf{superficies de riesgo condicional} diferentes según el régimen. Esta estructura es especialmente adecuada en swing trading porque la mayoría de las degradaciones severas de alpha no provienen de ruido de un día aislado, sino de cambios de entorno: expansión/compresión de volatilidad, deterioro de liquidez, concentración de correlaciones, pérdida de breadth o ruptura de tendencia sistémica.
+La pregunta exacta que debe responder el módulo es:
 
-Por tanto, el objetivo del módulo no es maximizar únicamente el \emph{in-sample fit}, sino producir una secuencia \(\{\hat{S}_t\}\) y unas probabilidades \(\{\hat{p}_{t,k}\}\) que cumplan simultáneamente cuatro propiedades:
-\begin{itemize}
-  \item \textbf{Interpretabilidad económica}: cada estado debe corresponder a un entorno distinguible de riesgo/participación.
-  \item \textbf{Persistencia razonable}: el modelo no debe fragmentar el mercado en micro-estados inestables.
-  \item \textbf{Estabilidad inter-run}: el significado operativo de los estados debe mantenerse entre reentrenamientos.
-  \item \textbf{Utilidad downstream}: las probabilidades de régimen deben mejorar la toma de decisiones en \texttt{regime\_gating.py} sin introducir look-ahead ni excesivo chattering.
-\end{itemize}
+“Dada una serie temporal X_{1:T} de features de régimen ya construidas sin leakage, qué secuencia de estados latentes S_t y qué probabilidades P(S_t=k | X_{1:t}) describen mejor la dinámica del entorno de mercado con suficiente estabilidad estadística y semántica como para ser usadas en gating downstream?”
 
-\subsection{Alcance del módulo}
+2. Principios no negociables
 
-El módulo incluye:
-\begin{itemize}
-  \item Entrenamiento de HMM gaussiano con EM/Baum--Welch sobre \texttt{regime\_features}.
-  \item Inferencia de probabilidades filtradas, suavizadas y camino Viterbi.
-  \item Selección controlada del número de estados \(K\) bajo criterios estadísticos y operativos.
-  \item Alineación semántica de estados entre reentrenamientos consecutivos.
-  \item Detección de degeneración, colapso de estados y cambios estructurales severos.
-  \item Persistencia de probabilidades, secuencias, parámetros, métricas de estabilidad y metadatos de entrenamiento.
-\end{itemize}
+2.1 Point-in-time estricto
+El módulo solo puede consumir features construidas con información disponible hasta t. No puede corregir leakage aguas arriba; debe asumir que regime_features.py ya lo ha evitado, pero sí debe preservar esta semántica.
 
-No incluye:
-\begin{itemize}
-  \item La construcción de \texttt{regime\_features} (responsabilidad de \texttt{regime\_features.py}).
-  \item La traducción final de probabilidades de estado a decisiones de riesgo o trading (responsabilidad de \texttt{regime\_gating.py}).
-\end{itemize}
+2.2 Filtrado live, smoothing solo offline
+Las probabilidades válidas para uso live son:
+P(S_t = k | X_{1:t})
+Nunca:
+P(S_t = k | X_{1:T})
+Las probabilidades suavizadas y Viterbi solo se usan para diagnóstico, análisis ex post y visualización.
 
-\subsection{Rol arquitectónico}
+2.3 Estados latentes, no labels narrativos
+Los estados internos 0,1,...,K-1 no tienen semántica económica por sí solos. Cualquier etiqueta tipo risk_on / risk_off debe construirse después y solo si la firma del estado es estable.
 
-La carpeta \texttt{models/regimes} se concibe como una cadena causal:
-\[
-\texttt{regime\_features} \;\longrightarrow\; \texttt{hmm} \;\longrightarrow\; \texttt{regime\_gating}.
-\]
+2.4 Robustez antes que sofisticación
+Es mejor un HMM finito gaussiano, estable y bien alineado que un modelo no paramétrico elegante pero semánticamente inestable o difícil de gobernar.
 
-En esta cadena, \texttt{hmm.py} ocupa la capa de \textbf{inferencia latente}. No produce señales de entrada/salida de mercado ni scores de alpha; produce un resumen probabilístico del entorno. Por ello, su criterio de calidad no es si “predice returns” de forma directa, sino si produce una segmentación suficientemente robusta del estado del sistema como para mejorar la decisión downstream.
+2.5 El mejor likelihood no basta
+Un modelo se acepta si, además de ajustar razonablemente, produce estados:
+- no degenerados,
+- suficientemente persistentes,
+- semánticamente estables entre reentrenos,
+- y útiles para el gating downstream.
 
-\subsection{Dependencias aguas arriba y aguas abajo}
+2.6 Este módulo infiere regímenes; no hace research abierto
+Online EM, HSMM, Student-t emissions o extensiones bayesianas pueden existir como fase 2, pero no forman parte del contrato mínimo.
 
-\paragraph{Upstream}
-\begin{itemize}
-  \item \texttt{regime\_features.parquet} con matriz \(\mathbf{X}_{1:T}\in\mathbb{R}^{T\times d}\).
-  \item Calendario de entrenamiento e inferencia.
-  \item Configuración de entrenamiento: \texttt{candidate\_n\_states}, \texttt{covariance\_type}, \texttt{train\_window\_mode}, \texttt{min\_train\_length}, \texttt{retrain\_freq}, \texttt{regularization}, \texttt{random\_seed}, \texttt{state\_alignment\_policy}, \texttt{model\_selection\_policy}, \texttt{structural\_break\_policy}.
-\end{itemize}
+3. Qué hace y qué no hace
 
-\paragraph{Downstream}
-\begin{itemize}
-  \item \texttt{models/regimes/regime\_gating.py}: consume \(\hat{p}_{t,k}\), \(\hat{S}_t\), confianza de régimen y métricas de estabilidad.
-  \item \texttt{validation/walkforward\_bias.py}: verifica ausencia de leakage y coherencia temporal.
-  \item \texttt{validation/regime\_stability.py}: audita persistencia, reasignación de estados y drift semántico.
-  \item \texttt{research/alpha\_discovery/regime\_detector.py}: evaluación de heterogeneidad de alpha por estado.
-\end{itemize}
+3.1 Qué hace
+- recibe una matriz temporal X_t de regime features;
+- estima HMMs gaussianos para varios K candidatos;
+- ejecuta EM / Baum-Welch con multi-start;
+- calcula probabilidades filtradas, suavizadas y Viterbi;
+- selecciona K bajo criterios predictivos y operativos;
+- alinea estados entre reentrenos para preservar semántica;
+- produce probabilidades live, estados dominantes y diagnósticos;
+- emite una decisión operativa de aceptación o rechazo del modelo.
 
-\subsection{Contrato de entrada y salida}
+3.2 Qué no hace
+- no construye las regime features;
+- no etiqueta estados económicos de forma irreversible sin capa posterior;
+- no usa smoothing en live;
+- no decide directamente posiciones o pesos;
+- no convierte el HMM en un predictor de retornos;
+- no obliga a usar online learning como parte del MVP.
 
-\paragraph{Entradas mínimas}
-\begin{itemize}
-  \item \texttt{regime\_features\_path}
-  \item \texttt{hmm\_config\_path}
-  \item \texttt{run\_id}
-\end{itemize}
+4. Rol dentro del stack
 
-\paragraph{Salidas persistidas}
-\begin{itemize}
-  \item \texttt{state\_probs.parquet}: matriz \((T \times K)\) con probabilidades filtradas y, opcionalmente, suavizadas separadas por namespace.
-  \item \texttt{state\_sequence.parquet}: camino Viterbi y estado dominante filtrado.
-  \item \texttt{hmm\_params.json}: \(\boldsymbol{\pi}\), \(\mathbf{A}\), \(\{\boldsymbol{\mu}_k,\boldsymbol{\Sigma}_k\}\), configuración efectiva, criterio de selección de \(K\).
-  \item \texttt{hmm\_summary.json}: log-likelihood, AIC/BIC, entropía media, persistencia, estabilidad, colapsos, breaks, score de aceptabilidad operativa.
-  \item \texttt{state\_mapping.json}: correspondencia entre IDs internos del run actual y etiquetas semánticas persistentes.
-  \item \texttt{manifest.json}: huella completa del run.
-\end{itemize}
+Secuencia correcta:
 
-\paragraph{Campos mínimos por fecha}
-\begin{itemize}
-  \item \texttt{date}
-  \item \texttt{dominant\_state\_filtered}
-  \item \texttt{p\_state\_0}, \dots, \texttt{p\_state\_\{K-1\}}
-  \item \texttt{state\_confidence} \(= \max_k \mathbb{P}(S_t=k\mid \mathbf{X}_{1:t})\)
-  \item \texttt{state\_entropy} \(= -\sum_k p_{t,k}\log p_{t,k}\)
-  \item \texttt{regime\_label}
-  \item \texttt{model\_accepted}
-  \item \texttt{run\_id}
-\end{itemize}
+market data
+-> regime_features.py
+-> hmm.py
+-> regime_gating.py
+-> portfolio / execution / risk logic
 
-\subsection{Formulación probabilística}
+Interpretación correcta:
+regime_features.py crea la representación observable del entorno;
+hmm.py infiere el estado latente;
+regime_gating.py traduce ese estado a políticas downstream.
 
-Sea \(\mathcal{D}=\{\mathbf{x}_1,\dots,\mathbf{x}_T\}\). El likelihood completo del modelo es:
-\begin{equation}
-\mathcal{L}(\boldsymbol{\theta}\mid \mathcal{D})
+El módulo vive exactamente entre representación del régimen e inferencia del régimen.
+
+5. Entradas contractuales
+
+5.1 Entrada principal
+- regime_features.parquet con columnas:
+  - date
+  - feature_1, ..., feature_d
+
+5.2 Configuración mínima
+- K_candidates
+- covariance_type ∈ {diag, full}
+- train_window_mode ∈ {rolling, expanding}
+- train_window_length
+- retrain_frequency
+- n_restarts
+- max_em_iter
+- tol_loglik
+- cov_reg_lambda
+- min_state_occupancy
+- min_median_duration
+- max_mean_entropy
+- selection_policy
+- alignment_policy
+- acceptance_policy
+- random_seed
+- policy_version
+
+5.3 Requisitos previos de integridad
+Antes de entrenar:
+- fechas estrictamente ordenadas;
+- sin duplicados por fecha;
+- sin NaN ni inf en columnas críticas;
+- dimensionalidad d estable;
+- cobertura suficiente del histórico para la ventana elegida.
+
+6. Modelo estadístico base
+
+Se utiliza un Hidden Markov Model gaussiano finito de orden 1:
+
+S_t ∈ {1,...,K}
+
+P(S_t = j | S_{t-1} = i) = A_{ij}
+
+X_t | S_t = k ~ N(μ_k, Σ_k)
+
+Parámetros:
+θ = (π, A, {μ_k, Σ_k}_{k=1}^K)
+
+donde:
+- π es la distribución inicial;
+- A es la matriz de transición K×K;
+- μ_k ∈ R^d es la media de emisión del estado k;
+- Σ_k ∈ R^{d×d} es la covarianza de emisión del estado k.
+
+Likelihood marginal:
+p(X_{1:T} | θ)
 =
-\sum_{s_{1:T}}
-\pi_{s_1}
-\prod_{t=2}^{T} A_{s_{t-1}s_t}
-\prod_{t=1}^{T}
-\mathcal{N}(\mathbf{x}_t\mid \boldsymbol{\mu}_{s_t},\boldsymbol{\Sigma}_{s_t}),
-\end{equation}
-donde
-\[
-\boldsymbol{\theta} = \left(\boldsymbol{\pi},\mathbf{A},\{\boldsymbol{\mu}_k,\boldsymbol{\Sigma}_k\}_{k=0}^{K-1}\right).
-\]
+Σ_{s_1,...,s_T}
+π_{s_1}
+Π_{t=2}^T A_{s_{t-1},s_t}
+Π_{t=1}^T N(X_t ; μ_{s_t}, Σ_{s_t})
 
-El entrenamiento se realiza mediante EM/Baum--Welch. En la etapa E se computan:
-\begin{equation}
-\gamma_t(k) = \mathbb{P}(S_t=k\mid \mathcal{D}),
-\end{equation}
-\begin{equation}
-\xi_t(i,j)=\mathbb{P}(S_{t-1}=i,S_t=j\mid \mathcal{D}).
-\end{equation}
+7. Supuestos explícitos
 
-En la etapa M se actualiza:
-\begin{align}
-\hat{\pi}_k &= \gamma_1(k), \\
-\hat{A}_{ij} &= \frac{\sum_{t=2}^{T}\xi_t(i,j)}{\sum_{t=2}^{T}\gamma_{t-1}(i)}, \\
-\hat{\boldsymbol{\mu}}_k &= \frac{\sum_{t=1}^{T}\gamma_t(k)\mathbf{x}_t}{\sum_{t=1}^{T}\gamma_t(k)}, \\
-\hat{\boldsymbol{\Sigma}}_k &= \frac{\sum_{t=1}^{T}\gamma_t(k)(\mathbf{x}_t-\hat{\boldsymbol{\mu}}_k)(\mathbf{x}_t-\hat{\boldsymbol{\mu}}_k)^\top}{\sum_{t=1}^{T}\gamma_t(k)}.
-\end{align}
+El módulo asume:
 
-En producción, la implementación debe operar en log-espacio y/o con factores de escalado para evitar \emph{underflow} numérico. Además, la estimación de covarianzas incorpora regularización explícita:
-\begin{equation}
-\hat{\boldsymbol{\Sigma}}_k^{\text{reg}}
+7.1 Markov order 1
+La dinámica latente viene determinada por el estado anterior.
+
+7.2 Emisiones gaussianas por estado
+Aun si las features upstream han sido robustizadas o gaussianizadas, esto sigue siendo una aproximación de conveniencia estadística, no verdad estructural del mercado.
+
+7.3 Cuasi-estacionariedad dentro de la ventana de entrenamiento
+Los parámetros θ son constantes dentro del bloque de entrenamiento elegido.
+
+7.4 Duraciones implícitamente geométricas
+En un HMM estándar, la duración de permanencia en el estado k viene implícita por A_{kk} y tiene forma geométrica. Esta hipótesis debe diagnosticarse, no ignorarse.
+
+8. Estimación del modelo
+
+8.1 Método base
+Estimación por EM / Baum-Welch con multi-start.
+
+8.2 E-step
+Se calculan:
+
+γ_t(k) = P(S_t = k | X_{1:T})
+
+ξ_t(i,j) = P(S_{t-1}=i, S_t=j | X_{1:T})
+
+mediante forward-backward.
+
+8.3 M-step
+Actualizaciones canónicas:
+
+π_k = γ_1(k)
+
+A_{ij}
 =
-\hat{\boldsymbol{\Sigma}}_k + \lambda I,
-\end{equation}
-con \(\lambda > 0\) configurable, o bien restricciones estructurales mediante \texttt{covariance\_type} \(\in \{\texttt{full},\texttt{diag},\texttt{tied},\texttt{spherical}\}\).
+Σ_{t=2}^T ξ_t(i,j)
+/
+Σ_{t=2}^T γ_{t-1}(i)
 
-\subsection{Inferencia: filtrado, suavizado y Viterbi}
+μ_k
+=
+Σ_{t=1}^T γ_t(k) X_t
+/
+Σ_{t=1}^T γ_t(k)
 
-\paragraph{Filtrado}
-Para uso live o walk-forward, únicamente se permiten probabilidades filtradas:
-\begin{equation}
-\alpha_t(k)
+Σ_k
 =
-\mathbb{P}(X_{1:t},S_t=k)
-=
-\left(\sum_{i=0}^{K-1}\alpha_{t-1}(i)A_{ik}\right)
-\mathcal{N}(\mathbf{x}_t\mid \boldsymbol{\mu}_k,\boldsymbol{\Sigma}_k),
-\end{equation}
+Σ_{t=1}^T γ_t(k) (X_t - μ_k)(X_t - μ_k)^⊤
+/
+Σ_{t=1}^T γ_t(k)
+
+y después regularización:
+
+Σ_k^reg = Σ_k + λ_reg I
+
+8.4 Reglas numéricas obligatorias
+- forward/backward en log-space o con scaling;
+- regularización obligatoria de covarianzas;
+- rechazo de covarianzas no PSD;
+- multi-start con selección del mejor óptimo local aceptable;
+- registro completo del log-likelihood por iteración.
+
+8.5 Convergencia EM
+Se declara convergencia si:
+
+(ℓ_m - ℓ_{m-1}) / max(1, |ℓ_{m-1}|) < tol_loglik
+
+durante varias iteraciones consecutivas y superado min_iter.
+
+No basta con “ha terminado”; debe persistirse:
+- converged_flag
+- n_iter
+- loglik_history
+- best_restart_id
+
+9. Probabilidades y secuencias
+
+9.1 Filtered probabilities
+Para fecha t, la única probabilidad válida en live es:
+
+p_{t,k}^{filtered} = P(S_t = k | X_{1:t})
+
+Estas probabilidades alimentan gating downstream.
+
+9.2 Smoothed probabilities
+Offline únicamente:
+
+p_{t,k}^{smoothed} = P(S_t = k | X_{1:T})
+
+Útiles para:
+- diagnosis ex post,
+- análisis de transiciones,
+- validación visual.
+
+9.3 Viterbi path
+El camino más probable:
+
+ŝ_{1:T}^{vit} = argmax_{s_{1:T}} P(s_{1:T} | X_{1:T})
+
+Se persiste como artefacto interpretativo, no como señal principal live.
+
+10. Política batch y semántica temporal
+
+10.1 MVP recomendado
+El MVP del módulo es:
+
+- reentrenamiento batch rolling o expanding;
+- parámetros θ congelados entre dos reentrenos;
+- filtrado online con parámetros fijos.
+
+10.2 Semántica correcta
+Entre t_retrain and t_retrain+1:
+- A, μ_k, Σ_k permanecen fijos;
+- solo evolucionan las probabilidades filtradas.
+
+10.3 Online EM
+No forma parte del contrato mínimo.
+Solo puede activarse como modo avanzado y debe estar claramente marcado como:
+mode = online_adaptation_experimental
+
+11. Selección del número de estados K
+
+11.1 Principio general
+K no debe seleccionarse solo por likelihood ni solo por BIC/AIC.
+El criterio correcto debe combinar:
+- calidad predictiva,
+- no degeneración,
+- persistencia,
+- estabilidad semántica,
+- y utilidad downstream.
+
+11.2 Candidatos
+Para cada K en K_candidates:
+- entrenar múltiples restarts;
+- seleccionar el mejor óptimo local aceptable;
+- evaluar score predictivo y filtros operativos.
+
+11.3 Filtros duros previos
+Un modelo con K estados solo es elegible si cumple:
+
+a) ocupación mínima
+occupancy_k = (1/T) Σ_t 1{dominant_state_t = k}
 y
-\begin{equation}
-\mathbb{P}(S_t=k\mid X_{1:t}) \propto \alpha_t(k).
-\end{equation}
+min_k occupancy_k >= min_state_occupancy
 
-\paragraph{Suavizado}
-Para auditoría offline o análisis ex post:
-\begin{equation}
-\beta_t(k)
-=
-\sum_{j=0}^{K-1}
-A_{kj}
-\mathcal{N}(\mathbf{x}_{t+1}\mid \boldsymbol{\mu}_j,\boldsymbol{\Sigma}_j)\beta_{t+1}(j),
-\end{equation}
+b) persistencia mínima
+median_duration_k >= min_median_duration
+
+c) entropía media razonable
+mean_entropy = (1/T) Σ_t H(p_t^{filtered})
 con
-\begin{equation}
-\mathbb{P}(S_t=k\mid X_{1:T}) \propto \alpha_t(k)\beta_t(k).
-\end{equation}
-Las probabilidades suavizadas quedan prohibidas para decisiones live.
+H(p_t) = -Σ_k p_{t,k} log p_{t,k}
+y
+mean_entropy <= max_mean_entropy
 
-\paragraph{Viterbi}
-Opcionalmente se calcula el camino más probable:
-\begin{equation}
-\hat{S}_{1:T}
+d) covarianzas válidas
+Σ_k^reg PSD para todo k
+
+e) no colapso semántico
+no todos los estados deben parecer la misma emisión con ocupaciones marginales artificiales.
+
+11.4 Score de selección recomendado
+Entre los modelos aceptables, seleccionar por:
+
+Score(K)
 =
-\arg\max_{S_{1:T}}\mathbb{P}(S_{1:T}\mid X_{1:T}),
-\end{equation}
-útil para análisis estructural y visualización, pero no necesariamente para gating directo si la política downstream trabaja con probabilidades continuas y no con asignaciones duras.
+PredLogScore(K)
+- λ_BIC * BIC_norm(K)
+- λ_deg * Degeneracy(K)
+- λ_align * AlignmentInstability(K)
 
-\subsection{Selección del número de estados \(K\)}
+donde:
 
-Uno de los principales puntos débiles de los HMM aplicados de forma ingenua es tratar \(K\) como un hiperparámetro decorativo. En este módulo, \(K\) se selecciona mediante una política \textbf{mixta estadístico-operativa}, no únicamente por AIC/BIC.
+PredLogScore(K):
+held-out filtered predictive log-score o walk-forward log-score
 
-Sea \(\mathcal{K}_{\text{cand}}=\{2,3,\dots,K_{\max}\}\). Para cada \(K\) candidato se evalúan:
-\begin{itemize}
-  \item \textbf{Fit estadístico}: log-likelihood validado, AIC, BIC.
-  \item \textbf{Persistencia}: duración media y mediana por estado.
-  \item \textbf{Ocupación efectiva}: ningún estado debe absorber masa ínfima de forma persistente.
-  \item \textbf{Separación}: distancia entre emisiones \((\boldsymbol{\mu}_k,\boldsymbol{\Sigma}_k)\).
-  \item \textbf{Entropía}: el modelo no debe producir incertidumbre crónica excesiva.
-  \item \textbf{Estabilidad inter-run}: consistencia al reentrenar en ventanas solapadas.
-  \item \textbf{Utilidad downstream}: mejora del desempeño de \texttt{regime\_gating} en validación walk-forward.
-\end{itemize}
+BIC_norm(K):
+BIC normalizado como penalización secundaria
 
-Se define una función de selección compuesta:
-\begin{equation}
-\text{Score}(K)
-=
-w_1 \cdot \text{Fit}(K)
-+
-w_2 \cdot \text{Persistence}(K)
-+
-w_3 \cdot \text{Stability}(K)
-+
-w_4 \cdot \text{Utility}(K)
--
-w_5 \cdot \text{DegeneracyPenalty}(K),
-\end{equation}
-donde los pesos se fijan por configuración. En producción, el valor elegido de \(K\) no debe ser el que maximiza únicamente el likelihood, sino el mayor \(K\) que siga siendo \textbf{estable, interpretable y accionable}. En la práctica, esto impide sobresegmentar el mercado en estados espurios con nulo valor operativo.
+Degeneracy(K):
+penalización por estados casi vacíos, duraciones ridículas o entropía excesiva
 
-\subsection{Alineación semántica de estados entre reentrenamientos}
+AlignmentInstability(K):
+penalización por mala estabilidad semántica frente al run anterior
 
-Un problema central en producción es que los IDs internos del HMM no tienen semántica intrínseca: el estado \(2\) de un run puede no corresponder al estado \(2\) del run siguiente. Para evitar que \texttt{risk-off} cambie de identidad de una ventana a otra, el módulo implementa una política explícita de \textbf{state alignment}.
+11.5 Regla importante
+BIC/AIC pueden entrar, pero no deben ser el árbitro único.
+La selección final de K debe ser predictiva y operativamente útil.
 
-Sea el conjunto de estados del run previo \(\mathcal{S}^{(old)}\) y del run actual \(\mathcal{S}^{(new)}\). Se construye una matriz de coste entre estados usando distancia entre emisiones y métricas económicas auxiliares:
-\begin{equation}
+12. Duración de estados y control de mis-specification
+
+12.1 Hecho estructural
+En un HMM estándar, la duración implícita del estado k es geométrica:
+P(D_k = d) = (A_{kk})^{d-1} (1 - A_{kk})
+
+12.2 Diagnóstico obligatorio
+Para cada estado k se debe persistir:
+- duración empírica observada de rachas;
+- mediana de duración;
+- duración media geométrica implícita:
+  E[D_k] = 1 / (1 - A_{kk})
+- una medida de discrepancia entre duración empírica y la geométrica implícita.
+
+12.3 Interpretación
+Si la discrepancia es alta y persistente:
+- no invalida automáticamente el modelo;
+- pero activa:
+  duration_misspec_flag = true
+
+12.4 Política
+Este flag justifica fase 2 con HSMM si y solo si el beneficio downstream compensa la complejidad.
+
+13. Alineación semántica entre reentrenos
+
+13.1 Problema
+Los estados internos no son identificables entre runs.
+El estado “2” hoy no tiene por qué ser el “2” mañana.
+
+13.2 Política recomendada
+Alinear estados del run nuevo con estados del run anterior mediante Hungarian matching sobre una matriz de coste C_{ij}.
+
+13.3 Coste recomendado
 C_{ij}
 =
-\lambda_\mu \|\mu_i^{(old)}-\mu_j^{(new)}\|_2
+w_emit * SKL_ij
 +
-\lambda_\Sigma \|\Sigma_i^{(old)}-\Sigma_j^{(new)}\|_F
+w_A * ||A_old[i,:] - A_new[j,:]||_2
 +
-\lambda_r | \bar{r}_i^{(old)}-\bar{r}_j^{(new)} |
-+
-\lambda_v | \bar{\sigma}_i^{(old)}-\bar{\sigma}_j^{(new)} |.
-\end{equation}
+w_sig * SignatureDist_ij
 
-Sobre esta matriz se resuelve una asignación óptima bipartita, por ejemplo con Hungarian matching. El resultado produce un mapeo:
-\[
-\texttt{state\_id\_internal} \longrightarrow \texttt{state\_id\_persistent}.
-\]
+donde:
 
-Si el coste mínimo excede un umbral de tolerancia, el estado se considera \textbf{no alineable} y se marca como \texttt{new\_state\_candidate}. Esto evita falsas equivalencias semánticas en presencia de drift estructural.
+SKL_ij:
+KL simétrica entre emisiones gaussianas del estado antiguo i y el nuevo j
 
-\subsection{Etiquetado semántico}
+SignatureDist_ij:
+distancia entre firmas económicas auxiliares del estado:
+- vol media
+- iliquidez media
+- correlación
+- breadth
+- etc., si se usan
 
-Tras la alineación, cada estado persistente se etiqueta mediante una política explícita de \texttt{state\_labeling}. La etiqueta no se asigna por nombre arbitrario, sino por firmas económicas robustas:
-\begin{itemize}
-  \item \textbf{Risk-on}: volatilidad baja o moderada, breadth razonable, liquidez sana, tendencia sistémica favorable.
-  \item \textbf{Risk-off}: volatilidad alta, deterioro de liquidez, aumento de correlación cross-sectional, presión bajista.
-  \item \textbf{Crisis / stress}: volatilidad extrema, colapso de breadth, correlaciones elevadas, spreads y fragilidad de ejecución.
-  \item \textbf{Neutral / transitional}: transición entre estructuras o mezcla de señales incompatibles.
-\end{itemize}
+13.4 Resultado del alignment
+El módulo debe persistir:
+- mapping_old_to_new
+- alignment_cost_mean
+- aligned_flag
 
-La asignación se documenta siempre en \texttt{state\_mapping.json}, separando tres niveles:
-\begin{itemize}
-  \item \texttt{internal\_state\_id}
-  \item \texttt{persistent\_state\_id}
-  \item \texttt{regime\_label}
-\end{itemize}
+13.5 Regla de seguridad
+Si el alignment_cost_mean supera umbral:
+- no forzar un mapping semántico falso;
+- marcar:
+  unstable_mapping_flag = true
+- downstream puede entrar en modo prudente.
 
-\subsection{Tratamiento de cambios estructurales}
+14. Etiquetado económico opcional
 
-Un buen módulo de regímenes no solo clasifica estados; también detecta cuándo la propia clasificación deja de ser fiable porque el proceso generador ha cambiado de forma material. Por ello, el HMM incorpora una política de \textbf{structural break handling}.
+14.1 Los estados latentes pueden etiquetarse de forma económica solo si:
+- el mapping inter-run es estable,
+- la firma del estado es coherente,
+- y la etiqueta tiene valor downstream.
 
-Se considera que existe sospecha de cambio estructural si se observan uno o varios de los siguientes fenómenos:
-\begin{itemize}
-  \item caída abrupta del log-likelihood out-of-sample;
-  \item incremento persistente de entropía de estado;
-  \item pérdida severa de persistencia de los estados;
-  \item rotación semántica inestable en los mapeos entre runs;
-  \item aumento acusado de la distancia entre \(\mathbf{A}\) o entre emisiones de runs consecutivos.
-\end{itemize}
+14.2 Etiquetas posibles
+- risk_on
+- neutral
+- risk_off
+- stress
+- transitional
 
-Formalmente, pueden monitorizarse estadísticas como:
-\begin{equation}
-D_A^{(m,n)} = \|\mathbf{A}^{(m)}-\mathbf{A}^{(n)}\|_F,
-\end{equation}
-\begin{equation}
-D_\mu^{(m,n)} = \max_k \|\boldsymbol{\mu}_k^{(m)}-\boldsymbol{\mu}_{\pi(k)}^{(n)}\|_2,
-\end{equation}
-donde \(\pi\) es el matching óptimo entre estados.
+14.3 Regla
+Las etiquetas económicas son una capa derivada.
+Nunca deben reemplazar el namespace estadístico base:
+state_0, state_1, ..., state_{K-1}
 
-Si las métricas exceden umbrales configurados, el módulo puede:
-\begin{itemize}
-  \item continuar con el modelo actual pero marcar \texttt{model\_accepted = false};
-  \item activar una política de \texttt{degraded mode};
-  \item forzar reentrenamiento completo con mayor ventana o distinta regularización;
-  \item congelar temporalmente el mapping semántico previo y reducir la intensidad del gating downstream.
-\end{itemize}
+15. Structural breaks y estabilidad
 
-\subsection{Política de reinicio y continuidad operativa}
+15.1 Señales a monitorizar entre reentrenos
+- cambio en A:
+  ||A_new - A_old_aligned||_F
+- cambio en medias:
+  max_k ||μ_k^new - μ_k^old_aligned||_2
+- cambio en covarianzas:
+  max_k ||Σ_k^new - Σ_k^old_aligned||_F
+- alignment cost
+- predictive log-score degradation
+- aumento de entropía media
 
-No basta con “reentrenar otra vez” cuando el modelo falla. La especificación debe dejar clara la jerarquía de recuperación.
+15.2 Política
+Si varias señales superan umbral:
+- structural_break_flag = true
 
-\paragraph{Caso 1: colapso parcial}
-Si uno o varios estados presentan masa efectiva muy baja, covarianza degenerada o absorción anómala, se intenta:
-\begin{itemize}
-  \item aumentar regularización;
-  \item cambiar \texttt{covariance\_type};
-  \item relanzar con varios \texttt{random\_seed};
-  \item reducir \(K\) en una unidad si la degeneración persiste.
-\end{itemize}
+15.3 Efecto
+El modelo puede seguir persistiéndose para auditoría, pero puede no ser aceptado para live gating si rompe la continuidad semántica o la utilidad operativa.
 
-\paragraph{Caso 2: colapso semántico}
-Si el modelo converge, pero los estados dejan de ser interpretables o alineables:
-\begin{itemize}
-  \item se rechaza el run como modelo operativo;
-  \item se mantiene el último mapping persistente estable;
-  \item se envía bandera de precaución a \texttt{regime\_gating}.
-\end{itemize}
+16. Criterios de aceptación del modelo
 
-\paragraph{Caso 3: break estructural severo}
-Si existe evidencia consistente de régimen nuevo no representado por la estructura previa:
-\begin{itemize}
-  \item se permite reinicialización completa de estados;
-  \item se crea nueva versión de \texttt{state\_mapping};
-  \item se obliga a periodo de observación antes de usar el nuevo mapping con máxima intensidad downstream.
-\end{itemize}
+Un run solo se considera aceptado si cumple todo lo siguiente:
 
-La idea general es que el HMM debe ser \textbf{adaptativo sin ser errático}. En un sistema real, continuidad operativa importa tanto como capacidad de reacción.
+1. convergencia EM razonable;
+2. probabilidades filtradas bien normalizadas;
+3. ningún estado degenerado por ocupación;
+4. persistencia mínima aceptable;
+5. entropía media no excesiva;
+6. covarianzas válidas;
+7. K seleccionado aceptable por score predictivo + filtros;
+8. alignment suficientemente estable o bandera prudente explícita;
+9. utilidad downstream no peor que baseline o estado “sin HMM”;
+10. no uso de smoothing en live.
 
-\subsection{Reglas point-in-time y anti-leakage}
+Si alguno de los filtros duros falla:
+model_accepted = false
 
-\begin{itemize}
-  \item En live y en backtest walk-forward solo se permite \(\mathbb{P}(S_t=k\mid X_{1:t})\).
-  \item El suavizado \(\mathbb{P}(S_t=k\mid X_{1:T})\) queda restringido a análisis offline, debugging o anotación histórica.
-  \item Toda salida persistida debe indicar \texttt{probability\_namespace} \(\in\) \{\texttt{filtered}, \texttt{smoothed}\}.
-  \item \texttt{prohibit\_smoothing\_in\_live = true} debe ser un \emph{hard guard}, no una convención blanda.
-  \item En reentrenamientos rolling/expanding, la ventana de fit debe cerrarse estrictamente antes o en \(t\), nunca después.
-\end{itemize}
+17. Namespace de probabilidades
 
-\subsection{Flujo operativo del proceso}
+La implementación debe distinguir claramente:
 
-\begin{enumerate}
-  \item \texttt{load\_hmm\_config} y \texttt{load\_regime\_features}.
-  \item Validación temporal y de cobertura de \(\mathbf{X}_{1:T}\).
-  \item Definición de ventana efectiva según \texttt{train\_window\_mode}.
-  \item Entrenamiento multi-start para cada \(K\) candidato.
-  \item Selección del mejor modelo por política mixta estadístico-operativa.
-  \item Inferencia filtrada y, si procede, suavizada en namespace separado.
-  \item Evaluación de degeneración, persistencia, estabilidad y drift.
-  \item Alineación semántica frente al run anterior.
-  \item Etiquetado económico de estados persistentes.
-  \item Decisión final de aceptabilidad operativa.
-  \item Persistencia de outputs, métricas y manifiestos.
-\end{enumerate}
+- p_state_k_filtered
+- p_state_k_smoothed
 
-\subsection{Métricas recomendadas}
+y, si existe:
+- dominant_state_filtered
+- dominant_state_smoothed
 
-\paragraph{Métricas de ajuste}
-\begin{itemize}
-  \item log-likelihood train / validation;
-  \item AIC / BIC:
-  \begin{equation}
-  \mathrm{BIC} = -2 \log \mathcal{L} + \log(T)\,\dim(\boldsymbol{\theta});
-  \end{equation}
-  \item convergencia del EM y número de iteraciones.
-\end{itemize}
+Regla dura:
+los objetos consumidos por downstream live solo pueden salir del namespace filtered.
 
-\paragraph{Métricas de estructura}
-\begin{itemize}
-  \item duración media y mediana por estado;
-  \item ocupación efectiva por estado;
-  \item entropía media de régimen;
-  \item distancia entre matrices de transición entre runs;
-  \item distancia entre emisiones alineadas.
-\end{itemize}
+18. Flujo operativo canónico
 
-\paragraph{Métricas de utilidad}
-\begin{itemize}
-  \item mejora de \texttt{regime\_gating} en validación walk-forward;
-  \item reducción de drawdown o mejora de convexidad de riesgo condicional;
-  \item capacidad del gating de desactivar exposición en estados adversos sin destruir exceso de alpha en estados normales.
-\end{itemize}
+Paso 1:
+cargar regime_features y config
 
-\subsection{Criterios de aceptación y rechazo del modelo}
+Paso 2:
+validar integridad temporal y cobertura
 
-El módulo no debe aceptar automáticamente todo run convergente. La convergencia numérica es condición necesaria, no suficiente. Un run se considera \texttt{accepted} solo si satisface simultáneamente:
-\begin{itemize}
-  \item normalización correcta de probabilidades;
-  \item \(K_{\text{effective}} \ge 2\);
-  \item ausencia de estados casi vacíos persistentes;
-  \item persistencia mínima por estado por encima de un umbral;
-  \item entropía media por debajo de un máximo admisible;
-  \item estabilidad inter-run suficiente;
-  \item alineación semántica satisfactoria;
-  \item mejora o, al menos, no deterioro material del comportamiento downstream en validación.
-\end{itemize}
+Paso 3:
+para cada K candidato:
+- entrenar multi-start
+- registrar convergencia
+- calcular filtros operativos
+- calcular predictive score
 
-Si no se cumplen estos criterios, el modelo puede persistirse para auditoría, pero no debe marcarse como válido para producción.
+Paso 4:
+seleccionar K con la política definida
 
-\subsection{Validaciones mínimas}
+Paso 5:
+alinear estados frente al modelo anterior si existe
 
-\begin{itemize}
-  \item \(\sum_{k=0}^{K-1} p_{t,k} = 1 \pm \varepsilon\) para toda fecha.
-  \item No existen \texttt{NaN} ni fechas faltantes en outputs.
-  \item Las covarianzas regularizadas son definidas positivas o semidefinidas positivas admisibles según implementación.
-  \item Ningún estado presenta absorción espuria no justificada por datos.
-  \item El mapping entre runs queda completamente documentado o explícitamente rechazado.
-\end{itemize}
+Paso 6:
+calcular filtered probs, smoothed probs y Viterbi
 
-\subsection{Consideraciones de implementación}
+Paso 7:
+calcular diagnósticos:
+- ocupación
+- duración
+- entropía
+- estabilidad
+- break flags
 
-La implementación debe priorizar robustez frente a elegancia académica:
-\begin{itemize}
-  \item operar en log-espacio;
-  \item soportar multi-start con selección del mejor óptimo local;
-  \item separar claramente entrenamiento, inferencia, alineación y persistencia;
-  \item permitir backfilling solo para auditoría, nunca para live decisions;
-  \item versionar exhaustivamente parámetros, ventanas, features y política de mapping;
-  \item evitar que un fallo del HMM provoque por sí mismo un fallo duro de todo el stack downstream.
-\end{itemize}
+Paso 8:
+emitir decisión model_accepted
 
-\subsection{Interpretación final}
+Paso 9:
+persistir artefactos y manifiesto
 
-Este módulo no debe entenderse como un clasificador ornamental de bull/bear market, sino como una \textbf{capa de estado latente de mercado} diseñada para operar bajo incertidumbre, con persistencia temporal, control de drift semántico y disciplina point-in-time. Su calidad no se mide únicamente por la elegancia de la formulación de Baum--Welch, sino por su capacidad para producir estados que sobrevivan a reentrenamientos, mantengan significado económico y puedan ser consumidos por \texttt{regime\_gating.py} sin introducir inestabilidad, leakage ni falsas transiciones.
+19. Invariantes matemáticos obligatorios
 
-En un sistema cuantitativo serio, el valor de un HMM no está en “detectar regímenes” en abstracto, sino en reducir errores de decisión cuando el entorno de mercado cambia. Esa es la función de este módulo dentro de \texttt{simons\_smallcap\_swing}.
+19.1 Normalización de probabilidades
+Para todo t:
+Σ_k p_{t,k}^{filtered} = 1 ± eps
+Σ_k p_{t,k}^{smoothed} = 1 ± eps
+
+19.2 Matriz de transición
+Para todo i:
+Σ_j A_{ij} = 1 ± eps
+A_{ij} >= 0
+
+19.3 Covarianzas
+Toda Σ_k^reg debe ser PSD.
+
+19.4 Namespace temporal
+live_namespace == filtered_only
+
+19.5 Persistencia mínima
+Si median_duration_k < threshold estructural,
+el estado no puede aceptarse como estado operativo normal.
+
+20. Tests mínimos obligatorios
+
+20.1 Integridad
+Fechas ordenadas, sin duplicados.
+
+20.2 Normalización
+Probabilidades suman 1 y A es estocástica por filas.
+
+20.3 PSD
+Covarianzas no singulares dentro de tolerancia.
+
+20.4 No leakage temporal
+No usar smoothing en live.
+
+20.5 Estabilidad semántica
+El alignment produce mapping válido o bandera prudente explícita.
+
+20.6 Degeneración
+Ningún estado aceptado con ocupación o duración ridículas.
+
+20.7 Reproducibilidad
+Misma seed + mismos datos + misma config => mismo run dentro de tolerancia numérica.
+
+21. Artefactos obligatorios
+
+21.1 state_probs_filtered.parquet
+Campos:
+- date
+- p_state_0_filtered ... p_state_{K-1}_filtered
+- dominant_state_filtered
+- state_confidence
+- state_entropy
+- run_id
+
+21.2 state_probs_smoothed.parquet
+Solo si se habilita.
+Mismos campos con sufijo smoothed.
+
+21.3 state_sequence.parquet
+- date
+- viterbi_state
+- dominant_state_filtered
+- dominant_state_smoothed si aplica
+- run_id
+
+21.4 hmm_params.json
+- K
+- pi
+- A
+- mu
+- Sigma
+- covariance_type
+- λ_reg
+- loglik_final
+- n_iter
+- converged_flag
+
+21.5 hmm_summary.json
+- run_id
+- K_selected
+- predictive_score
+- BIC
+- occupancy_by_state
+- median_duration_by_state
+- mean_entropy
+- alignment_cost_mean
+- duration_misspec_flag
+- structural_break_flag
+- model_accepted
+- rejection_reason if any
+- config_hash
+
+21.6 manifest.json
+- run_id
+- input hashes
+- config hash
+- train_window_mode
+- train_window_length
+- retrain_frequency
+- no_smoothing_in_live_assertion
+- alignment_policy
+- acceptance_policy
+- policy_version
+
+22. MVP vs versión avanzada
+
+22.1 MVP
+- HMM gaussiano finito
+- EM/Baum-Welch batch
+- multi-start
+- rolling/expanding refit
+- filtered probs live
+- selección de K con score predictivo + filtros duros
+- alignment por Hungarian
+- acceptance policy estricta
+
+22.2 Versión avanzada
+- online EM con forgetting factor
+- Student-t emissions
+- HSMM si duration_misspec_flag persistente
+- covariancias más ricas si d y muestra lo permiten
+- break detection más formal
+
+23. Qué NO conviene meter ahora
+
+No forma parte del contrato mínimo:
+- sticky HDP-HMM
+- infinite HMM
+- neural HMM
+- variational Bayesian HMM complejo
+- particle MCMC
+- mezcla bayesiana no paramétrica como selección estándar de K
+
+Todo eso puede ser research serio, pero no es la mejor forma de mejorar este módulo hoy.
+
+24. Interpretación correcta
+
+La lectura correcta de hmm.py no es:
+“clasificamos el mercado en etiquetas bonitas”.
+
+La lectura correcta es:
+“inferimos una cadena latente discreta de estados del entorno de mercado, con probabilidades filtradas utilizables en tiempo real, bajo una política estricta de estabilidad, aceptación y continuidad semántica”.
+
+Ese es su rol real.
+
+25. Conclusión
+
+models/regimes/hmm.py debe ser una pieza central de inferencia de regímenes del sistema.
+
+Recibe regime features limpias.
+Ajusta un HMM gaussiano finito de forma robusta.
+Selecciona K sin caer en sobresegmentación ingenua.
+Produce probabilidades filtradas para live.
+Mide degeneración, persistencia, entropía y estabilidad semántica.
+Alinea estados entre reentrenos.
+Y solo acepta el modelo si además de ajustar, sirve operativamente para gating downstream.
+
+Ese es exactamente el comportamiento que debe tener una capa seria de regime inference en un stack cuantitativo institucional.

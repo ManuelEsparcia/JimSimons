@@ -1,561 +1,449 @@
-\documentclass{article}
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
-\usepackage{amsmath,amssymb,amsfonts,mathtools}
-\usepackage{booktabs}
-\usepackage{array}
-\usepackage{enumitem}
-\usepackage{geometry}
-\usepackage{hyperref}
-\usepackage{listings}
-\usepackage{xcolor}
-\geometry{margin=1in}
+Especificación Cuantitativa: risk/drawdown_control.py
 
-\title{\textbf{Especificación Técnica: \texttt{risk/drawdown\_control.py}}}
-\author{Quant Research Infrastructure}
-\date{Marzo 2026}
+1. Propósito del módulo
 
-\begin{document}
-\maketitle
+El objetivo de risk/drawdown_control.py es imponer una capa de supervivencia y disciplina operacional sobre la curva de capital del sistema.
 
-\tableofcontents
-\newpage
+Su función no es maximizar retorno esperado ni sustituir la lógica de señales. Su función es más concreta:
 
-\section{Propósito del módulo}
+- medir drawdown realizado sobre la serie de NAV,
+- clasificar el estado operativo del sistema,
+- aplicar multiplicadores de riesgo y bloqueos coherentes,
+- y definir una política disciplinada de salida, cooldown y reentrada.
 
-Este módulo implementa la capa de control de drawdown del sistema. Su función es limitar deterioros acumulados de capital, imponer reglas de reducción de riesgo cuando la trayectoria del portafolio entra en zonas adversas y definir una política disciplinada de reanudación del riesgo una vez el sistema recupera estabilidad.
+La pregunta correcta del módulo es:
 
-El módulo no existe para maximizar retorno de forma directa ni para sustituir la lógica de señales. Su objetivo es introducir una restricción de supervivencia y disciplina operacional sobre la curva de capital del sistema. En una estrategia \emph{swing} sobre small caps, donde la liquidez puede deteriorarse rápidamente y las correlaciones aumentan en episodios de estrés, esta capa es necesaria para evitar que errores temporales de señal, shocks de mercado o regímenes adversos se conviertan en pérdidas acumuladas incompatibles con la continuidad del proceso.
+“Dado el deterioro acumulado de la curva de capital, ¿qué estado operativo de riesgo debe imponerse hoy y qué acciones concretas deben activarse?”
 
-\section{Definición del problema}
+2. Principios no negociables
 
-Sea \(NAV_t\) el valor liquidativo del portafolio en la fecha \(t\). Definimos el \emph{high-water mark} como
-\[
-HWM_t = \max_{s \le t} NAV_s,
-\]
-y el drawdown corriente como
-\[
-DD_t = \frac{NAV_t - HWM_t}{HWM_t}.
-\]
+2.1 Módulo reactivo, no predictivo
+El módulo responde al drawdown realizado. No pretende anticipar regímenes ni reemplazar modelos de riesgo ex-ante.
 
-Por construcción,
-\[
-DD_t \in [-1,0].
-\]
+2.2 Máquina de estados explícita
+Toda transición debe estar definida por reglas claras, auditables y reproducibles.
 
-El máximo drawdown en una ventana o en toda la historia observada viene dado por
-\[
-MDD = \min_t DD_t.
-\]
+2.3 Precedencia estricta
+Si varias reglas compiten, debe existir un orden de prioridad inequívoco.
 
-La lógica del módulo consiste en mapear el estado de drawdown del portafolio a un estado operativo de riesgo. Ese estado operativo determina si el sistema debe:
+2.4 No compensabilidad
+Un estado severo no puede deshacerse por una mejora puntual si no se cumplen las condiciones de salida formal.
 
-\begin{itemize}
-    \item seguir funcionando con normalidad;
-    \item entrar en modo de advertencia;
-    \item reducir tamaño de posición;
-    \item bloquear nuevas entradas;
-    \item liquidar o congelar riesgo;
-    \item o reingresar de forma gradual.
-\end{itemize}
+2.5 Integración multiplicativa simple
+La interacción canónica con sizing y portfolio se hace mediante multiplicadores de riesgo y flags de bloqueo, no mediante fórmulas decorativas.
 
-\section{Objetivo operativo}
+2.6 Auditabilidad total
+Cada fecha debe tener:
+- NAV,
+- HWM,
+- DD,
+- state,
+- multiplier,
+- entry_allowed,
+- exit_forced,
+- cooldown_remaining,
+- y razón de transición si aplica.
 
-El módulo debe cumplir simultáneamente las siguientes funciones:
+3. Qué hace y qué no hace
 
-\begin{enumerate}[label=\arabic*.]
-    \item Medir drawdown de forma consistente sobre la serie de \(NAV\).
-    \item Clasificar el estado del sistema en un conjunto finito de regímenes operativos.
-    \item Aplicar acciones deterministas y auditables para cada régimen.
-    \item Persistir eventos y transiciones de estado.
-    \item Coordinarse con el resto de la infraestructura de riesgo sin ambigüedad de precedencia.
-\end{enumerate}
+3.1 Qué hace
+- calcula HWM y drawdown;
+- asigna estado operativo;
+- aplica multiplicador de riesgo;
+- activa bloqueos o salidas forzadas;
+- administra cooldown;
+- y controla reentry gradual.
 
-No debe ser una capa de reglas vagas. Debe ser una máquina de estados simple, explícita y reproducible.
+3.2 Qué no hace
+- no reoptimiza cartera;
+- no estima expected shortfall;
+- no elige señales;
+- no sustituye optimizer ni sizing;
+- no hace control estocástico óptimo.
 
-\section{Entradas, salidas y contrato del módulo}
+4. Entradas obligatorias
 
-\subsection{Entradas}
+El módulo debe recibir como mínimo:
 
-El módulo recibe como mínimo:
+4.1 Serie principal
+- nav_t por fecha t
 
-\begin{itemize}
-    \item serie temporal de \(NAV_t\);
-    \item opcionalmente serie de \(PnL_t\), exposición agregada, volatilidad ex--ante y estado de otros controles;
-    \item parámetros:
-    \begin{itemize}
-        \item \texttt{warning\_thresh},
-        \item \texttt{derisk\_thresh},
-        \item \texttt{kill\_thresh},
-        \item \texttt{reentry\_thresh},
-        \item \texttt{cooldown\_days},
-        \item \texttt{derisk\_multiplier},
-        \item \texttt{reentry\_schedule},
-        \item \texttt{nav\_floor\_policy}.
-    \end{itemize}
-\end{itemize}
+4.2 Opcionales de auditoría
+- pnl_t
+- gross_t
+- net_t
+- vol_exante_t
+- flags de otros módulos de riesgo
 
-\subsection{Salida principal}
+4.3 Configuración
+- warning_down
+- warning_up
+- derisk_down
+- derisk_up
+- kill_down
+- kill_up
+- cooldown_days
+- derisk_multiplier
+- reentry_threshold
+- reentry_schedule
+- min_reentry_days_per_step
+- nav_jump_guard
+- nav_floor_policy
+- state_precedence
 
-La salida del módulo es un estado de control por fecha, junto con las acciones asociadas. Formalmente, para cada \(t\), el módulo produce:
+5. Definiciones canónicas
 
-\begin{itemize}
-    \item \(DD_t\),
-    \item \(HWM_t\),
-    \item \texttt{state\_t},
-    \item \texttt{risk\_multiplier\_t},
-    \item \texttt{entry\_allowed\_t},
-    \item \texttt{exit\_forced\_t},
-    \item \texttt{cooldown\_remaining\_t}.
-\end{itemize}
+Sea NAV_t el valor liquidativo del sistema en t.
 
-\subsection{Artefactos persistidos}
+Definimos:
 
-El módulo debe persistir:
+HWM_t = max_{s <= t} NAV_s
 
-\begin{itemize}
-    \item \texttt{series.parquet}: serie completa de \(NAV\), \(HWM\), \(DD\), estado y multiplicadores;
-    \item \texttt{actions.parquet}: eventos discretos de advertencia, de-risk, kill y reentry;
-    \item \texttt{summary.json}: métricas agregadas y parámetros usados;
-    \item \texttt{state\_transitions.json}: historial de cambios de régimen.
-\end{itemize}
+DD_t = (NAV_t - HWM_t) / HWM_t
 
-\subsection{Campos mínimos de \texttt{summary.json}}
+Por construcción:
+- HWM_t es no decreciente
+- DD_t in [-1,0] si NAV_t > 0
 
-\begin{itemize}
-    \item \texttt{max\_drawdown};
-    \item \texttt{days\_in\_warning};
-    \item \texttt{days\_in\_derisk};
-    \item \texttt{days\_in\_kill};
-    \item \texttt{num\_warning\_events};
-    \item \texttt{num\_derisk\_events};
-    \item \texttt{num\_kill\_events};
-    \item \texttt{avg\_recovery\_time};
-    \item \texttt{parameters};
-    \item \texttt{fallback\_triggered}.
-\end{itemize}
+El máximo drawdown observado es:
+MDD = min_t DD_t
 
-\section{Máquina de estados}
+6. Estados canónicos
 
-\subsection{Estados canónicos}
+La implementación base debe trabajar con:
 
-La implementación base debe usar los siguientes estados:
+- normal
+- warning
+- derisk
+- kill
+- cooldown
+- reentry
 
-\begin{center}
-\begin{tabular}{>{\raggedright\arraybackslash}p{3.5cm} >{\raggedright\arraybackslash}p{9.5cm}}
-\toprule
-Estado & Significado operativo \\
-\midrule
-\texttt{normal} & Operación estándar. Entradas y salidas permitidas. Multiplicador de riesgo \(=1\). \\
-\texttt{warning} & Deterioro moderado. No se fuerza liquidación, pero se endurece supervisión. \\
-\texttt{derisk} & Deterioro material. Se reduce riesgo activo y se restringen nuevas entradas. \\
-\texttt{kill} & Deterioro severo. Se cancela riesgo nuevo y se fuerza reducción máxima o cierre. \\
-\texttt{cooldown} & Estado posterior a kill. No se permite reentrada inmediata. \\
-\texttt{reentry} & Reincorporación gradual del riesgo con escalado controlado. \\
-\bottomrule
-\end{tabular}
-\end{center}
+Semántica:
 
-\subsection{Umbrales base}
+6.1 normal
+- multiplicador m_t = 1.0
+- entradas permitidas
+- sin salidas forzadas por drawdown
 
-La versión canónica puede usar, como valores por defecto:
+6.2 warning
+- drawdown moderado
+- entradas generalmente permitidas
+- supervisión reforzada
+- multiplicador normalmente 1.0 o ligeramente menor si config lo pide
 
-\[
-\texttt{warning\_thresh} = -0.08,
-\qquad
-\texttt{derisk\_thresh} = -0.12,
-\qquad
-\texttt{kill\_thresh} = -0.15.
-\]
+6.3 derisk
+- drawdown material
+- nuevas entradas restringidas o endurecidas
+- multiplicador:
+  m_t = derisk_multiplier
+  con 0 < derisk_multiplier < 1
 
-Estos umbrales son parámetros, no constantes universales. Deben ser calibrables por estrategia, frecuencia y tolerancia de capital. El módulo no debe suponer que estos valores son óptimos de forma general; solo constituyen una política inicial disciplinada.
+6.4 kill
+- drawdown severo
+- m_t = 0
+- entradas prohibidas
+- reducción máxima o cierre según policy
 
-\subsection{Regla de clasificación}
+6.5 cooldown
+- fase posterior a kill
+- m_t = 0 o residual si config lo autoriza
+- no se permite reentrada inmediata
 
-Sea \(DD_t\) el drawdown actual. La clasificación base es:
+6.6 reentry
+- reincorporación gradual del riesgo
+- multiplicador escalonado
+- requiere condiciones explícitas de permanencia y mejora
 
-\[
-\texttt{state}_t =
-\begin{cases}
-\texttt{kill}, & DD_t \le \texttt{kill\_thresh},\\
-\texttt{derisk}, & \texttt{kill\_thresh} < DD_t \le \texttt{derisk\_thresh},\\
-\texttt{warning}, & \texttt{derisk\_thresh} < DD_t \le \texttt{warning\_thresh},\\
-\texttt{normal}, & DD_t > \texttt{warning\_thresh}.
-\end{cases}
-\]
+7. Precedencia global
 
-Esta regla puede ser sobrescrita por estados persistentes como \texttt{cooldown} o \texttt{reentry}, que tienen precedencia temporal aunque el drawdown instantáneo haya mejorado.
+La precedencia correcta debe ser:
 
-\section{Precedencia entre reglas}
+kill > cooldown > derisk > warning > normal
 
-Uno de los errores más comunes en módulos de control es no definir qué regla manda cuando varias condiciones se activan a la vez. En este diseño, la precedencia debe ser:
+y reentry solo puede activarse si:
+- cooldown ha terminado,
+- no hay regla severa activa,
+- y se cumplen las condiciones de mejora.
 
-\[
-\texttt{kill} \;>\; \texttt{cooldown} \;>\; \texttt{derisk} \;>\; \texttt{warning} \;>\; \texttt{normal}.
-\]
+8. Umbrales y su semántica correcta
+
+La versión base puede usar umbrales como ejemplo:
+
+- warning_down = -0.08
+- derisk_down = -0.12
+- kill_down   = -0.15
+
+pero estos no deben tratarse como verdades universales.
+Deben ser parámetros versionados y calibrables por estrategia.
+
+La mejora importante aquí no es hacerlos “más matemáticos”, sino hacerlos operativamente más estables.
+
+9. Histéresis anti-chattering
+
+Este punto sí debe entrar en la versión seria del módulo.
+
+Cada estado severo debe tener:
+- umbral de entrada
+- y umbral de salida
+
+Ejemplo razonable:
+
+warning:
+- entra si DD_t <= warning_down
+- sale solo si DD_t > warning_up
+con warning_up > warning_down, por ejemplo:
+-0.06 > -0.08
+
+derisk:
+- entra si DD_t <= derisk_down
+- sale solo si DD_t > derisk_up
+por ejemplo:
+-0.10 > -0.12
+
+kill:
+- entra si DD_t <= kill_down
+- solo permite volver a lógica no-kill si DD_t > kill_up y además se completa cooldown
+
+Esto evita oscilaciones espurias cuando NAV rebota cerca del umbral.
+
+10. Máquina de estados formal
+
+10.1 Variables de estado
+El motor debe mantener:
+- current_state
+- current_multiplier
+- cooldown_remaining
+- reentry_step
+- last_transition_reason
+
+10.2 Reglas generales
+En cada fecha t:
+
+1. Validar NAV_t
+2. Actualizar HWM_t y DD_t
+3. Evaluar primero kill
+4. Si no hay kill:
+   - evaluar cooldown
+   - luego reentry
+   - luego derisk
+   - luego warning
+   - luego normal
+5. Persistir la transición y la acción
+
+11. Política de kill
+
+La semántica exacta de kill debe venir de config, pero la base correcta es:
+
+- m_t = 0
+- entry_allowed = False
+- exit_forced = True o reduce_to_min_risk según policy
+- cooldown_remaining = cooldown_days
+- reentry_step = None
+
+Kill no se “desactiva” por una observación aislada menos mala.
+Primero debe cumplirse cooldown y luego la lógica de reentry.
+
+12. Política de cooldown
+
+Durante cooldown:
+- no se permiten nuevas entradas,
+- el multiplicador se mantiene en 0,
+- el contador decrece cada periodo válido,
+- y no puede saltarse por mejora puntual del NAV.
+
+Condición mínima:
+cooldown_remaining must reach 0 before any reentry attempt.
+
+13. Política de reentry
+
+La reentrada debe ser escalonada, no binaria.
+
+Secuencia canónica razonable:
+reentry_schedule = [0.25, 0.50, 0.75, 1.00]
+
+Cada escalón solo puede activarse si:
+
+1. cooldown ha terminado
+2. DD_t > reentry_threshold
+3. no ha reaparecido derisk/kill
+4. han transcurrido al menos min_reentry_days_per_step desde el último escalón
+
+Si en reentry el drawdown vuelve a deteriorarse:
+- el sistema debe volver a derisk o kill según corresponda
+- y resetear la secuencia de reentry
+
+14. Integración con portfolio y sizing
+
+La integración canónica con la cartera es:
+
+w_exec_t = m_t * w_raw_t
+
+donde:
+- w_raw_t viene del stack de sizing/optimizer
+- m_t in [0,1] viene exclusivamente de drawdown_control
+
+Además:
+- entry_allowed_t puede bloquear nuevas aperturas
+- exit_forced_t puede imponer cierre o reducción
+
+La versión base no necesita Kelly ni fórmulas más complejas.
+La multiplicación escalar es la semántica correcta del MVP.
+
+15. Guards de calidad de datos
+
+15.1 NAV no positivo
+Si NAV_t <= 0:
+- status crítico
+- no continuar silenciosamente
+- activar error controlado o estado terminal según config
+
+15.2 Saltos espurios
+Si existe un salto de NAV incompatible con PnL o con el marco contable del sistema:
+- marcar anomaly_flag
+- persistir alerta
+- no reinterpretarlo automáticamente como evento de mercado real
+
+15.3 Serie demasiado corta
+Si no hay historial suficiente:
+- iniciar en normal
+- pero marcar low_history_flag
+
+16. Métricas diagnósticas obligatorias
+
+El módulo debe reportar al menos:
+
+- max_drawdown
+- num_warning_events
+- num_derisk_events
+- num_kill_events
+- days_in_warning
+- days_in_derisk
+- days_in_kill
+- days_in_cooldown
+- days_in_reentry
+- avg_recovery_time
+- worst_episode_length
+- percent_time_entries_blocked
+- num_reentry_failures
 
 Además:
 
-\begin{itemize}
-    \item un evento \texttt{kill} invalida cualquier señal nueva de entrada;
-    \item un estado \texttt{cooldown} mantiene bloqueo incluso si \(DD_t\) mejora transitoriamente;
-    \item \texttt{reentry} solo puede comenzar tras cumplir las condiciones formales de salida de \texttt{cooldown};
-    \item otros módulos de riesgo más severos pueden forzar un estado equivalente a \texttt{kill}.
-\end{itemize}
-
-\section{Acciones por estado}
-
-\subsection{\texttt{normal}}
-
-\begin{itemize}
-    \item multiplicador de riesgo:
-    \[
-    m_t = 1.0;
-    \]
-    \item nuevas entradas permitidas;
-    \item sin salidas forzadas por drawdown.
-\end{itemize}
-
-\subsection{\texttt{warning}}
-
-\begin{itemize}
-    \item multiplicador de riesgo:
-    \[
-    m_t = 1.0 \quad \text{o ligeramente menor, p.ej. } 0.9;
-    \]
-    \item nuevas entradas permitidas, salvo que otro control las bloquee;
-    \item emisión de evento de advertencia si el sistema entra por primera vez en este estado.
-\end{itemize}
-
-La función de \texttt{warning} no es castigar agresivamente, sino alertar de deterioro no trivial y aumentar la vigilancia.
-
-\subsection{\texttt{derisk}}
-
-\begin{itemize}
-    \item multiplicador de riesgo:
-    \[
-    m_t = \texttt{derisk\_multiplier},
-    \qquad
-    0 < \texttt{derisk\_multiplier} < 1;
-    \]
-    \item por defecto:
-    \[
-    \texttt{derisk\_multiplier} = 0.5;
-    \]
-    \item se bloquean nuevas entradas no prioritarias;
-    \item se reducen posiciones existentes conforme a la política de rebalanceo o de corte inmediato;
-    \item se registra evento de transición.
-\end{itemize}
-
-\subsection{\texttt{kill}}
-
-\begin{itemize}
-    \item multiplicador de riesgo:
-    \[
-    m_t = 0;
-    \]
-    \item nuevas entradas prohibidas;
-    \item reducción máxima de exposición;
-    \item cancelación de órdenes de apertura pendientes;
-    \item inicio del contador de \texttt{cooldown}.
-\end{itemize}
-
-La semántica exacta de ``reducción máxima'' debe quedar fijada en configuración. Puede significar:
-
-\begin{itemize}
-    \item cierre completo del libro;
-    \item o reducción a un nivel residual mínimo para permitir salidas ordenadas en activos ilíquidos.
-\end{itemize}
-
-\subsection{\texttt{cooldown}}
-
-Durante \texttt{cooldown}:
-
-\begin{itemize}
-    \item no se permiten nuevas entradas;
-    \item el multiplicador de riesgo permanece en cero o en nivel residual;
-    \item el sistema espera una mejora mínima y una permanencia temporal antes de autorizar reentrada.
-\end{itemize}
-
-\subsection{\texttt{reentry}}
-
-\texttt{reentry} es un estado intermedio de reincorporación gradual. Su objetivo es evitar el error de pasar de \(0\) a \(100\%\) de riesgo inmediatamente tras una mejora marginal del \(NAV\).
-
-Sea una secuencia de multiplicadores
-\[
-\mathcal{M}_{\text{reentry}} = (m_1, m_2, \dots, m_K),
-\qquad
-0 < m_1 < \cdots < m_K \le 1.
-\]
-
-Una política razonable por defecto es
-\[
-\mathcal{M}_{\text{reentry}} = (0.25,\,0.50,\,0.75,\,1.00).
-\]
-
-Cada escalón solo se activa si:
-
-\begin{itemize}
-    \item no se ha violado de nuevo ningún umbral severo;
-    \item han transcurrido los días mínimos del escalón anterior;
-    \item y el drawdown ha mejorado por encima del umbral de reentrada.
-\end{itemize}
-
-\section{Condición de salida de kill y reentrada}
-
-La parte más delicada del módulo no es detectar el drawdown, sino decidir cuándo levantar restricciones. La versión canónica debe fijar una regla explícita.
-
-Sea \(\texttt{reentry\_thresh}\) un umbral menos severo que \(\texttt{derisk\_thresh}\), por ejemplo:
-\[
-\texttt{reentry\_thresh} = -0.06.
-\]
-
-La salida de \texttt{kill} hacia \texttt{cooldown} y luego hacia \texttt{reentry} requiere:
-
-\begin{enumerate}[label=\arabic*.]
-    \item que hayan transcurrido al menos \texttt{cooldown\_days};
-    \item que \(DD_t > \texttt{reentry\_thresh}\);
-    \item que no exista un nuevo evento \texttt{kill} dentro de la ventana reciente;
-    \item que el resto de controles de riesgo no estén en estado bloqueante.
-\end{enumerate}
-
-Un valor razonable por defecto es:
-\[
-\texttt{cooldown\_days} = 5
-\]
-en backtests diarios, o su equivalente ajustado a la frecuencia efectiva de rebalanceo.
-
-\section{Integración con sizing}
-
-\subsection{Control multiplicativo base}
-
-La integración recomendada con el \emph{position sizing} es simple y estable. Si \(w_t^{\text{raw}}\) es el vector de pesos propuesto por señales y optimizador, el peso ejecutable es:
-
-\[
-w_t^{\text{exec}} = m_t \, w_t^{\text{raw}},
-\]
-donde \(m_t \in [0,1]\) es el multiplicador de drawdown control.
-
-Esta especificación es preferible, en la versión base, a fórmulas decorativas de Kelly no integradas operacionalmente.
-
-\subsection{Kelly fraccional como extensión}
-
-Si se desea una capa adicional de sizing dependiente de drawdown, puede definirse:
-
-\[
-f_t = \min\bigl(f_{\max},\, \max(0,\; f_K (1 + \beta DD_t))\bigr),
-\]
-donde
-\[
-f_K = \frac{\mu_p}{\sigma_p^2},
-\qquad
-\beta < 0.
-\]
-
-Sin embargo, esta fórmula no debe formar parte del comportamiento canónico del módulo salvo que:
-
-\begin{itemize}
-    \item exista una estimación robusta y estable de \(\mu_p\) y \(\sigma_p^2\);
-    \item el motor de sizing acepte formalmente un factor Kelly;
-    \item se hayan documentado límites, truncamientos y controles de error.
-\end{itemize}
-
-En ausencia de estas condiciones, el control multiplicativo por estados es la política correcta.
-
-\section{Interacción con otros módulos de riesgo}
-
-\subsection{Con \texttt{risk/cov\_shrinkage.py}}
-
-La covarianza shrinked no decide por sí sola el drawdown state, pero puede alimentar métricas complementarias como volatilidad ex--ante, riesgo marginal y niveles de de-risk más finos. Aun así, la máquina de estados de drawdown debe seguir siendo interpretable sin dependencia circular.
-
-\subsection{Con \texttt{risk/exposure\_report.py}}
-
-Si el portafolio está en \texttt{derisk} o \texttt{kill}, el módulo de exposición debe evaluar límites sobre los pesos ya ajustados por \(m_t\), no sobre pesos teóricos previos al control.
-
-\subsection{Con \texttt{portfolio/optimizer.py}}
-
-El optimizador produce pesos propuestos. Este módulo no reoptimiza; solo transforma la exposición agregada ejecutable vía restricciones de supervivencia.
-
-\subsection{Con \texttt{risk/stress\_tests.py}}
-
-Los escenarios de estrés deben comprobar si los umbrales de drawdown activan transiciones de estado prematuras o frecuentes. De este modo, \texttt{stress\_tests.py} puede evaluar la robustez de la política de thresholds.
-
-\section{Casos límite y políticas defensivas}
-
-\subsection{NAV no positivo}
-
-Si \(NAV_t \le 0\), el módulo debe activar error controlado o estado terminal, porque el drawdown deja de ser interpretable dentro del contrato estándar. No debe seguir calculando silenciosamente.
-
-\subsection{Saltos espurios en NAV}
-
-Si el \(NAV\) contiene saltos incompatibles con el \(PnL\) y la operativa observada, el módulo debe marcar la fecha como inconsistente y persistir una alerta. No debe asumir automáticamente que todo salto es un evento real de mercado.
-
-\subsection{Serie corta}
-
-Si la serie de \(NAV\) es demasiado corta para definir un \(HWM\) informativo, el sistema debe iniciar en \texttt{normal} con diagnóstico de baja historia disponible.
-
-\subsection{Oscilación en torno al umbral}
-
-Para evitar \emph{chattering} entre estados cuando \(DD_t\) oscila cerca de un threshold, es recomendable usar histéresis o permanencia mínima. Por ejemplo, la salida de \texttt{derisk} puede requerir dos observaciones consecutivas por encima del umbral de mejora.
-
-\section{Algoritmo de referencia}
-
-\begin{enumerate}[label=\arabic*.]
-    \item Cargar serie de \(NAV_t\) ordenada por fecha.
-    \item Validar monotonicidad temporal y ausencia de valores no finitos.
-    \item Calcular \(HWM_t = \max_{s\le t} NAV_s\).
-    \item Calcular \(DD_t = (NAV_t - HWM_t)/HWM_t\).
-    \item Determinar estado base por thresholds.
-    \item Aplicar reglas de precedencia: \texttt{kill}, \texttt{cooldown}, \texttt{reentry}.
-    \item Asignar multiplicador \(m_t\).
-    \item Generar acciones operativas: permitir entrada, reducir, bloquear, cerrar.
-    \item Persistir series, eventos y resumen.
-\end{enumerate}
-
-\section{Pseudocódigo de referencia}
-
-\begin{lstlisting}[language=Python,basicstyle=\ttfamily\small,breaklines=true]
-hwm = np.maximum.accumulate(nav)
-dd = (nav / hwm) - 1.0
-
-state = []
-mult = []
-cooldown_remaining = 0
-reentry_step = None
-
-for t in range(len(nav)):
-    if dd[t] <= kill_thresh:
-        s = "kill"
-        m = 0.0
-        cooldown_remaining = cooldown_days
-        reentry_step = None
-
-    elif cooldown_remaining > 0:
-        s = "cooldown"
-        m = 0.0
-        cooldown_remaining -= 1
-
-    elif reentry_step is not None:
-        s = "reentry"
-        m = reentry_schedule[reentry_step]
-        if dd[t] > reentry_thresh and reentry_step < len(reentry_schedule) - 1:
-            reentry_step += 1
-        elif dd[t] <= derisk_thresh:
-            s = "derisk"
-            m = derisk_multiplier
-            reentry_step = None
-
-    elif dd[t] <= derisk_thresh:
-        s = "derisk"
-        m = derisk_multiplier
-
-    elif dd[t] <= warning_thresh:
-        s = "warning"
-        m = 1.0
-
-    else:
-        s = "normal"
-        m = 1.0
-
-    if cooldown_remaining == 0 and dd[t] > reentry_thresh and s == "normal":
-        reentry_step = 0
-
-    state.append(s)
-    mult.append(m)
-\end{lstlisting}
-
-\section{Métricas diagnósticas}
-
-Además del máximo drawdown, el módulo debe reportar:
-
-\begin{itemize}
-    \item tiempo medio de recuperación;
-    \item número de eventos por tipo;
-    \item tiempo total en cada estado;
-    \item longitud media de episodios de drawdown;
-    \item peor episodio de drawdown;
-    \item frecuencia de reactivación tras reentry;
-    \item porcentaje del tiempo con entradas bloqueadas.
-\end{itemize}
-
-\subsection{Tiempo de recuperación}
-
-Para un episodio de drawdown iniciado en \(t_0\), el tiempo de recuperación es el número de periodos hasta volver a alcanzar el \(HWM\) previo:
-\[
-\tau_{\text{rec}} = \inf \{u > t_0 : NAV_u \ge HWM_{t_0}\} - t_0.
-\]
-
-Esta métrica es importante porque dos estrategias con el mismo \(MDD\) pueden diferir materialmente en persistencia del daño.
-
-\section{Pruebas mínimas de aceptación}
-
-\subsection{Test 1: monotonía del HWM}
-Debe cumplirse
-\[
-HWM_t \ge HWM_{t-1}.
-\]
-
-\subsection{Test 2: rango del drawdown}
-Para todo \(t\),
-\[
--1 \le DD_t \le 0.
-\]
-
-\subsection{Test 3: activación correcta de estados}
-En una serie sintética con caída controlada, el módulo debe activar exactamente \texttt{warning}, luego \texttt{derisk}, luego \texttt{kill} al cruzar los umbrales.
-
-\subsection{Test 4: precedencia}
-Si coinciden condición de mejora en drawdown y \texttt{cooldown} activo, debe prevalecer \texttt{cooldown}.
-
-\subsection{Test 5: reentry escalonada}
-Dada una recuperación gradual, los multiplicadores deben seguir exactamente la secuencia de \texttt{reentry\_schedule}.
-
-\subsection{Test 6: persistencia}
-Los artefactos deben escribirse con fechas coherentes, sin duplicados y con transición de estados consistente.
-
-\section{Qué no debe hacer este módulo}
+Tiempo de recuperación de un episodio iniciado en t0:
+tau_rec = inf {u > t0 : NAV_u >= HWM_t0} - t0
+
+17. Tests mínimos obligatorios
+
+17.1 HWM monótono
+HWM_t >= HWM_{t-1}
+
+17.2 Drawdown acotado
+Si NAV_t > 0:
+-1 <= DD_t <= 0
+
+17.3 Activación de estados
+En serie sintética con caídas progresivas:
+normal -> warning -> derisk -> kill
+
+17.4 Precedencia
+Si cooldown está activo y DD mejora, debe seguir dominando cooldown.
+
+17.5 Histéresis
+Oscilaciones pequeñas alrededor del umbral no deben disparar entradas y salidas repetidas.
+
+17.6 Reentry escalonada
+La secuencia de multiplicadores debe seguir exactamente reentry_schedule.
+
+17.7 Persistencia
+Todos los eventos y series deben cuadrar temporalmente sin duplicados ni saltos de estado imposibles.
+
+18. Salidas obligatorias
+
+18.1 series.parquet
+Debe contener por fecha:
+- nav
+- hwm
+- dd
+- state
+- multiplier
+- entry_allowed
+- exit_forced
+- cooldown_remaining
+- reentry_step
+- anomaly_flag
+
+18.2 actions.parquet
+Una fila por evento:
+- date
+- event_type
+- from_state
+- to_state
+- dd
+- multiplier_before
+- multiplier_after
+- reason
+
+18.3 summary.json
+Debe contener:
+- max_drawdown
+- days_in_warning
+- days_in_derisk
+- days_in_kill
+- days_in_cooldown
+- days_in_reentry
+- num_warning_events
+- num_derisk_events
+- num_kill_events
+- avg_recovery_time
+- parameters
+- fallback_triggered
+- config_hash
+
+19. Estado final del módulo
+
+Semántica recomendada:
+- ok
+- degraded_data
+- inconsistent_nav
+- terminal
+
+20. Qué no debe hacer este módulo
 
 La versión base no debe:
+- meter Expected Drawdown como criterio soberano,
+- usar CVaR como contrato principal,
+- optimizar umbrales automáticamente online,
+- deshacer kill por una sola vela buena,
+- ni mezclar control reactivo con investigación predictiva.
 
-\begin{itemize}
-    \item presentar tablas de \emph{backtest} grandilocuentes como sustituto de especificación;
-    \item mezclar en el contrato canónico HMM, filtros bayesianos o modelos de régimen no testeados;
-    \item introducir CVaR, Kelly o vol targeting como fórmulas ornamentales si no afectan directamente al estado operativo;
-    \item decidir thresholds con heurísticas implícitas no persistidas en metadatos;
-    \item deshacer silenciosamente un \texttt{kill} por una mejora puntual de una sola observación.
-\end{itemize}
+21. Extensiones futuras razonables
 
-\section{Extensiones futuras razonables}
+Como flags experimentales, no como contrato base:
+- calibración de umbrales por riesgo de ruina
+- integración con vol ex-ante
+- reentry dependiente de calidad de señal
+- histéresis adaptativa
+- indicadores tempranos de stress
 
-Una vez estabilizada la versión base, pueden estudiarse como extensiones:
+22. Interpretación correcta
 
-\begin{itemize}
-    \item thresholds dependientes de régimen;
-    \item integración con volatilidad ex--ante;
-    \item combinación con CVaR o expected shortfall;
-    \item reentry condicionada por calidad de señal;
-    \item histéresis adaptativa;
-    \item calibración por utilidad o por riesgo de ruina.
-\end{itemize}
+La lectura correcta de drawdown_control.py no es:
+“este módulo optimiza el perfil de riesgo-retorno mediante drawdown”.
 
-Estas extensiones deben vivir como investigación o flags experimentales, no dentro del núcleo mínimo del módulo.
+La lectura correcta es:
+“este módulo impone una política disciplinada y reactiva de supervivencia sobre la curva de capital.”
 
-\section{Resumen ejecutivo}
+Ese es su rol correcto.
 
-\texttt{risk/drawdown\_control.py} debe implementarse como una máquina de estados de riesgo basada en la curva de capital. Su valor no está en prometer mejoras espectaculares de Sharpe ni en usar terminología sofisticada, sino en imponer una disciplina simple y robusta sobre cuándo el sistema puede seguir arriesgando capital y cuándo debe reducirlo o detenerse.
+23. Conclusión
 
-La prioridad de diseño correcta es:
+risk/drawdown_control.py debe ser una máquina de estados simple, severa y auditable.
 
-\[
-\text{consistencia de estados}
-\;\rightarrow\;
-\text{precedencia clara}
-\;\rightarrow\;
-\text{reentrada disciplinada}
-\;\rightarrow\;
-\text{integración con ejecución}.
-\]
+Recibe NAV.
+Calcula HWM y DD.
+Clasifica el estado con precedencia clara e histéresis.
+Aplica multiplicador, bloqueos y salidas.
+Gestiona cooldown y reentry.
+Y persiste una historia suficiente para reconstruir cualquier transición.
 
-Si el módulo cumple ese orden, ya está cerca de una pieza de infraestructura cuantitativa seria y operativa.
-
-\end{document}
+Ese es exactamente el comportamiento que debe tener una capa seria de drawdown control en un stack cuantitativo institucional.

@@ -1,414 +1,522 @@
-% =====================================================
-% MODEL_ABLATION.TXT -- VERSION CORREGIDA
-% Nivel objetivo: Quant Research / PhD / Production Spec
-% Proyecto: simons_smallcap_swing
-% =====================================================
-
-\documentclass[11pt,a4paper]{article}
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
-\usepackage{amsmath,amssymb}
-\usepackage{booktabs}
-\usepackage{geometry}
-\usepackage{array}
-\usepackage{enumitem}
-\usepackage{hyperref}
-\geometry{margin=2.2cm}
+Módulo: research/ablation/model_ablation.py
+
+1. Objetivo del módulo
+
+El objetivo de model_ablation.py es medir el valor incremental out-of-sample de
+componentes arquitectónicos del pipeline de trading, comparando el baseline con la
+misma arquitectura tras eliminar un bloque concreto, bajo exactamente el mismo
+protocolo temporal, misma definición de labels, mismas hipótesis de ejecución y
+mismos costes.
+
+La pregunta correcta que responde este módulo no es si un componente “suena sofisticado”
+o si mejora el backtest en algún tramo aislado, sino algo mucho más operativo:
+
+- cuánto valor OOS robusto aporta realmente este bloque arquitectónico dentro del sistema actual;
+- y si ese valor justifica su complejidad, su latencia y su carga operativa.
+
+En una pipeline seria de small-cap swing trading, model_ablation.py debe servir para:
+- conservar bloques que sí aportan edge incremental;
+- simplificar capas cuya mejora es real pero cara;
+- eliminar componentes decorativos, redundantes o dañinos;
+- y distinguir mejoras genuinas de complejidad que sólo añade fragilidad.
+
+Su función no es rediseñar el modelo completo ni “demostrar teoría de ensembles”.
+Su función correcta es gobernanza de arquitectura. :contentReference[oaicite:1]{index=1}
+
+2. Qué hace y qué no hace
+
+2.1 Qué hace
+- ejecuta ablaciones de componentes arquitectónicos individuales;
+- soporta ablaciones acopladas de bloques declarados como dependientes;
+- compara baseline vs variante ablacionada bajo protocolo congelado;
+- calcula deltas OOS sobre la métrica primaria;
+- persiste contribuciones por ventana walk-forward;
+- estima estabilidad temporal del valor aportado por cada componente;
+- construye intervalos de confianza mediante bootstrap emparejado;
+- opcionalmente ajusta multiplicidad cuando hay muchos componentes o pares evaluados;
+- registra coste de complejidad y diagnóstico operativo;
+- y devuelve recomendación final: KEEP / REVIEW / SIMPLIFY / REMOVE.
+
+2.2 Qué no hace
+- no rediseña features;
+- no rehace labels ni target horizon;
+- no modifica el universo;
+- no rediseña el execution engine;
+- no permite retuning libre de hiperparámetros para “salvar” una ablación;
+- no sustituye un estudio de architecture redesign completo;
+- no demuestra causalidad económica profunda;
+- no convierte complejidad y performance en una métrica única opaca.
 
-\title{\textbf{Model Ablation Protocol for Small-Cap Swing Trading}}
-\author{Research Pipeline}
-\date{March 2026}
-
-\begin{document}
-\maketitle
-
-\section{Objective}
-
-The purpose of this module is to measure the \textbf{incremental out-of-sample value} of architectural components in the production trading stack. The question is not whether a component sounds sophisticated, but whether it improves the deployed system enough to justify its additional complexity and operational burden.
-
-Formally, the module evaluates whether removing a component from the baseline pipeline leads to a material degradation in out-of-sample trading performance under a fixed and leakage-safe protocol.
-
-This supports four practical decisions:
-\begin{itemize}[leftmargin=*]
-    \item retain a component that adds robust value;
-    \item simplify a component that adds value but is operationally expensive;
-    \item remove a component whose contribution is negligible or unstable;
-    \item identify component interactions that require joint evaluation.
-\end{itemize}
-
-\section{Design Principles}
-
-The model ablation study follows six principles.
-
-\begin{enumerate}[leftmargin=*]
-    \item \textbf{Out-of-sample first.} All conclusions are based on purged walk-forward evaluation.
-    \item \textbf{Frozen baseline.} The baseline pipeline, labels, splits, execution assumptions, and objective are fixed before any ablation begins.
-    \item \textbf{One primary performance metric.} Ranking is performed with a single predefined trading metric.
-    \item \textbf{Complexity is reported separately.} Complexity is not mixed into the performance metric through arbitrary formulas.
-    \item \textbf{Minimal intervention.} In canonical mode, the only intended change is removal of the component under test.
-    \item \textbf{Operational interpretability.} The result must support an implementation decision, not a rhetorical conclusion.
-\end{enumerate}
-
-\section{Primary Metric and Secondary Diagnostics}
-
-\subsection{Primary Metric}
-
-Let
-\[
-M = \operatorname{median}_{w=1,\dots,W} \mathrm{IR}^{\text{net}}_w
-\]
-where $\mathrm{IR}^{\text{net}}_w$ is the net Information Ratio of the out-of-sample portfolio return stream in walk-forward window $w$, evaluated using the same transaction-cost and slippage assumptions as the baseline system.
-
-The median across windows is used because it is more robust than a mean to isolated favorable periods and better reflects consistency across market states.
-
-\subsection{Secondary Diagnostics}
-
-The following quantities are reported separately and are not merged into the primary ranking score:
-
-\begin{itemize}[leftmargin=*]
-    \item net Sharpe ratio;
-    \item turnover;
-    \item maximum drawdown;
-    \item tail-loss statistics, if available;
-    \item latency impact;
-    \item implementation footprint;
-    \item fraction of OOS windows with positive contribution.
-\end{itemize}
-
-\section{Scope}
-
-\subsection{Included Components}
-
-Typical ablation candidates include, but are not limited to:
-
-\begin{itemize}[leftmargin=*]
-    \item probability calibration;
-    \item ensembling or blending layers;
-    \item stacking meta-models;
-    \item regime-gating logic;
-    \item turnover-control overlays;
-    \item post-processing layers that alter sizing or trade selection.
-\end{itemize}
-
-\subsection{Excluded}
-
-The following are out of scope for this module:
-
-\begin{itemize}[leftmargin=*]
-    \item feature ablation;
-    \item label redesign;
-    \item universe redesign;
-    \item execution-engine redesign;
-    \item unrestricted retuning of the remaining pipeline after each ablation.
-\end{itemize}
-
-If the study requires a re-optimization of the full architecture after removing a component, that experiment is classified as a model redesign study, not canonical model ablation.
-
-\section{Component Definition}
-
-A component is defined as a pipeline block that satisfies all three conditions:
-
-\begin{enumerate}[leftmargin=*]
-    \item it has a well-defined boundary in code;
-    \item it can be disabled or bypassed without changing the rest of the data contract;
-    \item its removal can be evaluated while keeping the remainder of the protocol fixed.
-\end{enumerate}
-
-Examples:
-\begin{itemize}[leftmargin=*]
-    \item \texttt{calibration}: transforms raw scores into calibrated probabilities;
-    \item \texttt{ensemble}: combines predictions from multiple base models;
-    \item \texttt{regime\_gating}: conditions participation or sizing on regime state;
-    \item \texttt{turnover\_control}: suppresses low-conviction or excessively costly trades.
-\end{itemize}
-
-A component is not defined by vague ideas such as ``intelligence'' or ``stability layer.'' It must correspond to an explicit software module or switchable pipeline stage.
-
-\section{Inputs and Outputs}
-
-\subsection{Input Contract}
-
-\begin{verbatim}
-baseline_pipeline_ref
-model_ablation_config_path
-run_id
-component_scope in {single, coupled}
-evaluation_mode in {drop_retrain}
-\end{verbatim}
-
-\subsection{Upstream Dependencies}
-
-The following artifacts must already exist:
-
-\begin{itemize}[leftmargin=*]
-    \item frozen baseline pipeline reference;
-    \item labels and target horizon;
-    \item purged walk-forward split specification;
-    \item execution and cost model;
-    \item model ablation configuration;
-    \item reproducibility metadata including seeds and software version.
-\end{itemize}
-
-\subsection{Output Contract}
-
-The canonical output is \texttt{model\_ablation\_results.parquet}. Each row represents one ablation candidate.
-
-\begin{table}[h]
-\centering
-\begin{tabular}{@{}p{3.2cm}p{1.7cm}p{8.4cm}@{}}
-\toprule
-Field & Type & Description \\
-\midrule
-ablation\_id & str & Unique ablation identifier \\
-component\_name & str & Name of removed component \\
-scope & str & single or coupled \\
-baseline\_metric & float & Baseline primary score $M_{\text{base}}$ \\
-ablated\_metric & float & Ablated primary score $M_{-k}$ \\
-delta\_metric & float & $M_{\text{base}} - M_{-k}$ \\
-positive\_window\_share & float & Fraction of OOS windows with positive delta \\
-drawdown\_delta & float & Change in max drawdown \\
-turnover\_delta & float & Change in turnover \\
-latency\_delta & float & Change in inference or decision latency \\
-complexity\_class & str & LOW, MEDIUM, HIGH \\
-ci\_lower & float & Lower bootstrap confidence bound for delta \\
-ci\_upper & float & Upper bootstrap confidence bound for delta \\
-recommendation & str & KEEP, REVIEW, SIMPLIFY, REMOVE \\
-notes & str & Free-form implementation notes \\
-\bottomrule
-\end{tabular}
-\caption{Canonical output schema for model ablation}
-\end{table}
-
-\section{Canonical Ablation Effect}
-
-For component $k$, define the canonical ablation effect as
-
-\[
-\Delta_k = M_{\text{base}} - M_{-k}
-\]
-
-where:
-\begin{itemize}[leftmargin=*]
-    \item $M_{\text{base}}$ is the baseline primary metric under the frozen protocol;
-    \item $M_{-k}$ is the primary metric after removing component $k$ and rerunning the pipeline under the same protocol.
-\end{itemize}
-
-Interpretation:
-\begin{itemize}[leftmargin=*]
-    \item $\Delta_k > 0$: the removed component was beneficial;
-    \item $\Delta_k \approx 0$: the component adds little incremental value;
-    \item $\Delta_k < 0$: the component is likely harmful or unnecessary in its current form.
-\end{itemize}
-
-This module does not collapse performance and complexity into a single formula such as
-\[
-\frac{\Delta \mathrm{IR}}{\Delta \mathrm{Comp} + \varepsilon}
-\]
-because that ratio is unstable, scale-dependent, and difficult to govern consistently across heterogeneous components.
-
-\section{Complexity and Operational Burden}
-
-Complexity is treated as a separate diagnostic axis rather than a pseudo-theoretical scalar.
-
-\subsection{Complexity Dimensions}
-
-Each component is assessed along three operational dimensions:
-
-\begin{enumerate}[leftmargin=*]
-    \item \textbf{Implementation complexity:} code surface area, number of dependencies, maintenance burden.
-    \item \textbf{Runtime complexity:} added latency, memory overhead, scheduling burden.
-    \item \textbf{Governance complexity:} number of extra failure modes, monitoring burden, calibration drift risk.
-\end{enumerate}
-
-\subsection{Complexity Classification}
-
-Instead of inventing an arbitrary continuous score, each component receives a coarse operational classification:
-\[
-\texttt{LOW},\quad \texttt{MEDIUM},\quad \texttt{HIGH}.
-\]
-
-This is intentional. For production decisions, a stable categorical assessment is often more useful than a fragile numeric proxy.
-
-\section{Operational Risk}
-
-Operational risk is also reported separately from performance.
-
-Typical risk indicators include:
-\begin{itemize}[leftmargin=*]
-    \item increase in realized drawdown;
-    \item increase in turnover or trading churn;
-    \item increased sensitivity to missing inputs or delayed data;
-    \item increase in instability across walk-forward windows;
-    \item higher frequency of degenerate or empty decision states.
-\end{itemize}
-
-A component is not considered robust merely because it improves the central metric slightly. If it introduces fragile behavior, that must be visible in the ablation report.
-
-\section{Evaluation Protocol}
-
-\subsection{Baseline Freeze}
-
-Before any run begins, the following are frozen:
-
-\begin{itemize}[leftmargin=*]
-    \item asset universe;
-    \item label definition;
-    \item purged split and embargo rules;
-    \item execution and transaction-cost model;
-    \item training configuration;
-    \item seed configuration;
-    \item baseline hyperparameters.
-\end{itemize}
-
-\subsection{Canonical Mode}
-
-Canonical model ablation uses \texttt{drop\_retrain}.
-
-For each component $k$:
-\begin{enumerate}[leftmargin=*]
-    \item disable or remove component $k$;
-    \item keep the rest of the pipeline unchanged;
-    \item rerun all training and evaluation stages needed by the remaining stack;
-    \item evaluate on the identical purged walk-forward schedule;
-    \item aggregate the out-of-sample results.
-\end{enumerate}
-
-\subsection{Retuning Policy}
+3. Rol dentro del stack
+
+Secuencia conceptual correcta:
 
-Component-specific retuning is not permitted in canonical mode.
+    baseline_pipeline
+    -> model_ablation.py
+    -> simplification / hardening / architecture review
+    -> validacion downstream y decision de promocion
+
+Interpretación correcta:
+- el baseline define la arquitectura congelada de referencia;
+- model_ablation.py mide dependencia marginal respecto a componentes concretos;
+- los resultados informan pruning, simplificación o refactor;
+- pero la decisión final de producción sigue dependiendo de validación fuerte downstream.
+
+4. Qué es un componente
+
+Un componente arquitectónico, en el contexto de este módulo, debe cumplir tres condiciones:
+
+- tener un límite claro en código;
+- poder activarse o desactivarse sin romper el contrato de datos del resto del pipeline;
+- y permitir una comparación limpia con el baseline manteniendo fijo todo lo demás.
 
-This rule is important. Otherwise the ablation result becomes a mixture of:
-\begin{itemize}[leftmargin=*]
-    \item the value of the removed component, and
-    \item the quality of re-optimizing the rest of the system after removal.
-\end{itemize}
+Ejemplos típicos:
+- calibration;
+- ensemble o blending layer;
+- stacking meta-model;
+- regime gating;
+- turnover-control overlay;
+- sizing overlay;
+- post-processing layer que altera selección o dimensionado de posiciones.
 
-Those are different research questions and must not be conflated.
-
-\section{Window-Level Contribution and Stability}
+No cuenta como componente una idea vaga del tipo “capa de inteligencia” o “módulo de robustez”.
+Tiene que ser un bloque real, identificable y con switch explícito.
 
-For each component $k$ and window $w$, define
-\[
-\Delta_{k,w} = \mathrm{IR}^{\text{net}}_{\text{base},w} - \mathrm{IR}^{\text{net}}_{-k,w}.
-\]
-
-Then define the stability statistic
-\[
-S_k = \frac{1}{W}\sum_{w=1}^{W}\mathbf{1}(\Delta_{k,w} > 0).
-\]
-
-Interpretation:
-\begin{itemize}[leftmargin=*]
-    \item $S_k \approx 1$: contribution is persistent across windows;
-    \item $S_k \approx 0.5$: contribution is regime-dependent or weak;
-    \item $S_k \ll 0.5$: the component is likely unnecessary or harmful.
-\end{itemize}
+5. Principios no negociables
 
-This statistic is simple, interpretable, and easier to govern than ad hoc Pareto scores.
+5.1 OOS first
+Toda conclusión se apoya en evaluación walk-forward purged fuera de muestra.
 
-\section{Coupled Ablations}
+5.2 Baseline congelado
+Antes de empezar la ablación deben quedar fijos:
+- universo;
+- labels;
+- splits;
+- ejecución;
+- costes;
+- seeds;
+- configuración de entrenamiento;
+- e hiperparámetros del baseline.
 
-Some components are structurally dependent. For example:
-\begin{itemize}[leftmargin=*]
-    \item stacking may depend on calibration;
-    \item regime gating may change the effective value of turnover control;
-    \item a blender may be irrelevant unless multiple experts are active.
-\end{itemize}
+5.3 Intervención mínima
+En modo canónico, la única diferencia intencional entre baseline y ablated es la eliminación
+del componente bajo prueba.
 
-Therefore the module supports two scopes:
-\begin{itemize}[leftmargin=*]
-    \item \textbf{single:} remove one component at a time;
-    \item \textbf{coupled:} remove a predefined dependency set jointly.
-\end{itemize}
+5.4 Métrica primaria única
+El ranking principal debe venir de una sola métrica declarada ex ante.
 
-Coupled ablations are not searched combinatorially. They must be declared explicitly in the configuration, based on known architectural dependencies. This keeps the experiment tractable and interpretable.
+5.5 Incertidumbre explícita
+Ningún delta puntual debe interpretarse sin estabilidad temporal y banda de incertidumbre.
 
-\section{Execution Flow}
+5.6 Complejidad separada de performance
+La complejidad debe diagnosticarse aparte, no mezclarse dentro de una función arbitraria
+que contamine el ranking principal.
 
-The expected execution flow is:
+5.7 Interpretación operativa
+El output debe servir para decidir mantener, revisar, simplificar o eliminar un bloque,
+no para adornar la arquitectura con justificaciones retrospectivas.
 
-\begin{enumerate}[leftmargin=*]
-    \item \texttt{load\_baseline\_pipeline\_context()}
-    \item \texttt{build\_component\_plan()}
-    \item \texttt{run\_ablated\_variant()}
-    \item \texttt{compute\_window\_level\_deltas()}
-    \item \texttt{aggregate\_component\_results()}
-    \item \texttt{attach\_complexity\_and\_risk\_diagnostics()}
-    \item \texttt{generate\_recommendations()}
-    \item \texttt{persist\_results()}
-\end{enumerate}
+6. Definición formal del problema
 
-All runs must be deterministic conditional on fixed inputs and seeds.
+Sea M la métrica primaria OOS del sistema bajo protocolo congelado.
+Para cada componente k, definimos el efecto de ablación:
 
-\section{Invariants}
+    Delta_k = M_base - M_-k
 
-The following invariants are mandatory:
+donde:
+- M_base es la métrica primaria del baseline;
+- M_-k es la métrica primaria de la misma pipeline sin el componente k.
 
-\begin{itemize}[leftmargin=*]
-    \item no future information may enter training, calibration, or gating logic;
-    \item baseline and ablated runs must use the same split structure;
-    \item baseline and ablated runs must use the same execution simulator;
-    \item in canonical mode, the only intentional architectural change is removal of the declared component;
-    \item all results must be traceable to a unique baseline pipeline reference and configuration hash.
-\end{itemize}
+Interpretación:
+- Delta_k > 0  -> quitar k empeora el sistema; el componente aporta valor;
+- Delta_k ~ 0  -> el valor incremental es débil, redundante o incierto;
+- Delta_k < 0  -> quitar k mejora el sistema; el bloque parece innecesario o dañino.
 
-Any violation invalidates the ablation result.
+La ablación no estima una verdad universal sobre el componente.
+Estima su valor marginal discreto dentro de la arquitectura actual. :contentReference[oaicite:2]{index=2}
 
-\section{Uncertainty Quantification}
+7. Métrica primaria
 
-For each component, a paired bootstrap confidence interval is computed over the out-of-sample evaluation units consistent with the portfolio aggregation layer.
+La métrica primaria recomendada es:
 
-A positive point estimate is not sufficient. If the confidence interval is wide and materially overlaps zero, the component is classified as uncertain rather than valuable.
+    M = median_w IR_net,w
 
-\section{Recommendation Logic}
+donde:
+- w indexa ventanas OOS del protocolo purged walk-forward;
+- IR_net,w es el Information Ratio neto de costes en la ventana w.
 
-Recommendations are conservative and rule-based.
+La mediana entre ventanas se usa porque:
+- penaliza menos los periodos excepcionalmente favorables;
+- es más robusta que la media ante heterogeneidad de régimen;
+- y refleja mejor consistencia transversal en el tiempo que un promedio frágil.
 
-\begin{itemize}[leftmargin=*]
-    \item \textbf{KEEP:} $\Delta_k$ is clearly positive, the uncertainty is acceptable, and stability is high.
-    \item \textbf{REVIEW:} contribution exists but is unstable, weak, or operationally awkward.
-    \item \textbf{SIMPLIFY:} contribution is positive but comparable gains may be achievable with a lighter implementation.
-    \item \textbf{REMOVE:} $\Delta_k \le 0$ or the component fails persistently across windows.
-\end{itemize}
+Las métricas secundarias deben persistirse por separado como diagnóstico:
+- Sharpe neto;
+- max drawdown;
+- turnover;
+- tail risk si existe;
+- latency impact;
+- fracción de ventanas positivas;
+- estados degenerados o vacíos;
+- robustez ante missing inputs.
 
-The recommendation is not a theorem. It is a governance output for the research and production roadmap.
+Pero ninguna de ellas debe reemplazar a M como criterio principal de ranking.
 
-\section{Validation and Acceptance Criteria}
+8. Unidad temporal correcta de evaluación
 
-The module is accepted only if the following conditions hold:
+La unidad estadística natural del módulo es la ventana walk-forward completa.
 
-\begin{enumerate}[leftmargin=*]
-    \item \textbf{Reproducibility:} fixed seeds reproduce the same ranking up to numerical tolerance.
-    \item \textbf{Leakage safety:} no future information enters any ablated or baseline path.
-    \item \textbf{Isolation:} disabling a component does not silently alter unrelated pipeline behavior.
-    \item \textbf{Dependency sanity check:} known coupled components show sensible behavior in coupled ablation mode.
-    \item \textbf{Output completeness:} every candidate generates a full result row with delta, uncertainty, complexity class, operational diagnostics, and recommendation.
-\end{enumerate}
+Para cada componente k y ventana w:
 
-\section{Operational Interpretation}
+    Delta_k,w = IR_net,base,w - IR_net,-k,w
 
-This module should be used when:
-\begin{itemize}[leftmargin=*]
-    \item the production stack has become too layered or fragile;
-    \item a component is suspected of adding operational burden without clear trading value;
-    \item a simpler architecture is being considered for deployment hardening;
-    \item research performance is decaying and the system needs structural pruning.
-\end{itemize}
+y la agregación principal recomendada es:
 
-It should not be used to advertise target performance levels or to justify arbitrary complexity metrics.
+    Delta_k = median_w Delta_k,w
 
-\section{Conclusion}
+Persistir Delta_k,w es esencial, porque la calidad del componente no depende sólo
+de la magnitud agregada, sino de cómo se comporta a través del tiempo y de los regímenes.
 
-A strong model ablation module does not attempt to prove that a sophisticated architecture is intrinsically superior. It answers a narrower and more useful question:
+9. Estadístico de estabilidad
 
-\begin{quote}
-\emph{Which architectural components produce robust out-of-sample value, and which ones should be simplified or removed?}
-\end{quote}
+La estabilidad temporal del componente se resume mediante:
 
-That is the correct standard for model governance in a professional small-cap swing trading pipeline.
+    S_k = (1 / W) * sum_w 1{ Delta_k,w > 0 }
 
-\end{document}
+donde W es el número de ventanas válidas.
 
-% =====================================================
-% END OF DOCUMENT
-% =====================================================
+Interpretación:
+- S_k cercano a 1   -> el componente ayuda de forma persistente;
+- S_k cercano a 0.5 -> valor dependiente del régimen o incierto;
+- S_k bajo          -> el componente parece prescindible o perjudicial.
+
+Este resumen tiene una lectura muy operativa:
+“¿en cuántas ventanas quitar el componente empeoró realmente el sistema?”
+
+10. Modos y alcance de la ablación
+
+10.1 single
+Se elimina un único componente cada vez.
+
+Uso correcto:
+- identificar capas claramente innecesarias;
+- medir valor incremental individual;
+- localizar complejidad prescindible.
+
+10.2 coupled
+Se elimina conjuntamente un conjunto pequeño y explícitamente declarado de componentes.
+
+Uso correcto:
+- capturar dependencias arquitectónicas conocidas;
+- evitar conclusiones erróneas sobre componentes que solo tienen sentido juntos;
+- estudiar pares como calibration + stacking, gating + turnover control, etc.
+
+Regla importante:
+las coupled ablations no deben explorarse de forma combinatoria masiva.
+Sólo deben evaluarse pares o grupos pequeños previamente declarados por dependencia conocida.
+
+11. Modo canónico de ejecución
+
+El modo autoritativo debe ser drop_retrain.
+
+Flujo correcto:
+- desactivar o eliminar el componente k;
+- mantener congelado el resto del pipeline;
+- reentrenar todas las etapas necesarias del stack restante;
+- evaluar en el mismo calendario walk-forward purged;
+- agregar resultados OOS con las mismas hipótesis de costes.
+
+La política correcta es:
+- sí al retraining necesario para que el pipeline restante funcione;
+- no al retuning oportunista de hiperparámetros específico para cada ablación.
+
+Si al quitar un componente se reoptimiza libremente el resto, la pregunta deja de ser
+“qué valor aportaba este bloque” y pasa a ser “qué tal se puede rediseñar la arquitectura
+sin él”, que es otro experimento distinto.
+
+12. Cuantificación de incertidumbre
+
+Cada componente debe recibir una banda de incertidumbre sobre Delta_k.
+
+Procedimiento recomendado:
+- bootstrap emparejado por ventanas completas;
+- la unidad de remuestreo es la ventana walk-forward;
+- en cada réplica se muestrean con reemplazo ventanas completas;
+- se recalcula el Delta agregado;
+- se construyen intervalos percentiles.
+
+Columnas mínimas recomendadas:
+- ci_lower
+- ci_upper
+- p_value_boot
+
+Interpretación correcta:
+- Delta_k positivo con intervalo ancho que cruza cero no es evidencia fuerte;
+- Delta_k claramente positivo y estable sí apoya KEEP o SIMPLIFY;
+- Delta_k negativo con consistencia temporal refuerza REMOVE;
+- con pocas ventanas, los CIs deben leerse como señal cualitativa más que como
+  inferencia fuerte.
+
+Si el esquema walk-forward tiene solapamiento fuerte entre ventanas, puede añadirse
+block bootstrap como extensión metodológica, pero el MVP puede empezar con bootstrap
+por ventana bien definido. :contentReference[oaicite:3]{index=3}
+
+13. Tamaño de efecto interno
+
+Además del delta principal, es útil persistir un indicador interno de tamaño de efecto
+basado en la dispersión de los Delta_k,w.
+
+Definiciones recomendadas:
+- media de Delta_k,w;
+- desviación estándar de Delta_k,w;
+- effect_size_Tk = mean_delta / std_delta
+
+Este effect_size:
+- no debe venderse como t-test formal;
+- no debe reemplazar el ranking principal;
+- sí ayuda a priorizar investigación cuando dos componentes tienen deltas parecidos
+  pero distinta relación señal/ruido.
+
+14. Complejidad cuantificada
+
+La complejidad no debe quedarse sólo en LOW / MEDIUM / HIGH.
+Conviene además registrar un coste cuantitativo kappa_k.
+
+Forma recomendada:
+
+    kappa_k = w_lat * L_k + w_ops * O_k + w_code * C_k
+
+donde:
+- L_k mide impacto relativo en latencia o CPU;
+- O_k mide burden operativo: jobs extra, monitorización, dependencias, puntos de fallo;
+- C_k mide superficie de código o entropía de implementación.
+
+Esto permite persistir:
+
+    delta_per_complexity = Delta_k / kappa_k
+
+Interpretación correcta:
+- no sustituye la métrica primaria;
+- sí ayuda a discutir cuándo simplificar una capa cuyo valor es positivo pero caro;
+- y permite diferenciar un bloque ligeramente útil pero muy costoso de otro igual de útil
+  y mucho más ligero.
+
+15. Riesgo operativo
+
+La mejora en IR no basta para defender un componente.
+
+Cada fila debería registrar, cuando sea posible:
+- drawdown_delta;
+- turnover_delta;
+- latency_delta;
+- incidencia de estados degenerados;
+- sensibilidad a inputs faltantes o retrasados;
+- burden de monitorización;
+- riesgo de drift en calibración o gating.
+
+Un componente sólo merece mantenerse si su mejora OOS no viene acompañada de una fragilidad
+operativa desproporcionada.
+
+16. Sinergias en coupled ablations
+
+Para pares o grupos pequeños declarados como coupled, puede definirse una métrica simple
+de sinergia.
+
+Para un par A, B:
+
+    synergy_delta = Delta_AuB - (Delta_A + Delta_B)
+
+Interpretación:
+- synergy_delta > 0  -> juntos aportan más que la suma de sus efectos individuales;
+- synergy_delta < 0  -> hay trabajo duplicado, solapamiento o interferencia.
+
+Esta métrica es útil, pero debe limitarse a pocos casos conocidos.
+No debe abrir la puerta a una explosión combinatoria de experimentos.
+
+17. Multiple testing
+
+Si se evalúan bastantes componentes o varios pares coupled, el módulo debe poder activar
+un ajuste BH-FDR sobre los p-values bootstrap.
+
+Uso correcto:
+- preservar Delta_k como eje principal de ranking;
+- usar q_value_fdr como señal de cautela;
+- evitar llamar “importante” a una mejora marginal que puede ser compatible con suerte
+  tras muchas pruebas.
+
+Para pocos componentes, puede dejarse como opcional.
+Cuando el número de pruebas supera aproximadamente 10–15, ya tiene bastante sentido activarlo.
+
+18. Contrato de entrada
+
+Entradas mínimas esperadas:
+- baseline_pipeline_ref
+- model_ablation_config_path
+- run_id
+
+Dependencias upstream que deben existir:
+- baseline pipeline congelado;
+- labels y target horizon;
+- split specification purged;
+- simulador de ejecución y modelo de costes;
+- seeds y metadata de reproducibilidad.
+
+Campos de control recomendados:
+- component_scope in {single, coupled}
+- evaluation_mode in {drop_retrain}
+- bootstrap.enabled
+- bootstrap.n_reps
+- bootstrap.alpha
+- bootstrap.unit
+- multiple_testing.enabled
+- multiple_testing.method
+- multiple_testing.q_level
+- complexity_cost.enabled
+- complexity_cost.weights
+
+19. Contrato de salida
+
+La salida canónica debe ser:
+
+    model_ablation_results.parquet
+
+Cada fila debe representar una ablación y persistir como mínimo:
+- ablation_id
+- component_name
+- scope
+- baseline_metric
+- ablated_metric
+- delta_metric
+- delta_median_window
+- positive_window_share
+- drawdown_delta
+- turnover_delta
+- latency_delta
+- complexity_class
+- complexity_cost          # si aplica
+- delta_per_complexity     # si aplica
+- ci_lower
+- ci_upper
+- p_value_boot
+- q_value_fdr              # si aplica
+- effect_size_Tk           # opcional recomendado
+- synergy_delta            # sólo para coupled
+- recommendation
+- notes
+
+20. Flujo de ejecución esperado
+
+Secuencia correcta:
+
+    load_baseline_pipeline_context()
+    -> build_component_plan()
+    -> run_ablated_variant()
+    -> compute_window_level_deltas()
+    -> bootstrap_component_delta()
+    -> attach_complexity_and_risk_diagnostics()
+    -> apply_multiple_testing_if_needed()
+    -> compute_recommendation()
+    -> persist_results()
+
+El proceso debe ser determinista condicional en seeds fijas e inputs fijos.
+
+21. Invariantes
+
+Los invariantes obligatorios son:
+
+- no puede entrar información futura en entrenamiento, calibración o gating;
+- baseline y ablated deben usar exactamente los mismos splits;
+- baseline y ablated deben usar el mismo execution simulator;
+- en modo canónico, el único cambio intencional es eliminar el componente declarado;
+- no se permite retuning oportunista específico para cada ablación;
+- el bootstrap debe remuestrear unidades temporales completas;
+- todo resultado debe ser trazable a baseline_pipeline_ref y config hash;
+- cada candidato debe tener un número mínimo de ventanas válidas para ser rankeable.
+
+Si alguno de estos invariantes falla, el resultado no vale para ranking.
+
+22. Lógica de recomendación
+
+La recomendación debe ser conservadora y rule-based.
+
+22.1 KEEP
+- Delta_k claramente positivo;
+- estabilidad alta;
+- incertidumbre razonablemente acotada;
+- y riesgo operativo aceptable.
+
+22.2 REVIEW
+- efecto modesto;
+- o estabilidad intermedia;
+- o CI amplio;
+- o comportamiento sensible al régimen;
+- o diagnósticos operativos ambiguos.
+
+22.3 SIMPLIFY
+- contribución positiva;
+- pero coste de complejidad alto;
+- o ganancia marginal comparable a una alternativa más ligera;
+- o sospecha de que el componente está sobrediseñado para el edge que aporta.
+
+22.4 REMOVE
+- Delta_k <= 0 de forma consistente;
+- o evidencia de daño temporal persistente;
+- o complejidad injustificable para una mejora irrelevante.
+
+23. Failure modes
+
+Los errores más peligrosos del módulo son:
+- retunear el sistema al quitar un componente y vender eso como ablación canónica;
+- cambiar accidentalmente el simulador o los costes entre baseline y ablated;
+- tratar componentes dependientes como si fueran totalmente separables;
+- interpretar mejoras pequeñas sin mirar CIs ni S_k;
+- ignorar coste operativo y latencia;
+- confundir valor marginal dentro del stack actual con valor “intrínseco” universal del bloque;
+- y abrir demasiadas coupled ablations hasta perder tractabilidad e interpretabilidad.
+
+24. Criterios de aceptación
+
+El módulo sólo debe considerarse listo si cumple:
+
+- reproducibilidad:
+  mismas seeds e inputs -> mismo ranking salvo tolerancia numérica;
+
+- leakage safety:
+  ninguna ruta baseline o ablated introduce información futura;
+
+- aislamiento:
+  desactivar un componente no altera silenciosamente otros bloques no declarados;
+
+- dependency sanity:
+  componentes conocidos como acoplados muestran resultados coherentes en modo coupled;
+
+- completitud:
+  toda fila contiene delta, incertidumbre, complejidad, riesgo operativo y recomendación;
+
+- interpretabilidad:
+  las recomendaciones pueden explicarse de forma clara a research y a producción.
+
+25. Uso correcto dentro del research process
+
+model_ablation.py debe usarse:
+- cuando la arquitectura ha acumulado demasiadas capas;
+- cuando hay sospecha de complejidad decorativa;
+- cuando se quiere endurecer el sistema para producción;
+- cuando el rendimiento cae y conviene podar o simplificar;
+- y cuando se quiere decidir qué bloques justifican realmente su coste.
+
+No debe usarse para:
+- justificar arquitecturas complejas por prestigio técnico;
+- reemplazar una validación fuerte downstream;
+- ni convertir cada diferencia mínima en una narrativa de superioridad arquitectónica.
+
+26. Conclusión
+
+model_ablation.py no existe para premiar la arquitectura más sofisticada.
+Existe para responder una pregunta mucho más útil para una pipeline profesional:
+
+- qué componentes arquitectónicos aportan valor OOS robusto;
+- cuáles sólo añaden complejidad;
+- y cuáles conviene simplificar o retirar.
+
+Ese es el estándar correcto de gobernanza para una arquitectura de small-cap swing trading.

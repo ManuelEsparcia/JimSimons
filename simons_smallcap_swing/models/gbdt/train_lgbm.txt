@@ -1,469 +1,551 @@
-\documentclass[12pt,a4paper]{article}
-\usepackage[utf8]{inputenc}
-\usepackage[spanish]{babel}
-\usepackage{amsmath, amssymb, bm, amsthm, mathtools}
-\usepackage{hyperref}
-\usepackage{graphicx}
-\usepackage{booktabs}
-\usepackage{longtable}
-\usepackage{enumitem}
-\usepackage{siunitx}
-
-\DeclareMathOperator{\E}{\mathbb{E}}
-\DeclareMathOperator{\Var}{Var}
-\DeclareMathOperator{\Bias}{Bias}
-\DeclareMathOperator{\Cov}{Cov}
-\DeclareMathOperator{\Corr}{Corr}
-\DeclareMathOperator{\Prob}{\mathbb{P}}
-\DeclareMathOperator{\IC}{IC}
-\DeclareMathOperator{\AUC}{AUC}
-\DeclareMathOperator{\NDCG}{NDCG}
-\DeclareMathOperator{\RMSE}{RMSE}
-\DeclareMathOperator{\MAE}{MAE}
-\DeclareMathOperator{\MSE}{MSE}
-\DeclareMathOperator{\argmin}{arg\,min}
-\DeclareMathOperator{\argmax}{arg\,max}
-
-\title{Entrenamiento de modelos LightGBM cross-sectional \\ \texttt{models/gbdt/train\_lgbm.py}}
-\author{}
-\date{}
-
-\begin{document}
-
-\maketitle
-
-\section{Objetivo estratégico del módulo}
-
-El módulo \texttt{models/gbdt/train\_lgbm.py} implementa el entrenamiento de modelos \textbf{LightGBM} dentro de una arquitectura cuantitativa cross-sectional para \textbf{small caps}. Su función no es simplemente ajustar un modelo de boosting sobre una matriz tabular, sino producir una función predictiva temporalmente válida, metodológicamente auditable y operacionalmente reutilizable dentro de un pipeline de selección, ranking y decisión de cartera.
-
-La unidad económica relevante del sistema no es la observación aislada, sino la sección cruzada por fecha. En cada instante \(t\), el modelo recibe un universo elegible \(\mathcal{U}_t\) de activos y asigna a cada nombre \(i \in \mathcal{U}_t\) un score que pretende capturar señal futura útil para trading. Formalmente, si \(\bm{x}_{i,t} \in \mathbb{R}^{d}\) denota el vector de características del activo \(i\) en fecha \(t\), el objetivo del módulo es estimar una función
-\[
-\hat{f}: \mathcal{X} \rightarrow \mathbb{R}
-\]
-tal que
-\begin{equation}
-\hat{y}_{i,t} = \hat{f}(\bm{x}_{i,t})
-\approx
-\E\!\left[y_{i,t}\mid \bm{x}_{i,t}\right],
-\end{equation}
-donde \(y_{i,t}\) puede representar:
-\begin{itemize}[leftmargin=2em]
-    \item un retorno forward continuo,
-    \item una etiqueta binaria de dirección o superación de umbral,
-    \item o una relevancia ordinal para ranking cross-sectional.
-\end{itemize}
-
-La salida del modelo no se interpreta de forma abstracta. Debe ser apta para alimentar downstream:
-\begin{itemize}[leftmargin=2em]
-    \item selección de candidatos,
-    \item ordenación relativa dentro del universo,
-    \item combinación con otros modelos en un ensemble,
-    \item calibración posterior de probabilidades,
-    \item y evaluación walk-forward genuinamente fuera de muestra.
-\end{itemize}
-
-Por ello, este módulo debe entenderse como una pieza de \textbf{research-to-production}, no como un experimento aislado.
-
-\section{Principios de diseño}
-
-El módulo se rige por una doctrina explícita:
-
-\begin{enumerate}[leftmargin=2em]
-    \item \textbf{La cronología es inviolable.} Ninguna observación puede contaminar el entrenamiento de un bloque temporal anterior a su realización económica.
-    
-    \item \textbf{El modelo se evalúa por utilidad cross-sectional fuera de muestra, no por ajuste in-sample.} Una pérdida baja en entrenamiento no tiene valor si no se traduce en ranking o discriminación robusta OOS.
-    
-    \item \textbf{La reproducibilidad es obligatoria.} Toda ejecución debe dejar artefactos, métricas, configuración y metadatos suficientes para reconstruir exactamente el experimento.
-    
-    \item \textbf{La complejidad del modelo debe merecerse.} El aumento de capacidad solo se acepta si produce mejora estable y no una simple captura de ruido histórico.
-    
-    \item \textbf{La promoción a ensemble o producción requiere gates explícitos.} Un modelo no avanza por intuición; avanza si cumple reglas formales.
-\end{enumerate}
-
-\section{Unidad de modelado y contexto cross-sectional}
-
-En estrategias de small caps, el objetivo raramente es acertar el valor absoluto de retorno de un único activo de forma aislada. Lo relevante es ordenar el universo contemporáneo de forma que los activos con score alto presenten, en agregado, mejor comportamiento futuro que los de score bajo.
-
-Sea \(\mathcal{U}_t = \{1,\dots,N_t\}\) el universo elegible en fecha \(t\). El modelo genera el conjunto de scores
-\[
-\{\hat{y}_{i,t}\}_{i \in \mathcal{U}_t}.
-\]
-La calidad de esos scores se juzga principalmente por su capacidad para inducir un ranking económicamente útil dentro de cada fecha, más que por minimizar un error global agregado mezclando periodos y activos heterogéneos.
-
-Esta perspectiva tiene consecuencias importantes:
-\begin{itemize}[leftmargin=2em]
-    \item las métricas deben computarse por fecha y luego agregarse,
-    \item la validación debe respetar dependencia temporal,
-    \item y el tratamiento del universo, coverage y missingness no puede separarse del problema económico.
-\end{itemize}
-
-\section{Definición formal de los datos de entrada}
-
-El módulo asume como inputs contractuales:
-
-\begin{itemize}[leftmargin=2em]
-    \item \texttt{features\_path}: matriz de features con clave lógica mínima \texttt{(date, symbol)};
-    \item \texttt{labels\_path}: etiquetas forward compatibles con la misma clave lógica;
-    \item \texttt{splits\_path}: asignación de folds y roles temporales \texttt{train/valid/test} generada aguas arriba;
-    \item \texttt{config\_path}: configuración cerrada del experimento;
-    \item \texttt{run\_id}: identificador único de ejecución.
-\end{itemize}
-
-El join entre tablas se realiza exclusivamente sobre claves canónicas. Cualquier ambigüedad, duplicado o desalineación se trata como error de integridad, no como advertencia cosmética.
-
-\section{Splits temporales purged y embargo}
-
-La validez del módulo depende críticamente del esquema de partición temporal. En presencia de labels forward, ventanas superpuestas y dependencia serial, la validación aleatoria clásica es metodológicamente inaceptable. Por ello, el entrenamiento se apoya en splits \textbf{purged} con \textbf{embargo}.
-
-Intuitivamente:
-\begin{itemize}[leftmargin=2em]
-    \item el \textbf{purging} elimina del entrenamiento observaciones cuyo horizonte de evento intersecta el bloque de validación o test;
-    \item el \textbf{embargo} retira además una banda temporal alrededor del bloque evaluado para reducir contaminación por proximidad.
-\end{itemize}
-
-Sea \(\mathcal{D}\) el conjunto de observaciones elegibles tras el join de features, labels y splits. Para un fold \(k\), el conjunto de entrenamiento efectivo se define como
-\begin{equation}
-\mathcal{D}^{(k)}_{\mathrm{train}}
-=
-\left\{
-i \in \mathcal{D}
-\;\middle|\;
-\texttt{fold\_id}_i = k,\;
-\texttt{split\_role}_i = \texttt{train},\;
-\texttt{inclusion\_flag}_i = 1
-\right\},
-\end{equation}
-mientras que validación y test se restringen a observaciones temporalmente posteriores y libres de solapamiento causal con el bloque de entrenamiento:
-\begin{equation}
-\mathcal{D}^{(k)}_{\mathrm{eval}}
-=
-\left\{
-i \in \mathcal{D}
-\;\middle|\;
-\texttt{split\_role}_i \in \{\texttt{valid},\texttt{test}\},
-\;
-t_i > t_{\max}^{\mathrm{train},k},
-\;
-i \notin \texttt{purged/embargo}
-\right\}.
-\end{equation}
-
-La propiedad que se busca no es solo separación cronológica superficial, sino \textbf{independencia operacional suficiente} entre bloques para que la performance observada se aproxime a un entorno de despliegue real.
-
-\section{Formulación matemática de LightGBM}
-
-Sea \(f^{(m)}\) el predictor tras \(m\) iteraciones de boosting. En LightGBM, el modelo final se construye de forma aditiva:
-\begin{equation}
-f^{(M)}(\bm{x}) = \sum_{m=1}^{M} \nu \, T_m(\bm{x}),
-\end{equation}
-donde \(T_m\) es el árbol añadido en la iteración \(m\) y \(\nu\) es la tasa de aprendizaje.
-
-El problema de entrenamiento puede expresarse como la minimización de una pérdida regularizada:
-\begin{equation}
-\min_{f}
-\;
-\sum_{i=1}^{n}\ell\!\left(y_i, f(\bm{x}_i)\right)
-+
-\sum_{m=1}^{M}\Omega(T_m),
-\end{equation}
-con penalización de complejidad típicamente de la forma
-\begin{equation}
-\Omega(T_m)=\gamma L_m + \frac{\lambda}{2}\sum_{l=1}^{L_m} w_{m,l}^{2},
-\end{equation}
-donde \(L_m\) es el número de hojas del árbol \(m\), \(w_{m,l}\) son los pesos de hoja y \((\gamma,\lambda)\) controlan complejidad estructural y regularización.
-
-Desde una perspectiva cuantitativa, los hiperparámetros principales no son meros knobs de librería: definen la capacidad efectiva del modelo para aproximar interacciones no lineales, efectos umbral, saturaciones y jerarquías entre señales. En particular:
-\begin{itemize}[leftmargin=2em]
-    \item \texttt{num\_leaves} regula granularidad funcional;
-    \item \texttt{max\_depth} limita complejidad jerárquica;
-    \item \texttt{min\_data\_in\_leaf} impone masa mínima por partición;
-    \item \texttt{feature\_fraction} y \texttt{bagging\_fraction} actúan como regularización estocástica;
-    \item \texttt{lambda\_l1}, \texttt{lambda\_l2} penalizan sobreajuste paramétrico;
-    \item \texttt{learning\_rate} gobierna el compromiso entre plasticidad y estabilidad.
-\end{itemize}
-
-\section{Objetivos soportados}
-
-\subsection{Regresión}
-
-Cuando el target es un retorno continuo, el módulo entrena bajo objetivo de regresión. En ese caso, la pérdida puntual puede ser, según configuración, cuadrática o absoluta:
-\begin{align}
-\mathcal{L}_{\mathrm{MSE}}
-&=
-\frac{1}{n}\sum_{i=1}^{n}(y_i-\hat{y}_i)^2,\\
-\mathcal{L}_{\mathrm{MAE}}
-&=
-\frac{1}{n}\sum_{i=1}^{n}|y_i-\hat{y}_i|.
-\end{align}
-
-Sin embargo, en un problema de stock selection cross-sectional, estas pérdidas son auxiliares. La métrica central es la calidad ordinal por fecha, medida típicamente mediante Information Coefficient de Spearman:
-\begin{equation}
-\IC_t
-=
-\Corr\!\left(
-\rank(\hat{y}_{i,t}),
-\rank(y_{i,t})
-\right)_{i\in\mathcal{U}_t}.
-\end{equation}
-A nivel agregado, se reportan estadísticas como:
-\[
-\mathrm{median}(\IC_t), \qquad
-\mathrm{mean}(\IC_t), \qquad
-\frac{\mathrm{mean}(\IC_t)}{\mathrm{std}(\IC_t)}.
-\]
-
-También puede calcularse el \textit{hit ratio} direccional:
-\begin{equation}
-\mathrm{HitRatio}
-=
-\frac{1}{n}\sum_{i=1}^{n}\mathbf{1}\!\left(y_i\hat{y}_i>0\right),
-\end{equation}
-aunque esta métrica se considera secundaria frente a medidas ordinales y de ranking.
-
-\subsection{Clasificación binaria}
-
-Cuando el label es binario, el modelo optimiza una pérdida logística:
-\begin{equation}
-\mathcal{L}_{\mathrm{CE}}
-=
--\frac{1}{n}
-\sum_{i=1}^{n}
-\left[
-y_i\log \hat{p}_i + (1-y_i)\log(1-\hat{p}_i)
-\right].
-\end{equation}
-
-Las métricas principales incluyen:
-\begin{itemize}[leftmargin=2em]
-    \item \(\AUC\)-ROC;
-    \item \(\AUC\)-PR en clases desbalanceadas;
-    \item logloss;
-    \item y, si las probabilidades van a usarse downstream, métricas de calibración.
-\end{itemize}
-
-Si el dataset presenta desbalance severo o calidad heterogénea de observaciones, se admiten pesos muestrales:
-\begin{equation}
-\mathcal{L}_{\mathrm{weighted}}
-=
--\frac{1}{n}
-\sum_{i=1}^{n}
-w_i
-\left[
-y_i\log \hat{p}_i + (1-y_i)\log(1-\hat{p}_i)
-\right].
-\end{equation}
-
-\subsection{Ranking}
-
-Para problemas donde el objetivo económico es explícitamente ordenar activos dentro de cada fecha, el módulo soporta \texttt{lambdarank}. Si \(\mathcal{Q}_t\) denota la lista de activos del día \(t\), la calidad del ranking puede medirse mediante:
-\begin{equation}
-\NDCG@k
-=
-\frac{\DCG@k}{\IDCG@k}.
-\end{equation}
-
-Lo relevante aquí es que el modelo deja de perseguir error puntual y optimiza directamente una funcional relacionada con la utilidad del ordenamiento. En contextos donde la cartera solo consume top-\(k\) nombres o percentiles extremos, este objetivo puede ser más fiel al problema económico que una regresión estándar.
-
-\section{Selección de métrica principal}
-
-Una de las carencias típicas en documentos técnicamente buenos pero no cerrados es dejar varias métricas coexistiendo sin una jerarquía oficial. Este módulo corrige eso estableciendo una doctrina explícita:
-
-\begin{itemize}[leftmargin=2em]
-    \item Si el uso downstream es \textbf{ranking cross-sectional}, la métrica principal es una métrica ordinal por fecha agregada OOS, normalmente \(\mathrm{median}(\IC_t)\) o \(\NDCG@k\).
-    \item Si el uso downstream es \textbf{clasificación probabilística}, la métrica principal es logloss o AUC según el objetivo operativo exacto.
-    \item Métricas auxiliares como RMSE, MAE, coverage o hit ratio nunca sustituyen a la métrica principal; solo contextualizan.
-\end{itemize}
-
-En consecuencia, el early stopping, la comparación entre folds y la promoción final deben referirse siempre a una métrica primaria definida ex ante en configuración.
-
-\section{Preprocesado y contrato de features}
-
-El módulo asume que la mayor parte del feature engineering ocurre aguas arriba, pero impone un contrato mínimo de consistencia:
-
-\begin{enumerate}[leftmargin=2em]
-    \item La lista \texttt{feature\_list\_final} debe ser idéntica entre folds.
-    \item Se eliminan columnas no numéricas si no existe tratamiento explícito para ellas.
-    \item Se excluyen columnas con varianza nula o cobertura insuficiente según umbrales configurados.
-    \item Los missing values deben seguir una política definida y estable; no se admite tratamiento ad hoc distinto por fold sin quedar documentado.
-\end{enumerate}
-
-LightGBM puede manejar missingness de forma nativa, pero eso no exime de distinguir entre:
-\begin{itemize}[leftmargin=2em]
-    \item missing estructural con contenido informativo,
-    \item missing accidental por problemas de datos,
-    \item y columnas cuya tasa de ausencia las vuelve inestables o irrelevantes.
-\end{itemize}
-
-La carpeta necesita una política explícita porque el tratamiento de missing puede alterar de forma sustancial la estabilidad del modelo en small caps.
-
-\section{Pesos muestrales y estructura por fecha}
-
-El módulo permite pesos de observación cuando existe una hipótesis económica clara, por ejemplo:
-\begin{itemize}[leftmargin=2em]
-    \item penalizar observaciones de menor calidad,
-    \item ponderar por liquidez,
-    \item o modular el coste de errores en subuniversos con distinta relevancia económica.
-\end{itemize}
-
-En tareas de ranking, además, la estructura por fecha debe preservarse mediante información de grupos. Esto es crucial: la sección cruzada diaria no puede tratarse como una bolsa indiferenciada de filas si el objetivo económico vive en el orden relativo dentro de cada fecha.
-
-\section{Controles anti-leakage}
-
-El módulo define prohibiciones explícitas:
-
-\begin{itemize}[leftmargin=2em]
-    \item no se entrena sobre observaciones con \texttt{inclusion\_flag = 0};
-    \item no se utiliza \texttt{test} para early stopping;
-    \item no se usa performance de test para elegir hiperparámetros dentro de la misma ejecución;
-    \item no se recalibra sobre el test final;
-    \item no se permiten joins que introduzcan información futura en features o labels.
-\end{itemize}
-
-Estas restricciones no son un detalle de implementación; son parte de la definición del experimento. Un modelo que viola estas reglas queda invalidado aunque su score aparente sea excelente.
-
-\section{Early stopping y regularización}
-
-Cada fold se entrena con early stopping sobre un bloque de validación estrictamente separado:
-\begin{itemize}[leftmargin=2em]
-    \item si la métrica principal deja de mejorar durante \texttt{early\_stopping\_rounds}, el entrenamiento se detiene;
-    \item el mejor número de iteraciones se congela para ese fold;
-    \item el test se evalúa únicamente una vez finalizado el ajuste.
-\end{itemize}
-
-La política correcta de early stopping exige dos cosas:
-\begin{enumerate}[leftmargin=2em]
-    \item que la métrica monitorizada sea la métrica económicamente relevante, no una proxy cómoda;
-    \item que la decisión no toque nunca el bloque de test.
-\end{enumerate}
-
-\section{Gates de aceptación del modelo}
-
-Para pasar de research a candidato serio de ensemble o producción, el modelo debe superar un conjunto de gates. El módulo fija al menos los siguientes:
-
-\begin{enumerate}[leftmargin=2em]
-    \item \textbf{Gate de performance primaria}: la métrica principal OOS debe superar un umbral mínimo predefinido.
-    
-    \item \textbf{Gate de overfitting}: la divergencia entre entrenamiento y validación no puede exceder una tolerancia:
-    \begin{equation}
-    \Delta_{\mathrm{overfit}}
-    =
-    \mathcal{M}_{\mathrm{train}}-\mathcal{M}_{\mathrm{valid}}
-    \le \varepsilon
-    \quad
-    \text{o equivalente según la orientación de la métrica.}
-    \end{equation}
-    
-    \item \textbf{Gate de estabilidad}: la dispersión entre folds debe permanecer bajo control; no se aceptan modelos cuyo resultado dependa enteramente de uno o dos subperiodos.
-    
-    \item \textbf{Gate de coverage}: el porcentaje de filas válidas con score generado debe superar un umbral contractual.
-    
-    \item \textbf{Gate de integridad}: flags críticos de fuga, duplicados, fechas inválidas o labels corruptos deben ser cero.
-\end{enumerate}
-
-Un score medio atractivo no compensa una mala estabilidad o una cobertura insuficiente. En entornos cuantitativos reales, la robustez domina a la brillantez puntual.
-
-\section{Flujo operativo del módulo}
-
-El flujo oficial es:
-
-\begin{enumerate}[leftmargin=2em]
-    \item Cargar configuración, datos y \texttt{run\_id}.
-    \item Unir features, labels y splits por clave canónica.
-    \item Filtrar observaciones no elegibles.
-    \item Construir datasets por fold y por rol temporal.
-    \item Ejecutar prechecks de integridad.
-    \item Entrenar LightGBM por fold con early stopping en validación.
-    \item Generar predicciones OOF, valid y test según corresponda.
-    \item Calcular métricas por fold y agregadas.
-    \item Persistir artefactos del modelo y manifest de entrenamiento.
-    \item Emitir veredicto \texttt{pass}, \texttt{warn} o \texttt{fail}.
-\end{enumerate}
-
-\section{Artefactos de salida}
-
-Toda ejecución debe persistir, como mínimo:
-
-\begin{itemize}[leftmargin=2em]
-    \item modelo por fold;
-    \item predicciones \texttt{oof};
-    \item predicciones de test por fold;
-    \item resumen de métricas;
-    \item importancias de variables;
-    \item manifest con configuración, timestamps, rutas, hashes y cobertura.
-\end{itemize}
-
-Una estructura típica sería:
-
-\begin{verbatim}
-models/artifacts/lgbm/{run_id}/fold_k/model.txt
-models/predictions/lgbm/{run_id}/oof.parquet
-models/predictions/lgbm/{run_id}/fold_k_test_pred.parquet
-models/predictions/lgbm/{run_id}/latest_scores.parquet
-models/reports/lgbm/{run_id}/metrics_summary.json
-models/reports/lgbm/{run_id}/metrics_by_fold.parquet
-models/reports/lgbm/{run_id}/feature_importance.parquet
-models/reports/lgbm/{run_id}/training_manifest.json
-\end{verbatim}
-
-\section{Criterio de promoción a ensemble o producción}
-
-La carpeta necesitaba cerrar esta parte con más fuerza. El hecho de que un fold concreto salga bien no convierte automáticamente al modelo en candidato real. La promoción exige:
-
-\begin{enumerate}[leftmargin=2em]
-    \item mejora neta frente a baselines relevantes;
-    \item estabilidad inter-fold e inter-periodo;
-    \item cobertura suficiente del universo objetivo;
-    \item ausencia de señales evidentes de fragilidad por régimen;
-    \item compatibilidad con calibración, ensemble y capa de ejecución.
-\end{enumerate}
-
-Si un modelo ofrece gran score medio pero comportamiento errático, alta sensibilidad a hiperparámetros o dependencia excesiva de un subperiodo, debe permanecer en research.
-
-\section{Validaciones obligatorias}
-
-Antes de dar el módulo por correcto, deben superarse como mínimo las siguientes pruebas:
-
-\subsection{Integridad}
-\begin{itemize}[leftmargin=2em]
-    \item unicidad de \texttt{(date, symbol)};
-    \item ausencia de desalineaciones entre features y labels;
-    \item fechas ordenadas y compatibles con los splits.
-\end{itemize}
-
-\subsection{Sanidad de features}
-\begin{itemize}[leftmargin=2em]
-    \item no hay columnas completamente nulas;
-    \item no hay columnas constantes no justificadas;
-    \item la lista de features es idéntica en todos los folds.
-\end{itemize}
-
-\subsection{Sanidad de outputs}
-\begin{itemize}[leftmargin=2em]
-    \item número de predicciones consistente con coverage esperado;
-    \item ausencia de NaNs o infinitos en scores;
-    \item metadatos completos en archivos persistidos.
-\end{itemize}
-
-\subsection{Validez experimental}
-\begin{itemize}[leftmargin=2em]
-    \item ninguna métrica de test intervino en tuning o early stopping;
-    \item embargo y purging fueron efectivamente respetados;
-    \item el run puede reconstruirse a partir del manifest.
-\end{itemize}
-
-\section{Definición de Done}
-
-El módulo \texttt{train\_lgbm.py} solo se considera terminado si:
-
-\begin{enumerate}[leftmargin=2em]
-    \item entrena LightGBM de forma temporalmente válida;
-    \item produce predicciones OOF y OOS trazables;
-    \item calcula métricas consistentes con el problema económico;
-    \item persiste artefactos y metadatos suficientes para auditoría;
-    \item aplica gates explícitos de aceptación;
-    \item y deja una salida apta para calibración, ensemble o inferencia posterior.
-\end{enumerate}
-
-En consecuencia, \texttt{train\_lgbm.py} no debe interpretarse como un simple wrapper de LightGBM. Es el módulo que convierte una hipótesis de señal tabular en un predictor cross-sectional evaluado con disciplina temporal, gobernanza experimental y criterios explícitos de promoción dentro de un stack cuantitativo serio.
-
-\end{document}
+Especificación Cuantitativa: models/gbdt/train_lgbm.py
+
+1. Propósito del módulo
+
+El objetivo de models/gbdt/train_lgbm.py es entrenar modelos LightGBM temporalmente válidos para problemas cross-sectional en small caps y producir predicciones, métricas y artefactos reutilizables por el resto del stack.
+
+La función correcta del módulo no es “ajustar un GBDT sobre una tabla”, sino convertir una hipótesis predictiva en un objeto modelado que sea:
+
+- cronológicamente limpio,
+- económicamente evaluable,
+- reproducible,
+- y apto para promoción o descarte.
+
+La pregunta exacta que debe responder el módulo es:
+
+“Dadas features, labels y splits temporales válidos, qué función f(x) puede entrenarse con LightGBM de forma metodológicamente limpia y con suficiente utilidad fuera de muestra como para seguir viva en el pipeline?”
+
+2. Principios no negociables
+
+2.1 La cronología es inviolable
+El módulo nunca puede entrenar, validar o seleccionar con información futura respecto al bloque evaluado.
+
+2.2 La unidad económica relevante es la sección cruzada por fecha
+El objetivo no es sólo minimizar error agregado entre filas, sino generar un score útil dentro de cada fecha.
+
+2.3 Loss de entrenamiento y métrica económica no son lo mismo
+La loss sirve para ajustar el modelo.
+La métrica primaria sirve para decidir si el modelo merece existir.
+
+2.4 Test no participa en tuning
+Ni hiperparámetros, ni early stopping, ni selección de features, ni calibración pueden apoyarse en el test final.
+
+2.5 Reproducibilidad total
+Toda ejecución debe dejar suficiente traza para reconstruir exactamente qué se entrenó, con qué datos, con qué parámetros y con qué resultado.
+
+2.6 El módulo entrena; no investiga todo
+HPO avanzado, análisis SHAP profundo o tests sofisticados de drift pueden existir como capas adyacentes, pero no deben contaminar el contrato base del entrenamiento.
+
+3. Qué hace y qué no hace
+
+3.1 Qué hace
+- carga features, labels y splits;
+- construye datasets train/valid/test por fold;
+- entrena LightGBM según objetivo configurado;
+- aplica early stopping sobre validación limpia;
+- genera predicciones OOF y OOS;
+- calcula métricas por fecha, por fold y agregadas;
+- persiste artefactos y manifiesto;
+- emite un veredicto de promoción o no promoción.
+
+3.2 Qué no hace
+- no genera splits;
+- no calibra probabilidades;
+- no combina modelos en ensemble;
+- no ejecuta HPO sofisticado como contrato mínimo;
+- no decide por sí solo la entrada en producción final.
+
+4. Rol dentro del stack
+
+Ubicación correcta del módulo:
+
+features + labels + temporal_splits
+-> train_lgbm
+-> oof predictions + oos predictions + model artifacts
+-> calibrate / ensemble / inference / validation
+
+Interpretación correcta:
+train_lgbm.py es la capa que produce el predictor base, no la capa que resuelve todo el ciclo de vida del modelo.
+
+5. Unidad de modelado
+
+Sea x_{i,t} el vector de features del activo i en fecha t y sea y_{i,t} el label asociado.
+
+El modelo aprende una función:
+
+    f: X -> R
+
+tal que:
+
+    yhat_{i,t} = f(x_{i,t})
+
+dependiendo del objetivo:
+
+- regresión:
+  yhat aproxima E[y | x]
+
+- clasificación binaria:
+  yhat o p̂ aproxima P(y=1 | x)
+
+- ranking:
+  yhat induce un orden relativo útil dentro de la fecha
+
+La lectura correcta del output es económica, no solo estadística:
+el valor del modelo está en cómo ordena o discrimina el universo OOS de cada fecha.
+
+6. Inputs contractuales
+
+6.1 Entradas mínimas
+- features_path
+- labels_path
+- splits_path
+- config_path
+- run_id
+
+6.2 Claves mínimas de join
+- date
+- symbol
+
+6.3 Campos recomendados en splits
+- fold_id
+- split_role ∈ {train, valid, test}
+- inclusion_flag
+- purged_flag
+- embargo_days
+
+6.4 Regla crítica
+Cualquier duplicado o desalineación en (date, symbol) invalida el run.
+
+7. Política de integridad previa
+
+Antes de entrenar, el módulo debe verificar:
+
+- unicidad de claves
+- cobertura razonable tras joins
+- ausencia de NaN o infinitos en columnas críticas no permitidas
+- consistencia de tipos
+- que feature_list_final sea estable entre folds
+- que labels y features correspondan exactamente a las mismas observaciones elegibles
+
+Sin estos checks, el resto del entrenamiento carece de valor.
+
+8. Splits temporales purged y embargo
+
+La versión canónica del módulo debe asumir que los splits ya vienen construidos aguas arriba, pero debe tratarlos como contrato duro, no como simple metadata decorativa.
+
+Para fold k:
+
+D_train^(k) =
+    { obs : fold_id = k, split_role = train, inclusion_flag = 1 }
+
+D_valid^(k) y D_test^(k) deben satisfacer:
+- posterioridad temporal respecto al bloque de entrenamiento,
+- ausencia de observaciones purged,
+- respeto del embargo configurado.
+
+El módulo no debe intentar “arreglar” splits inválidos silenciosamente.
+Debe fallar o degradar el run con trazabilidad explícita.
+
+9. Invariante temporal obligatorio
+
+Para toda observación de evaluación en el fold k:
+
+t_eval > t_max_train,k
+
+y además no debe haber solapamiento económico relevante entre ventanas de entrenamiento y ventanas de label de evaluación si el split aguas arriba marca purging/embargo.
+
+Este punto es estructural, no cosmético.
+
+10. Objetivos soportados
+
+La versión canónica debe soportar al menos:
+
+10.1 Regresión
+Targets continuos de retorno u otro valor real.
+
+Loss típicas:
+- MSE
+- MAE
+
+10.2 Clasificación binaria
+Targets 0/1.
+
+Loss típica:
+- binary cross-entropy
+
+10.3 Ranking
+Cuando el problema económico es explícitamente de ordenación cross-sectional.
+
+Loss típica:
+- LambdaRank o equivalente
+
+La elección del objetivo debe quedar cerrada por config y persistida en el manifiesto.
+
+11. Formulación GBDT
+
+El modelo de boosting puede expresarse como:
+
+    f^(M)(x) = sum_{m=1}^M nu * T_m(x)
+
+donde:
+- T_m es el árbol m
+- nu es learning_rate
+- M es el número efectivo de iteraciones
+
+La regularización de LightGBM debe entenderse como parte del contrato económico del modelo, no solo como knob técnico:
+controla capacidad, granularidad, estabilidad y riesgo de sobreajuste.
+
+12. Hiperparámetros estructurales importantes
+
+La especificación debe tratar como principales:
+
+- num_leaves
+- max_depth
+- min_data_in_leaf
+- learning_rate
+- feature_fraction
+- bagging_fraction / bagging_freq
+- lambda_l1
+- lambda_l2
+- min_gain_to_split
+- max_bin si aplica
+
+Todos deben persistirse por fold o por run si son globales.
+
+13. Relación entre loss y métrica principal
+
+Este es uno de los puntos que conviene dejar más rígido.
+
+La loss de LightGBM es una herramienta de ajuste.
+La métrica primaria es la que decide si el modelo sirve o no.
+
+Jerarquía recomendada:
+
+- si el uso downstream es ranking cross-sectional:
+  primary_metric = median(IC_t) o NDCG@k OOS
+
+- si el uso downstream es clasificación:
+  primary_metric = AUC, logloss o combinación explícita según caso
+
+- si el uso downstream es regresión pero aplicada a selección:
+  el primary_metric sigue siendo una métrica cross-sectional por fecha, no RMSE agregado sin más
+
+Regla crítica:
+el early stopping y la promoción deben alinearse con la métrica económica relevante, no solo con la loss interna.
+
+14. Métrica cross-sectional canónica
+
+Para muchos casos de stock selection, la métrica principal recomendada es:
+
+IC_t =
+    Corr(rank(yhat_{i,t}), rank(y_{i,t}))  sobre i en U_t
+
+Agregados recomendados:
+- median(IC_t)
+- mean(IC_t)
+- std(IC_t)
+- IC IR = mean(IC_t) / std(IC_t) si std > 0
+
+La mediana suele ser una opción robusta como resumen principal.
+
+15. Métricas auxiliares
+
+Además de la métrica primaria, el módulo debe poder reportar:
+
+- hit ratio
+- AUC / PR-AUC
+- RMSE / MAE
+- NDCG@k
+- top-bottom spread proxy si aplica
+- coverage
+- overfit gap train-valid
+
+Pero ninguna de estas métricas debe sustituir por sí sola a la primary_metric fijada ex ante.
+
+16. Sample weights y estructura por fecha
+
+La versión base puede admitir sample weights si existe una justificación económica explícita:
+- liquidez
+- calidad de dato
+- importancia operativa de ciertas observaciones
+
+En ranking, la estructura por fecha debe respetarse como grupo.
+No se debe tratar el universo entero como una nube indiferenciada de filas cuando la utilidad económica vive dentro de cada fecha.
+
+17. Política de features
+
+El módulo asume que el feature engineering serio ocurre aguas arriba, pero impone un contrato mínimo:
+
+- misma lista final de features entre folds
+- exclusión de columnas constantes o degeneradas
+- política explícita para missingness
+- columnas no numéricas tratadas de forma coherente o excluidas
+
+LightGBM tolera missing, pero eso no exonera al módulo de medir coverage y estabilidad.
+
+18. Missingness y coverage
+
+Toda ejecución debe reportar:
+- número de filas tras filtros
+- coverage por fold
+- tasa de missing por feature si se desea
+- porcentaje de universo efectivamente puntuado
+
+Si el coverage cae por debajo de threshold contractual, el run no debe promocionarse aunque la métrica primaria sea atractiva.
+
+19. Early stopping
+
+La política canónica debe ser:
+
+- entrenar en train
+- monitorizar valid
+- detener por lack of improvement tras early_stopping_rounds
+- congelar best_iteration por fold
+- evaluar test solo una vez cerrada la fase de ajuste
+
+Regla crítica:
+test nunca participa en la decisión de early stopping.
+
+20. HPO y outer loop
+
+Aquí conviene ser explícito.
+
+La versión canónica del módulo no exige Bayesian HPO como contrato base.
+
+La arquitectura correcta es:
+- train_lgbm = inner training engine
+- HPO, si existe, vive en un outer loop o módulo adyacente
+
+Esto evita confusión semántica entre:
+- entrenar un modelo
+- y explorar el espacio de configuración del sistema
+
+El manifiesto sí debe registrar si el run proviene de:
+- config fija
+- grid search
+- random search
+- HPO externo
+
+21. Importancia de variables
+
+La versión base puede persistir:
+- gain importance
+- split importance
+
+SHAP o estabilidad avanzada de importancia pueden existir como extensión, pero no deben ser requisito duro del contrato mínimo.
+
+Razón:
+el objetivo principal del módulo es producir predictor válido y métricas fiables, no una capa completa de interpretabilidad avanzada.
+
+22. Predicciones OOF y OOS
+
+El módulo debe producir como mínimo:
+
+- OOF predictions:
+  una predicción por observación validada fuera de su bloque de entrenamiento
+
+- test predictions:
+  predicciones estrictamente fuera de muestra por fold o bloque final
+
+Regla importante:
+las OOF son el artefacto natural para:
+- calibración,
+- análisis de error,
+- y ensemble downstream
+
+23. Gates de aceptación del modelo
+
+La promoción del modelo debe seguir reglas explícitas.
+
+PROMOTE solo si se cumplen, al menos:
+
+1. primary_metric_OOS >= threshold
+2. overfit_gap <= tolerance
+3. coverage >= coverage_min
+4. no leakage flags
+5. estabilidad inter-fold razonable
+6. artefactos completos y reproducibles
+
+Puede añadirse una condición de robustez temporal descriptiva, pero no hace falta imponer un CUSUM formal como parte del contrato base.
+
+24. Overfit gap
+
+Definir una diferencia de referencia entre desempeño train y valid/OOS, por ejemplo:
+
+overfit_gap =
+    M_train - M_valid
+
+o equivalente según el signo de la métrica.
+
+El manifiesto debe dejar clara la convención usada y el threshold aceptable.
+
+25. Estabilidad entre folds y periodos
+
+El módulo debe mirar no solo la media de la métrica, sino también su dispersión:
+- por fold
+- por bloque temporal
+- y, si aplica, por subperiodos OOS
+
+Regla correcta:
+un modelo no promociona solo porque un fold fue extraordinario.
+Debe ser suficientemente estable.
+
+26. IC decay y drift
+
+La versión base no necesita un test formal de CUSUM como requisito duro.
+Pero sí debe permitir, al menos, una lectura descriptiva de degradación temporal:
+- rolling IC
+- IC por año/semestre
+- métricas por subperiodo
+
+Eso basta para el contrato mínimo serio.
+
+27. Flujo operativo canónico
+
+Paso 1:
+cargar config, features, labels, splits y run_id
+
+Paso 2:
+hacer join sobre claves canónicas
+
+Paso 3:
+aplicar filtros de inclusión y checks de integridad
+
+Paso 4:
+construir datasets por fold y por split_role
+
+Paso 5:
+entrenar LightGBM por fold con early stopping en valid
+
+Paso 6:
+generar OOF y OOS predictions
+
+Paso 7:
+calcular métricas por fecha, por fold y agregadas
+
+Paso 8:
+evaluar promotion gates
+
+Paso 9:
+persistir modelos, predicciones, métricas y manifiesto
+
+28. Invariantes del módulo
+
+Toda ejecución válida debe cumplir:
+
+- temporal purity por fold
+- train ∩ eval = ∅ en el sentido operativo del split
+- test no usado en tuning
+- predicciones finitas
+- artefactos serializados
+- mismo config + mismos datos + misma seed => mismo resultado
+
+29. Tests mínimos obligatorios
+
+29.1 Integridad
+Unicidad de (date, symbol), sin duplicados tras join.
+
+29.2 Temporalidad
+Toda observación de evaluación posterior y no contaminada respecto al entrenamiento.
+
+29.3 Outputs finitos
+No NaN ni infinito en predicciones.
+
+29.4 Coverage
+Coverage recomputable desde predicciones persistidas.
+
+29.5 Reproducibilidad
+Mismo seed y misma config producen el mismo run.
+
+29.6 Test isolation
+El test no puede aparecer en early stopping ni en selección del modelo dentro del mismo run.
+
+30. Artefactos obligatorios
+
+30.1 Modelos
+- model_fold_k.pkl o artefacto equivalente
+
+30.2 Predicciones
+- oof_predictions.parquet
+- test_predictions.parquet
+- latest_scores.parquet si aplica
+
+30.3 Reportes
+- metrics_by_fold.parquet
+- metrics_summary.json
+- feature_importance.parquet
+- training_manifest.json
+
+31. Campos mínimos de metrics_summary.json
+
+- run_id
+- objective_type
+- primary_metric_name
+- primary_metric_train
+- primary_metric_valid
+- primary_metric_test
+- median_ic_oos if applicable
+- overfit_gap
+- coverage
+- num_folds
+- accepted_flag
+- rejection_reason if any
+- config_hash
+
+32. Campos mínimos de training_manifest.json
+
+- run_id
+- input hashes
+- config hash
+- feature_list_final
+- label_name
+- split_definition
+- seed
+- objective_type
+- early_stopping_rounds
+- best_iteration_by_fold
+- no_leakage_assertion
+- policy_version
+
+33. Qué no debe hacer este módulo
+
+La versión canónica no debe:
+- meter HPO bayesiano como requisito base
+- usar SHAP stability como gate duro
+- confundir interpretabilidad con validez predictiva
+- promocionar por score medio sin estabilidad
+- usar test como herramienta de tuning disfrazada
+
+34. Extensiones futuras razonables
+
+Como fase 2 o capas adyacentes:
+- Bayesian HPO
+- SHAP stability
+- formal drift tests
+- cross-validated ensembles
+- feature pruning más sofisticado
+
+Pero ninguna de estas extensiones debe contaminar el contrato mínimo.
+
+35. Interpretación correcta
+
+La lectura correcta de train_lgbm.py no es:
+“entrenamos LightGBM y miramos si sale bien”.
+
+La lectura correcta es:
+“ejecutamos un procedimiento temporalmente válido y reproducible para producir un predictor cross-sectional, medir su utilidad fuera de muestra y decidir si merece seguir vivo en el stack.”
+
+Ese es su rol real.
+
+36. Conclusión
+
+models/gbdt/train_lgbm.py debe ser una pieza central de infraestructura predictiva.
+
+Recibe datos y splits temporales.
+Entrena LightGBM con disciplina causal.
+Separa loss y métrica económica.
+Genera predicciones OOF y OOS.
+Evalúa gates explícitos.
+Y persiste artefactos suficientes para auditoría, calibración y promoción posterior.
+
+Ese es exactamente el comportamiento que debe tener una capa seria de entrenamiento GBDT en un stack cuantitativo institucional.

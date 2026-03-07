@@ -1,524 +1,608 @@
-\documentclass[11pt,a4paper]{article}
+Módulo: models/regimes/regime_detector.py
 
-\usepackage[spanish,english]{babel}
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
-\usepackage{amsmath,amssymb,amsfonts,amsthm}
-\usepackage{booktabs}
-\usepackage{longtable}
-\usepackage{array}
-\usepackage{hyperref}
-\usepackage{geometry}
-\usepackage{graphicx}
-\usepackage{enumitem}
-\usepackage{natbib}
-\geometry{margin=2cm}
-\bibliographystyle{plainnat}
+1. Propósito del módulo
 
-\title{\textbf{Regime Detector: Especificación Formal para Segmentación de Mercado y Evaluación Condicional de Alphas}}
-\author{Research Pipeline --- Quantitative Research Specification}
-\date{Marzo 2026}
+regime_detector.py segmenta el mercado en una secuencia temporal de regímenes
+r_t ∈ {1,…,K} usando proxies de mercado observables y point-in-time (PIT).
 
-\begin{document}
+El rol del módulo NO es asignar pesos, hacer gating final, ni optimizar cartera.
+Su rol es más preciso:
 
-\maketitle
+- producir etiquetas de régimen reproducibles por fecha;
+- cuantificar su persistencia y estabilidad;
+- permitir evaluación condicional de señales/alphas por régimen;
+- dejar una base auditable para análisis downstream.
 
-\section{Propósito del módulo}
+Debe responder a dos preguntas:
 
-El objetivo de este módulo es asignar, para cada fecha \(t\), una etiqueta de régimen de mercado \(r_t\) que permita segmentar la evaluación de señales y estrategias de forma \textbf{condicional, reproducible y point-in-time}. El módulo no pretende demostrar por sí mismo que el \emph{regime gating} mejora la rentabilidad final, ni debe confundirse con una capa de asignación de pesos o de ejecución. Su función es más acotada y más útil: proporcionar una \textbf{segmentación temporal formal} sobre la que puedan medirse diferencias de comportamiento entre alphas, labels o carteras.
+(1) ¿qué estado de mercado describe mejor la fecha t?
+(2) ¿cambia la calidad de una señal cuando condicionamos por ese estado?
 
-En términos operativos, \texttt{regime\_detector} debe responder a dos preguntas distintas:
+2. Qué hace y qué no hace
 
-\begin{enumerate}[leftmargin=1.5em]
-    \item ¿Qué régimen observable o latente describe mejor el estado del mercado en la fecha \(t\)?
-    \item Dada esa segmentación, ¿cómo cambia la calidad de una señal cuando se condiciona por régimen?
-\end{enumerate}
+2.1 Qué hace
+- consume una serie temporal de proxies de mercado z_t;
+- aplica una metodología explícita de segmentación:
+  threshold rules, GMM o HMM;
+- genera una etiqueta r_t por fecha;
+- persiste probabilidad/confianza si la metodología lo soporta;
+- calcula estadísticas de duración y transición;
+- opcionalmente calcula métricas condicionales de alphas por régimen.
 
-La detección de regímenes y la evaluación condicional deben permanecer conceptualmente separadas. Mezclarlas produce especificaciones ambiguas y dificulta la trazabilidad del pipeline.
+2.2 Qué no hace
+- no decide directamente si un alpha debe activarse o desactivarse;
+- no reasigna capital ni modifica gross/net;
+- no sustituye un módulo de regime_gating;
+- no debe usar información futura para etiquetar fechas live;
+- no debe convertirse en un laboratorio de modelos de series temporales complejos.
 
-\section{Definición del problema}
+3. Definición formal del problema
 
-Sea \(\mathbf{z}_t \in \mathbb{R}^p\) el vector de proxies de mercado observables en la fecha \(t\), construido únicamente con información disponible hasta esa fecha. El módulo debe producir una secuencia de etiquetas
+Sea z_t ∈ ℝ^p el vector de proxies de mercado observables en la fecha t.
+El módulo produce una secuencia:
 
-\[
-r_t \in \{1,\dots,K\},
-\]
+    r_t ∈ {1,...,K}
 
-donde \(K\) es el número de regímenes configurado o inferido bajo la metodología elegida.
+y, cuando aplica, una distribución de probabilidad:
 
-Una vez obtenidas las etiquetas \(r_t\), el módulo debe permitir evaluación condicional de cualquier señal \(\alpha\) frente a su label futuro \(y\). Si \(IC_t(\alpha)\) es el Information Coefficient cross-sectional diario de la señal, entonces la media condicional por régimen se define como
+    p_t(k) = P(r_t = k | 𝓘_t)
 
-\[
-\overline{IC}^{(r)}(\alpha)=
-\frac{1}{T_r}\sum_{t:\,r_t=r} IC_t(\alpha),
-\]
+donde 𝓘_t es la información disponible hasta t.
 
-donde \(T_r\) es el número de fechas asignadas al régimen \(r\).
+Una vez obtenidos los regímenes, para cualquier alpha α se define el IC diario:
 
-La finalidad del módulo no es construir directamente \(\alpha^{(r)}\), sino producir \(r_t\) y las estadísticas necesarias para que otros módulos decidan si esa segmentación resulta útil.
+    IC_t(α) = ρ_S( α_{t,·}, y_{t,·} )
 
-\section{Jerarquía metodológica}
+y su media condicional por régimen:
 
-Una debilidad frecuente en este tipo de diseño es presentar reglas por umbral, clustering y HMM como si fueran metodologías intercambiables sin coste conceptual. No lo son. Este módulo debe fijar una jerarquía explícita:
+    IC̄^(r)(α) = (1 / T_r) Σ_{t : r_t = r} IC_t(α)
 
-\subsection{Nivel 1: método canónico baseline}
+donde T_r es el número de fechas asignadas al régimen r.
 
-El método baseline recomendado es \textbf{threshold-based deterministic labeling}. Se usa cuando se quiere:
+4. Jerarquía metodológica
 
-\begin{itemize}[leftmargin=1.5em]
-    \item máxima interpretabilidad,
-    \item reproducibilidad exacta,
-    \item bajo coste computacional,
-    \item control transparente sobre las reglas.
-\end{itemize}
+El módulo soporta varias metodologías, pero no deben tratarse como intercambiables.
+Debe existir una jerarquía explícita.
 
-Ejemplo genérico:
-\[
-r_t=
-\begin{cases}
-\texttt{high\_vol}, & \text{si } VIX_t > c_1,\\
-\texttt{down\_trend}, & \text{si } \mathrm{ret}^{(m)}_t < c_2,\\
-\texttt{calm\_uptrend}, & \text{si } VIX_t \le c_1 \text{ y } \mathrm{ret}^{(m)}_t \ge c_3,\\
-\texttt{neutral}, & \text{en otro caso}.
-\end{cases}
-\]
+4.1 Nivel 1 — baseline interpretable
+Método: threshold-based deterministic labeling.
 
-Este método debe ser el \textbf{default} cuando la prioridad es una segmentación robusta y fácilmente auditable.
+Uso correcto:
+- baseline productivo inicial;
+- máxima interpretabilidad;
+- validación interna;
+- semántica de regímenes totalmente controlada.
 
-\subsection{Nivel 2: método exploratorio offline}
+Ejemplo:
 
-El segundo método es \textbf{clustering no supervisado} sobre proxies de mercado, por ejemplo mediante Gaussian Mixture Models (GMM). Debe usarse cuando el objetivo es explorar si la estructura empírica de los proxies sugiere agrupaciones no obvias.
+    r_t =
+      high_vol        if vix_t > c_1
+      down_trend      if ret_mkt_20d < c_2
+      calm_uptrend    if vix_t ≤ c_1 and ret_mkt_20d ≥ c_3
+      neutral         otherwise
 
-La densidad se modela como
+Ventajas:
+- 100% interpretable
+- 100% PIT si los proxies lo son
+- reproducibilidad exacta
+- robustez operacional
 
-\[
-p(\mathbf{z}_t)=\sum_{k=1}^{K}\pi_k\,\mathcal{N}(\mathbf{z}_t;\mu_k,\Sigma_k),
-\]
+4.2 Nivel 2 — clustering exploratorio
+Método: Gaussian Mixture Model (GMM).
 
-y la asignación puede hacerse por máxima probabilidad a posteriori:
-\[
-\hat r_t=\arg\max_k\, P(r_t=k\mid \mathbf{z}_t).
-\]
-
-Este método es útil para \emph{research exploration}, pero no debe ser el baseline operativo por defecto si no existe una convención clara de etiquetado y persistencia semántica de clusters.
-
-\subsection{Nivel 3: método secuencial latente}
-
-El método más sofisticado soportado debe ser un \textbf{Hidden Markov Model} (HMM), apropiado cuando se quiere modelar persistencia temporal y transiciones de estado latentes. Sea \(s_t\) el estado latente:
-
-\[
-P(s_t=j\mid s_{t-1}=i)=A_{ij},
-\qquad
-\mathbf{z}_t \mid s_t=k \sim b_k(\mathbf{z}_t).
-\]
+Definición:
 
-En la versión gaussiana:
-\[
-b_k(\mathbf{z}_t)=\mathcal{N}(\mathbf{z}_t;\mu_k,\Sigma_k).
-\]
+    p(z_t) = Σ_{k=1}^K π_k N(z_t ; μ_k, Σ_k)
 
-El filtrado secuencial produce:
-\[
-P(s_t=k\mid \mathbf{z}_{1:t}),
-\]
-y la etiqueta online debe derivarse de esa cantidad, no de una suavización retrospectiva si se desea respetar estricto \emph{point-in-time}.
+Asignación por MAP:
 
-El HMM es apropiado cuando se busca un compromiso entre estructura dinámica y parsimonia, pero exige mayor cuidado en inicialización, estabilidad de estados y semántica de etiquetas.
+    r_t = argmax_k P(r_t = k | z_t)
 
-\section{Principio de selección metodológica}
+Uso correcto:
+- research exploratorio offline;
+- detectar agrupaciones empíricas de proxies;
+- comparar si la estructura latente coincide con reglas threshold.
 
-El módulo debe soportar varias metodologías, pero su elección debe estar gobernada por un criterio explícito:
+Limitación:
+- no modela persistencia secuencial explícita;
+- semántica de clusters puede rotar entre runs.
 
-\begin{center}
-\begin{tabular}{p{4cm} p{8.5cm}}
-\toprule
-\textbf{Método} & \textbf{Cuándo usarlo} \\
-\midrule
-Threshold rules & baseline interpretable, producción inicial, auditoría interna \\
-GMM clustering & análisis exploratorio offline, detección de grupos empíricos \\
-HMM & segmentación secuencial con persistencia temporal latente \\
-\bottomrule
-\end{tabular}
-\end{center}
+4.3 Nivel 3 — segmentación secuencial latente
+Método: Hidden Markov Model (HMM).
 
-No debe permitirse cambiar de método sin registrar en persistencia:
-\begin{itemize}[leftmargin=1.5em]
-    \item la familia metodológica,
-    \item los hiperparámetros,
-    \item el conjunto de proxies,
-    \item y la convención de naming de regímenes.
-\end{itemize}
+Definición:
 
-\section{Construcción de proxies}
+    s_t ∈ {1,...,K}
+    P(s_t = j | s_{t-1} = i) = A_ij
+    z_t | s_t = k ~ N(μ_k, Σ_k)
 
-El vector \(\mathbf{z}_t\) debe construirse a partir de variables de mercado observables y alineadas \emph{point-in-time}. Ejemplos razonables incluyen:
+El output causal correcto para uso live es:
 
-\begin{itemize}[leftmargin=1.5em]
-    \item volatilidad implícita o proxy de estrés de mercado,
-    \item retorno agregado de benchmark a varias ventanas,
-    \item volatilidad realizada,
-    \item pendiente o aceleración de tendencia,
-    \item amplitud de mercado,
-    \item medidas de liquidez o spread agregado.
-\end{itemize}
+    p_t(k) = P(s_t = k | z_1,...,z_t)
 
-Formalmente:
-\[
-\mathbf{z}_t = \big(z_{1,t},\dots,z_{p,t}\big).
-\]
+y NO:
 
-Cada componente debe tener:
-\begin{enumerate}[leftmargin=1.5em]
-    \item definición exacta,
-    \item unidad y transformación aplicada,
-    \item política de \emph{missing values},
-    \item garantía de disponibilidad temporal.
-\end{enumerate}
+    P(s_t = k | z_1,...,z_T)
 
-\subsection{Normalización}
+porque esta última usa smoothing retrospectivo y mete look-ahead.
 
-Si la metodología requiere escalado, éste debe hacerse de forma compatible con el eje temporal. Por ejemplo, si se usa z-score rolling:
+Uso correcto:
+- si se desea persistencia temporal explícita;
+- si los regímenes son latentes y no sólo reglas visibles;
+- si se acepta más complejidad a cambio de una estructura dinámica mejor.
 
-\[
-\tilde z_{j,t}=
-\frac{z_{j,t}-\mu_{j,t}^{(W)}}{\sigma_{j,t}^{(W)}+\varepsilon},
-\]
+5. Principio central PIT
 
-donde \(\mu_{j,t}^{(W)}\) y \(\sigma_{j,t}^{(W)}\) se calculan únicamente con información hasta \(t\). No se debe usar estandarización global ex post si el objetivo es preservar semántica PIT.
+La regla más importante del módulo es:
 
-\section{Definición de etiquetas de régimen}
+    si la etiqueta r_t va a usarse downstream en una fecha t,
+    entonces debe depender sólo de información disponible hasta t.
 
-Las etiquetas producidas por el modelo deben persistirse en dos niveles:
+En particular:
 
-\begin{itemize}[leftmargin=1.5em]
-    \item \textbf{label interno}: entero o código estable \(1,\dots,K\),
-    \item \textbf{label semántico}: nombre legible como \texttt{high\_vol}, \texttt{down\_trend}, \texttt{calm}, etc.
-\end{itemize}
+- threshold rules: triviales si z_t es PIT;
+- GMM: si se reentrena rolling y luego se asigna sólo con z_t, es aceptable;
+- HMM: usar filtering P(s_t | z_1:t), no smoothing P(s_t | z_1:T).
 
-En métodos latentes como GMM o HMM, la asignación semántica no debe hacerse arbitrariamente en cada ejecución. Debe construirse una regla estable basada en estadísticas del estado, por ejemplo:
+6. Construcción de proxies
 
-\begin{itemize}[leftmargin=1.5em]
-    \item media de volatilidad del estado,
-    \item media de retorno del benchmark,
-    \item persistencia media del estado,
-    \item ranking relativo frente a otros estados.
-\end{itemize}
+Sea:
 
-Sin esta convención, el estado 1 de una ejecución no será comparable con el estado 1 de otra.
+    z_t = (z_{1,t}, ..., z_{p,t})
 
-\section{Persistencia temporal y duraciones}
+Los proxies pueden incluir, por ejemplo:
+- VIX o proxy equivalente de estrés;
+- retorno benchmark 20d / 60d;
+- volatilidad realizada 20d;
+- breadth / pct above MA;
+- realized correlation proxy;
+- amplitud de spreads o liquidez agregada;
+- corr concentration / turbulence proxies.
 
-Una buena segmentación de regímenes no debe oscilar patológicamente entre etiquetas de un día para otro si la estructura económica que pretende capturar es de naturaleza lenta. Por ello, el módulo debe registrar estadísticas de persistencia:
+Cada proxy debe tener:
+- definición exacta;
+- unidad;
+- ventana lookback;
+- política de missing;
+- garantía PIT.
 
-\[
-L_r^{(m)} = \text{duración del } m\text{-ésimo bloque consecutivo del régimen } r.
-\]
+7. Normalización temporal
 
-A partir de estas duraciones deben persistirse:
-\begin{itemize}[leftmargin=1.5em]
-    \item duración media por régimen,
-    \item percentiles de duración,
-    \item frecuencia de transiciones,
-    \item matriz de transición empírica si aplica.
-\end{itemize}
-
-En particular, si el método produce regímenes demasiado efímeros para ser accionables, debe emitirse un \emph{warning} o un \emph{fail} según configuración.
-
-\section{Evaluación condicional de señales}
-
-Una vez persistidas las etiquetas \(r_t\), el módulo debe soportar el cálculo de estadísticas condicionales para una señal \(\alpha\). El IC diario se define como
-
-\[
-IC_t(\alpha)=\rho_S\big(\alpha_{t,\cdot},y_{t,\cdot}\big),
-\]
-
-y su promedio por régimen es:
-
-\[
-\overline{IC}^{(r)}(\alpha)=\frac{1}{T_r}\sum_{t:\,r_t=r} IC_t(\alpha).
-\]
-
-Además deben registrarse, por régimen:
-
-\begin{itemize}[leftmargin=1.5em]
-    \item \(T_r\): número de fechas válidas,
-    \item coverage media,
-    \item dispersión del IC condicional,
-    \item hit rate del signo del IC,
-    \item comparación frente al IC incondicional.
-\end{itemize}
-
-La comparación relevante no es una frase del tipo ``el alpha funciona mejor en bull que en bear'', sino un cuadro auditable de métricas condicionales con soporte muestral suficiente.
-
-\section{No-confundir segmentación con gating}
-
-Este módulo puede producir información \emph{usable} para \emph{gating}, pero no debe decidir por sí mismo un mecanismo de activación/desactivación de alphas. En otras palabras:
-
-\[
-\texttt{regime\_detector} \neq \texttt{regime\_allocator}.
-\]
-
-La salida adecuada del módulo es:
-\begin{itemize}[leftmargin=1.5em]
-    \item etiquetas \(r_t\),
-    \item métricas de calidad de segmentación,
-    \item métricas condicionales de señales.
-\end{itemize}
-
-La decisión downstream de usar
-\[
-w_t(\alpha) = 0 \quad \text{o} \quad w_t(\alpha) > 0
-\]
-según el régimen pertenece a otra capa del sistema.
-
-\section{Entradas del módulo}
-
-El módulo debe consumir, como mínimo, los siguientes elementos:
-
-\begin{longtable}{p{4.5cm} p{9.5cm}}
-\toprule
-\textbf{Entrada} & \textbf{Descripción} \\
-\midrule
-\endhead
-
-\texttt{market\_proxies\_panel} & Serie temporal de proxies de mercado ya alineados PIT. \\
-\texttt{signals\_panel} & Señales opcionales, sólo si se desea evaluación condicional en la misma ejecución. \\
-\texttt{label\_panel} & Labels futuros para cálculo de IC condicional. \\
-\texttt{config\_yaml} & Método, número de estados, reglas, thresholds y política de persistencia. \\
-\texttt{run\_id} & Identificador único de la ejecución. \\
-\texttt{data\_snapshot\_id} & Snapshot exacto de proxies y señales. \\
-\bottomrule
-\end{longtable}
-
-\section{Salidas esperadas}
-
-La salida debe incluir al menos:
-
-\begin{enumerate}[leftmargin=1.5em]
-    \item \textbf{tabla de etiquetas de régimen por fecha};
-    \item \textbf{summary del modelo de segmentación};
-    \item \textbf{estadísticas de persistencia y transiciones};
-    \item \textbf{métricas condicionales por señal} cuando se proporcionen señales.
-\end{enumerate}
-
-Un esquema mínimo razonable sería:
-
-\begin{verbatim}
-date
-regime_id
-regime_name
-regime_prob_max
-method
-run_id
-\end{verbatim}
-
-y, en la tabla resumen:
-
-\begin{verbatim}
-method
-n_regimes
-coverage_by_regime
-mean_duration_by_regime
-transition_counts
-labeling_convention
-quality_flags
-run_id
-\end{verbatim}
-
-Si hay análisis condicional de señales:
-
-\begin{verbatim}
-alpha_id
-regime_id
-n_dates
-mean_ic_cond
-std_ic_cond
-hit_rate_cond
-coverage_cond
-mean_ic_uncond
-delta_ic_vs_uncond
-\end{verbatim}
-
-\section{Validaciones obligatorias}
-
-\subsection{Validaciones PIT}
-
-\begin{enumerate}[leftmargin=1.5em]
-    \item cada proxy debe estar disponible en la fecha \(t\);
-    \item no se permiten revisiones retrospectivas no timestamped;
-    \item la normalización temporal debe usar sólo historia pasada;
-    \item las etiquetas online de régimen no deben depender de información futura.
-\end{enumerate}
-
-\subsection{Validaciones de segmentación}
-
-\begin{enumerate}[leftmargin=1.5em]
-    \item ningún régimen debe quedar con soporte muestral despreciable;
-    \item la frecuencia de transición no debe ser patológicamente alta;
-    \item la convención semántica de etiquetas debe ser estable;
-    \item la distribución temporal de regímenes debe persistirse para auditoría.
-\end{enumerate}
-
-\subsection{Validaciones de evaluación condicional}
-
-\begin{enumerate}[leftmargin=1.5em]
-    \item cada régimen debe tener un mínimo de fechas válidas para cálculo de IC;
-    \item el número de nombres por fecha debe ser suficiente para correlaciones cross-sectional informativas;
-    \item coverage y soporte condicional deben persistirse junto a cada métrica.
-\end{enumerate}
-
-\section{Configuración recomendada}
-
-La configuración debe ser completamente declarativa. Un ejemplo mínimo razonable es:
-
-\begin{verbatim}
+Si se requiere normalización, debe ser rolling o expanding causal.
+
+Ejemplo de z-score rolling:
+
+    z̃_{j,t} = ( z_{j,t} - μ_{j,t}^{(W)} ) / ( σ_{j,t}^{(W)} + ε )
+
+donde μ_{j,t}^{(W)} y σ_{j,t}^{(W)} usan sólo datos ≤ t.
+
+Nunca usar:
+- z-score global ex post;
+- PCA entrenado con toda la muestra si luego se usa para etiquetar live;
+- winsorización con cuantiles calculados usando futuro.
+
+8. Métodos concretos
+
+8.1 Threshold rules
+
+Contrato:
+- input: proxies PIT
+- output: regime_id exacto por fecha
+- optional: confidence heuristic if desired
+
+Ventajas:
+- baseline canónico
+- mejor opción si el objetivo principal es interpretabilidad
+
+MVP:
+- rules versionadas en config
+- precedence entre reglas
+- bucket “unknown/neutral” explícito
+
+8.2 GMM
+
+Modelo:
+
+    p(z_t) = Σ_{k=1}^K π_k N(z_t; μ_k, Σ_k)
+
+Selección de K:
+- BIC por defecto;
+- AIC como diagnóstico secundario;
+- no elegir K sólo por intuición visual.
+
+Conteo de parámetros para covariance_type='full':
+
+    d(K) = (K - 1)                  # mixture weights
+           + K p                    # means
+           + K p(p+1)/2             # covariances
+
+BIC:
+
+    BIC(K) = -2 logL_K + d(K) log(T)
+
+AIC:
+
+    AIC(K) = -2 logL_K + 2 d(K)
+
+Regla recomendada:
+- usar BIC como selector principal;
+- si BIC y AIC divergen, persistir ambos y emitir warning.
+
+8.3 HMM
+
+Modelo gaussiano:
+
+    s_t ~ Markov(A)
+    z_t | s_t = k ~ N(μ_k, Σ_k)
+
+Parámetros:
+
+    θ = {π, A, μ_1,...,μ_K, Σ_1,...,Σ_K}
+
+Likelihood:
+
+    L(θ) = P(z_1,...,z_T | θ)
+
+Estimación: EM / Baum-Welch.
+
+Inferencia:
+- filtering: α_t(k) ∝ P(z_t | s_t=k) Σ_j α_{t-1}(j) A_{jk}
+- posterior filtered:
+    p_t(k) = P(s_t=k | z_1:t)
+
+Etiquetado causal:
+
+    r_t = argmax_k p_t(k)
+
+No usar por defecto para live:
+- Viterbi path global si usa toda la muestra;
+- smoothing posterior con datos futuros.
+
+9. Selección de K
+
+9.1 Threshold method
+K viene impuesto por diseño de reglas.
+
+9.2 GMM/HMM
+K debe seleccionarse con:
+- BIC primario;
+- AIC secundario;
+- filtros de estabilidad y viabilidad.
+
+No basta con minimizar BIC.
+También deben imponerse:
+
+- min_dates_per_regime
+- min_mean_duration
+- max_ephemeral_fraction
+- no estados degenerados
+
+Score recomendado:
+
+    score(K) = -BIC_norm(K)
+               + λ_dur * duration_score(K)
+               + λ_occ * occupancy_score(K)
+               - λ_deg * degeneracy_score(K)
+
+MVP:
+- elegir K por BIC entre candidatos viables;
+- si el mejor K por BIC produce un estado degenerado, bajar al siguiente viable.
+
+10. Persistencia y duración de regímenes
+
+Sea una racha consecutiva del régimen r de longitud L_{r,m}.
+Persistir por régimen:
+
+- n_blocks_r
+- mean_duration_r
+- median_duration_r
+- p10/p50/p90 duration
+- occupancy_r = T_r / T
+- transitions_out_r
+
+Si mean_duration_r o median_duration_r es demasiado baja,
+la segmentación puede ser demasiado ruidosa para uso downstream.
+
+11. Matriz de transición
+
+Para HMM:
+- persistir A estimada;
+- persistir también una matriz empírica basada en r_t.
+
+Para métodos no secuenciales:
+- persistir transición empírica simple entre etiquetas consecutivas.
+
+Campos mínimos:
+- A_ij model
+- A_ij empirical
+- self_transition_i
+- expected_duration_i ≈ 1 / (1 - A_ii)  [si HMM y A_ii<1]
+
+12. Estabilidad semántica de estados
+
+Problema:
+en GMM/HMM el label “estado 1” puede no significar lo mismo entre runs.
+
+Solución:
+mapear estados latentes a nombres semánticos usando una convención estable.
+
+Ejemplo de ordenación:
+- ordenar estados por media de volatilidad proxy;
+- desempatar por retorno benchmark medio;
+- o construir vector resumen por estado:
+
+    m_k = [E[VIX|k], E[ret_20d|k], E[rv_20d|k]]
+
+y alinear estados entre runs minimizando distancia.
+
+Coste sugerido:
+
+    C_ij = w_vol |m_i(vol)-m_j(vol)|
+         + w_ret |m_i(ret)-m_j(ret)|
+         + w_rv  |m_i(rv)-m_j(rv)|
+
+Luego resolver matching con Hungarian algorithm.
+
+Esto no es obligatorio en threshold rules, pero sí muy recomendable en GMM/HMM.
+
+13. Evaluación condicional de alphas
+
+Para cada alpha α:
+
+    IC_t(α) = ρ_S( α_{t,·}, y_{t,·} )
+
+y por régimen:
+
+    IC̄^(r)(α) = (1 / T_r) Σ_{t:r_t=r} IC_t(α)
+
+Persistir además:
+- std_ic_cond^(r)
+- hit_rate_cond^(r) = mean(1{IC_t>0} | r_t=r)
+- n_dates_cond^(r)
+- coverage_cond^(r)
+- delta_ic_vs_uncond^(r) = IC̄^(r) - IC̄
+
+No interpretar regímenes con T_r demasiado pequeño.
+
+14. Gates mínimos de validez del módulo
+
+FAIL si cualquiera:
+- proxies no PIT
+- normalización usa futuro
+- K seleccionado produce estados con n_dates < min_dates_per_regime
+- HMM etiquetado con smoothing en modo live
+- semántica de estados no resoluble / no persistida
+
+WARN si:
+- AIC y BIC discrepan de forma material
+- un régimen está cerca del umbral mínimo de fechas
+- mean_duration demasiado baja
+- confidence posterior demasiado difusa
+- mapping semántico inestable entre runs
+
+PASS:
+- segmentación PIT válida
+- soporte por régimen suficiente
+- estabilidad mínima cumplida
+- outputs completos persistidos
+
+15. Inputs mínimos
+
+- market_proxies_panel
+- config_yaml
+- run_id
+- data_snapshot_id
+
+Opcionales:
+- alpha_scores_panel
+- forward_labels_panel
+- universe_mask
+
+16. Output schema mínimo
+
+16.1 regimes.parquet
+Campos:
+- date
+- regime_id
+- regime_name
+- method
+- posterior_max         # GMM/HMM if applicable
+- posterior_entropy     # optional
+- run_id
+
+16.2 regime_summary.parquet
+- method
+- n_regimes
+- bic
+- aic
+- min_dates_per_regime
+- occupancy_by_regime
+- mean_duration_by_regime
+- median_duration_by_regime
+- transition_summary
+- config_hash
+- run_id
+
+16.3 conditional_alpha_stats.parquet
+- alpha_id
+- regime_id
+- n_dates
+- mean_ic_cond
+- std_ic_cond
+- hit_rate_cond
+- mean_ic_uncond
+- delta_ic_vs_uncond
+- coverage_cond
+- run_id
+
+16.4 diagnostics.json
+- selector_method
+- K_candidates
+- chosen_K
+- PIT_validation_passed
+- label_alignment_method
+- warnings
+- failure_reasons
+
+17. Config declarativa recomendada
+
 method:
-  name: threshold
-  n_regimes: 4
+  name: hmm          # threshold | gmm | hmm
+  k_candidates: [2,3,4,5]
+  covariance_type: full
+  online_labeling: filter
+  random_state: 42
 
-proxies:
-  - vix_1d
-  - benchmark_ret_20d
-  - realized_vol_20d
-  - breadth_20d
+normalization:
+  method: rolling_zscore
+  lookback: 252
+  eps: 1e-8
+  winsor: [0.01, 0.99]
 
-threshold_rules:
-  high_vol:
-    vix_1d: [25, inf]
-  down_trend:
-    benchmark_ret_20d: [-inf, -0.05]
-  calm_uptrend:
-    vix_1d: [-inf, 25]
-    benchmark_ret_20d: [0.03, inf]
-
-minimums:
+quality:
   min_dates_per_regime: 30
-  min_avg_duration: 3
-  min_names_per_date: 25
+  min_mean_duration: 3
+  max_entropy_mean: 1.2
+
+selection:
+  criterion: bic
+  require_viable_states: true
 
 conditional_eval:
   enabled: true
   metric: spearman_ic
-\end{verbatim}
+  min_names_per_date: 25
 
-Para HMM, la configuración debería además incluir:
+18. Interfaz funcional sugerida
 
-\begin{verbatim}
-method:
-  name: hmm
-  n_regimes: 4
-  covariance_type: full
-  online_labeling: filter
-  random_state: 42
-\end{verbatim}
+- load_market_proxies(...)
+- validate_proxy_panel(...)
+- normalize_proxies_pit(...)
+- fit_threshold_regimes(...)
+- fit_gmm_regimes(...)
+- fit_hmm_regimes(...)
+- filter_hmm_online(...)
+- select_regime_count(...)
+- assign_semantic_labels(...)
+- compute_regime_durations(...)
+- compute_transition_stats(...)
+- compute_conditional_ic(...)
+- persist_regime_outputs(...)
 
-\section{Interfaz funcional esperada}
+19. Flujo canónico
 
-Las operaciones mínimas deberían ser:
+1. cargar proxies
+2. validar PIT y cobertura
+3. normalizar causalmente
+4. elegir metodología
+5. si aplica, seleccionar K entre candidatos
+6. ajustar modelo
+7. etiquetar fechas de forma causal
+8. asignar nombres semánticos estables
+9. calcular duración, ocupación y transiciones
+10. calcular estadísticas condicionales de alphas
+11. persistir artefactos y diagnósticos
 
-\begin{enumerate}[leftmargin=1.5em]
-    \item \texttt{load\_market\_proxies(path)}
-    \item \texttt{validate\_proxies(panel, config)}
-    \item \texttt{normalize\_proxies(panel, config)}
-    \item \texttt{fit\_regime\_model(proxies, config)}
-    \item \texttt{label\_regimes(model, proxies, mode)}
-    \item \texttt{assign\_semantic\_names(labels, summary)}
-    \item \texttt{compute\_duration\_stats(labels)}
-    \item \texttt{compute\_conditional\_alpha\_stats(labels, signals, labels\_fwd)}
-    \item \texttt{persist\_results(artifacts, metadata)}
-\end{enumerate}
+20. Invariantes matemáticos y operativos
 
-\section{Flujo operacional}
+20.1 Etiquetado válido
+    r_t ∈ {1,...,K}  para todo t válido
 
-El flujo recomendado del módulo es:
+20.2 PIT
+    r_t depende sólo de información ≤ t
 
-\[
-\texttt{load proxies}
-\rightarrow
-\texttt{validate PIT}
-\rightarrow
-\texttt{normalize}
-\rightarrow
-\texttt{fit / apply regime model}
-\rightarrow
-\texttt{label states}
-\rightarrow
-\texttt{semantic mapping}
-\rightarrow
-\texttt{duration \& transition stats}
-\rightarrow
-\texttt{conditional alpha evaluation}
-\rightarrow
-\texttt{persist}.
-\]
+20.3 Probabilidades válidas
+    Σ_k p_t(k) = 1  para todo t  si el método es probabilístico
 
-Desarrollado paso a paso:
+20.4 Viabilidad de estados
+    T_r ≥ min_dates_per_regime
 
-\begin{enumerate}[leftmargin=1.5em]
-    \item cargar y validar proxies de mercado;
-    \item aplicar transformaciones temporales compatibles con PIT;
-    \item ajustar o aplicar el modelo de segmentación;
-    \item obtener etiqueta interna por fecha;
-    \item asignar nombre semántico estable a cada régimen;
-    \item calcular duración media, transiciones y cobertura temporal;
-    \item si se proporcionan señales, calcular estadísticas condicionales por régimen;
-    \item persistir tablas y resumen de la ejecución.
-\end{enumerate}
+20.5 Persistencia
+    duration_stats disponibles para todo régimen
 
-\section{Criterios de calidad del módulo}
+20.6 Reproducibilidad
+    mismo snapshot + misma config + misma seed → mismos labels
 
-El módulo estará correctamente implementado si:
+21. Failure modes principales
 
-\begin{enumerate}[leftmargin=1.5em]
-    \item separa con claridad detección de régimen y evaluación condicional;
-    \item fija una metodología baseline y documenta cuándo usar las demás;
-    \item produce etiquetas PIT reproducibles por fecha;
-    \item persiste una semántica estable de los estados;
-    \item cuantifica duración y transición de regímenes;
-    \item soporta métricas condicionales por señal con soporte muestral explícito;
-    \item no necesita promesas decorativas de Sharpe para justificar su utilidad.
-\end{enumerate}
+- proxies con leakage por estandarización global;
+- estados latentes degenerados con muy pocas fechas;
+- switching excesivo entre regímenes;
+- HMM mal usado con smoothing retrospectivo;
+- semántica de estados inestable entre runs;
+- K demasiado grande para T disponible;
+- confundir clustering exploratorio con segmentación productiva.
 
-\section{Definition of Done}
+22. Qué NO conviene introducir
 
-El módulo se considera completado cuando:
+No conviene meter aquí:
+- MS-VAR;
+- regime-switching GARCH;
+- HDP-HMM / Bayesian nonparametrics;
+- deep Markov models;
+- copulas dinámicas;
+- gating policies aprendidas;
+- RL para asignar regímenes.
 
-\begin{itemize}[leftmargin=1.5em]
-    \item genera etiquetas de régimen por fecha mediante un método explícitamente configurado;
-    \item persiste summary de estados, coberturas, duraciones y transiciones;
-    \item soporta evaluación condicional de señales mediante IC por régimen;
-    \item valida restricciones PIT y mínimos de soporte;
-    \item deja artefactos reutilizables por módulos downstream de análisis o allocation.
-\end{itemize}
+Todo eso cambia el rol del módulo.
+Este módulo debe seguir siendo una capa de segmentación temporal interpretable y utilizable.
 
-\section{Conclusión}
+23. MVP vs versión avanzada
 
-La segmentación por regímenes puede ser útil, pero sólo si se trata como un problema de modelado temporal con semántica estable y no como una fuente de narrativas ad hoc sobre por qué una estrategia funcionó mejor en una fase concreta del mercado. El valor de \texttt{regime\_detector} no reside en prometer mejoras directas de Sharpe, sino en proporcionar una descomposición temporal rigurosa sobre la cual puedan formularse y contrastarse hipótesis condicionales.
+23.1 MVP
+- threshold rules
+- GMM con selección BIC
+- HMM gaussiano con etiquetado online por filtering
+- duración / ocupación / transición
+- evaluación condicional de IC
+- semántica estable básica de estados
 
-Dicho de otro modo, este módulo debe aportar estructura, no marketing: etiquetas reproducibles, persistencia auditable, soporte estadístico por régimen y una base clara para decidir aguas abajo si ciertas señales muestran dependencia real del contexto de mercado.
+23.2 Avanzado
+- alineación de estados entre runs con Hungarian
+- confidence / entropy diagnostics
+- score compuesto BIC + viabilidad
+- importance de proxies por separación entre estados
+- monitoring de drift de proxies y de labels de régimen
 
-\begin{thebibliography}{9}
+24. Definition of Done
 
-\bibitem[Hamilton(1989)]{hamilton1989}
-James D. Hamilton.
-\newblock A new approach to the economic analysis of nonstationary time series and the business cycle.
-\newblock \emph{Econometrica}, 57(2), 1989.
+El módulo se considera terminado cuando:
+- genera una etiqueta de régimen por fecha con garantía PIT;
+- persiste resumen de ocupación, duración y transiciones;
+- soporta threshold, GMM y HMM bajo un contrato común;
+- en HMM usa filtering online para live labeling;
+- en GMM/HMM selecciona K con criterio explícito;
+- soporta evaluación condicional de alphas por régimen;
+- deja artefactos reutilizables por módulos downstream.
 
-\bibitem[Rabiner(1989)]{rabiner1989}
-Lawrence R. Rabiner.
-\newblock A tutorial on hidden Markov models and selected applications in speech recognition.
-\newblock \emph{Proceedings of the IEEE}, 77(2), 1989.
+25. Conclusión
 
-\bibitem[Chan(2013)]{chan2013}
-Ernest P. Chan.
-\newblock \emph{Algorithmic Trading: Winning Strategies and Their Rationale}.
-\newblock Wiley, 2013.
+regime_detector.py debe ser leído como un módulo de segmentación temporal,
+no como un generador de narrativa ex post.
 
-\bibitem[L{\'o}pez de Prado(2018)]{lopez2018}
-Marcos L{\'o}pez de Prado.
-\newblock \emph{Advances in Financial Machine Learning}.
-\newblock Wiley, 2018.
+Su valor real no está en decir “el mercado estaba risk-off”,
+sino en producir una partición temporal reproducible, causal y suficientemente estable
+como para que el resto del stack pueda contrastar hipótesis condicionales con disciplina.
 
-\end{thebibliography}
+La implementación correcta aquí no es la más sofisticada,
+sino la que preserve simultáneamente:
+- causalidad temporal,
+- semántica estable,
+- soporte estadístico suficiente,
+- y utilidad downstream real.
 
-\end{document}
+26. Base teórica mínima recomendada
+
+- Hamilton (1989): Markov switching / regime models en macro-finance
+- Rabiner (1989): forward-backward, filtering, Viterbi
+- Schwarz (1978): BIC para selección de modelo
+- Bishop (2006): mixture models y EM
+- López de Prado (2018): disciplina PIT y evaluación temporal en research financiero
+
+27. Técnica clave realmente adecuada aquí
+
+Online HMM filtering es esencial aquí porque:
+- elimina el look-ahead de usar smoothing P(s_t|z_1:T);
+- mantiene el módulo usable en tiempo real;
+- y conserva casi toda la utilidad de una segmentación secuencial
+  sin convertir el sistema en un research toy de modelos latentes más complejos.
