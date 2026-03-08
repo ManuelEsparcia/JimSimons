@@ -1,507 +1,494 @@
-\section{Módulo: \texttt{data/edgar/fetch\_companyfacts.py}}
+Especificación Cuantitativa: data/edgar/fetch_companyfacts.py
 
-\subsection{Objetivo estratégico del módulo}
+1. Propósito del módulo
 
-El módulo \texttt{fetch\_companyfacts.py} implementa la capa de ingestión regulatoria de \emph{company facts} desde la API oficial de EDGAR/SEC para un universo de emisores identificado por \texttt{CIK}. Su función no es simplemente descargar JSONs, sino construir una \textbf{base raw versionada, reproducible, auditable e idempotente} de hechos financieros que pueda alimentar, sin ambigüedad semántica ni contaminación temporal, las capas posteriores de canonización, resolución PIT y generación de features fundamentales.
+El módulo `data/edgar/fetch_companyfacts.py` implementa la capa de ingestión raw de `companyfacts` desde la API oficial de la SEC. Su función no es “bajar JSONs” sin más, sino capturar de forma reproducible, auditable, idempotente y conservadora la fuente regulatoria de facts financieros por emisor, preservando suficiente contexto para que las capas posteriores de canonización, resolución PIT y feature engineering puedan operar sin contaminación semántica ni pérdida de linaje.
 
-El objetivo económico-operativo del módulo es transformar un conjunto de entidades regulatorias
+Su misión central es transformar un universo de emisores identificado por `CIK` en un conjunto dual de artefactos:
 
-\[
-\mathcal{C} = \{c_1,\dots,c_N\}
-\]
+- persistencia raw del payload SEC;
+- tabla mínima de facts extraídos con contexto suficiente para downstream.
 
-en un repositorio raw de hechos financieros observables, preservando:
+La filosofía del módulo es estricta: esta capa no decide la verdad económica final del dato, ni resuelve conflictos contables profundos, ni impone observabilidad point-in-time final. Lo que sí debe garantizar es que la fuente SEC quede capturada de manera íntegra, trazable y operativamente robusta. En un stack cuantitativo serio, este módulo no “embellece” los fundamentales; preserva su fuente de verdad regulatoria. :contentReference[oaicite:0]{index=0}
 
-\begin{itemize}
-    \item la trazabilidad completa hasta la fuente SEC,
-    \item la separación estricta entre \emph{ingestión raw} y \emph{canonización semántica},
-    \item la reproducibilidad exacta por \texttt{run\_id},
-    \item la robustez ante errores transitorios, cambios de payload y cobertura parcial,
-    \item y la aptitud del dato para su posterior uso en \texttt{parse\_xbrl.py} y \texttt{point\_in\_time.py}.
-\end{itemize}
+2. Papel dentro de la arquitectura
 
-Formalmente, el módulo implementa una aplicación de ingestión
+`fetch_companyfacts.py` ocupa la primera capa material del subsistema EDGAR y se sitúa entre:
 
-\[
-\mathcal{I}_{\mathrm{cf}} : (\mathcal{C}, \mathcal{T}, \theta, r) \longrightarrow (\mathcal{R}, \mathcal{E}, \mathcal{M}),
-\]
+- la resolución previa de identidad regulatoria (`ticker_cik`);
+- y la capa posterior de normalización/canonización (`parse_xbrl.py`) y construcción point-in-time (`point_in_time.py`).
 
-donde:
+La secuencia lógica correcta es:
 
-\begin{itemize}
-    \item \(\mathcal{C}\) es el conjunto de \texttt{CIK} a procesar,
-    \item \(\mathcal{T}\) es el conjunto de taxonomías o filtros permitidos,
-    \item \(\theta\) es la configuración de ingestión (\emph{rate-limit}, concurrencia, \emph{retry policy}, timeouts, persistencia, validaciones),
-    \item \(r\) es el \texttt{run\_id},
-    \item \(\mathcal{R}\) es el repositorio raw persistido,
-    \item \(\mathcal{E}\) es el conjunto de incidencias y fallos,
-    \item \(\mathcal{M}\) es el \emph{manifest} auditable de la corrida.
-\end{itemize}
+1. resolver identidad regulatoria y universo de `CIK`;
+2. descargar payloads oficiales `companyfacts`;
+3. preservar raw + extraer tabla mínima;
+4. canonizar y resolver semántica downstream;
+5. construir vista PIT final.
 
-El principio rector del módulo es:
+Esta separación de responsabilidades es crítica. El módulo no debe:
 
-\begin{quote}
-\emph{La capa de ingestión no decide la verdad económica final del dato; decide únicamente si la fuente regulatoria ha sido capturada de forma completa, reproducible, trazable y apta para las transformaciones posteriores.}
-\end{quote}
+- resolver equivalencias económicas profundas entre tags;
+- imputar valores ausentes;
+- colapsar prematuramente unidades o contextos;
+- decidir observabilidad temporal final;
+- sustituir la lógica de parse o PIT.
 
-\subsection{Posición dentro de la arquitectura EDGAR}
+Su responsabilidad institucional es más estrecha y más importante: capturar fielmente la estructura raw del endpoint SEC y preservarla con disciplina industrial. :contentReference[oaicite:1]{index=1}
 
-Este módulo ocupa la capa de entrada del subsistema EDGAR y se sitúa entre:
+3. Principios de diseño no negociables
 
-\begin{itemize}
-    \item la resolución previa de identidad regulatoria (\texttt{ticker\_cik}),
-    \item y la capa de normalización/canonización de hechos (\texttt{parse\_xbrl}) y construcción \emph{point-in-time} (\texttt{point\_in\_time}).
-\end{itemize}
+La especificación del módulo se rige por los siguientes principios:
 
-En consecuencia, \texttt{fetch\_companyfacts.py} \textbf{no debe mezclar responsabilidades} que pertenecen a etapas posteriores. En particular:
+1. Dual persistence obligatoria:
+   debe persistirse tanto el payload raw como la tabla mínima de facts.
 
-\begin{itemize}
-    \item no resuelve definitivamente conflictos semánticos entre tags similares;
-    \item no realiza imputación económica;
-    \item no determina la observabilidad PIT final;
-    \item no fuerza agregaciones contables complejas;
-    \item no sustituye la lógica de normalización avanzada de unidades/contextos.
-\end{itemize}
+2. Separación estricta de responsabilidades:
+   ingestión raw no es canonización semántica ni resolución PIT.
 
-Su responsabilidad es más estricta y más importante: \textbf{capturar fielmente la estructura raw del endpoint SEC y preservarla con disciplina industrial.}
+3. Idempotencia operativa:
+   reejecuciones bajo mismo alcance lógico no deben introducir duplicación inconsistente.
 
-\subsection{Objetivo técnico exacto}
+4. Trazabilidad completa:
+   todo fact tabular debe poder vincularse al payload, `CIK`, `run_id` y `asof`.
 
-El módulo descarga el endpoint oficial
+5. Deduplicación conservadora:
+   sólo se eliminan duplicados exactos o operacionalmente redundantes bajo clave explícita.
 
-\[
-\texttt{https://data.sec.gov/api/xbrl/companyfacts/CIK\{c:010\}.json}
-\]
+6. Robustez de red:
+   retries, backoff y clasificación de errores deben ser explícitos y auditables.
 
-para cada \(c \in \mathcal{C}\), aplica validaciones mínimas de integridad estructural y persistencia, y transforma la respuesta en dos niveles complementarios:
+7. Versionado completo:
+   la configuración de ingestión y los artefactos generados deben quedar firmados por `run_id`, `asof` y `config_hash`.
 
-\begin{enumerate}
-    \item \textbf{Persistencia raw del payload fuente}, para trazabilidad y reproducibilidad.
-    \item \textbf{Extracción tabular mínima de facts}, sin colapsar todavía la ambigüedad semántica que será resuelta downstream.
-\end{enumerate}
+8. Conservadurismo ante ambigüedad:
+   ante payload dudoso o schema inesperado, el sistema debe registrar y aislar, no “arreglar” silenciosamente.
 
-Este doble nivel es crítico. Un sistema débil conserva solo la tabla final y pierde la capacidad de auditar cambios de schema, errores de parseo o diferencias históricas del payload. Un sistema fuerte preserva tanto la representación fuente como la representación operacional.
+Estos principios convierten al módulo en una puerta de entrada de datos fundamentalmente seria y no en un scraper oportunista. :contentReference[oaicite:2]{index=2}
 
-\subsection{Alcance funcional}
+4. Objetivo técnico exacto
 
-El alcance del módulo incluye:
+Para cada emisor con identificador regulatorio `CIK = c`, el módulo descarga el endpoint oficial:
 
-\begin{itemize}
-    \item ingestión robusta desde la API \texttt{companyfacts} de la SEC;
-    \item validación estructural mínima de payload y campos obligatorios;
-    \item extracción tabular de hechos por taxonomía, tag, unidad y observación temporal;
-    \item persistencia raw y tabular bajo un esquema versionado por \texttt{run\_id} y \texttt{asof};
-    \item registro explícito de fallos, cobertura y métricas operativas;
-    \item soporte para \emph{reruns} idempotentes y reconciliación parcial.
-\end{itemize}
+`https://data.sec.gov/api/xbrl/companyfacts/CIK{c:010}.json`
 
-El alcance \textbf{no} incluye:
+y produce dos representaciones complementarias:
 
-\begin{itemize}
-    \item resolución final de duplicados semánticos entre hechos económicamente equivalentes;
-    \item ranking definitivo entre taxonomías competidoras;
-    \item selección PIT final por \texttt{acceptance\_ts} frente a \texttt{asof};
-    \item transformación del dato raw en features listas para backtest;
-    \item imputación de ausencias o armonización contable cross-issuer.
-\end{itemize}
+1. payload raw completo;
+2. facts tabulares mínimos sin colapso semántico fuerte.
 
-Esta separación evita uno de los errores más costosos en pipelines cuantitativos: contaminar la ingestión con lógica económica ad hoc, haciendo irreproducible el linaje del dato.
+Formalmente, la aplicación de ingestión se representa como:
 
-\subsection{Entradas del módulo}
-
-Las entradas del módulo son:
-
-\begin{itemize}
-    \item \texttt{cik\_list\_path}: ruta al universo de \texttt{CIK} a procesar.
-    \item \texttt{taxonomy\_filter}: subconjunto permitido de taxonomías, por ejemplo \texttt{us-gaap} y/o \texttt{dei}.
-    \item \texttt{config\_path}: configuración externa del proceso de ingestión.
-    \item \texttt{run\_id}: identificador único y auditable de ejecución.
-    \item \texttt{asof}: fecha/hora lógica de la corrida, usada para particionado y versionado.
-\end{itemize}
-
-En notación formal:
-
-\[
-\mathcal{I} = \{\mathcal{C}, \mathcal{T}, \theta_{\mathrm{ingest}}, r, a\},
-\]
+`I_cf : (C, T, theta, r, a) -> (R_raw, F_min, E_fail, M_manifest)`
 
 donde:
 
-\begin{itemize}
-    \item \(\mathcal{C}\) es el universo de CIKs;
-    \item \(\mathcal{T}\) es el subconjunto de taxonomías permitidas;
-    \item \(\theta_{\mathrm{ingest}}\) contiene parámetros de red, persistencia, validación y tolerancias;
-    \item \(r\) es el \texttt{run\_id};
-    \item \(a\) es el timestamp lógico \texttt{asof}.
-\end{itemize}
+- `C` es el conjunto de `CIK` objetivo;
+- `T` es el subconjunto permitido de taxonomías;
+- `theta` es la configuración de ingestión;
+- `r` es el `run_id`;
+- `a` es el `asof`;
+- `R_raw` es el repositorio raw persistido;
+- `F_min` es la tabla mínima de facts;
+- `E_fail` es el conjunto de incidencias y fallos;
+- `M_manifest` es el manifest auditable de la corrida.
 
-\subsection{Contrato de entrada mínimo}
+Este objetivo técnico es más fuerte que “hacer requests y parsear JSON”. Requiere que la salida sea reproducible, versionada, trazable y apta para las transformaciones posteriores. :contentReference[oaicite:3]{index=3}
+
+5. Entradas y contrato mínimo
+
+Entradas requeridas:
+
+- `cik_list_path`
+- `taxonomy_filter`
+- `config_path`
+- `run_id`
+- `asof`
+
+Notación formal:
+
+`I = {C, T, theta_ingest, r, a}`
+
+donde:
+
+- `C` es el universo de `CIK`;
+- `T` es el conjunto de taxonomías permitidas;
+- `theta_ingest` contiene rate limits, concurrencia, timeouts, persistencia, thresholds y política de retry;
+- `r` es el identificador único de corrida;
+- `a` es el timestamp lógico de ejecución.
 
 Antes de iniciar la descarga, el módulo debe verificar:
 
-\begin{itemize}
-    \item que \texttt{cik\_list\_path} existe y es legible;
-    \item que el universo no contiene \texttt{CIK} nulos;
-    \item que los \texttt{CIK} pueden transformarse al formato canónico de 10 dígitos con \emph{zero-padding};
-    \item que \texttt{run\_id} no es vacío y cumple el formato de auditoría definido por el sistema;
-    \item que la configuración de \emph{rate-limit}, concurrencia y \emph{retry} es válida.
-\end{itemize}
+- existencia y legibilidad del universo de `CIK`;
+- ausencia de `CIK` nulos;
+- canonización correcta a formato de 10 dígitos con zero-padding;
+- validez del `run_id`;
+- validez de la configuración de red y persistencia.
 
-Si falla alguno de estos prechecks, la corrida no debe comenzar. Este rechazo temprano es obligatorio porque evita generar artefactos parciales con un linaje roto desde origen.
+Si falla cualquiera de estos prechecks, la corrida no debe comenzar. No se permiten artefactos parciales nacidos de una entrada estructuralmente inválida. :contentReference[oaicite:4]{index=4}
 
-\subsection{Modelo de datos raw y tabular}
+6. Modelo de datos raw y tabular
 
 El módulo trabaja con dos representaciones complementarias.
 
-\subsubsection{1. Payload raw}
+6.1. Payload raw
 
-Para cada \texttt{CIK} \(c\), se preserva el payload fuente \(\omega_c\) tal como lo devuelve la API SEC, junto con metadatos de captura:
+Para cada `CIK` `c`, se preserva el payload fuente junto con metadatos de captura:
 
-\[
-\omega_c = (\texttt{cik}, \texttt{payload}, \texttt{http\_status}, \texttt{fetched\_at}, \texttt{run\_id}, \texttt{asof}).
-\]
+`omega_c = (cik, payload, http_status, fetched_at, run_id, asof)`
 
 Esta capa raw permite:
 
-\begin{itemize}
-    \item reconstrucción exacta de la ingestión;
-    \item auditoría ex post;
-    \item detección de cambios de schema o de cobertura de la API;
-    \item depuración de errores de parseo posteriores.
-\end{itemize}
+- reconstrucción exacta de la ingestión;
+- auditoría ex post;
+- detección de cambios de schema;
+- depuración de parse downstream;
+- reconciliación entre reruns.
 
-\subsubsection{2. Facts tabulares mínimos}
+6.2. Facts tabulares mínimos
 
 Cada hecho extraído se representa como una tupla:
 
-\[
-f = (c, \tau, t, u, e, fd, fy, fp, v, form, acc, frame, r, a),
-\]
+`f = (c, tau, t, u, e, fd, fy, fp, v, form, accn, frame, r, a)`
 
 donde:
 
-\begin{itemize}
-    \item \(c\) es el \texttt{CIK};
-    \item \(\tau\) es la taxonomía;
-    \item \(t\) es el tag XBRL;
-    \item \(u\) es la unidad;
-    \item \(e\) es \texttt{end\_date};
-    \item \(fd\) es \texttt{filed\_date};
-    \item \(fy\) es \texttt{fiscal\_year} si está disponible;
-    \item \(fp\) es \texttt{fiscal\_period} si está disponible;
-    \item \(v \in \mathbb{R} \cup \{\mathrm{NaN}\}\) es el valor;
-    \item \texttt{form} es el tipo de filing si está presente;
-    \item \(acc\) es el \texttt{accession\_number} si está disponible;
-    \item \texttt{frame} es el contexto temporal SEC si existe;
-    \item \(r\) es el \texttt{run\_id};
-    \item \(a\) es el \texttt{asof}.
-\end{itemize}
+- `c` = `CIK`
+- `tau` = taxonomía
+- `t` = tag XBRL
+- `u` = unidad
+- `e` = `end_date`
+- `fd` = `filed_date`
+- `fy` = fiscal year
+- `fp` = fiscal period
+- `v` = valor
+- `form` = tipo de filing
+- `accn` = accession number
+- `frame` = contexto SEC si existe
+- `r` = `run_id`
+- `a` = `asof`
 
-La presencia de \texttt{fy}, \texttt{fp}, \texttt{form} y \texttt{frame} es importante porque reduce pérdida de contexto. Aunque la canonización semántica completa sea posterior, eliminar estos campos en ingestión debilitaría de forma innecesaria el linaje del dato.
+La preservación de `fy`, `fp`, `form`, `frame` y `accn` no es opcionalmente deseable, sino estratégicamente correcta: reduce pérdida de contexto y fortalece la trazabilidad antes de la canonización semántica. :contentReference[oaicite:5]{index=5}
 
-\subsection{Campos mínimos obligatorios}
+7. Campos obligatorios y recomendados
 
-Cada fila tabular debe contener, como mínimo:
+Cada fila tabular válida debe contener, como mínimo:
 
-\[
-(\texttt{cik}, \texttt{taxonomy}, \texttt{tag}, \texttt{unit}, \texttt{end\_date}, \texttt{filed\_date}, \texttt{value}, \texttt{run\_id}, \texttt{asof}).
-\]
+- `cik`
+- `taxonomy`
+- `tag`
+- `unit`
+- `end_date`
+- `filed_date`
+- `value`
+- `run_id`
+- `asof`
 
-Campos recomendados de alta prioridad:
+Campos de alta prioridad que deben preservarse cuando existan:
 
-\[
-(\texttt{accession\_number}, \texttt{form}, \texttt{fy}, \texttt{fp}, \texttt{frame}).
-\]
+- `accession_number`
+- `form`
+- `fy`
+- `fp`
+- `frame`
 
-Si faltan campos obligatorios en un hecho extraído, ese registro no puede pasar a la tabla válida y debe registrarse explícitamente en el artefacto de fallos.
+Si un hecho extraído carece de uno o más campos obligatorios, no puede entrar en la tabla válida. Debe registrarse explícitamente en el artefacto de fallos. La política correcta no es imputar silencio, sino aislar la fila inválida preservando evidencia diagnóstica. :contentReference[oaicite:6]{index=6}
 
-\subsection{Principio de idempotencia y versionado}
+8. Idempotencia y versionado
 
-Una especificación de nivel institucional exige idempotencia operacional. Para ello, el módulo debe satisfacer:
+La especificación exige idempotencia operacional. Dos corridas con el mismo universo, misma configuración lógica, mismo `run_scope` y mismo estado observable de la API deben producir artefactos equivalentes o reconciliables.
 
-\begin{quote}
-\emph{Dos ejecuciones con el mismo universo, misma configuración lógica, mismo estado observable de la API y mismo \texttt{run\_scope} deben producir artefactos equivalentes o detectablemente reconciliables.}
-\end{quote}
+Formalmente, si `Phi` denota la ingestión y `H` el estado observable del endpoint:
 
-Esto implica:
-
-\begin{itemize}
-    \item que la escritura sea determinista;
-    \item que los \emph{reruns} no dupliquen artefactos válidos ya persistidos;
-    \item que la partición por \texttt{asof}/\texttt{run\_id} permita distinguir claramente entre refresco completo y reintento parcial;
-    \item que los \texttt{CIK} ya descargados con éxito puedan omitirse en reintentos salvo modo \texttt{force-refresh}.
-\end{itemize}
-
-Formalmente, si \(\Phi\) representa la ingestión y \(H\) el estado observable del endpoint, se desea:
-
-\[
-\Phi(\mathcal{C}, \theta, r; H) \approx \Phi(\mathcal{C}, \theta, r; H),
-\]
+`Phi(C, theta, r; H) ≈ Phi(C, theta, r; H)`
 
 salvo diferencias explicables por metadatos de captura o por actualización real del origen.
 
-\subsection{Política de red, reintentos y control de carga}
+Esto implica:
 
-El módulo debe operar bajo una política explícita de robustez de red. No basta con “tener retries”; deben definirse precedencias y clases de error.
+- escritura determinista;
+- reruns sin duplicación inválida;
+- separación clara entre `force_refresh` y reintento parcial;
+- particionado consistente por `asof` y `run_id`;
+- posibilidad de omitir CIKs ya descargados con éxito en reintentos, salvo política explícita contraria.
 
-Sea \(q(c)\) la solicitud del \texttt{CIK} \(c\). Cada solicitud puede terminar en uno de los estados:
+La idempotencia aquí no es un lujo de ingeniería; es la condición para que lineage, QC y PIT no colapsen bajo reruns. :contentReference[oaicite:7]{index=7}
 
-\[
-\texttt{success}, \texttt{retryable\_failure}, \texttt{permanent\_failure}, \texttt{schema\_failure}.
-\]
+9. Política de red, concurrencia y reintentos
 
-Se distinguen, como mínimo:
+Cada request `q(c)` para un `CIK = c` debe terminar en uno de los estados:
 
-\begin{itemize}
-    \item \textbf{Errores transitorios}: timeouts, \texttt{429}, \texttt{5xx}.
-    \item \textbf{Errores permanentes}: \texttt{404} consistente, recurso no encontrado, CIK mal formado.
-    \item \textbf{Errores de payload}: respuesta legible pero incompatible con el schema esperado.
-\end{itemize}
+- `success`
+- `retryable_failure`
+- `permanent_failure`
+- `schema_failure`
+
+Clasificación mínima:
+
+- errores transitorios: `429`, `5xx`, timeouts;
+- errores permanentes: `404` consistente, `CIK` inválido, recurso inexistente;
+- errores de payload: respuesta técnicamente legible pero incompatible con el contrato esperado.
 
 La política correcta es:
 
-\begin{enumerate}
-    \item reintentar únicamente errores transitorios;
-    \item no reintentar indefinidamente errores permanentes;
-    \item aislar y registrar separadamente payloads corruptos o inesperados;
-    \item aplicar \emph{backoff} exponencial con \emph{jitter};
-    \item respetar estrictamente el límite operativo de la SEC.
-\end{enumerate}
+1. reintentar sólo errores transitorios;
+2. no reintentar indefinidamente errores permanentes;
+3. aislar payloads corruptos o inesperados como `schema_failure`;
+4. aplicar backoff exponencial con jitter;
+5. respetar estrictamente el límite operativo de la SEC.
 
-Esto evita tanto saturar la fuente como degradar silenciosamente la cobertura.
+Esto evita dos patologías simétricas: saturar la fuente y degradar silenciosamente la cobertura. El módulo debe ser robusto, pero nunca agresivo o opaco con la API de origen. :contentReference[oaicite:8]{index=8}
 
-\subsection{Checks estructurales mínimos sobre el payload}
+10. Checks estructurales mínimos sobre el payload
 
-El módulo no debe asumir que cualquier JSON recibido es válido. Deben aplicarse checks mínimos de integridad estructural antes de tabularizar:
+El módulo no puede asumir que cualquier JSON devuelto por la API sea utilizable. Antes de tabularizar, deben aplicarse checks mínimos de integridad estructural:
 
-\begin{itemize}
-    \item existencia del nodo de entidad y metadatos básicos;
-    \item existencia de taxonomías relevantes;
-    \item estructura esperada de conceptos y unidades;
-    \item posibilidad de iterar observaciones sin pérdida de contexto;
-    \item presencia de campos temporales parseables.
-\end{itemize}
+- existencia de nodo de entidad y metadatos básicos;
+- presencia de taxonomías relevantes o, al menos, estructura taxonómica parseable;
+- estructura esperada de conceptos y unidades;
+- posibilidad de iterar observaciones conservando contexto;
+- parseabilidad de fechas relevantes.
 
-Si el payload es técnicamente JSON pero viola el contrato estructural esperado, el caso debe clasificarse como \texttt{schema\_failure}, no como \texttt{success} parcial.
+Si el payload es JSON pero viola el contrato estructural esperado, debe clasificarse como `schema_failure`, no como éxito parcial. Esta distinción es esencial para downstream QC: una descarga técnicamente completada puede ser, económicamente, una ingestión fallida. :contentReference[oaicite:9]{index=9}
 
-\subsection{Filtrado de taxonomías}
+11. Filtrado de taxonomías
 
-El filtrado de taxonomías debe ser explícito y auditable. Para una taxonomía \(\tau\), la regla general es:
+Sea `T_allowed` el subconjunto de taxonomías permitidas. La regla operativa es:
 
-\[
-\tau \in \mathcal{T}_{\mathrm{allowed}}.
-\]
+`tau in T_allowed`
 
-Sin embargo, el módulo debe preservar en el manifest la información sobre taxonomías presentes y descartadas, ya que esto puede revelar:
+pero el manifest debe registrar también taxonomías presentes y descartadas. Esto permite detectar:
 
-\begin{itemize}
-    \item cambios de estructura del emisor;
-    \item aparición de taxonomías no previstas;
-    \item pérdida de cobertura si el filtro resulta demasiado restrictivo.
-\end{itemize}
+- cambios de estructura del emisor;
+- aparición de taxonomías no previstas;
+- filtros excesivamente restrictivos;
+- deriva de schema implícita del origen.
 
-Una mala práctica sería eliminar silenciosamente taxonomías no esperadas. La práctica correcta es descartar operativamente pero registrar su existencia.
+La práctica correcta no es eliminar silenciosamente taxonomías no esperadas, sino descartarlas operativamente dejando evidencia de su presencia. :contentReference[oaicite:10]{index=10}
 
-\subsection{Unidades, contexto y observaciones múltiples}
+12. Unidades, contexto y observaciones múltiples
 
-Para un mismo tag \(t\), la API puede devolver múltiples unidades \(u\) y múltiples observaciones por unidad. El módulo de ingestión no debe colapsarlas prematuramente, sino preservarlas con el mayor contexto posible.
+Para un mismo tag `t`, el endpoint puede devolver múltiples unidades y múltiples observaciones por unidad. Esta capa no debe colapsarlas prematuramente. Debe preservarse cada combinación relevante `(tag, unit, observation)` con el mayor contexto posible.
 
 Sea:
 
-\[
-\mathcal{U}(t) = \{u_1,\dots,u_m\}
-\]
+`U(t) = {u_1, ..., u_m}`
 
-el conjunto de unidades observadas para el tag \(t\). La salida raw-tabular debe preservar cada combinación \((t,u)\), dejando la resolución semántica fina a \texttt{parse\_xbrl.py}.
+el conjunto de unidades observadas para el tag `t`. La salida tabular debe conservar cada par `(t,u)` y sus observaciones asociadas, dejando la resolución fina de equivalencias o unidades canónicas a `parse_xbrl.py`.
 
-No obstante, sí deben aplicarse checks de plausibilidad mínima:
+Sí deben aplicarse checks mínimos de plausibilidad:
 
-\begin{itemize}
-    \item que la unidad esté presente;
-    \item que el valor sea parseable;
-    \item que las fechas relevantes existan cuando el hecho no sea instantáneo ambiguo;
-    \item que el registro conserve suficiente contexto para ser resuelto downstream.
-\end{itemize}
+- unidad presente;
+- valor parseable;
+- fechas temporales presentes cuando proceda;
+- contexto suficiente para resolución downstream.
 
-\subsection{Regla de deduplicación de primer nivel}
+El error metodológico aquí sería fusionar temprano observaciones que sólo “parecen” equivalentes. En ingestión raw, la regla correcta es preservar. :contentReference[oaicite:11]{index=11}
 
-La deduplicación en ingestión debe ser conservadora. No corresponde aquí decidir equivalencia económica profunda, pero sí eliminar duplicados exactos u operacionalmente redundantes.
+13. Deduplicación conservadora de primer nivel
 
-Se define una clave de deduplicación de primer nivel:
+La deduplicación de ingestión debe ser explícita y conservadora. Se define la clave de deduplicación de primer nivel:
 
-\[
-k = (\texttt{cik}, \texttt{taxonomy}, \texttt{tag}, \texttt{unit}, \texttt{end\_date}, \texttt{filed\_date}, \texttt{value}, \texttt{accession\_number}).
-\]
+`k_dedup = (cik, taxonomy, tag, unit, end_date, filed_date, value, accession_number)`
 
-La política correcta es:
+Política:
 
-\begin{itemize}
-    \item eliminar duplicados exactos de \(k\);
-    \item conservar registros distintos aunque compartan parte de la clave si difieren en contexto relevante;
-    \item no fusionar observaciones solo porque “parecen el mismo hecho”.
-\end{itemize}
+- eliminar duplicados exactos de `k_dedup`;
+- conservar registros distintos aunque compartan gran parte de la clave si difieren en contexto material;
+- no fusionar observaciones sólo porque “parecen el mismo hecho” económicamente.
 
-Este criterio es deliberadamente conservador: es preferible cargar redundancia resoluble downstream que destruir información contextual potencialmente valiosa.
+Esta política es correcta porque downstream aún debe decidir semántica, PIT y arbitraje entre hechos competidores. Ingestión no debe destruir información potencialmente resoluble después. :contentReference[oaicite:12]{index=12}
 
-\subsection{Cobertura y métricas operativas}
+14. Cobertura y métricas operativas
 
-Sea \(\mathcal{C}\) el universo objetivo y \(\mathcal{C}_{\mathrm{ok}}\) el subconjunto descargado y validado correctamente. La cobertura de ingestión se define como:
+Sea `C` el universo objetivo y `C_ok` el subconjunto descargado y validado correctamente. La cobertura de ingestión se define como:
 
-\[
-\rho_{\mathrm{cf}} = \frac{|\mathcal{C}_{\mathrm{ok}}|}{|\mathcal{C}|}.
-\]
+`rho_cf = |C_ok| / |C|`
 
-Se computan además:
+Además se computan:
 
-\[
-\epsilon_{\mathrm{http}} = \frac{|\mathcal{C}_{\mathrm{http\_fail}}|}{|\mathcal{C}|},
-\qquad
-\epsilon_{\mathrm{schema}} = \frac{|\mathcal{C}_{\mathrm{schema\_fail}}|}{|\mathcal{C}|},
-\qquad
-\epsilon_{\mathrm{parse}} = \frac{|\mathcal{C}_{\mathrm{parse\_fail}}|}{|\mathcal{C}|}.
-\]
+`epsilon_http   = |C_http_fail|   / |C|`
+`epsilon_schema = |C_schema_fail| / |C|`
+`epsilon_parse  = |C_parse_fail|  / |C|`
 
-A nivel más granular, también deben emitirse métricas como:
+A nivel más granular, el módulo debe emitir métricas como:
 
-\begin{itemize}
-    \item número de facts extraídos por \texttt{CIK};
-    \item taxonomías observadas por emisor;
-    \item número de tags distintos por emisor;
-    \item distribución de unidades por tag;
-    \item tasa de registros descartados por campo faltante;
-    \item tasa de duplicados exactos eliminados;
-    \item latencia media y percentiles de descarga;
-    \item porcentaje de reintentos consumidos.
-\end{itemize}
+- número de facts por `CIK`;
+- taxonomías observadas por emisor;
+- número de tags distintos por emisor;
+- distribución de unidades por tag;
+- tasa de registros descartados por campo faltante;
+- tasa de duplicados exactos eliminados;
+- latencia media y percentiles de descarga;
+- porcentaje de reintentos consumidos.
 
-Estas métricas son esenciales porque una corrida puede “parecer exitosa” a nivel HTTP y, sin embargo, estar degradada de forma grave en riqueza informativa.
+Una corrida puede ser exitosa a nivel HTTP y aun así estar gravemente degradada en riqueza informativa. Por eso la cobertura operativa no puede reducirse a un único ratio grueso. :contentReference[oaicite:13]{index=13}
 
-\subsection{Artefactos de salida}
+15. Precedencia de errores
 
-El módulo genera, como mínimo, los siguientes artefactos:
+No todos los errores tienen la misma gravedad. La precedencia correcta del módulo es:
 
-\begin{itemize}
-    \item \texttt{data/edgar/raw/companyfacts/date=\{asof\}/run\_id=\{run\_id\}/part-*.parquet}
-    \item \texttt{data/edgar/raw/companyfacts\_payloads/date=\{asof\}/run\_id=\{run\_id\}/part-*.parquet} o repositorio equivalente de payload raw
-    \item \texttt{data/edgar/raw/companyfacts\_failures\_\{run\_id\}.parquet}
-    \item \texttt{data/edgar/raw/companyfacts\_metrics\_\{run\_id\}.parquet}
-    \item \texttt{data/edgar/raw/companyfacts\_manifest\_\{run\_id\}.json}
-\end{itemize}
+`input_failure > systemic_api_failure > coverage_collapse > payload_anomaly > row_level_parse_issue`
 
-El \emph{manifest} debe incluir, como mínimo:
+Interpretación:
 
-\begin{itemize}
-    \item \texttt{run\_id},
-    \item \texttt{asof},
-    \item número total de CIKs objetivo,
-    \item número de CIKs con éxito,
-    \item número de fallos por clase,
-    \item número total de facts extraídos,
-    \item taxonomías permitidas,
-    \item versión lógica/config hash,
-    \item timestamps de inicio y fin,
-    \item paths de artefactos generados.
-\end{itemize}
+- un fallo de entrada o contrato puede invalidar toda la corrida;
+- un fallo sistémico de API no se reduce a una colección de fallos locales;
+- un colapso severo de cobertura puede bloquear producción aunque existan datos parciales;
+- los errores fila a fila son menos graves si la cobertura y trazabilidad agregadas siguen siendo sólidas.
 
-\subsection{Principio de precedencia de errores}
+Esta jerarquía evita decisiones erróneas basadas en medias agregadas que ocultan fallos estructurales. :contentReference[oaicite:14]{index=14}
 
-No todos los errores tienen la misma gravedad. La precedencia correcta debe ser:
+16. Artefactos obligatorios de salida
 
-\[
-\texttt{input/schema failure} \succ \texttt{systemic API failure} \succ \texttt{coverage collapse} \succ \texttt{payload anomaly} \succ \texttt{row-level parse issue}.
-\]
+El módulo debe persistir, como mínimo:
 
-Esto significa:
+- raw tabular de companyfacts
+- payloads raw de companyfacts
+- artefacto de failures
+- artefacto de metrics
+- `companyfacts_manifest_{run_id}.json`
 
-\begin{itemize}
-    \item un error de entrada o de contrato puede invalidar toda la corrida;
-    \item una degradación sistémica de la API no puede tratarse como un conjunto de fallos menores independientes;
-    \item una caída severa de cobertura puede bloquear producción aunque existan datos válidos parciales;
-    \item pequeños errores fila a fila son menos graves si la cobertura y la trazabilidad global siguen siendo robustas.
-\end{itemize}
+El manifest debe contener, como mínimo:
 
-Esta jerarquía impide tomar decisiones equivocadas basadas en promedios agregados que ocultan fallos estructurales.
+- `run_id`
+- `asof`
+- número total de `CIK` objetivo
+- número de `CIK` con éxito
+- número de fallos por clase
+- número total de facts extraídos
+- taxonomías permitidas
+- `config_hash` o versión lógica
+- timestamps de inicio y fin
+- rutas de artefactos generados
 
-\subsection{Flujo de ejecución}
+Un sistema sin manifest completo no es auditable. Y un sistema no auditable en ingestión raw no puede sostener un pipeline EDGAR institucionalmente serio. :contentReference[oaicite:15]{index=15}
 
-El flujo correcto del módulo se descompone en ocho fases:
+17. Flujo de ejecución
 
-\begin{enumerate}
-    \item validación de entradas y configuración;
-    \item carga y canonización de \texttt{CIK};
-    \item planificación de solicitudes y particionado por lotes;
-    \item descarga robusta con control de carga y reintentos;
-    \item validación estructural de payloads;
-    \item extracción tabular mínima y deduplicación conservadora;
-    \item persistencia de raw, tabla válida, fallos y métricas;
-    \item cierre auditable mediante \emph{manifest} y estado final de la corrida.
-\end{enumerate}
+El flujo oficial del módulo consta de ocho fases:
 
-\subsection{CLI y uso operativo}
+1. validación de entradas y configuración;
+2. carga y canonización de `CIK`;
+3. planificación de solicitudes y batching;
+4. descarga robusta con control de carga y retries;
+5. validación estructural de payloads;
+6. extracción tabular mínima y deduplicación conservadora;
+7. persistencia de raw, tabla válida, fallos y métricas;
+8. cierre auditable mediante manifest y estado final de corrida.
 
-La interfaz operativa del módulo es:
+Este flujo debe permanecer estable y versionado. Cambios en la lógica de batching, thresholds o clasificación de fallos deben reflejarse en config y en el manifest. :contentReference[oaicite:16]{index=16}
 
-\begin{verbatim}
-python -m data.edgar.fetch_companyfacts ^
-  --cik-list-path data/edgar/mappings/ticker_cik_current.parquet ^
-  --config-path configs/data/edgar_fetch_companyfacts.yaml ^
-  --run-id fetch_companyfacts_20260305_001 ^
-  --asof 2026-03-05
-\end{verbatim}
+18. CLI y uso operativo
 
-El parámetro \texttt{asof} debe ser explícito o derivarse de forma determinista. No debe quedar implícito en la hora del sistema si el objetivo es reproducibilidad seria.
+La interfaz operativa del módulo debe aceptar, al menos:
 
-\subsection{Reglas downstream}
+- `--cik-list-path`
+- `--config-path`
+- `--run-id`
+- `--asof`
 
-La salida de este módulo se considera \textbf{raw utilizable} únicamente si:
+El parámetro `asof` debe ser explícito o derivarse de forma determinista. No debe depender implícitamente del reloj del sistema si el objetivo es reproducibilidad seria.
 
-\begin{itemize}
-    \item la cobertura supera el umbral mínimo configurado;
-    \item los payloads son estructuralmente válidos en proporción suficiente;
-    \item la trazabilidad por \texttt{run\_id} y \texttt{asof} es completa;
-    \item los artefactos de fallos y manifest han sido persistidos correctamente.
-\end{itemize}
+La semántica correcta del CLI es institucional: una corrida debe poder reproducirse, auditarse y distinguirse claramente de un rerun parcial, un refresh forzado o una ejecución incremental. :contentReference[oaicite:17]{index=17}
 
-Aun cumpliéndose estas condiciones, la salida \textbf{no} debe consumirse directamente para señales cuantitativas finales sin pasar por:
+19. Reglas downstream
 
-\begin{itemize}
-    \item \texttt{parse\_xbrl.py}, para resolver canonización y semántica;
-    \item \texttt{point\_in\_time.py}, para imponer observabilidad temporal estricta.
-\end{itemize}
+La salida de este módulo sólo se considera raw utilizable si:
 
-\subsection{Tests mínimos obligatorios}
+- la cobertura supera el umbral mínimo configurado;
+- los payloads son estructuralmente válidos en proporción suficiente;
+- la trazabilidad por `run_id` y `asof` es completa;
+- los artefactos de failures y manifest han sido persistidos correctamente.
 
-Para cerrar el módulo a nivel de producción, su DoD debe exigir al menos:
+Aun así, la salida no debe consumirse directamente para señales cuantitativas finales sin pasar por:
 
-\begin{itemize}
-    \item test de canonización correcta de \texttt{CIK} a 10 dígitos;
-    \item test de reintento solo para errores transitorios;
-    \item test de no reintento para error permanente;
-    \item test de clasificación correcta de payload estructuralmente inválido;
-    \item test de persistencia idempotente bajo mismo \texttt{run\_id};
-    \item test de deduplicación exacta conservadora;
-    \item test de escritura íntegra de manifest y failures;
-    \item test de particionado correcto por \texttt{asof};
-    \item test de preservación de campos contextuales relevantes;
-    \item test de cobertura agregada correctamente computada.
-\end{itemize}
+- `parse_xbrl.py`
+- `point_in_time.py`
 
-\subsection{Definición de terminado (DoD)}
+Esta cláusula es fundamental: `fetch_companyfacts.py` no produce todavía verdad PIT final ni facts semánticamente canónicos; produce materia prima regulatoria usable. :contentReference[oaicite:18]{index=18}
 
-El módulo se considera terminado solo si:
+20. Tests e invariantes obligatorios
 
-\begin{itemize}
-    \item descarga de forma robusta el universo objetivo de \texttt{CIK};
-    \item persiste tanto payload raw como facts tabulares mínimos;
-    \item registra fallos de forma explícita y auditable;
-    \item produce métricas de cobertura y calidad operativa;
-    \item soporta reejecución idempotente o reconciliable;
-    \item preserva el contexto suficiente para la canonización downstream;
-    \item y expone una interfaz CLI reproducible y estable.
-\end{itemize}
+La implementación debe incluir, como mínimo, tests sobre:
 
-\subsection{Conclusión}
+1. canonización correcta de `CIK` a 10 dígitos;
+2. retry sólo para errores transitorios;
+3. no retry para errores permanentes;
+4. clasificación correcta de payload estructuralmente inválido;
+5. persistencia idempotente bajo mismo `run_id` o comportamiento reconciliable explícito;
+6. deduplicación exacta conservadora;
+7. escritura íntegra de manifest y failures;
+8. particionado correcto por `asof`;
+9. preservación de campos contextuales relevantes;
+10. cobertura agregada correctamente computada.
 
-\texttt{fetch\_companyfacts.py} no es un simple descargador de JSON, sino la puerta de entrada del capital informacional fundamental del sistema. Si esta capa falla, todo el stack posterior ---normalización, PIT, features, modelos y backtests--- queda expuesto a sesgos de cobertura, pérdida de linaje, errores silenciosos y degradación estadística.
+Estos tests no son cosméticos. Definen el contrato institucional del módulo. :contentReference[oaicite:19]{index=19}
 
-Por tanto, este módulo debe diseñarse con el mismo estándar de rigor que cualquier componente crítico de un sistema cuantitativo serio: \textbf{reproducibilidad, idempotencia, trazabilidad, precedencia de errores, separación de responsabilidades y disciplina formal de persistencia}. Su función no es embellecer el dato, sino capturarlo correctamente para que las capas posteriores puedan convertirlo, sin autoengaño metodológico, en información explotable.
+21. Definition of Done
+
+El módulo `fetch_companyfacts.py` se considera terminado únicamente si:
+
+- descarga robustamente el universo objetivo de `CIK`;
+- persiste tanto payload raw como facts tabulares mínimos;
+- registra fallos e incidencias de forma explícita y auditable;
+- produce métricas operativas de cobertura y calidad;
+- soporta reejecución idempotente o reconciliable;
+- preserva contexto suficiente para canonización downstream;
+- expone una interfaz CLI reproducible y estable.
+
+En otras palabras, el módulo no está terminado cuando “baja datos”, sino cuando captura datos regulatorios con suficiente disciplina como para que el resto del stack pueda confiar en ellos sin autoengaño metodológico. :contentReference[oaicite:20]{index=20}
+
+22. MVP vs versión avanzada
+
+MVP correcto:
+
+- validación de entradas y canonización de `CIK`;
+- descarga robusta con retries y backoff;
+- dual persistence raw + tabla mínima;
+- validación estructural de payload;
+- deduplicación conservadora;
+- métricas de cobertura y fallos;
+- manifest auditable;
+- reruns idempotentes o reconciliables.
+
+Versión avanzada justificable:
+
+- detección explícita de schema drift;
+- fingerprinting de payloads;
+- incremental ingestion tipo CDC;
+- clasificación más fina de fallos sistémicos vs locales;
+- content-addressable storage;
+- monitorización de deriva de cobertura por familia de emisores.
+
+No es obligatorio, en esta fase, introducir Hawkes para disponibilidad de API, MDP batching o validación bayesiana de payload como núcleo del módulo oficial. Son extensiones plausibles de research infra, pero sin evidencia empírica suficiente corren el riesgo de añadir complejidad aparente más que robustez efectiva. La prioridad correcta aquí es disciplina de ingestión, no sofisticación estadística ornamental. :contentReference[oaicite:21]{index=21}
+
+23. Interpretación correcta
+
+Este módulo no debe interpretarse como un parser de fundamentales ni como una capa de features, sino como la puerta de entrada raw del capital informacional fundamental del sistema.
+
+Su función correcta es:
+
+- capturar fielmente el endpoint SEC;
+- preservar raw y contexto;
+- mantener cobertura y trazabilidad auditables;
+- aislar fallos sin contaminarlos semánticamente;
+- dejar a downstream la resolución económica y PIT.
+
+Un ingestor que “saca una tabla bonita” pero destruye contexto, pierde lineage o mezcla responsabilidades no sirve. Un ingestor conservador, dual, trazable e idempotente sí sirve, aunque deje más trabajo downstream. En un pipeline cuantitativo serio, eso no es una debilidad: es exactamente el diseño correcto. :contentReference[oaicite:22]{index=22}
+
+24. Conclusión
+
+`data/edgar/fetch_companyfacts.py` debe quedar definido como una pieza institucional de raw ingestion regulatoria, no como un simple descargador HTTP.
+
+La especificación correcta no es “descargar companyfacts y parsearlos un poco”, sino:
+
+- fijar qué entra;
+- fijar cómo se valida;
+- fijar qué se persiste;
+- fijar cómo se deduplica;
+- fijar cómo se clasifican los errores;
+- fijar qué artefactos salen;
+- y fijar qué límites de responsabilidad separan ingestión, canonización y PIT.
+
+Si cumple esta especificación, el módulo deja de ser una utilidad de scraping y pasa a ser una base fiable para todo el stack EDGAR. Si no la cumple, el riesgo no es sólo técnico: es contaminar desde origen la verdad regulatoria sobre la que luego se construyen features, modelos y backtests. :contentReference[oaicite:23]{index=23}

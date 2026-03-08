@@ -1,486 +1,600 @@
-\section{Modulo: \texttt{data/price/adjust\_prices.py}}
+Especificación Cuantitativa: data/price/adjust_prices.py
 
-\subsection{Objetivo, alcance y motivacion economica}
+1. Propósito del módulo
 
-El modulo \texttt{data/price/adjust\_prices.py} transforma series diarias de precios brutos (\textit{raw}) en \textbf{series ajustadas, auditables y point-in-time} para \textit{research}, estimacion de factores, construccion de señales, validacion estadística y backtesting. Su funcion no es “embellecer” la serie, sino imponer una representacion numericamente estable y financieramente correcta del historial de cotizacion cuando existen \textit{corporate actions}.
+El módulo `data/price/adjust_prices.py` implementa la capa formal de ajuste de series históricas OHLCV por corporate actions visibles point-in-time, con el objetivo de producir series ajustadas, auditables y financieramente coherentes para research, construcción de señales, validación estadística y backtesting. Su función no es “suavizar” precios, sino imponer continuidad económica allí donde existen discontinuidades mecánicas generadas por splits, reverse splits, stock dividends y dividendos en efectivo correctamente visibles para la corrida. :contentReference[oaicite:0]{index=0}
 
-El objetivo economico central es preservar la semantica del retorno. En particular, una posicion larga mantenida a traves de un split, reverse split o dividendo en efectivo no debe generar saltos espurios en la serie ajustada que contaminen el calculo de retornos, volatilidades, \textit{drawdowns}, rankings cross-sectional o variables de entrada de modelos. Si el ajuste no se realiza correctamente, el sistema aprende estructura artificial inducida por la microestructura del proveedor de datos y no por el proceso economico subyacente.
+El principio rector del módulo es el siguiente:
 
-El modulo debe, por tanto, satisfacer simultaneamente cuatro propiedades:
+una serie de precios histórica no es cuantitativamente utilizable porque sea cronológicamente completa, sino porque preserva correctamente la semántica del retorno bajo cambios en la estructura del capital y distribuciones al accionista, sin introducir leakage temporal ni arbitraje implícito entre convenciones incompatibles. :contentReference[oaicite:1]{index=1}
 
-\begin{enumerate}
-  \item \textbf{Correccion financiera}: los precios ajustados deben ser coherentes con la mecanica economica de splits y dividendos.
-  \item \textbf{Disciplina PIT}: solo pueden utilizarse eventos corporativos conocidos y vigentes segun el corte temporal de la corrida.
-  \item \textbf{Reproducibilidad}: dos corridas con el mismo \texttt{run\_id}, la misma version de eventos y la misma entrada deben producir exactamente la misma salida.
-  \item \textbf{Auditabilidad}: cada factor diario debe poder reconstruirse a partir de una lista explícita de eventos aplicados, con reglas deterministas de precedencia.
-\end{enumerate}
+Formalmente, el módulo define un operador de ajuste:
 
-Este modulo \textbf{no} debe corregir heurísticamente datos erróneos, inferir eventos corporativos faltantes a partir de saltos de precio, ni mezclar \textit{quality control} con ajuste. Su responsabilidad es exclusivamente transformar precios usando un calendario corporativo validado y versionado. Toda deteccion de anomalias pertenece a \texttt{qc\_prices.py}; toda reingesta o reconciliacion de fuentes pertenece a la capa de ingestión.
+`A_price : (P_raw, E_ca, Θ_adj, r, a) -> (P_adj, F_factors, E_applied, M_manifest)`
 
-\subsection{Principios de diseño}
+donde:
 
-El diseño del modulo se apoya en seis principios obligatorios:
+- `P_raw` es la serie bruta OHLCV;
+- `E_ca` es el conjunto de corporate actions visibles point-in-time;
+- `Θ_adj` es la configuración de modos, prioridades, thresholds e invalid safeguards;
+- `r` es el `run_id`;
+- `a` es el `asof_ts_utc`;
+- `P_adj` es la tabla ajustada;
+- `F_factors` es la tabla de factores acumulados y elementales;
+- `E_applied` es el log de eventos efectivamente aplicados;
+- `M_manifest` es el manifest auditable de la corrida.
 
-\begin{itemize}
-  \item \textbf{Backward adjustment como convención canónica}: se reexpresa la historia pasada en unidades comparables con la escala mas reciente del rango.
-  \item \textbf{Separacion entre ajuste por estructura de capital y ajuste por distribucion}: splits y dividendos deben modelarse mediante factores distintos.
-  \item \textbf{Dualidad economica explícita}: una serie \texttt{split\_only} responde a la pregunta “\textit{share return} sin saltos de capitalización”; una serie \texttt{total\_return\_like} responde a la pregunta “retorno aproximado del accionista reinvirtiendo dividendos”.
-  \item \textbf{Reglas cerradas de precedencia}: si hay múltiples eventos en una misma fecha, el modulo no deja libertad interpretativa al desarrollador.
-  \item \textbf{Contratos de datos estrictos}: entradas, salidas, invariantes y \textit{failure modes} deben estar totalmente especificados.
-  \item \textbf{Versionado fuerte}: el ajuste solo es válido si queda ligado a una instantánea concreta del feed corporativo.
-\end{itemize}
+El módulo constituye, por tanto, la frontera entre “tener precios brutos” y “tener una base de retornos defendible”. Si esta capa falla, el sistema no aprende estructura económica, sino artefactos inducidos por la microestructura del proveedor y por la mecánica de eventos corporativos mal tratados. :contentReference[oaicite:2]{index=2}
 
-\subsection{Modelo matematico formal}
+2. Papel dentro de la arquitectura
 
-Sea \(t \in \{1,\dots,T\}\) una secuencia de sesiones ordenadas crecientemente y sea \(P_t\) el cierre bruto. El ajuste se modela mediante factores multiplicativos acumulados definidos sobre eventos corporativos con fecha ex-date.
+`adjust_prices.py` se sitúa aguas abajo de la capa de ingestión de precios brutos y de la capa de corporate actions PIT, y aguas arriba de:
 
-\subsubsection{Factor de split}
+- construcción de retornos;
+- features de momentum, reversión, volatilidad y microestructura;
+- backtesting y validación;
+- portfolio construction y risk analytics.
 
-Para un evento de split o reverse split con razon \(a:b\) en fecha \(E\), definimos el factor elemental como
+Su responsabilidad no es hacer QC del feed bruto ni reconciliar proveedores a gran escala. Sí debe:
 
-\[
-\phi_{\mathrm{split}}^{(E)} = \frac{b}{a}.
-\]
+- consumir un snapshot PIT de eventos corporativos;
+- imponer una convención única y estable de factores de ajuste;
+- producir series ajustadas con semántica económica explícita;
+- y preservar trazabilidad completa de qué evento afectó a qué fechas y de qué modo.
 
-Esta definicion cubre de forma uniforme tanto splits ordinarios como reverse splits:
+No debe:
 
-\begin{itemize}
-  \item Split \(2{:}1 \Rightarrow \phi_{\mathrm{split}}^{(E)} = \frac{1}{2}\).
-  \item Reverse split \(1{:}10 \Rightarrow \phi_{\mathrm{split}}^{(E)} = 10\).
-\end{itemize}
+- inferir corporate actions faltantes a partir de saltos de precio;
+- truncar heurísticamente eventos inválidos para “salvar” la serie;
+- mezclar quality control upstream con ajuste downstream;
+- ni ocultar conflictos entre modos de ajuste bajo una única columna ambigua.
 
-El factor acumulado backward aplicable en la fecha \(t\) es
+La separación de responsabilidades es esencial: la ingestión obtiene precios y eventos; este módulo los transforma en continuidad económica reproducible. :contentReference[oaicite:3]{index=3}
 
-\[
-S_t = \prod_{E > t} \phi_{\mathrm{split}}^{(E)},
-\]
+3. Principios de diseño no negociables
 
-donde el producto se toma sobre los ex-dates estrictamente posteriores a \(t\) y dentro del conjunto de eventos PIT visibles para la corrida. Con esta convención se impone que en la fecha mas reciente del rango no hay reescalado retrospectivo adicional, esto es, \(S_T = 1\) si no existen eventos posteriores dentro de la ventana efectiva.
+La especificación del módulo se rige por los siguientes principios:
 
-La serie ajustada por split es
+1. Convención backward canónica:
+   la historia pasada se reexpresa en unidades comparables con la escala más reciente del rango procesado.
 
-\[
-P_t^{\mathrm{adj\mbox{-}split}} = P_t \cdot S_t.
-\]
+2. Separación entre estructura de capital y distribución:
+   splits y dividendos se modelan mediante factores distintos y nunca se confunden.
 
-Obsérvese que esta forma es algebraicamente equivalente a dividir por un “factor acumulado inverso” definido bajo otra convención; lo importante no es la notación sino fijar una semántica única y no mezclar ambas. En este modulo, \textbf{la convención oficial} es que el factor backward \(S_t\) ya incorpora el reescalado multiplicativo directo sobre fechas pasadas. Esto elimina ambigüedad en implementación y testing.
+3. Dualidad económica explícita:
+   `split_only` y `total_return_like` son modos distintos con significado distinto.
 
-Para el volumen bruto \(V_t\), la transformación canónica asociada es
+4. Disciplina PIT estricta:
+   sólo se aplican eventos visibles a `asof_ts_utc`.
 
-\[
-V_t^{\mathrm{adj}} = \frac{V_t}{S_t},
-\]
+5. Precedencia cerrada:
+   múltiples eventos el mismo día deben resolverse con una jerarquía fija y auditable.
 
-de modo que split y volumen conserven coherencia dimensional: si el precio histórico se divide por 2, el volumen histórico efectivo debe duplicarse; bajo la convención adoptada aquí, eso queda codificado de manera consistente mediante la división por \(S_t\).
+6. Contrato de datos fuerte:
+   entradas, salidas, factores, invariantes y fallos deben quedar explícitamente definidos.
 
-\subsubsection{Factor de dividendo en efectivo}
+7. Versionado completo:
+   ningún ajuste es válido sin quedar ligado a un snapshot concreto del feed corporativo.
 
-Sea un dividendo en efectivo ordinario de cuantia \(d_E\) con ex-date \(E\). El factor elemental backward se define como
+8. Conservadurismo ante ambigüedad:
+   ante evento no soportado o inválido, el sistema debe registrar y aislar, no “arreglar” silenciosamente.
 
-\[
-\phi_{\mathrm{div}}^{(E)} =
-\begin{cases}
-1 - \dfrac{d_E}{P_{E-1}}, & \text{si } P_{E-1} > d_E > 0, \\
-\texttt{invalid}, & \text{si } d_E \ge P_{E-1}, \\
-1, & \text{si } d_E = 0.
-\end{cases}
-\]
+Estos principios convierten el módulo en una capa de verdad económica operativa y no en una rutina cosmética de preprocesado. :contentReference[oaicite:4]{index=4}
 
-El factor acumulado por dividendos es
+4. Alcance funcional
 
-\[
-D_t = \prod_{E > t} \phi_{\mathrm{div}}^{(E)}.
-\]
+El módulo cubre, como mínimo, las siguientes familias de ajuste:
 
-La serie \texttt{total\_return\_like} se define como
+1. Splits y reverse splits.
+2. Stock dividends o eventos equivalentes en acciones, si el feed los soporta explícitamente.
+3. Dividendos ordinarios en efectivo para una serie `total_return_like`.
+4. Dual output simultáneo:
+   - serie `split_only`
+   - serie `total_return_like`
 
-\[
-P_t^{\mathrm{adj\mbox{-}total}} = P_t \cdot S_t \cdot D_t.
-\]
+Quedan fuera del alcance por defecto:
 
-Esta construccion no pretende replicar exactamente un índice institucional de retorno total con todas sus convenciones de reinversion, impuestos, retenciones, retards operativos o ajustes especiales, pero sí construir una aproximacion estable y consistente al retorno economico del accionista para backtesting diario.
+- spin-offs;
+- return of capital;
+- distribuciones complejas;
+- cambios de ticker sin identidad estable resuelta aguas arriba;
+- inferencia heurística de eventos no presentes en el feed;
+- mezcla silenciosa de eventos especiales con dividendos ordinarios.
 
-\subsubsection{Observacion importante sobre la convención de factores}
+Estos casos deben quedar como `unsupported`, `warn` o `fail` según política, pero no deben ajustarse implícitamente. :contentReference[oaicite:5]{index=5}
 
-Uno de los errores mas frecuentes en sistemas de trading es mezclar convenciones incompatibles: definir \(S_t\) como factor directo en unas funciones, como factor inverso en otras, y terminar con expresiones del tipo \(P_t/S_t\) en una parte del pipeline y \(P_t \cdot S_t\) en otra. En este modulo eso queda prohibido.
+5. Entradas del módulo
 
-\textbf{Convención oficial del repositorio}:
+Entradas mínimas requeridas:
 
-\begin{itemize}
-  \item Los factores acumulados backward \(\texttt{split\_factor\_cum}\) y \(\texttt{dividend\_factor\_cum}\) son \textbf{factores directos de multiplicacion sobre el precio bruto}.
-  \item Toda columna ajustada de precio se obtiene multiplicando por dichos factores.
-  \item Toda columna ajustada de volumen se obtiene dividiendo por el factor de split acumulado.
-\end{itemize}
+- `prices_raw_path`
+- `corporate_actions_path`
+- `run_id`
+- `asof_ts_utc`
+- `adjust_mode`
+- `start_date`
+- `end_date`
 
-Esta decisión debe mantenerse invariable en codigo, tests, documentación y outputs persistidos.
+En notación formal:
 
-\subsection{Modos operativos del modulo}
+`I = {P_raw, E_ca, Θ_adj, r, a}`
 
-El modulo soporta exactamente tres modos, con semántica cerrada:
+donde:
 
-\begin{enumerate}
-  \item \texttt{split\_only}: genera una serie ajustada exclusivamente por splits/reverse splits. Es la salida recomendada cuando se quiere modelar dinamica de precio sin incorporar la componente distributiva.
-  \item \texttt{total\_return\_like}: genera una unica serie ajustada por splits y dividendos ordinarios en efectivo.
-  \item \texttt{dual\_output}: genera simultaneamente las dos familias de series y retornos, permitiendo que capas posteriores elijan la representacion adecuada sin relanzar el pipeline.
-\end{enumerate}
+- `P_raw` contiene precios brutos diarios;
+- `E_ca` contiene eventos corporativos PIT;
+- `Θ_adj` contiene reglas de ajuste;
+- `r` es el `run_id`;
+- `a` es el `asof_ts_utc`.
 
-\textbf{Regla de gobernanza}: el modo por defecto del sistema es \texttt{dual\_output}. Ningun experimento serio de \textit{research} debe depender de que un desarrollador recuerde a posteriori si entrenó con \texttt{split\_only} o \texttt{total\_return\_like}. La ambigüedad aquí genera errores silenciosos extremadamente caros.
+6. Contrato mínimo de entrada
 
-\subsection{Retornos y semantica economica}
+Antes de ajustar ninguna serie, el módulo debe validar:
 
-Dados los cierres diarios, los retornos se calculan como
+- existencia y legibilidad de inputs;
+- unicidad lógica por `(symbol, date)` en precios brutos;
+- orden temporal estricto por símbolo;
+- presencia mínima de:
+  `symbol, date, open, high, low, close, volume`
+  en precios;
+- presencia mínima de:
+  `symbol, ex_date, action_type, effective_ts_utc`
+  y campos específicos del evento en corporate actions;
+- parseabilidad de fechas y timestamps;
+- validez del `adjust_mode`;
+- consistencia de la configuración.
 
-\begin{align}
-r_t^{\mathrm{raw}} &= \frac{P_t}{P_{t-1}} - 1, \\
-r_t^{\mathrm{adj\mbox{-}split}} &= \frac{P_t^{\mathrm{adj\mbox{-}split}}}{P_{t-1}^{\mathrm{adj\mbox{-}split}}} - 1, \\
-r_t^{\mathrm{adj\mbox{-}total}} &= \frac{P_t^{\mathrm{adj\mbox{-}total}}}{P_{t-1}^{\mathrm{adj\mbox{-}total}}} - 1.
-\end{align}
+Si falla este contrato, el módulo no debe construir una serie parcial silenciosa. Debe abortar o degradar formalmente según severidad. Un ajuste sobre datos contractualmente débiles produce errores silenciosos mucho más peligrosos que un fallo explícito. :contentReference[oaicite:6]{index=6}
 
-La serie \(r_t^{\mathrm{adj\mbox{-}split}}\) elimina discontinuidades puramente mecánicas debidas a cambios en el numero de acciones por título. La serie \(r_t^{\mathrm{adj\mbox{-}total}}\) incorpora además el efecto de distribuciones ordinarias de efectivo.
+7. Convención semántica oficial de factores
 
-Debe quedar claro que:
+Éste es el punto más importante de la especificación. El módulo debe fijar una única convención semántica para factores acumulados, idéntica en código, tests, persistencia y documentación.
 
-\begin{itemize}
-  \item \texttt{split\_only} es la referencia natural para muchos modelos de momentum, reversión, microestructura y señales de precio puro.
-  \item \texttt{total\_return\_like} es la referencia correcta para PnL del accionista, benchmark de rentabilidad agregada y comparaciones de \textit{holding return}.
-  \item Nunca se deben mezclar retornos de una convención con umbrales, validaciones o features diseñadas para la otra sin documentarlo explícitamente.
-\end{itemize}
+Convención oficial del repositorio:
 
-\subsection{Entradas del modulo y contrato de datos}
+- `split_factor_cum` y `dividend_factor_cum` son factores backward de multiplicación directa sobre el precio bruto.
+- Toda columna ajustada de precio se obtiene multiplicando por esos factores.
+- Toda columna ajustada de volumen se obtiene dividiendo por el factor acumulado de split.
 
-Las entradas mínimas son dos datasets versionados:
+Esto implica:
 
-\paragraph{1. Precios brutos diarios}
+`P_adj = P_raw * factor_cum`
 
-Deben contener, como minimo:
+y nunca debe coexistir en el sistema una segunda convención de signo o inversión implícita del factor. Queda prohibido mezclar `P/S` en unas funciones y `P*S` en otras. La convención debe ser única y total. :contentReference[oaicite:7]{index=7}
 
-\[
-\texttt{symbol, date, open, high, low, close, volume}
-\]
+8. Factor de split
 
-con clave lógica \((\texttt{symbol}, \texttt{date})\), sesiones únicas, orden temporal estricto por símbolo y tipos numéricos válidos.
+Para un evento de split o reverse split con razón `a:b` en fecha `E`, el factor elemental es:
 
-\paragraph{2. Corporate actions PIT}
+`phi_split^(E) = b / a`
 
-Deben contener, como minimo, columnas equivalentes a:
+Ejemplos:
 
-\[
-\texttt{symbol, ex\_date, action\_type, split\_ratio\_num, split\_ratio\_den, cash\_amount, source, effective\_ts\_utc}
-\]
+- split `2:1`:
+  `phi_split^(E) = 1/2`
+- reverse split `1:10`:
+  `phi_split^(E) = 10`
 
-y una política explícita de versionado que permita reconstruir \textbf{qué se sabía y cuándo se sabía}. No basta con tener el ex-date; es obligatorio saber qué versión del evento estaba disponible al tiempo de la corrida.
+El factor acumulado backward aplicable en fecha `t` es:
 
-\subsection{Reglas PIT y de versionado}
+`S_t = prod_{E > t} phi_split^(E)`
 
-Este punto no es accesorio: es estructural. Un sistema sin PIT fuerte en corporate actions produce \textit{backtests} formalmente contaminados.
+donde el producto recorre los ex-dates posteriores a `t` visibles a la corrida.
 
-El modulo debe implementar las siguientes reglas:
+La serie ajustada por split es:
 
-\begin{enumerate}
-  \item Un evento solo puede aplicarse si su \texttt{effective\_ts\_utc} es menor o igual que el \texttt{as\_of\_ts\_utc} de la corrida.
-  \item Si existen múltiples revisiones del mismo evento, se usa exclusivamente la última revisión visible a \texttt{as\_of\_ts\_utc}.
-  \item El \texttt{manifest} de salida debe incluir identificador de snapshot, hash criptográfico del input corporativo y timestamp de corte.
-  \item Si un proveedor reescribe retroactivamente el histórico, eso no puede sobrescribir silenciosamente corridas previas; debe quedar versionado como nueva instantánea.
-\end{enumerate}
+`P_t^(adj-split) = P_t * S_t`
 
-\textbf{Regla de oro}: ningún ajuste histórico puede depender de información publicada después del instante lógico de simulación.
+y el volumen ajustado es:
 
-\subsection{Orden de precedencia y resolucion de conflictos}
+`V_t^(adj) = V_t / S_t`
 
-Para que la implementación sea determinista, el modulo fija las siguientes reglas obligatorias.
+Esta relación no es opcional: garantiza coherencia dimensional entre precio y volumen cuando cambia el número de acciones por título. :contentReference[oaicite:8]{index=8}
 
-\subsubsection{Múltiples eventos el mismo día}
+9. Factor de dividendo en efectivo
 
-Si en una fecha \(E\) coexisten varios eventos para un mismo símbolo, el orden oficial de aplicación es:
+Para un dividendo ordinario en efectivo de cuantía `d_E` con ex-date `E`, el factor elemental backward se define como:
 
-\begin{enumerate}
-  \item Split / reverse split.
-  \item Stock dividend o evento equivalente en acciones, si la fuente lo normaliza separadamente.
-  \item Cash dividend ordinario.
-  \item Cash dividend extraordinario.
-  \item Resto de eventos no soportados explícitamente.
-\end{enumerate}
+`phi_div^(E) =
+    1 - d_E / P_(E-1)     si P_(E-1) > d_E > 0
+    invalid               si d_E >= P_(E-1)
+    1                     si d_E = 0`
 
-\subsubsection{Eventos duplicados entre proveedores}
+El factor acumulado por dividendos es:
 
-Si el sistema admite múltiples fuentes, el orden de prioridad por defecto debe ser configurable pero fijo, por ejemplo:
+`D_t = prod_{E > t} phi_div^(E)`
 
-\[
-\texttt{primary\_provider} \succ \texttt{secondary\_provider} \succ \texttt{vendor\_fallback}.
-\]
+La serie `total_return_like` queda definida como:
 
-Cuando dos fuentes discrepan materialmente en un mismo evento, el modulo no debe promediar ni “fusionar” heurísticamente. Debe:
+`P_t^(adj-total) = P_t * S_t * D_t`
 
-\begin{enumerate}
-  \item elegir una fuente ganadora según prioridad,
-  \item registrar la discrepancia en un artefacto de reconciliación,
-  \item marcar el símbolo/fecha para revisión si la diferencia supera tolerancia.
-\end{enumerate}
+Esta serie no pretende replicar exactamente un índice institucional de retorno total con todas sus convenciones operativas, pero sí construir una aproximación coherente y estable al retorno del accionista para backtesting diario. :contentReference[oaicite:9]{index=9}
 
-\subsubsection{Eventos no soportados}
+10. Modos operativos
 
-Spin-offs, \textit{return of capital}, distribuciones complejas, cambios de ticker o reestructuraciones que no puedan mapearse inequívocamente a split o dividendo ordinario no deben ajustarse de manera implícita. Deben quedar como:
+El módulo soporta exactamente tres modos:
 
-\[
-\texttt{action\_status = unsupported}
-\]
+1. `split_only`
+2. `total_return_like`
+3. `dual_output`
 
-y escalarse a \texttt{warn} o \texttt{fail} según política de cobertura del universo.
+Semántica:
 
-\subsection{Politica formal para casos especiales}
+- `split_only` responde a la pregunta:
+  “¿cómo habría evolucionado el precio sin discontinuidades mecánicas por estructura de capital?”
+- `total_return_like` responde a la pregunta:
+  “¿cómo habría evolucionado una aproximación al retorno del accionista reinvirtiendo dividendos ordinarios?”
+- `dual_output` genera simultáneamente ambas familias de columnas.
 
-Esta es precisamente una de las zonas donde muchos documentos se quedan “bonitos” pero no ejecutables. Aquí la política debe quedar cerrada.
+Regla de gobernanza:
+el modo por defecto del sistema debe ser `dual_output`. Ningún experimento serio debe depender de que un desarrollador recuerde ex post si entrenó sobre `split_only` o `total_return_like`. La ambigüedad aquí es una fuente clásica de errores silenciosos. :contentReference[oaicite:10]{index=10}
 
-\subsubsection{Dividendos extraordinarios}
+11. Retornos y semántica económica
 
-Los dividendos extraordinarios no deben incorporarse por defecto al factor \texttt{total\_return\_like} salvo que la fuente los etiquete como ordinarios o que una política explícita del sistema los habilite. Por defecto:
+Dados cierres diarios, se definen:
 
-\[
-\texttt{include\_special\_cash\_dividends = false}
-\]
+`r_t^(raw) = P_t / P_(t-1) - 1`
 
-porque en small caps estos eventos pueden mezclar devoluciones de capital, liquidaciones parciales u operaciones no representativas del flujo recurrente del accionista.
+`r_t^(adj-split) = P_t^(adj-split) / P_(t-1)^(adj-split) - 1`
 
-\subsubsection{Caso \(d_E \ge P_{E-1}\)}
+`r_t^(adj-total) = P_t^(adj-total) / P_(t-1)^(adj-total) - 1`
 
-Si un dividendo en efectivo cumple \(d_E \ge P_{E-1}\), el factor no es economicamente interpretable bajo el esquema estándar. La política obligatoria es:
+Interpretación:
 
-\begin{enumerate}
-  \item no aplicar el factor,
-  \item emitir \texttt{fail} o \texttt{warn\_critical} según configuración,
-  \item registrar el evento como \texttt{invalid\_dividend\_factor},
-  \item delegar la revisión a QC/manual review.
-\end{enumerate}
+- `adj-split` elimina discontinuidades puramente mecánicas de capitalización;
+- `adj-total` incorpora además el efecto de distribuciones ordinarias de efectivo.
 
-Queda prohibido truncar silenciosamente el factor a epsilon o inventar una corrección ad hoc.
+Regla institucional:
+nunca deben mezclarse retornos de una convención con thresholds, validaciones o features diseñadas para la otra sin documentación explícita. El módulo debe dejar clara la semántica económica de cada familia de columnas. :contentReference[oaicite:11]{index=11}
 
-\subsubsection{Falta de \(P_{E-1}\)}
+12. Reglas PIT y versionado
 
-Si no existe precio bruto utilizable en la sesión anterior al ex-date por suspensión, falta de cotización o ausencia de datos, la política por defecto es:
+El módulo debe imponer las siguientes reglas:
 
-\begin{enumerate}
-  \item no construir \(\phi_{\mathrm{div}}^{(E)}\),
-  \item etiquetar \texttt{missing\_prev\_close\_for\_dividend},
-  \item no imputar precios,
-  \item propagar flag de auditoría.
-\end{enumerate}
+1. Un evento sólo puede aplicarse si:
+   `effective_ts_utc <= asof_ts_utc`
 
-\subsubsection{Reverse splits extremos}
+2. Si existen múltiples revisiones del mismo evento:
+   se usa exclusivamente la última visible a `asof_ts_utc`.
 
-Los reverse splits con factores grandes son frecuentes en universos de microcaps deterioradas. El modulo debe aceptarlos matemáticamente, pero si
+3. El `manifest` debe incluir:
+   - snapshot corporativo utilizado
+   - hash del input de eventos
+   - `asof_ts_utc`
+   - `run_id`
 
-\[
-\phi_{\mathrm{split}}^{(E)} > \tau_{\mathrm{reverse}},
-\]
+4. Si el proveedor reescribe el histórico:
+   la nueva instantánea no debe sobrescribir silenciosamente corridas previas; debe versionarse como snapshot distinto.
 
-por ejemplo \(\tau_{\mathrm{reverse}} = 20\), debe generar \texttt{warning} reforzado y anotarse en el reporte de eventos extremos.
+Regla de oro:
+ningún ajuste histórico puede depender de información publicada después del instante lógico de simulación. :contentReference[oaicite:12]{index=12}
 
-\subsubsection{Símbolos sin eventos}
+13. Orden de precedencia entre eventos
 
-Si un símbolo no tiene eventos visibles en la ventana PIT, entonces
+Si coexisten múltiples eventos en la misma fecha para un símbolo, el orden oficial de aplicación es:
 
-\[
-S_t = 1, \qquad D_t = 1 \quad \forall t,
-\]
+1. `split`
+2. `stock_div`
+3. `cash_ordinary`
+4. `cash_special`
+5. resto de eventos no soportados
 
-y las columnas ajustadas deben ser algebraicamente equivalentes a las brutas, manteniendo aun así las columnas de factores por homogeneidad del contrato de salida.
+Esta jerarquía es cerrada y obligatoria. El módulo no debe dejar libertad interpretativa al desarrollador sobre el orden operativo. :contentReference[oaicite:13]{index=13}
 
-\subsubsection{Cambios de ticker y continuidad de identidad}
+14. Reconciliación multi-fuente
 
-Un cambio de ticker no implica por sí mismo continuidad económica segura. La entidad económica relevante es el identificador maestro del activo, no el símbolo textual. Si el pipeline de ingestión no dispone de identificador estable de seguridad, \texttt{adjust\_prices.py} no debe suponer continuidad a través de renombres; debe operar sobre la identidad ya resuelta por capas previas.
+Si el sistema admite múltiples proveedores de corporate actions, la prioridad debe ser configurable pero fija. Por ejemplo:
 
-\subsection{Ajuste de OHLC}
+`primary_provider > secondary_provider > vendor_fallback`
 
-La transformación debe aplicarse de forma uniforme a todas las columnas de precio:
+Cuando dos fuentes discrepan materialmente sobre un mismo evento:
 
-\begin{align}
-\texttt{open\_adj\_split}_t  &= \texttt{open\_raw}_t  \cdot S_t, \\
-\texttt{high\_adj\_split}_t  &= \texttt{high\_raw}_t  \cdot S_t, \\
-\texttt{low\_adj\_split}_t   &= \texttt{low\_raw}_t   \cdot S_t, \\
-\texttt{close\_adj\_split}_t &= \texttt{close\_raw}_t \cdot S_t.
-\end{align}
+1. se elige la fuente ganadora según prioridad;
+2. se registra la discrepancia en `adjustment_conflicts`;
+3. si la diferencia supera tolerancia, se emite `warn` o `fail` según política.
 
-En modo \texttt{total\_return\_like}:
+No está permitido promediar o fusionar heurísticamente eventos incompatibles. En corporate actions, la semántica correcta es elección explícita + conflicto auditado. :contentReference[oaicite:14]{index=14}
 
-\begin{align}
-\texttt{open\_adj\_total}_t  &= \texttt{open\_raw}_t  \cdot S_t \cdot D_t, \\
-\texttt{high\_adj\_total}_t  &= \texttt{high\_raw}_t  \cdot S_t \cdot D_t, \\
-\texttt{low\_adj\_total}_t   &= \texttt{low\_raw}_t   \cdot S_t \cdot D_t, \\
-\texttt{close\_adj\_total}_t &= \texttt{close\_raw}_t \cdot S_t \cdot D_t.
-\end{align}
+15. Política formal de edge cases
 
-La aplicación uniforme del factor a OHLC es obligatoria para preservar relaciones intrabarra y evitar incoherencias geométricas en velas históricas.
+15.1. Dividendos extraordinarios
 
-\subsection{Invariantes obligatorios}
+Por defecto:
 
-Tras el ajuste, deben verificarse los siguientes invariantes por símbolo y fecha:
+`include_special_cash_dividends = false`
 
-\begin{enumerate}
-  \item \textbf{Monotonicidad temporal}: fechas estrictamente crecientes y únicas.
-  \item \textbf{Positividad}: \(S_t > 0\), \(D_t > 0\) cuando exista, precios ajustados \(>0\) salvo política explícita de tolerancia para microprecios.
-  \item \textbf{Coherencia OHLC}:
-  \[
-  \texttt{low} \le \min(\texttt{open},\texttt{close}) \le \max(\texttt{open},\texttt{close}) \le \texttt{high}.
-  \]
-  \item \textbf{Coherencia de volumen}: \(V_t^{\mathrm{adj}} \ge 0\).
-  \item \textbf{Determinismo}: mismos inputs y mismo snapshot producen mismos factores.
-\end{enumerate}
+Los dividendos extraordinarios no deben incorporarse automáticamente a `total_return_like` salvo política explícita. En small caps, estos eventos pueden mezclar devoluciones de capital, liquidaciones parciales u operaciones no recurrentes. :contentReference[oaicite:15]{index=15}
 
-Cualquier violación debe quedar clasificada bajo un sistema de severidades, no absorbida silenciosamente.
+15.2. Caso `d_E >= P_(E-1)`
 
-\subsection{Sistema de severidades}
+Si un dividendo cumple:
 
-A diferencia de una documentación blanda, este modulo debe dejar cerrado qué rompe la corrida y qué no. La jerarquía recomendada es:
+`d_E >= P_(E-1)`
 
-\begin{itemize}
-  \item \texttt{FAIL}: corrupción del contrato de datos, duplicados de clave, factor no positivo, imposibilidad de construir factor requerido, conflicto irresoluble de eventos, snapshot PIT ausente.
-  \item \texttt{WARN}: reverse split extremo, dividendo especial excluido, discrepancia menor entre fuentes, símbolo con soporte incompleto de eventos.
-  \item \texttt{INFO}: símbolo sin eventos, columnas opcionales no requeridas en el modo elegido.
-\end{itemize}
+la política obligatoria es:
 
-\textbf{Regla de agregación}: si un símbolo contiene al menos una observación \texttt{FAIL}, la salida para ese símbolo debe excluirse o marcarse explícitamente como no apta para consumo downstream, según configuración del pipeline.
+- no aplicar el factor;
+- registrar `invalid_dividend_factor`;
+- emitir `warn_critical` o `fail`;
+- delegar a QC o revisión manual.
 
-\subsection{Flujo de ejecucion}
+Queda prohibido truncar silenciosamente el factor a epsilon o inventar una corrección ad hoc. :contentReference[oaicite:16]{index=16}
 
-El proceso debe ser totalmente determinista:
+15.3. Falta de `P_(E-1)`
 
-\begin{enumerate}
-  \item Cargar precios brutos y snapshot PIT de corporate actions.
-  \item Validar schema, tipos, claves lógicas y cobertura temporal.
-  \item Resolver identidad de símbolo y ordenar por \((\texttt{symbol}, \texttt{date})\).
-  \item Construir tabla normalizada de eventos por símbolo y ex-date.
-  \item Resolver duplicados y conflictos entre eventos/fuentes según precedencia.
-  \item Construir factores elementales por fecha.
-  \item Construir factores acumulados backward \(S_t\) y, si aplica, \(D_t\).
-  \item Generar columnas ajustadas de OHLC y volumen.
-  \item Calcular retornos por convención.
-  \item Verificar invariantes y clasificar incidencias.
-  \item Persistir dataset ajustado, tabla de factores, registro de eventos aplicados y manifest.
-\end{enumerate}
+Si no existe cierre bruto utilizable en la sesión anterior al ex-date:
 
-\subsection{Contrato de salida}
+- no construir `phi_div^(E)`;
+- registrar `missing_prev_close_for_dividend`;
+- no imputar precio;
+- propagar flag de auditoría.
 
-La salida canónica debe incluir al menos:
+15.4. Reverse splits extremos
 
-\begin{itemize}
-  \item Identidad:
-  \[
-  \texttt{symbol, date, run\_id, adjustment\_mode, as\_of\_ts\_utc}
-  \]
-  \item Precios y volumen brutos:
-  \[
-  \texttt{open\_raw, high\_raw, low\_raw, close\_raw, volume\_raw}
-  \]
-  \item Factores:
-  \[
-  \texttt{split\_factor\_cum, dividend\_factor\_cum}
-  \]
-  \item Precios ajustados:
-  \[
-  \texttt{open\_adj\_split, high\_adj\_split, low\_adj\_split, close\_adj\_split}
-  \]
-  y, si aplica,
-  \[
-  \texttt{open\_adj\_total, high\_adj\_total, low\_adj\_total, close\_adj\_total}
-  \]
-  \item Volumen ajustado:
-  \[
-  \texttt{volume\_adj}
-  \]
-  \item Retornos:
-  \[
-  \texttt{ret\_1d\_raw, ret\_1d\_adj\_split, ret\_1d\_adj\_total}
-  \]
-  \item Metadatos de auditoría:
-  \[
-  \texttt{event\_count\_applied, has\_unsupported\_events, severity\_max}
-  \]
-\end{itemize}
+Si:
 
-Además, deben persistirse los siguientes artefactos auxiliares:
+`phi_split^(E) > tau_reverse`
 
-\begin{itemize}
-  \item \texttt{adjustment\_factors.parquet}
-  \item \texttt{adjustment\_events\_applied.parquet}
-  \item \texttt{adjustment\_conflicts.parquet}
-  \item \texttt{adjustment\_manifest.json}
-\end{itemize}
+por ejemplo `tau_reverse = 20`, el evento puede aceptarse matemáticamente, pero debe generar `warn` reforzado y aparecer en el reporte de eventos extremos.
 
-\subsection{Manifest y reproducibilidad}
+15.5. Símbolos sin eventos
 
-El \texttt{manifest} no es decorativo; es una dependencia lógica del modulo. Debe contener como minimo:
+Si un símbolo no tiene eventos visibles:
 
-\begin{itemize}
-  \item \texttt{run\_id}
-  \item \texttt{code\_version} o hash de commit
-  \item \texttt{input\_prices\_snapshot}
-  \item \texttt{input\_corporate\_actions\_snapshot}
-  \item \texttt{input\_corporate\_actions\_hash}
-  \item \texttt{adjustment\_mode}
-  \item \texttt{as\_of\_ts\_utc}
-  \item \texttt{symbol\_count}
-  \item \texttt{row\_count}
-  \item \texttt{fail\_count, warn\_count}
-\end{itemize}
+`S_t = 1`
+`D_t = 1`
 
-Sin este manifest, la corrida no debe considerarse producción-grade.
+para todo `t`, y la serie ajustada debe ser algebraicamente equivalente a la bruta, manteniendo las columnas de factores por homogeneidad contractual.
 
-\subsection{CLI de referencia}
+15.6. Cambios de ticker
 
-\begin{verbatim}
-python -m data.price.adjust_prices \
-  --prices-raw-path data/price/raw/provider=polygon/freq=1d/date=2026-03-05 \
-  --corporate-actions-path data/universe/corporate_actions/snapshot_2026-03-05.parquet \
-  --start-date 2014-01-01 \
-  --end-date 2026-03-01 \
-  --adjust-mode dual_output \
-  --as-of-ts-utc 2026-03-05T23:59:59Z \
-  --run-id adjust_prices_20260305_001
-\end{verbatim}
+Un cambio de ticker no implica por sí mismo continuidad económica. El módulo no debe asumir continuidad a través de renombres si la identidad estable del activo no ha sido resuelta aguas arriba. :contentReference[oaicite:17]{index=17}
 
-\subsection{Criterios de aceptacion}
+16. Ajuste uniforme de OHLC
 
-La \textit{Definition of Done} del modulo se cumple solo si:
+La transformación debe aplicarse uniformemente a todas las columnas OHLC.
 
-\begin{enumerate}
-  \item el ajuste es reproducible bit a bit bajo mismos inputs y snapshot;
-  \item todos los factores diarios son trazables a eventos explícitos;
-  \item el pipeline rechaza entradas no PIT o contractualmente inválidas;
-  \item los retornos ajustados eliminan discontinuidades mecánicas de corporate actions;
-  \item el modo \texttt{dual\_output} permite distinguir inequívocamente entre \textit{share return} y \textit{total return};
-  \item los conflictos entre fuentes o revisiones quedan registrados, no ocultos;
-  \item la semántica del factor es única y consistente en codigo, persistencia y tests.
-\end{enumerate}
+Modo `split_only`:
 
-\subsection{Suite minima de tests}
+`open_adj_split  = open_raw  * S_t`
+`high_adj_split  = high_raw  * S_t`
+`low_adj_split   = low_raw   * S_t`
+`close_adj_split = close_raw * S_t`
 
-La batería mínima debe incluir, como poco:
+Modo `total_return_like`:
 
-\begin{itemize}
-  \item Split \(2{:}1\) con verificación de OHLC, volumen y continuidad de retornos ajustados.
-  \item Reverse split \(1{:}10\) con verificación de factores acumulados y \texttt{warning} si supera umbral.
-  \item Dividendo ordinario con cálculo exacto de \(\phi_{\mathrm{div}}^{(E)}\).
-  \item Dividendo con \(d_E \ge P_{E-1}\): no aplicación y generación de incidencia.
-  \item Ausencia de \(P_{E-1}\): no imputación y flag correcto.
-  \item Múltiples eventos el mismo día con orden estable de precedencia.
-  \item Evento fuera del rango PIT: no aplicación.
-  \item Revisión tardía de corporate action: cambio entre snapshots y reproducibilidad de cada corrida.
-  \item Símbolo sin eventos: igualdad algebraica entre serie bruta y ajustada.
-  \item Evento no soportado: \texttt{unsupported} registrado sin ajuste silencioso.
-\end{itemize}
+`open_adj_total  = open_raw  * S_t * D_t`
+`high_adj_total  = high_raw  * S_t * D_t`
+`low_adj_total   = low_raw   * S_t * D_t`
+`close_adj_total = close_raw * S_t * D_t`
 
-\subsection{Checklist de implementacion}
+La aplicación uniforme del factor es obligatoria para preservar la geometría intrabarra. Un sistema que ajusta solo el close pero no el resto de OHLC produce velas históricas incoherentes y señales técnicas contaminadas. :contentReference[oaicite:18]{index=18}
 
-\begin{itemize}
-  \item [ ] Fijar una única convención semántica para factores acumulados.
-  \item [ ] Implementar resolución determinista de conflictos y precedencia.
-  \item [ ] Versionar snapshot PIT y persistir manifest completo.
-  \item [ ] Separar explícitamente \texttt{split\_only} de \texttt{total\_return\_like}.
-  \item [ ] Endurecer política para dividendos especiales, casos inválidos y ausencia de \(P_{E-1}\).
-  \item [ ] Persistir artefactos auxiliares de factores, eventos y conflictos.
-  \item [ ] Implementar suite de tests con edge cases reales de small caps.
-\end{itemize}
+17. Invariantes obligatorios
 
-\subsection{Conclusion operativa}
+Tras el ajuste, deben verificarse como mínimo los siguientes invariantes por símbolo y fecha:
 
-\texttt{data/price/adjust\_prices.py} no es una utilidad cosmética; es una \textbf{capa fundacional de verdad economica} dentro del pipeline. Si este modulo es ambiguo, todo el stack downstream ---señales, factores, riesgo, validación, atribución y backtest--- queda contaminado por errores silenciosos. Si, por el contrario, el modulo impone una convención única, PIT, auditabilidad total y políticas cerradas de edge cases, entonces se convierte en una pieza de infraestructura cuantitativa de nivel institucional: suficientemente rigurosa para investigación seria y suficientemente determinista para producción.
+1. Fechas estrictamente crecientes y únicas.
+2. Positividad:
+   `S_t > 0`, `D_t > 0` cuando exista, precios ajustados `> 0` salvo política explícita de tolerancia.
+3. Coherencia OHLC:
+   `low <= min(open, close) <= max(open, close) <= high`
+4. Coherencia de volumen:
+   `volume_adj >= 0`
+5. Determinismo:
+   mismos inputs y mismo snapshot producen mismos factores y misma salida.
+
+Cualquier violación debe quedar clasificada por severidad; nunca absorbida silenciosamente. :contentReference[oaicite:19]{index=19}
+
+18. Sistema de severidades
+
+La jerarquía recomendada es:
+
+`FAIL`
+- corrupción del contrato de datos
+- duplicados de clave
+- factor no positivo
+- imposibilidad de construir factor requerido
+- conflicto irresoluble de eventos
+- snapshot PIT ausente
+
+`WARN`
+- reverse split extremo
+- dividendo especial excluido
+- discrepancia menor entre fuentes
+- soporte incompleto de eventos para el símbolo
+
+`INFO`
+- símbolo sin eventos
+- columnas opcionales ausentes en modo no requerido
+
+Regla de agregación:
+si un símbolo contiene al menos una observación `FAIL`, la salida para ese símbolo debe excluirse o marcarse como no apta para consumo downstream según configuración. :contentReference[oaicite:20]{index=20}
+
+19. Flujo de ejecución
+
+El flujo oficial del módulo debe constar de once etapas:
+
+1. cargar precios brutos y snapshot PIT de corporate actions;
+2. validar schema, tipos, claves y cobertura temporal;
+3. resolver identidad del símbolo ya saneada aguas arriba;
+4. construir tabla normalizada de eventos por símbolo y ex-date;
+5. resolver duplicados y conflictos entre eventos/fuentes;
+6. construir factores elementales;
+7. construir factores acumulados backward `S_t` y `D_t`;
+8. generar columnas ajustadas de OHLC y volumen;
+9. calcular retornos por convención;
+10. verificar invariantes y clasificar incidencias;
+11. persistir dataset ajustado, factores, eventos aplicados, conflictos y manifest.
+
+Este flujo debe permanecer estable y versionado. Cambios en precedencia, thresholds o semántica de factores deben reflejarse en configuración y manifest. :contentReference[oaicite:21]{index=21}
+
+20. Contrato exacto de salida
+
+La salida canónica debe incluir, al menos:
+
+Identidad:
+- `symbol`
+- `date`
+- `run_id`
+- `adjustment_mode`
+- `asof_ts_utc`
+
+Precios y volumen brutos:
+- `open_raw`
+- `high_raw`
+- `low_raw`
+- `close_raw`
+- `volume_raw`
+
+Factores:
+- `split_factor_cum`
+- `dividend_factor_cum`
+
+Precios ajustados:
+- `open_adj_split`
+- `high_adj_split`
+- `low_adj_split`
+- `close_adj_split`
+
+y, si aplica:
+
+- `open_adj_total`
+- `high_adj_total`
+- `low_adj_total`
+- `close_adj_total`
+
+Volumen ajustado:
+- `volume_adj`
+
+Retornos:
+- `ret_1d_raw`
+- `ret_1d_adj_split`
+- `ret_1d_adj_total`
+
+Metadatos de auditoría:
+- `event_count_applied`
+- `has_unsupported_events`
+- `severity_max`
+
+Artefactos auxiliares obligatorios:
+
+- `adjustment_factors.parquet`
+- `adjustment_events_applied.parquet`
+- `adjustment_conflicts.parquet`
+- `adjustment_manifest.json`
+
+Este contrato no es opcional. Sin él, el módulo no ofrece trazabilidad suficiente para un entorno de research-production serio. :contentReference[oaicite:22]{index=22}
+
+21. Manifest y reproducibilidad
+
+El `manifest` debe contener, como mínimo:
+
+- `run_id`
+- `code_version` o hash de commit
+- `input_prices_snapshot`
+- `input_corporate_actions_snapshot`
+- `input_corporate_actions_hash`
+- `adjustment_mode`
+- `asof_ts_utc`
+- `symbol_count`
+- `row_count`
+- `fail_count`
+- `warn_count`
+
+Sin este manifest, la corrida no debe considerarse producción-grade. El ajuste de precios no es reproducible sólo porque el código sea determinista; también debe ser reproducible respecto del snapshot de corporate actions utilizado. :contentReference[oaicite:23]{index=23}
+
+22. Uso downstream
+
+Las series ajustadas deben consumirse con semántica precisa:
+
+- `split_only` para señales de precio puro, momentum, reversión y microestructura donde interesa eliminar saltos mecánicos de capitalización;
+- `total_return_like` para benchmarking de holding return y aproximaciones al retorno del accionista;
+- `dual_output` para entornos de research donde ambas representaciones deban coexistir.
+
+No es aceptable que módulos downstream infieran por su cuenta qué convención se utilizó. El propio contrato de salida debe eliminar esa ambigüedad. :contentReference[oaicite:24]{index=24}
+
+23. Tests e invariantes mínimos
+
+La implementación debe incluir, como mínimo, tests sobre:
+
+1. split `2:1` con verificación de OHLC, volumen y continuidad de retornos;
+2. reverse split `1:10` con verificación de factores acumulados y `warn` si supera umbral;
+3. dividendo ordinario con cálculo exacto de `phi_div^(E)`;
+4. dividendo con `d_E >= P_(E-1)`: no aplicación y incidencia;
+5. ausencia de `P_(E-1)`: no imputación y flag correcto;
+6. múltiples eventos el mismo día con orden estable de precedencia;
+7. evento fuera del rango PIT: no aplicación;
+8. revisión tardía de corporate action: corridas distintas con snapshots distintos pero reproducibles;
+9. símbolo sin eventos: igualdad algebraica entre serie bruta y ajustada;
+10. evento no soportado: registro como `unsupported` sin ajuste silencioso.
+
+Estos tests no son cosméticos. Definen el contrato institucional del módulo. :contentReference[oaicite:25]{index=25}
+
+24. Definition of Done
+
+El módulo `adjust_prices.py` se considera terminado únicamente si:
+
+- el ajuste es reproducible bit a bit bajo mismos inputs y snapshot;
+- todos los factores diarios son trazables a eventos explícitos;
+- el pipeline rechaza entradas no PIT o contractualmente inválidas;
+- los retornos ajustados eliminan discontinuidades mecánicas de corporate actions;
+- el modo `dual_output` distingue inequívocamente entre `share return` y `total return`;
+- los conflictos entre fuentes o revisiones quedan registrados, no ocultos;
+- la semántica del factor es única y consistente en código, persistencia y tests.
+
+En otras palabras, el módulo no está terminado cuando “ajusta precios”, sino cuando impone una convención económica única, PIT-safe, auditable y suficientemente robusta como para sostener research cuantitativo serio sin artefactos mecánicos. :contentReference[oaicite:26]{index=26}
+
+25. MVP vs versión avanzada
+
+MVP correcto:
+
+- convención semántica única para factores acumulados;
+- ajuste backward por splits;
+- `total_return_like` con dividendos ordinarios;
+- dual output;
+- precedencia cerrada entre eventos;
+- invalid safeguards explícitos;
+- manifest completo;
+- artefactos auxiliares de factores, eventos y conflictos;
+- suite mínima de tests con edge cases reales.
+
+Versión avanzada justificable:
+
+- monitorización de leakage IC entre series raw y ajustadas;
+- soporte multi-provider más rico con reconciliación explícita;
+- detección de drift de corporate actions entre snapshots;
+- modelado más fino de special dividends y eventos complejos;
+- métricas agregadas de impacto por símbolo y universo.
+
+No es obligatorio, en esta fase, introducir jump-diffusion, RL de precedencia o DAG causal complejo como núcleo del módulo oficial. Son extensiones plausibles, pero la prioridad correcta aquí es cerrar perfectamente la convención backward, la disciplina PIT, la dualidad económica y el tratamiento explícito de edge cases. :contentReference[oaicite:27]{index=27}
+
+26. Interpretación correcta
+
+`adjust_prices.py` no debe interpretarse como una utilidad cosmética de charting, sino como la capa que preserva la integridad económica de la serie histórica sobre la que se construyen retornos, señales y validaciones.
+
+Su función correcta es:
+
+- eliminar discontinuidades mecánicas de corporate actions;
+- preservar el significado económico de distintos tipos de retorno;
+- impedir leakage temporal en la aplicación de eventos;
+- exponer trazabilidad completa de factores y eventos aplicados;
+- y mantener una convención única y estable en todo el stack.
+
+Un ajustador que “suaviza” series pero mezcla convenciones, aplica eventos no PIT o arregla edge cases silenciosamente no sirve. Un ajustador conservador, dual, auditable y determinista sí sirve, aunque deje sin ajustar algunos eventos dudosos. En precios, el principal error no es perder una corrección marginal; es contaminar todo el research con una semántica de retorno inconsistente. :contentReference[oaicite:28]{index=28}
+
+27. Conclusión
+
+`data/price/adjust_prices.py` debe quedar definido como una pieza institucional de continuidad económica y de integridad de retornos, no como una simple transformación de precios.
+
+La especificación correcta no es “ajustar OHLCV por corporate actions”, sino:
+
+- fijar qué entra;
+- fijar qué eventos se aplican y en qué orden;
+- fijar una convención única de factores;
+- fijar qué significan `split_only` y `total_return_like`;
+- fijar qué edge cases se rechazan y cuáles sólo se avisan;
+- fijar qué artefactos auditables salen;
+- y fijar qué invariantes protegen al research de discontinuidades mecánicas y leakage silencioso.
+
+Si cumple esta especificación, el módulo deja de ser un utilitario técnico y pasa a ser una capa fundacional de verdad económica del stack de precios. Si no la cumple, el riesgo no es sólo técnico: es contaminar retornos, factores, rankings y backtests con errores que rara vez rompen el código, pero casi siempre rompen la validez del resultado. :contentReference[oaicite:29]{index=29}

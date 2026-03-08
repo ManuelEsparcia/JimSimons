@@ -1,531 +1,608 @@
-\section{Módulo: \texttt{features/interactions.py}}
+Especificación Cuantitativa: features/interactions.py
 
-\paragraph{Objetivo general}
-Este módulo construye \textbf{features de interacción} entre familias de señales ya validadas ---precio, liquidez, volatilidad, calidad, valor, tamaño, microestructura, crecimiento y régimen de mercado--- con el objetivo de capturar \textbf{dependencias condicionales, no linealidades de primer orden y efectos de contexto} que no aparecen en las señales base consideradas de forma aislada.
+1. Propósito del módulo
 
-La función del módulo no es “multiplicar features entre sí”, sino imponer una capa disciplinada de \textbf{composición económica supervisada}. En un sistema multifactor de \textit{small caps}, muchas señales dependen de su contexto de implementación: un \textit{momentum} puede comportarse de forma distinta en nombres líquidos frente a ilíquidos; una señal de valor puede tener significado muy diferente en régimen alcista frente a régimen defensivo; una métrica de calidad puede ser más valiosa cuando la volatilidad o el deterioro microestructural son bajos. El propósito del módulo es formalizar estas dependencias \textbf{sin degenerar en expansión combinatoria, \textit{multiple testing}, colinealidad estructural ni overfitting oportunista}.
+El objetivo de interactions.py no es multiplicar features entre sí ni expandir mecánicamente el espacio de búsqueda del modelo. Su función es construir una capa disciplinada de hipótesis económicas de segundo orden: señales que solo existen porque el valor predictivo de una feature depende del contexto definido por otra feature, por una condición de régimen o por una modulación económica explícita.
 
-Por tanto, \texttt{features/interactions.py} debe entenderse como una \textbf{capa de ingeniería de hipótesis económicas de segundo orden}, sujeta a reglas mucho más restrictivas que las features base. La filosofía correcta no es “generar muchas interacciones y dejar que el modelo elija”, sino “permitir solo interacciones escasas, justificadas, PIT-correctas y con contribución incremental demostrable”.
+La pregunta correcta del módulo es:
 
-\subsection{Rol dentro de la arquitectura}
+“¿Podemos introducir interacciones condicionales que capturen contexto económico real sin caer en combinatorial explosion, redundancia estructural, escalas degeneradas, leakage de régimen ni multiple testing descontrolado?”
 
-Este módulo se sitúa aguas abajo de:
-\begin{itemize}
-    \item \texttt{features/build\_features.py},
-    \item \texttt{features/cross\_sectional.py},
-    \item \texttt{features/fundamentals\_core.py},
-    \item \texttt{features/fundamentals\_deltas.py},
-    \item \texttt{features/microstructure.py},
-\end{itemize}
-y aguas arriba de:
-\begin{itemize}
-    \item \texttt{features/feature\_qc.py},
-    \item modelos multifactor,
-    \item validación walk-forward,
-    \item y promoción eventual al catálogo canónico.
-\end{itemize}
+En un stack cuantitativo serio, muchas señales no son universalmente válidas. Momentum no significa lo mismo en nombres líquidos que en nombres ilíquidos. Value puede cambiar de sentido según el régimen agregado. Calidad puede tener utilidad distinta bajo estrés de volatilidad. Pero esa intuición económica solo es valiosa si se implementa con gobernanza fuerte. Por eso este módulo no debe verse como un generador libre de combinaciones, sino como una capa supervisada de composición económica escasa, explícita y auditable.
 
-Su responsabilidad es:
-\begin{enumerate}
-    \item recibir features base ya PIT-correctas y preferentemente ya normalizadas;
-    \item seleccionar un conjunto pequeño y gobernado de pares o tripletas permitidas;
-    \item construir interacciones de tipo producto, ratio, gating o modulación por régimen;
-    \item aplicar filtros de cobertura, estabilidad de escala y redundancia;
-    \item y persistir únicamente aquellas interacciones que satisfacen el contrato metodológico del sistema.
-\end{enumerate}
+Si esta capa falla, el sistema se llena de señales decoradas pero epistemológicamente débiles: productos sin semántica, ratios con denominadores degenerados, gates con leakage temporal y combinaciones redundantes que parecen sofisticación cuando en realidad son ruido.
 
-\paragraph{Principio arquitectónico}
-Las interacciones no deben redefinir la semántica de las features base ni duplicar transformaciones ya existentes en otros módulos. Deben actuar como una capa adicional de composición controlada, no como sustituto de \texttt{cross\_sectional.py}, \texttt{feature\_qc.py} o de la selección económica de señales.
+2. Alcance y no-objetivos
 
-\subsection{Marco teórico y motivación cuantitativa}
+2.1 Alcance
 
-La motivación del módulo se apoya en una observación empírica recurrente: muchas relaciones predictivas son \textbf{condicionales}. El valor económico de una señal no es invariante al contexto. Ejemplos típicos:
-\begin{itemize}
-    \item el \textit{momentum} puede ser más explotable en nombres con menor fricción o mejor calidad de ejecución;
-    \item las señales de calidad pueden perder poder cuando la firma está sometida a estrés extremo de volatilidad o funding;
-    \item la valoración relativa puede requerir una lectura distinta según el régimen agregado del mercado;
-    \item los cambios fundamentales pueden ser más relevantes en small caps de cierto tamaño o con cierta calidad de flujo.
-\end{itemize}
+El módulo:
+- recibe features base ya PIT-correctas y preferentemente ya estandarizadas;
+- define un whitelist explícito de interacciones permitidas;
+- construye interacciones de tipo product, ratio, gating y modulation;
+- impone filtros previos de cobertura conjunta, estado QC y redundancia mínima;
+- exige política explícita de denominador en ratios;
+- exige que cualquier variable de régimen sea PIT-strict;
+- limita por diseño la escasez del bloque mediante n≤max_canonical_interactions;
+- distingue interacciones canónicas de interacciones experimentales;
+- y entrega outputs listos para feature_qc.py, modelado y validación walk-forward.
 
-Sin embargo, convertir esta intuición en un módulo utilizable exige resolver tres riesgos estructurales:
-\begin{enumerate}
-    \item \textbf{multiple testing}: el número de posibles productos entre features crece de forma explosiva;
-    \item \textbf{redundancia}: muchas interacciones replican casi exactamente información ya presente en señales base;
-    \item \textbf{fragilidad}: ratios, gates o modulaciones mal definidas producen explosiones de escala, cobertura pobre o colapsos fuera de muestra.
-\end{enumerate}
+2.2 Fuera de alcance
 
-En consecuencia, el módulo no debe optimizar por amplitud del espacio de búsqueda, sino por \textbf{disciplina de admisión}.
+El módulo no:
+- corrige PIT de las features base;
+- no sustituye a cross_sectional.py ni a feature_qc.py;
+- no debe descubrir interacciones arbitrarias “todo contra todo”;
+- no debe redefinir la semántica de las señales base;
+- no debe servir como motor general de feature synthesis sin control económico;
+- ni debe promocionar automáticamente cualquier interacción que sea matemáticamente computable.
 
-\subsection{Marco formal y notación}
+3. Objeto formal del módulo
 
-Sea \( \mathcal{T} \) el conjunto de fechas de trading y \( \mathcal{S}_t \) el universo elegible PIT en fecha \( t \). Sea además:
-\[
-X_t^{(f)}(s)
-\]
-una feature base ya validada para el símbolo \( s \in \mathcal{S}_t \), perteneciente a una familia \( f \in \mathcal{F} \).
+Sea S_t el universo elegible PIT en la fecha t y sea Z_t^(f)(s) una feature base ya validada y estandarizada para el símbolo s∈S_t.
 
 El módulo define una familia restringida de interacciones:
-\[
-I_t^{(g)}(s) = \Psi_g\Big(X_t^{(f_1)}(s), X_t^{(f_2)}(s), R_t, \theta_g\Big),
-\]
+
+I_t^g(s) = Ψ_g(Z_t^{f1}(s), Z_t^{f2}(s), R_t, θ_g)
+
 donde:
-\begin{itemize}
-    \item \( g \) identifica la interacción;
-    \item \( f_1, f_2 \) son features base permitidas;
-    \item \( R_t \) representa opcionalmente un estado de régimen agregado calculado con información \(\le t\);
-    \item \( \theta_g \) contiene umbrales, clipping, políticas de cobertura y validación.
-\end{itemize}
+- g identifica la interacción;
+- f1 y f2 son features base elegibles;
+- R_t es un estado de régimen o contexto agregado, construido con información ≤ t;
+- θ_g contiene umbrales, políticas de validez, parámetros de clipping y metadatos de admisión.
 
-\paragraph{Restricción básica}
-Toda interacción válida debe satisfacer:
-\[
-I_t^{(g)}(s)
-=
-\Psi_g(\cdot)
-\quad \text{con inputs íntegramente observables en } t,
-\]
-sin introducir ninguna dependencia futura ni reinterpretación ex post del régimen o del universo.
+La restricción central es:
 
-\subsection{Principios de diseño}
+toda interacción válida debe construirse solo con inputs observables en t, con semántica económica explícita y bajo una clase funcional permitida por catálogo.
 
-\paragraph{1. Escasez por defecto}
-El módulo debe construir pocas interacciones y bien justificadas. La ausencia de una interacción es el estado por defecto; la inclusión requiere justificación económica explícita.
+4. Principio central: composición económica supervisada, no expansión combinatoria
 
-\paragraph{2. Admisión condicionada}
-Ninguna interacción puede entrar en la build canónica si no supera antes filtros de:
-\begin{itemize}
-    \item cobertura,
-    \item validez PIT,
-    \item estabilidad numérica,
-    \item y redundancia razonable frente a señales base.
-\end{itemize}
+La regla estructural del módulo es:
 
-\paragraph{3. Semántica económica antes que sofisticación algebraica}
-Un producto o ratio solo se permite si la operación conserva interpretación económica clara. Transformaciones matemáticamente posibles pero económicamente opacas deben quedar fuera del catálogo canónico.
+las interacciones no se descubren por amplitud de búsqueda; se admiten por hipótesis económica gobernada.
 
-\paragraph{4. Gobernanza más dura que para features base}
-Las interacciones son de segundo orden y, por tanto, deben someterse a umbrales más severos de QC, cobertura y promoción.
+Eso implica que:
+- no se permiten productos automáticos entre todas las columnas;
+- no se generan ratios sin política explícita de denominador;
+- no se aceptan gates o modulaciones definidos con información futura;
+- no se promueven interacciones por “suenan bien”;
+- y no se permite que el módulo sustituya criterio económico por algebra arbitraria.
 
-\paragraph{5. Separación entre canónicas y experimentales}
-El módulo debe distinguir explícitamente entre:
-\begin{itemize}
-    \item \textbf{interacciones canónicas}: pocas, robustas, justificadas y utilizables en producción research;
-    \item \textbf{interacciones experimentales}: accesibles bajo bandera explícita y nunca incluidas por defecto en la build oficial.
-\end{itemize}
+La build canónica debe ser pequeña, explícita y justificada. La ausencia de interacción es el estado por defecto; la inclusión requiere evidencia.
 
-\subsection{Catálogo permitido de formas funcionales}
+5. Catálogo funcional permitido
 
 Solo se permiten por defecto cuatro familias de interacción.
 
-\subsubsection{Producto entre señales estandarizadas}
-
-\paragraph{Definición}
-Dadas dos señales ya estandarizadas:
-\[
-Z_t^{(f_1)}(s), \qquad Z_t^{(f_2)}(s),
-\]
-se define:
-\[
-I_t^{(f_1 \times f_2)}(s)
-=
-Z_t^{(f_1)}(s)\cdot Z_t^{(f_2)}(s).
-\]
-
-\paragraph{Interpretación}
-Esta interacción captura el caso en el que una señal gana o pierde potencia en función de la otra. Su uso está especialmente justificado cuando ambas features:
-\begin{itemize}
-    \item ya viven en escala comparable,
-    \item no presentan colinealidad extrema persistente,
-    \item y representan ejes económicos distintos.
-\end{itemize}
-
-\paragraph{Ejemplo canónico}
-\[
-\texttt{int\_mom\_x\_liq}
-=
-Z_t^{(\mathrm{momentum})}(s)\cdot Z_t^{(\mathrm{liquidity})}(s).
-\]
-La interpretación es: \textit{momentum condicionado por calidad de ejecución o liquidez relativa}.
-
-\subsubsection{Ratio estabilizado}
-
-\paragraph{Definición}
-Para dos señales \( Z_t^{(f_1)} \) y \( Z_t^{(f_2)} \), el ratio solo se permite si el denominador satisface una condición explícita de validez:
-\[
-I_t^{(f_1/f_2)}(s)
-=
-\frac{Z_t^{(f_1)}(s)}{D\!\left(Z_t^{(f_2)}(s)\right)},
-\]
-donde \( D(\cdot) \) es una transformación de denominador gobernada por contrato.
-
-\paragraph{Política de denominador}
-No se permite usar:
-\[
-Z_t^{(f_2)}(s)+\epsilon
-\]
-como solución genérica silenciosa. La versión canónica debe exigir una de las siguientes políticas explícitas:
-\begin{itemize}
-    \item \texttt{valid\_if\_abs\_denominator\_gt\_tau},
-    \item \texttt{signed\_safe\_denominator},
-    \item o invalidación si el denominador no conserva interpretación económica.
-\end{itemize}
-
-\paragraph{Ejemplo}
-\[
-\texttt{int\_quality\_x\_vol}
-=
-\frac{Z_t^{(\mathrm{quality})}(s)}{D\!\left(Z_t^{(\mathrm{volatility})}(s)\right)}.
-\]
-Esta interacción solo es canónica si la política de denominador evita explosiones y preserva semántica interpretable.
-
-\subsubsection{Gating por régimen}
-
-\paragraph{Definición}
-Sea \( G_t \in \{0,1\} \) un gate de régimen agregado calculado con información \(\le t\). Entonces:
-\[
-I_t^{(f \times \mathrm{regime})}(s)
-=
-Z_t^{(f)}(s)\cdot G_t.
-\]
-
-\paragraph{Interpretación}
-La señal base solo “se activa” en un subconjunto de regímenes permitidos. Esto no equivale a una interacción cross-sectional pura, sino a una modulación contextual del entorno de mercado.
-
-\paragraph{Ejemplo}
-\[
-\texttt{int\_value\_x\_regime}
-=
-Z_t^{(\mathrm{value})}(s)\cdot \mathbb{I}(R_t \in \mathcal{R}_{\mathrm{active}}).
-\]
-
-\paragraph{Regla obligatoria}
-La variable de régimen debe construirse fuera del módulo o mediante una rutina claramente PIT-safe. No se permite inferir regímenes usando labels futuros ni información posterior al corte.
-
-\subsubsection{Masking o modulación suave}
-
-\paragraph{Definición}
-Sea \( M_t \in [0,1] \) una variable agregada de modulación:
-\[
-I_t^{(f \times M)}(s)
-=
-Z_t^{(f)}(s)\cdot M_t.
-\]
-
-\paragraph{Interpretación}
-A diferencia del gating binario, aquí la activación es continua. Esta forma es útil cuando el contexto no es naturalmente discreto, pero exige mayor control porque puede volverse equivalente a reescalar toda la cross-section por una constante temporal.
-
-\paragraph{Restricción}
-Una modulación puramente temporal que no altere el orden cross-sectional puede aportar poco o nada en ciertos modelos. Por ello, estas interacciones deben tratarse como experimentales salvo justificación muy clara.
-
-\subsection{Interacciones canónicas permitidas}
-
-La build canónica debe partir de un conjunto pequeño y explícito. Como referencia:
-
-\begin{itemize}
-    \item \texttt{int\_mom\_x\_liq}: momentum \(\times\) liquidez.
-    \item \texttt{int\_quality\_x\_vol}: calidad modulada por volatilidad o estrés.
-    \item \texttt{int\_value\_x\_regime}: valor condicionado por régimen agregado.
-    \item \texttt{int\_micro\_x\_turnover}: fricción microestructural \(\times\) rotación de volumen.
-    \item \texttt{int\_growth\_x\_size}: crecimiento/modificación fundamental \(\times\) tamaño relativo.
-\end{itemize}
-
-\paragraph{Regla de catálogo}
-Estas interacciones no deben entenderse como obligatorias, sino como \textbf{candidatas permitidas}. La configuración final debe elegir un subconjunto pequeño. El número máximo de interacciones canónicas activas debe fijarse por configuración:
-\[
-n_{\mathrm{interactions,canonical}} \le \texttt{max\_canonical\_interactions}.
-\]
-
-\subsection{Interacciones prohibidas por defecto}
-
-Para evitar expansión desordenada, quedan prohibidas por defecto:
-
-\begin{itemize}
-    \item productos entre dos features de la misma semántica casi duplicada;
-    \item ratios con denominadores que pueden cruzar cero sin política explícita;
-    \item interacciones de orden superior a dos en la build canónica;
-    \item combinaciones automáticas “todo contra todo”;
-    \item gates definidos con información futura;
-    \item y cualquier interacción cuyo único propósito sea incrementar complejidad sin interpretación económica clara.
-\end{itemize}
-
-\subsection{Política de admisión previa}
-
-Antes de computar una interacción, sus componentes deben superar un filtro de elegibilidad.
-
-\subsubsection{Cobertura mínima}
-
-Sean \( f_1 \) y \( f_2 \) dos features base candidatas. Solo se permite interactuarlas si:
-\[
-\rho_{\mathrm{cov}}^{(f_1)} \ge \tau_{\mathrm{cov,base}},
-\qquad
-\rho_{\mathrm{cov}}^{(f_2)} \ge \tau_{\mathrm{cov,base}},
-\]
-y además la cobertura conjunta esperada satisface:
-\[
-\rho_{\mathrm{cov}}^{(f_1,f_2)}
-\ge
-\tau_{\mathrm{cov,joint}}.
-\]
-
-\subsubsection{Separación económica mínima}
-
-Debe existir una distancia económica o funcional suficiente entre ambas señales. Como regla práctica, no deben combinarse dos columnas que sean:
-\begin{itemize}
-    \item transformaciones casi equivalentes de la misma fuente,
-    \item duplicados semánticos,
-    \item o señales con correlación extrema persistente ya documentada.
-\end{itemize}
-
-\subsubsection{Estado QC de las features base}
-
-Una interacción solo puede entrar en build canónica si ambas señales base están al menos en:
-\[
-\texttt{gate\_status} \in \{\texttt{pass}, \texttt{warn-controlado}\}.
-\]
-No se deben construir interacciones canónicas sobre features base fallidas o en cuarentena.
-
-\subsection{Reglas PIT y seguridad temporal}
-
-\paragraph{Inputs}
-Solo se interactúan features ya PIT-correctas. El módulo no corrige PIT; lo hereda.
-
-\paragraph{Regímenes}
-Si existe una variable de régimen \( R_t \), debe cumplir:
-\[
-R_t = \varphi(\mathcal{I}_{\le t}),
-\]
-donde \( \mathcal{I}_{\le t} \) es información disponible hasta la fecha \( t \).
-
-\paragraph{Ejemplo de régimen permitido}
-Un régimen tipo:
-\[
-\mathrm{regime}_t = \mathbb{I}\big(\mathrm{EMA}_{20}(M_t) > \mathrm{EMA}_{200}(M_t)\big)
-\]
-es admisible si ambas EMAs se construyen exclusivamente con datos históricos hasta \( t \).
-
-\paragraph{Universo}
-La interacción debe calcularse únicamente sobre símbolos elegibles del universo PIT de esa fecha. No se permite usar estadísticas o gates definidos con nombres fuera del universo efectivo si eso altera la semántica de la interacción.
-
-\subsection{Orden canónico de transformación}
-
-El flujo correcto debe ser:
-
-\[
-\text{load base features}
-\rightarrow
-\text{eligibility filters}
-\rightarrow
-\text{interaction computation}
-\rightarrow
-\text{interaction-specific validation}
-\rightarrow
-\text{post-interaction standardization}
-\rightarrow
-\text{persist}
-\]
-
-\paragraph{Nota}
-Las interacciones deben construirse preferentemente sobre señales ya estandarizadas. La estandarización posterior de la interacción sigue siendo recomendable para controlar escala cross-sectional y comparabilidad aguas abajo.
-
-\subsection{Validación específica de interacciones}
-
-\subsubsection{Explosión de escala}
-
-Para una interacción \( I_t^{(g)} \), deben controlarse colas extremas:
-\[
-\max_{s \in \mathcal{S}_t} |I_t^{(g)}(s)| < \tau_{\mathrm{scale,max}}
-\]
-como \textit{soft check}. No obstante, el control real debe usar medidas robustas:
-\[
-\mathrm{MAD}(I_t^{(g)}) ,
-\qquad
-Q_{0.99}\big(|I_t^{(g)}|\big),
-\qquad
-\rho_{\mathrm{out}}^{(g,t)}.
-\]
-
-\paragraph{Regla}
-Los extremos válidos pueden winsorizarse o reestandarizarse; las explosiones causadas por denominadores degenerados deben invalidarse.
-
-\subsubsection{Cobertura}
-
-La cobertura de la interacción:
-\[
-\rho_{\mathrm{cov}}^{(g)}
-\]
-debe superar un umbral más duro que el de ciertas features base, ya que la intersección de missingness tiende a degradar la señal.
-
-\subsubsection{Redundancia incremental}
-
-La interacción debe compararse contra:
-\begin{itemize}
-    \item cada una de sus señales base;
-    \item el conjunto de interacciones ya existentes;
-    \item y el bloque económico al que pretende añadir valor.
-\end{itemize}
-
-\paragraph{Criterio mínimo}
-Debe medirse una dependencia tipo:
-\[
-\rho\big(I^{(g)}, X^{(f_1)}\big),
-\qquad
-\rho\big(I^{(g)}, X^{(f_2)}\big),
-\]
-por fecha y de forma agregada. Si la interacción es casi una réplica monótona de una señal base, debe degradarse o descartarse.
-
-\subsubsection{Persistencia de colinealidad}
-
-Para dos interacciones \( g_i, g_j \):
-\[
-\rho_{ij,t}
-=
-\mathrm{corr}\big(I_t^{(g_i)}, I_t^{(g_j)}\big).
-\]
-La redundancia debe evaluarse por persistencia temporal:
-\[
-\frac{1}{|\mathcal{T}|}
-\sum_t
-\mathbb{I}\big(|\rho_{ij,t}| > \tau_{\rho,\mathrm{int}}\big)
->
-\tau_{\mathrm{persist,int}}.
-\]
-No basta una correlación alta puntual.
-
-\subsubsection{Aporte incremental real}
-
-La promoción a catálogo canónico no debe basarse solo en que la interacción “suena bien”. Debe exigirse evidencia incremental frente a las señales base en validación:
-\begin{itemize}
-    \item mejora de monotonicidad de buckets;
-    \item mejora de IC o rank-IC fuera de muestra;
-    \item estabilidad razonable en subperiodos;
-    \item o mejora marginal en un modelo parsimonioso respecto al baseline sin interacción.
-\end{itemize}
-
-\paragraph{Principio}
-Una interacción puede ser metodológicamente correcta y, aun así, no merecer promoción. El módulo debe permitir su existencia experimental sin convertirla automáticamente en parte del núcleo del sistema.
-
-\subsection{Flujo de procesamiento}
-
-\paragraph{Secuencia de alto nivel}
-\begin{enumerate}
-    \item Cargar features base y universo PIT.
-    \item Cargar configuración de interacciones permitidas.
-    \item Aplicar filtros de admisión a las features candidatas.
-    \item Resolver variables de régimen o modulación si aplica.
-    \item Computar interacciones permitidas.
-    \item Aplicar validaciones específicas de escala, cobertura y redundancia.
-    \item Reestandarizar por fecha las interacciones válidas.
-    \item Persistir dataset, summary y manifest.
-\end{enumerate}
-
-\paragraph{Descomposición funcional sugerida}
-\begin{itemize}
-    \item \texttt{load\_base\_features()}
-    \item \texttt{load\_interaction\_config()}
-    \item \texttt{filter\_eligible\_base\_features()}
-    \item \texttt{resolve\_regime\_signals()}
-    \item \texttt{compute\_product\_interactions()}
-    \item \texttt{compute\_ratio\_interactions()}
-    \item \texttt{compute\_gated\_interactions()}
-    \item \texttt{validate\_interaction\_scale()}
-    \item \texttt{validate\_interaction\_coverage()}
-    \item \texttt{validate\_interaction\_redundancy()}
-    \item \texttt{standardize\_interactions()}
-    \item \texttt{persist\_interactions()}
-    \item \texttt{main()}
-\end{itemize}
-
-\subsection{Salidas y estructura de almacenamiento}
-
-\paragraph{Outputs principales}
-\begin{itemize}
-    \item \texttt{features/interactions/run\_id=<RUN\_ID>/date=\{yyyy-mm-dd\}/part-*.parquet}
-    \item \texttt{features/interactions/run\_id=<RUN\_ID>/_meta/summary.json}
-    \item \texttt{features/interactions/run\_id=<RUN\_ID>/_meta/manifest.json}
-    \item \texttt{features/interactions/run\_id=<RUN\_ID>/_meta/dictionary.json}
-\end{itemize}
-
-\paragraph{Columnas mínimas}
-\begin{itemize}
-    \item \texttt{date}, \texttt{symbol}, \texttt{run\_id}
-    \item interacciones activas según config:
-    \begin{itemize}
-        \item \texttt{int\_mom\_x\_liq}
-        \item \texttt{int\_quality\_x\_vol}
-        \item \texttt{int\_value\_x\_regime}
-        \item \texttt{int\_micro\_x\_turnover}
-        \item \texttt{int\_growth\_x\_size}
-    \end{itemize}
-    \item flags opcionales:
-    \begin{itemize}
-        \item \texttt{interaction\_coverage\_warn}
-        \item \texttt{interaction\_redundancy\_warn}
-        \item \texttt{interaction\_scale\_warn}
-    \end{itemize}
-\end{itemize}
-
-\paragraph{Manifest}
-El manifest debe incluir:
-\begin{itemize}
-    \item \texttt{run\_id}
-    \item \texttt{base\_features\_run\_id}
-    \item \texttt{interactions\_config\_hash}
-    \item \texttt{dictionary\_hash}
-    \item \texttt{lineage\_hash}
-    \item \texttt{n\_interactions\_built}
-    \item \texttt{n\_interactions\_dropped}
-\end{itemize}
-
-\paragraph{Summary recomendado}
-\begin{itemize}
-    \item cobertura por interacción;
-    \item número de invalidaciones por denominador;
-    \item número de redundancias detectadas;
-    \item percentiles de escala post-transformación;
-    \item número de interacciones canónicas vs experimentales.
-\end{itemize}
-
-\subsection{CLI y uso en el pipeline global}
-
-\paragraph{CLI recomendada}
-\begin{verbatim}
-python -m features.interactions ^
-  --base-features-path features/store ^
-  --config-path configs/features/interactions.yaml ^
-  --run-id interactions_20260305_001
-\end{verbatim}
-
-\paragraph{Uso downstream}
-\begin{itemize}
-    \item \texttt{features/build\_features.py} integra solo las interacciones canónicas aprobadas.
-    \item \texttt{feature\_qc.py} aplica gates más estrictos sobre este bloque.
-    \item \texttt{models/*/train\_*.py} puede evaluar la mejora incremental frente a baseline sin interacción.
-    \item \texttt{backtest/run\_walkforward.py} debe tratar estas señales como de mayor riesgo de inestabilidad y exigir validación más severa.
-\end{itemize}
-
-\subsection{Definition of Done}
-
-\paragraph{El módulo se considerará terminado únicamente si:}
-\begin{enumerate}
-    \item solo construye interacciones explícitamente permitidas por catálogo/configuración;
-    \item ninguna interacción viola PIT ni utiliza gates o regímenes con información futura;
-    \item ratios y modulaciones tienen política explícita de estabilidad numérica;
-    \item la cobertura y redundancia se evalúan antes de promoción a catálogo canónico;
-    \item existe separación clara entre interacciones canónicas y experimentales;
-    \item y la promoción requiere evidencia incremental real, no solo plausibilidad económica.
-\end{enumerate}
-
-\subsection{Casos de prueba mínimos}
-
-\begin{itemize}
-    \item Verificación de que una interacción prohibida por catálogo no se construye.
-    \item Invalidación correcta de ratio cuando el denominador no supera el umbral permitido.
-    \item Confirmación de que una variable de régimen solo usa datos \(\le t\).
-    \item Verificación de cobertura conjunta insuficiente y descarte correspondiente.
-    \item Detección de redundancia persistente entre una interacción y su feature base.
-    \item Reestandarización correcta de la interacción tras su construcción.
-    \item Persistencia correcta de metadata, dictionary y manifest.
-\end{itemize}
-
-\paragraph{Síntesis final}
-\texttt{features/interactions.py} no debe verse como un generador libre de combinaciones, sino como el módulo que formaliza un conjunto muy restringido de hipótesis económicas de segundo orden. En un sistema de \textit{small caps}, estas hipótesis pueden añadir valor real porque muchas señales son contextuales; pero precisamente por eso son una fuente natural de sobreajuste, redundancia y complejidad innecesaria. Si el módulo está mal especificado, la “sofisticación” se convierte en ruido decorado. Si está bien blindado, añade una capa selectiva de contexto económico sin romper la disciplina estadística del sistema.
+5.1 Product entre señales estandarizadas
+
+Forma canónica:
+
+I_t^g(s) = Z_t^{f1}(s) × Z_t^{f2}(s)
+
+Interpretación:
+captura dependencia condicional donde el efecto de una señal cambia según la intensidad de otra, preservando escala razonable al trabajar sobre inputs ya estandarizados.
+
+Condiciones mínimas:
+- ambas señales deben estar estandarizadas o en escalas comparables;
+- no deben ser duplicados semánticos;
+- no deben presentar colinealidad extrema persistente;
+- y la interacción debe tener lectura económica clara.
+
+5.2 Ratio con política explícita de denominador
+
+Forma canónica:
+
+I_t^g(s) = Z_t^{f1}(s) / D(Z_t^{f2}(s))
+
+donde D(·) no puede ser un ε-hack silencioso.
+
+Políticas permitidas de denominador:
+- valid_if_abs_denominator_gt_tau;
+- signed_safe_denominator;
+- invalidación explícita si el denominador pierde semántica.
+
+La regla estructural es:
+
+D(denom) debe ser una política explícita; nunca una corrección oportunista ad hoc.
+
+5.3 Gating por régimen
+
+Forma canónica:
+
+I_t^g(s) = Z_t^f(s) × G_t
+
+donde G_t∈{0,1} y debe venir de una variable de régimen PIT-safe.
+
+Interpretación:
+la señal base solo se activa en regímenes donde su hipótesis económica tiene sentido.
+
+5.4 Modulación suave
+
+Forma canónica:
+
+I_t^g(s) = Z_t^f(s) × M_t
+
+donde M_t∈[0,1] o en un rango acotado explícito.
+
+Interpretación:
+la señal no se activa/desactiva en binario, sino que se repondera suavemente según el contexto.
+
+Restricción:
+si M_t es puramente temporal y no altera el orden cross-sectional de forma útil, la interacción debe tratarse como experimental salvo evidencia fuerte.
+
+6. Whitelist canónico de interacciones
+
+El catálogo permitido por defecto debe ser pequeño y explícito. Ejemplos canónicos razonables:
+
+- mom×liq
+- quality×vol
+- value×regime
+- micro×turnover
+- growth×size
+
+Estas interacciones no son obligatorias, sino candidatas permitidas.
+La configuración final debe seleccionar un subconjunto pequeño tal que:
+
+n_canonical_interactions ≤ max_canonical_interactions
+
+La escasez no es una preferencia estética; es un principio de control de fragilidad estadística.
+
+7. Interacciones prohibidas por defecto
+
+Quedan prohibidas, salvo justificación extraordinaria y bandera experimental explícita:
+
+- productos entre dos features de la misma semántica o casi duplicadas;
+- ratios con denominadores que cruzan cero sin política formal;
+- interacciones de orden superior a 2 en el catálogo canónico;
+- combinaciones “all pairs” o “all triples” automáticas;
+- gates definidos con información futura;
+- modulaciones que solo reescalan toda la cross-section sin contenido nuevo;
+- y cualquier interacción cuyo valor principal sea aumentar complejidad sin aportar hipótesis económica verificable.
+
+8. Política de admisión previa
+
+Antes de computar una interacción, el par candidato debe superar filtros de elegibilidad.
+
+8.1 Cobertura conjunta mínima
+
+La interacción solo puede admitirse si:
+
+ρ_cov^{f1,f2} ≥ τ_joint
+
+Esto evita construir señales cuyo missingness conjunto haga inútil la comparación cross-sectional.
+
+8.2 Estado QC de las features base
+
+Ambas features base deben tener:
+
+gate_status ∈ {pass, warn}
+
+Nunca se deben construir interacciones canónicas sobre features fallidas, en cuarentena o metodológicamente ambiguas.
+
+8.3 Separación económica mínima
+
+Las dos señales deben representar ejes económicos suficientemente distintos.
+No deben combinarse:
+- duplicados semánticos;
+- transformaciones casi equivalentes de la misma fuente;
+- o pares con redundancia extrema ya conocida.
+
+8.4 Escasez por configuración
+
+Aunque muchos pares pasen elegibilidad, el módulo debe aplicar scarcity governance:
+
+n ≤ max_canonical_interactions
+
+La decisión final no es “todo lo permitido entra”, sino “solo entra lo mejor dentro de un presupuesto de complejidad”.
+
+9. Régimen y seguridad temporal
+
+Toda variable de régimen o contexto agregado debe cumplir:
+
+R_t = ϕ(I_{≤t})
+
+Es decir, debe construirse solo con información disponible hasta t.
+
+Esto implica:
+- no usar labels futuros;
+- no usar estimadores retrospectivos del régimen;
+- no usar datos posteriores al corte operativo;
+- y no reetiquetar ex post un entorno de mercado.
+
+La regla del módulo es:
+
+R_t debe ser PIT-strict o la interacción queda invalidada.
+
+10. Orden correcto de transformación
+
+El flujo correcto del módulo es:
+
+load base features
+→ eligibility filters
+→ interaction computation
+→ interaction-specific validation
+→ post-interaction standardization
+→ persist
+
+La lógica correcta es:
+primero se comprueba si la interacción merece existir;
+después se construye;
+después se valida;
+y solo al final se estandariza y persiste.
+
+No debe usarse una reestandarización final para ocultar un error estructural de escala o de denominador.
+
+11. Validación específica de interacciones
+
+La secuencia correcta de validación específica debe ser:
+
+1. validar cobertura conjunta;
+2. validar que el par pertenece al whitelist permitido;
+3. validar gate_status de las features base;
+4. validar régimen PIT-safe si aplica;
+5. validar estabilidad de escala o denominador;
+6. construir la interacción;
+7. medir redundancia frente a features base y bloque existente;
+8. exigir evidencia de incremental_IC;
+9. reestandarizar si procede;
+10. y solo entonces persistir.
+
+12. Gobernanza de escala
+
+Las interacciones son especialmente vulnerables a scale explosion.
+El módulo debe controlar:
+- colas extremas;
+- percentiles altos de |I_t^g|;
+- MAD o dispersiones robustas;
+- y frecuencia de outliers.
+
+Regla central:
+- extremos válidos pueden winsorizarse o reestandarizarse;
+- explosiones producidas por denominador degenerado o construcción ilegítima deben invalidarse, no maquillarse.
+
+13. Redundancia e incrementalidad
+
+Una interacción no merece promoción canónica si es casi una réplica monótona de una de sus señales base o de otra interacción ya existente.
+
+Por ello debe medirse:
+- correlación con f1;
+- correlación con f2;
+- correlación con otras interacciones;
+- persistencia temporal de esa redundancia;
+- y contribución incremental real sobre baseline.
+
+La lógica mínima de admisión es:
+
+|ρ(I,g1)| < τ_redundancy
+
+como filtro inicial, pero la gobernanza real debe ir más allá de una sola correlación estática. Debe exigir persistencia razonable de no redundancia y utilidad incremental fuera de muestra.
+
+14. Aporte incremental real
+
+La promoción a bloque canónico no puede descansar solo en plausibilidad económica.
+Debe exigirse evidencia como:
+- mejora incremental en IC o rank-IC fuera de muestra;
+- mejora de monotonicidad de buckets;
+- mejora robusta en subperiodos;
+- o aportación marginal en modelos parsimoniosos respecto al baseline sin interacción.
+
+La regla correcta es:
+
+una interacción puede ser metodológicamente correcta y aun así no merecer promoción.
+
+Este módulo debe permitir existencia experimental sin confundir “existencia válida” con “inclusión canónica”.
+
+15. Experimental vs canónico
+
+El módulo debe distinguir de forma explícita entre:
+
+15.1 Interacciones canónicas
+Pocas, gobernadas, utilizables por defecto en el pipeline oficial.
+
+15.2 Interacciones experimentales
+Permitidas bajo bandera explícita, con umbrales más laxos de exploración, pero nunca activadas por defecto.
+
+Esta separación es esencial para evitar que la capa de research exploratorio contamine la build oficial del sistema.
+
+16. Invariantes del módulo
+
+El módulo debe imponer, al menos, los siguientes invariantes:
+
+- toda interacción pertenece a una clase funcional permitida;
+- no existen interacciones canónicas fuera del whitelist/config;
+- toda feature base usada ha pasado QC mínimo;
+- ρ_cov^{joint} debe superar τ_joint;
+- D(denom) debe estar gobernado por política explícita;
+- cualquier R_t o G_t debe ser PIT-strict;
+- no se permiten productos entre duplicados semánticos;
+- no se permiten órdenes >2 en catálogo canónico;
+- toda interacción persistida debe poder trazarse a sus inputs base y a la configuración de construcción;
+- la promoción canónica requiere evidencia incremental real;
+- y la build debe respetar el presupuesto de escasez configurado.
+
+17. Failure modes frecuentes
+
+El módulo debe capturar explícitamente:
+
+17.1 Combinatorial explosion
+Generar demasiadas interacciones candidatas y colapsar en overfitting.
+
+17.2 Scale explosion
+Productos o ratios que generan colas extremas sin semántica económica útil.
+
+17.3 Denominator degeneracy
+Ratios con denominadores cercanos a cero o con cambio de signo no gobernado.
+
+17.4 Semantic duplication
+Interacción entre señales esencialmente equivalentes.
+
+17.5 Regime leakage
+Variables de gating o modulation construidas con información futura.
+
+17.6 Redundancia persistente
+Interacción casi idéntica a una señal base o a otra interacción ya presente.
+
+17.7 False sophistication
+Interacción matemáticamente vistosa pero sin contenido económico ni utilidad incremental.
+
+17.8 Coverage collapse
+La intersección de missingness vuelve inútil la señal resultante.
+
+18. Flags mínimos recomendados
+
+El output canónico debe incluir flags explícitos como:
+
+- interaction_coverage_warn
+- interaction_redundancy_warn
+- interaction_scale_warn
+- invalid_denominator_flag
+- regime_pit_violation_flag
+- non_whitelisted_interaction_flag
+- excessive_order_flag
+- insufficient_incremental_ic_flag
+
+Estos flags forman parte del contrato interpretativo del módulo y permiten distinguir una interacción simplemente ausente de una interacción rechazada por razones estructurales.
+
+19. Gobernanza PASS / WARN / FAIL
+
+19.1 PASS
+
+El módulo o una interacción recibe PASS si:
+- pertenece al whitelist permitido;
+- usa solo inputs PIT-correctos;
+- supera cobertura conjunta mínima;
+- respeta denominador explícito si es ratio;
+- el régimen es PIT-safe si aplica;
+- la escala es controlable;
+- la redundancia es aceptable;
+- y existe evidencia incremental suficiente para su estado canónico o experimental admitido.
+
+19.2 WARN
+
+Recibe WARN si:
+- la construcción es correcta pero la incrementalidad es modesta;
+- la cobertura es aceptable pero no holgada;
+- la redundancia está controlada pero cerca de umbral;
+- la modulación temporal puede aportar poco;
+- o la interacción es válida para research pero todavía no merece promoción plena.
+
+19.3 FAIL
+
+Recibe FAIL si:
+- no pertenece al catálogo permitido;
+- hay leakage temporal en régimen o gating;
+- el denominador no está gobernado;
+- la cobertura conjunta es insuficiente;
+- la redundancia estructural es extrema;
+- hay explosión de escala por construcción ilegítima;
+- o la interacción no puede auditarse ni justificarse económicamente.
+
+20. Qué ya está muy bien en esta especificación
+
+La especificación base ya acierta en piezas de mucho nivel:
+
+- I_t^g definido sobre inputs estandarizados;
+- whitelist explícito de interacciones económicas razonables;
+- gate de admisión por cobertura conjunta y estado QC;
+- política explícita D(denom) ≠ ε-hack;
+- régimen R_t=ϕ(≤t) PIT-strict;
+- scarcity governance n≤max_canonical_interactions;
+- jerarquía de validación coverage→redundancy→scale→incremental_IC;
+- y separación explícita entre experimental y canónico.
+
+Eso sitúa el módulo claramente en territorio institucional y muy por encima de un simple feature-crossing engine.
+
+21. Qué falta para rozar el 99.5
+
+Si el objetivo es empujarlo hacia nivel “Simons-scale”, faltan sobre todo extensiones de gobernanza avanzada:
+
+21.1 Bayesian admission
+Formalizar algo como:
+
+P(admit^g | f1,f2,IC_incremental,multiple_testing,redundancy)
+
+para no depender solo de reglas deterministas.
+
+21.2 Dynamic interaction selection
+Permitir selección contextual del mejor subconjunto:
+
+g_t^* = argmax_{g∈G} IC(g | regime_t, base_features_t)
+
+sin perder disciplina PIT ni multiplicar el testing.
+
+21.3 Causal attribution
+Modelar la cadena:
+
+interaction_noise → IC_degradation → alpha_loss
+
+para priorizar controles donde más duele el error.
+
+21.4 Marginal contribution optimization
+Cuantificar:
+
+∂IC_total / ∂I^g
+
+como criterio más fino de valor incremental.
+
+21.5 Online monitoring
+Monitorizar en tiempo real:
+- cobertura de cada interacción;
+- redundancia con otras señales;
+- drift de escala;
+- y estabilidad de incrementalidad.
+
+22. Salida del módulo
+
+Formato recomendado:
+
+{
+  "run_id": "...",
+  "gate": "PASS|WARN|FAIL",
+  "coverage": {
+      "joint_coverage": ...,
+      "n_symbols_valid": ...,
+      "n_symbols_invalid": ...
+  },
+  "interactions_built": [...],
+  "interactions_dropped": [...],
+  "quality": {
+      "n_invalid_denominator": ...,
+      "n_redundancy_warn": ...,
+      "n_scale_warn": ...,
+      "n_regime_pit_violation": ...,
+      "n_non_whitelisted": ...
+  },
+  "incremental_value": {
+      "ic_incremental": ...,
+      "bucket_monotonicity_delta": ...,
+      "promotion_status": "canonical|experimental|rejected"
+  },
+  "hard_failures": [...],
+  "soft_flags": [...],
+  "binding_failure": "...",
+  "recommended_action": "...",
+  "notes": [...]
+}
+
+Cada fallo relevante debe indicar:
+- interacción afectada;
+- forma funcional;
+- causa concreta;
+- severidad;
+- fecha/símbolo si aplica;
+- y acción recomendada.
+
+23. Esqueleto de implementación
+
+def build_interactions(base_features_df, config, regime_df=None):
+    eligible_pairs = filter_eligible_base_features(
+        base_features_df,
+        whitelist=config.whitelist,
+        min_joint_coverage=config.tau_joint,
+        allowed_gate_status={"pass", "warn"}
+    )
+
+    regime_state = resolve_regime_signals(
+        regime_df,
+        pit_strict=True,
+        config=config
+    )
+
+    candidate_interactions = compute_whitelisted_interactions(
+        base_features_df,
+        eligible_pairs=eligible_pairs,
+        regime_state=regime_state,
+        denominator_policy=config.denominator_policy,
+        max_order=2
+    )
+
+    scale_report = validate_interaction_scale(candidate_interactions, config)
+    coverage_report = validate_interaction_coverage(candidate_interactions, config)
+    redundancy_report = validate_interaction_redundancy(
+        candidate_interactions,
+        base_features_df,
+        config
+    )
+
+    incremental_report = validate_incremental_ic(
+        candidate_interactions,
+        base_features_df,
+        config
+    )
+
+    admitted = apply_interaction_governance(
+        candidate_interactions,
+        coverage_report,
+        redundancy_report,
+        scale_report,
+        incremental_report,
+        config
+    )
+
+    standardized = standardize_interactions(admitted, config)
+    return persist_interactions(standardized, config)
+
+24. MVP vs versión avanzada
+
+24.1 MVP
+
+- whitelist explícito;
+- product/ratio/gating/modulation bien gobernados;
+- cobertura conjunta mínima;
+- estado QC mínimo de features base;
+- política explícita de denominador;
+- régimen PIT-strict;
+- control de redundancia básico;
+- incremental_IC mínimo;
+- separación canónico vs experimental;
+- y límite de escasez fuerte.
+
+24.2 Versión avanzada
+
+- Bayesian admission scoring;
+- selección dinámica por régimen;
+- causal attribution de ruido de interacción;
+- optimización por contribución marginal;
+- monitorización online de redundancia y cobertura;
+- y testing formal adicional por fragilidad estadística.
+
+25. Interpretación correcta
+
+La lectura correcta de interactions.py es:
+
+“este módulo construye una capa selectiva de conditional alpha, donde una señal solo se combina con otra si existe hipótesis económica explícita, gobernanza fuerte y evidencia incremental suficiente.”
+
+La lectura incorrecta es:
+
+“este módulo genera combinaciones de features para que el modelo encuentre relaciones no lineales.”
+
+No está para “probar cosas a lo loco”.
+Está para formalizar contexto económico sin romper la disciplina estadística del sistema.
+
+26. Referencias orientativas
+
+- literatura sobre interaction effects y supervised feature engineering;
+- trabajos de multiple testing en asset pricing;
+- research sobre nonlinearities contextuales en señales cross-sectional;
+- prácticas de feature governance en research platforms institucionales;
+- y literatura de ML aplicado a selección parsimoniosa de interacciones en finanzas.
+
+27. Conclusión
+
+interactions.py está ya conceptualmente en un nivel altísimo.
+
+La combinación de:
+- whitelist explícito,
+- cobertura conjunta mínima,
+- política formal de denominador,
+- régimen PIT-strict,
+- escasez gobernada,
+- validación coverage→redundancy→scale→incremental_IC,
+- y separación canónico vs experimental
+
+define una especificación claramente institucional para una capa de señales condicionales.
+
+Lo que le falta para rozar el techo absoluto no es una mejor intuición económica —esa ya está muy bien—, sino una capa adicional de admisión probabilística, selección dinámica y monitorización continua del valor incremental.
+
+Como módulo de second-order hypothesis engineering, está muy cerca de excelencia real.

@@ -1,313 +1,359 @@
-% =====================================================
-% Copiar desde aquí para .txt o LaTeX
-% Módulo: simons_core/calendar.py
-% Especificación técnica refinada
-% Nivel objetivo: >95/100 | Quant PhD / implementation-ready
-% =====================================================
+Especificación Cuantitativa: simons_core/calendar.py
 
-\documentclass{article}
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
-\usepackage{lmodern}
-\usepackage{amsmath,amssymb,amsfonts}
-\usepackage{geometry}
-\usepackage{hyperref}
-\usepackage{xcolor}
-\usepackage{listings}
-\usepackage{enumitem}
-\usepackage{booktabs}
-\geometry{margin=1in}
+0. Propósito y papel dentro del stack
 
-\lstset{
-  language=Python,
-  basicstyle=\ttfamily\small,
-  keywordstyle=\color{blue},
-  commentstyle=\color{teal},
-  stringstyle=\color{red},
-  showstringspaces=false,
-  frame=single,
-  breaklines=true
-}
+simons_core/calendar.py define la fuente de verdad temporal del stack para mercados de renta variable estadounidense, en particular NYSE/NASDAQ bajo la convención horaria de America/New_York. Su función no es contener lógica de señal, entrenamiento o ejecución, sino fijar de forma inequívoca qué fechas civiles corresponden a sesiones válidas de mercado, cómo se avanza o retrocede entre ellas, cómo se cuentan distancias en trading days y cómo se alinean timestamps a una sesión canónica.
 
-\title{\textbf{simons\_core/calendar.py}: Especificación de Calendario de Mercado}
-\author{Documento técnico de arquitectura}
-\date{Marzo 2026}
+En un sistema cuantitativo serio, este módulo es infraestructura crítica. Su valor no está en “gestionar fechas”, sino en impedir una familia muy concreta de errores:
+- confundir días naturales con días de mercado;
+- usar reglas distintas de avance temporal entre research, backtest y ejecución;
+- alinear timestamps a sesiones inconsistentes según el componente consumidor;
+- contaminar horizontes de predicción y validación por drift temporal.
 
-\begin{document}
-\maketitle
+La regla institucional debe ser esta:
 
-\section{Propósito del módulo}
+    toda transformación temporal del stack
+    que dependa de sesiones de mercado
+    debe resolverse a través de una única geometría temporal,
+    explícita, determinista y reusable.
 
-El módulo \texttt{simons\_core/calendar.py} proporciona una \emph{fuente de verdad temporal} para el sistema. Su función es traducir fechas de calendario civil a fechas y sesiones de mercado, de forma consistente, reproducible y explícita.
+1. Objetivo formal del módulo
 
-En un stack cuantitativo, este módulo existe para evitar una familia de errores muy concreta:
+Sea un calendario de mercado dado y sea
 
-\begin{itemize}
-    \item confundir días naturales con días de mercado;
-    \item avanzar horizontes temporales con reglas inconsistentes entre submódulos;
-    \item alinear timestamps a sesiones distintas según el componente que consuma los datos;
-    \item introducir drift temporal entre research, backtest, validación y ejecución.
-\end{itemize}
+    S = {s_1 < s_2 < ... < s_n}
 
-El objetivo del módulo no es ``optimizar rentabilidad'', sino garantizar integridad temporal. En sistemas de trading, la capa de calendario es infraestructura: si falla, todo lo demás queda contaminado.
+el conjunto ordenado de sesiones válidas del mercado dentro de un horizonte temporal. El módulo implementa operaciones sobre S, no sobre el calendario civil bruto.
 
-\section{Responsabilidad exacta}
+La semántica central del módulo consiste en definir aplicaciones del tipo:
 
-\texttt{calendar.py} debe resolver cinco problemas y solo esos cinco:
+    Φ : CivilDate × Market -> TradingSession
 
-\begin{enumerate}[label=\arabic*.]
-    \item Definir qué días son sesiones válidas para un mercado dado.
-    \item Avanzar o retroceder en días de trading.
-    \item Contar distancias en trading days entre dos fechas.
-    \item Alinear fechas o timestamps a una sesión válida.
-    \item Exponer estas reglas mediante una API pequeña, estable y verificable.
-\end{enumerate}
+y transformaciones derivadas como:
 
-No debe contener lógica de features, labels, entrenamiento, señales ni ejecución. Tampoco debe inferir reglas temporales implícitas fuera de su contrato.
+    next(d, n)
+    prev(d, n)
+    between(d1, d2, inclusive)
+    align(ts, mode)
 
-\section{Modelo conceptual}
+donde:
+- d, d1, d2 son fechas civiles o timestamps normalizados;
+- n es un desplazamiento entero positivo;
+- mode fija la regla exacta de alineación;
+- inclusive fija la semántica de intervalo.
 
-Sea \( \mathcal{C} \) un calendario de mercado y sea
+La propiedad operativa clave del módulo es:
 
-\[
-\mathcal{S} = \{ s_1, s_2, \dots, s_n \}
-\]
+    mismas entradas lógicas, mismo calendario y misma convención
+    deben producir siempre la misma sesión resultado.
 
-el conjunto ordenado de sesiones válidas del mercado dentro de un horizonte temporal. Cada \( s_i \) representa una sesión de trading, no un día natural arbitrario.
+2. Principios no negociables
 
-La función central del módulo es operar siempre sobre \( \mathcal{S} \), no sobre el calendario gregoriano bruto.
+P1. Temporal single source of truth.
+Toda lógica de trading day debe anclarse a este módulo, no a offsets civiles improvisados.
 
-En particular, si \( d \) es una fecha civil, las transformaciones relevantes son:
+P2. Timezone canónica.
+La geometría temporal base para US equities debe ser America/New_York.
 
-\[
-d \mapsto s(d)
-\]
+P3. Sesión ≠ día natural.
+El módulo opera sobre sesiones válidas, no sobre business days genéricos.
 
-donde \( s(d) \) puede significar:
+P4. Semántica explícita de inclusividad.
+between() y funciones afines deben documentar exactamente qué extremos cuentan.
 
-\begin{itemize}
-    \item la siguiente sesión válida;
-    \item la sesión previa válida;
-    \item la sesión que contiene un timestamp;
-    \item la sesión más cercana bajo una regla explícita de alineación.
-\end{itemize}
+P5. Normalización explícita.
+str, date, datetime naive y tz-aware deben pasar por rutas de normalización cerradas.
 
-\section{Mercado y zona horaria}
+P6. Determinismo.
+No puede depender de timezone local del proceso, locale del sistema o heurísticas implícitas.
 
-Para el caso base del repositorio, el calendario debe tratar \textbf{US equities} bajo la zona horaria:
+P7. Fail-closed.
+Entradas inválidas, rangos fuera de cobertura o convenciones no soportadas deben fallar explícitamente.
 
-\[
-\texttt{America/New\_York}
-\]
+3. Ámbito y no-objetivos
 
-Esta decisión no es cosmética. Toda operación temporal del módulo debe ser coherente con la convención horaria del mercado, no con la timezone local del servidor ni con UTC sin contextualización.
+El módulo cubre:
 
-El módulo debe distinguir claramente entre:
+- carga de calendario de mercado;
+- representación interna de sesiones válidas;
+- next_trading_day;
+- prev_trading_day;
+- trading_days_between;
+- align_to_session;
+- normalización de fechas y timestamps;
+- soporte para sesiones regulares y, idealmente, sesiones especiales.
 
-\begin{itemize}
-    \item \textbf{fecha de trading}: etiqueta de sesión;
-    \item \textbf{timestamp timezone-aware}: instante temporal concreto;
-    \item \textbf{fecha naive}: entrada civil que requiere normalización.
-\end{itemize}
+Queda fuera de alcance:
 
-\section{API pública esperada}
+- generación de señales;
+- construcción de features;
+- labelled data;
+- ejecución;
+- scheduling general de tareas;
+- time arithmetic arbitraria fuera del contexto de mercado.
 
-Una API pública mínima y suficiente para \texttt{calendar.py} es la siguiente:
+4. Modelo conceptual
 
-\begin{lstlisting}
+La estructura conceptual base es:
+
+    S = {s_1, s_2, ..., s_n}
+
+con:
+- orden total estricto;
+- unicidad de sesiones;
+- timezone consistente;
+- cobertura explícita en un rango temporal finito o extensible.
+
+Cada s_i representa una sesión de trading, no un instante cualquiera. Según el grado de detalle del calendario, una sesión puede además llevar metadatos de tipo, por ejemplo:
+- regular
+- early_close
+- half_day
+- special
+
+Este enriquecimiento no es ornamental: evita perder información crítica como el hecho de que Thanksgiving Friday en NYSE sí es trading day, pero no una sesión regular completa.
+
+5. API pública recomendada
+
+La API pública mínima y suficiente debe ser:
+
+~~~python
 load_market_calendar(market: str = "US_EQ") -> MarketCalendar
 
 next_trading_day(date_like, n: int = 1, market: str = "US_EQ") -> date
 prev_trading_day(date_like, n: int = 1, market: str = "US_EQ") -> date
 
-trading_days_between(start, end, market: str = "US_EQ",
-                     inclusive: str = "left") -> int
+trading_days_between(
+    start,
+    end,
+    market: str = "US_EQ",
+    inclusive: str = "left",
+) -> int
 
-align_to_session(ts_like, mode: str = "next_open",
-                 market: str = "US_EQ") -> pd.Timestamp
-\end{lstlisting}
+align_to_session(
+    ts_like,
+    mode: str = "next_open",
+    market: str = "US_EQ",
+) -> pd.Timestamp
+~~~
 
-Si se desea un diseño más limpio, estas funciones pueden ser wrappers sobre una clase principal:
+o, preferiblemente, como métodos sobre una clase principal:
 
-\begin{lstlisting}
+~~~python
 class MarketCalendar:
     def next_trading_day(self, date_like, n: int = 1) -> date: ...
     def prev_trading_day(self, date_like, n: int = 1) -> date: ...
     def trading_days_between(self, start, end, inclusive="left") -> int: ...
     def align_to_session(self, ts_like, mode="next_open") -> pd.Timestamp: ...
-\end{lstlisting}
+~~~
 
-\section{Semántica de cada operación}
+6. Semántica precisa de operaciones
 
-\subsection{\texttt{load\_market\_calendar}}
+6.1. load_market_calendar
 
-Carga o construye la representación interna del calendario de mercado. Debe devolver un objeto con semántica estable y reutilizable, preferiblemente cacheado.
+Debe cargar o construir una representación reutilizable del calendario, cacheable por mercado y rango. Dos llamadas equivalentes con misma especificación no deben producir reglas distintas.
 
-\textbf{Invariante:} dos llamadas equivalentes para el mismo mercado y mismo rango no deben producir reglas distintas.
+6.2. next_trading_day(date_like, n=1)
 
-\subsection{\texttt{next\_trading\_day(date, n=1)}}
+Debe devolver la n-ésima sesión válida posterior a la fecha dada, bajo convención estrictamente posterior salvo que la API documente otra cosa.
 
-Devuelve la \(n\)-ésima sesión estrictamente posterior a la fecha dada, salvo que la especificación indique explícitamente una convención distinta.
+Formalmente, si s_k es la primera sesión estrictamente posterior a d:
 
-Formalmente, si \(d\) es una fecha y \(s_k\) es la primera sesión válida posterior, entonces:
+    next(d, n) = s_{k+n-1}
 
-\[
-\texttt{next\_trading\_day}(d, n) = s_{k+n-1}
-\]
+Regla crítica:
+n debe satisfacer n >= 1.
 
-Debe quedar documentado si una fecha que ya es sesión válida cuenta o no como punto de partida inclusivo. En general, para evitar ambigüedad, es preferible comportamiento \emph{estrictamente posterior}.
+6.3. prev_trading_day(date_like, n=1)
 
-\subsection{\texttt{prev\_trading\_day(date, n=1)}}
+Análogo hacia atrás. Si s_k es la última sesión estrictamente anterior o igual según convención, prev debe documentar exactamente la semántica que aplica.
 
-Análogo al caso anterior, pero hacia atrás en el conjunto ordenado de sesiones.
+6.4. trading_days_between(start, end, inclusive)
 
-\subsection{\texttt{trading\_days\_between(start, end)}}
+Debe contar sesiones válidas entre extremos bajo una convención explícita. La implementación no debe basarse en restar fechas civiles ni en business days genéricos.
 
-Cuenta el número de sesiones válidas entre dos extremos bajo una convención explícita de inclusividad.
+Convenciones admisibles recomendadas:
 
-No basta con ``hacer una resta de fechas'' ni con contar business days genéricos. El resultado debe depender del calendario real del mercado y de la convención elegida.
+- "left"
+- "right"
+- "both"
+- "neither"
 
-Debe definirse, por ejemplo, si para un intervalo \([d_1, d_2)\) la cuenta incluye la sesión de \(d_1\), la de \(d_2\), ambas o ninguna.
+Esto es preferible a una semántica implícita difícil de auditar.
 
-\subsection{\texttt{align\_to\_session(ts, mode)}}
+6.5. align_to_session(ts_like, mode)
 
-Mapea un timestamp o fecha a un instante representativo de una sesión válida. La semántica debe depender de \texttt{mode}, por ejemplo:
+Debe mapear un timestamp o fecha a un instante representativo de una sesión válida. Modos recomendados:
+- next_open
+- prev_close
+- session_label
 
-\begin{itemize}
-    \item \texttt{next\_open}
-    \item \texttt{prev\_close}
-    \item \texttt{nearest\_open}
-    \item \texttt{session\_label}
-\end{itemize}
+Cada uno debe tener semántica cerrada. Por ejemplo:
+- next_open -> timestamp del open de la siguiente sesión válida;
+- prev_close -> timestamp del close de la última sesión válida anterior;
+- session_label -> etiqueta de sesión correspondiente.
 
-Este punto es especialmente importante porque la palabra ``align'' es ambigua si no se fija exactamente el resultado esperado.
+7. Zona horaria y normalización
 
-\section{Normalización de entradas}
+Toda operación debe ser coherente con:
 
-El módulo debe aceptar, como mínimo, tipos razonables de entrada:
+    America/New_York
 
-\begin{itemize}
-    \item \texttt{str}
-    \item \texttt{datetime.date}
-    \item \texttt{datetime.datetime}
-    \item \texttt{pandas.Timestamp}
-\end{itemize}
+El módulo debe distinguir claramente entre:
+- fecha civil;
+- timestamp naive;
+- timestamp tz-aware;
+- etiqueta de sesión.
 
-Toda entrada debe pasar por una fase explícita de normalización:
+7.1. Reglas mínimas de normalización
 
-\begin{enumerate}[label=\arabic*.]
-    \item parseo;
-    \item asignación o validación de timezone;
-    \item reducción a fecha o timestamp según la operación;
-    \item validación de rango y tipo.
-\end{enumerate}
+Para date-like:
+1. parseo a Timestamp;
+2. si llega tz-aware, tz_convert a timezone canónica;
+3. si llega naive, política explícita de localización;
+4. reducción a fecha o normalize() local.
 
-Un módulo de calendario robusto no debe depender de coerciones implícitas opacas.
+Para ts-like:
+1. parseo a Timestamp;
+2. tz_localize o tz_convert según corresponda;
+3. alineación posterior al dominio de sesiones.
 
-\section{Representación interna}
+7.2. Regla crítica
 
-La representación interna puede basarse en una secuencia ordenada de sesiones, por ejemplo un \texttt{DatetimeIndex}, una estructura propia o un backend externo. La implementación concreta es secundaria; lo importante es preservar estas propiedades:
+No debe depender de la timezone local del servidor ni asumir silenciosamente UTC si el contrato no lo especifica.
 
-\begin{enumerate}[label=\textbf{R\arabic*.}]
-    \item orden total;
-    \item unicidad de sesiones;
-    \item acceso eficiente por búsqueda;
-    \item semántica determinista;
-    \item independencia respecto al consumidor.
-\end{enumerate}
+8. Representación interna
 
-Una estructura razonable para el caso base es un índice ordenado y cacheado de sesiones válidas por mercado.
+Una representación razonable y eficiente para el caso base es:
 
-\section{Casos límite que deben quedar resueltos}
+- sessions: pd.DatetimeIndex
+- session_types: estructura alineada opcional
+- timezone fija
+- market id
 
-El módulo debe documentar y testear explícitamente los siguientes edge cases:
+La estructura sessions debe satisfacer:
+- monotonic increasing;
+- unique;
+- tz-aware o semánticamente normalizada de forma consistente;
+- búsqueda eficiente por searchsorted.
 
-\begin{itemize}
-    \item entrada en fin de semana;
-    \item entrada en festivo de mercado;
-    \item entrada fuera de horario regular;
-    \item timestamp timezone-naive;
-    \item cambio de horario de verano (DST);
-    \item rango invertido en \texttt{trading\_days\_between};
-    \item \(n \le 0\) en desplazamientos;
-    \item consulta fuera del rango del calendario precargado;
-    \item medias sesiones o cierres tempranos, si el sistema decide soportarlos.
-\end{itemize}
+9. SessionType y geometría de sesión
 
-Estos casos no son periféricos: constituyen la mayor parte de los fallos reales en infraestructura temporal.
+Para llevar el módulo a estándar realmente de producción, debe introducirse un enum explícito:
 
-\section{Medias sesiones y cierres tempranos}
+~~~python
+from enum import Enum
 
-Una decisión arquitectónica importante es si el módulo modela solo sesiones \emph{válidas/inválidas} o si además distingue tipos de sesión:
+class SessionType(Enum):
+    REGULAR = "regular"
+    EARLY_CLOSE = "early_close"
+    HALF_DAY = "half_day"
+    SPECIAL = "special"
+~~~
 
-\begin{itemize}
-    \item sesión regular;
-    \item cierre temprano;
-    \item sesión especial;
-    \item sesión no operativa.
-\end{itemize}
+Esto permite distinguir:
+- una sesión regular completa;
+- un cierre temprano;
+- una media sesión;
+- una sesión especial ad hoc.
 
-Si el repositorio no necesita aún esa granularidad, el módulo puede empezar con un modelo binario ``hay sesión / no hay sesión''. Pero la interfaz debe diseñarse de forma que ampliar a tipos de sesión no rompa la API pública.
+Regla institucional:
+un early close sigue siendo trading day. No debe quedar invisibilizado por un modelo binario demasiado pobre.
 
-\section{Invariantes formales}
+10. Invariantes formales obligatorios
 
-El módulo debe satisfacer, como mínimo, las siguientes invariantes:
+El módulo debe respetar, como mínimo, los siguientes invariantes:
 
-\begin{enumerate}[label=\textbf{I\arabic*.}]
-    \item \textbf{Monotonía:}
-    \[
-    \texttt{next\_trading\_day}(d,1) > d
-    \]
-    bajo orden temporal de sesiones.
+I1. Monotonía
+Para toda fecha d dentro de rango,
 
-    \item \textbf{Consistencia de ida y vuelta:} si \(d\) es una sesión válida y la convención es estricta,
-    \[
-    \texttt{prev\_trading\_day}(\texttt{next\_trading\_day}(d,1),1) = d
-    \]
+    next_trading_day(d, 1) > d
 
-    \item \textbf{Conteo no negativo:}
-    \[
-    \texttt{trading\_days\_between}(d_1,d_2) \ge 0
-    \]
-    cuando \(d_2 \ge d_1\) bajo la convención documentada.
+bajo orden temporal de sesiones.
 
-    \item \textbf{Determinismo:} mismas entradas y mismo calendario implican mismo resultado.
+I2. Consistencia de ida y vuelta
+Para una sesión válida s y convención estricta compatible,
 
-    \item \textbf{Cierre bajo normalización:} distintos formatos válidos de una misma fecha deben producir la misma sesión resultante.
-\end{enumerate}
+    prev_trading_day(next_trading_day(s, 1), 1) = s
 
-\section{Complejidad y rendimiento}
+I3. No negatividad del conteo
+Si end >= start bajo orden temporal y la convención está bien definida, entonces:
 
-La prioridad del módulo es corrección semántica. Una vez garantizada, el rendimiento deseable es:
+    trading_days_between(start, end, ...) >= 0
 
-\begin{itemize}
-    \item búsqueda de siguiente o anterior sesión en tiempo sublineal o amortizado constante sobre estructura cacheada;
-    \item conteos sobre rangos sin necesidad de iterar día a día;
-    \item coste de inicialización controlado mediante caché por mercado.
-\end{itemize}
+I4. Determinismo
+Mismas entradas, mismo calendario y misma convención producen el mismo resultado.
 
-En otras palabras: primero exactitud temporal, después eficiencia. Nunca al revés.
+I5. Cierre bajo normalización
+Representaciones distintas de la misma fecha/timestamp lógico deben inducir la misma sesión final.
 
-\section{Diseño recomendado}
+11. Interval algebra para between
 
-Una implementación sobria podría verse así:
+La semántica de inclusividad no debe quedarse en un flag ambiguo. Conviene formalizarla como álgebra de intervalos semiabiertos o cerrados.
 
-\begin{lstlisting}
+Convenciones recomendadas:
+- left   -> [start, end)
+- right  -> (start, end]
+- both   -> [start, end]
+- neither-> (start, end)
+
+Esto evita bugs clásicos en:
+- labels forward;
+- conteo de horizontes;
+- evaluaciones OOS;
+- ventanas rolling.
+
+12. Cobertura y range extension
+
+El módulo debe definir explícitamente qué ocurre si la fecha consultada cae fuera del rango precargado del calendario.
+
+Políticas razonables:
+- fail explícito;
+- o range extension controlado mediante backend de calendario.
+
+Para un sistema productivo serio, es recomendable cargar o soportar extensión de varios años hacia delante y hacia atrás, por ejemplo:
+- start_date configurable;
+- end_date configurable;
+- horizonte por defecto amplio.
+
+13. DST y discontinuidades temporales
+
+Un módulo serio de calendario no puede ignorar DST. Debe garantizar que:
+- normalización de timestamps alrededor del cambio horario no rompa align_to_session;
+- una misma fecha civil en transición DST siga alineándose a la sesión correcta;
+- la timezone canónica se aplique siempre antes de mapear a sesión.
+
+Regla importante:
+la API pública debe trabajar en términos de sesiones, no confiar en offsets horarios fijos tipo “close = 16:00 UTC-5” en bruto.
+
+14. Diseño recomendado de clase
+
+~~~python
 from dataclasses import dataclass
 from datetime import date
+from enum import Enum
+from typing import Literal
 import pandas as pd
+
+class SessionType(Enum):
+    REGULAR = "regular"
+    EARLY_CLOSE = "early_close"
+    HALF_DAY = "half_day"
+    SPECIAL = "special"
 
 @dataclass(frozen=True)
 class MarketCalendar:
     market: str
     timezone: str
     sessions: pd.DatetimeIndex
+    session_types: pd.Series | None = None
 
     def next_trading_day(self, date_like, n: int = 1) -> date:
         if n < 1:
             raise ValueError("n must be >= 1")
         d = self._normalize_date(date_like)
         pos = self.sessions.searchsorted(pd.Timestamp(d), side="right")
+        if pos + n - 1 >= len(self.sessions):
+            raise ValueError("Requested date is beyond loaded calendar range.")
         return self.sessions[pos + n - 1].date()
 
     def prev_trading_day(self, date_like, n: int = 1) -> date:
@@ -315,72 +361,161 @@ class MarketCalendar:
             raise ValueError("n must be >= 1")
         d = self._normalize_date(date_like)
         pos = self.sessions.searchsorted(pd.Timestamp(d), side="left") - 1
+        if pos - (n - 1) < 0:
+            raise ValueError("Requested date is before loaded calendar range.")
         return self.sessions[pos - (n - 1)].date()
 
-    def trading_days_between(self, start, end, inclusive: str = "left") -> int:
+    def trading_days_between(
+        self,
+        start,
+        end,
+        inclusive: Literal["left", "right", "both", "neither"] = "left",
+    ) -> int:
         s = self._normalize_date(start)
         e = self._normalize_date(end)
         if e < s:
             raise ValueError("end must be >= start")
-        left = self.sessions.searchsorted(pd.Timestamp(s), side="left")
-        right = self.sessions.searchsorted(pd.Timestamp(e), side="left")
-        count = right - left
-        if inclusive == "both" and pd.Timestamp(e) in self.sessions:
-            count += 1
-        return count
 
-    def align_to_session(self, ts_like, mode: str = "next_open") -> pd.Timestamp:
+        s_ts = pd.Timestamp(s)
+        e_ts = pd.Timestamp(e)
+
+        left = self.sessions.searchsorted(s_ts, side="left")
+        right = self.sessions.searchsorted(e_ts, side="left")
+
+        count = right - left
+
+        if inclusive == "left":
+            pass
+        elif inclusive == "right":
+            if e_ts in self.sessions:
+                count += 1
+        elif inclusive == "both":
+            if e_ts in self.sessions:
+                count += 1
+        elif inclusive == "neither":
+            if s_ts in self.sessions:
+                count -= 1
+        else:
+            raise ValueError("invalid inclusive mode")
+
+        return max(count, 0)
+
+    def align_to_session(
+        self,
+        ts_like,
+        mode: Literal["next_open", "prev_close", "session_label"] = "next_open",
+    ) -> pd.Timestamp:
         ts = self._normalize_timestamp(ts_like)
-        # explicit mode semantics go here
-        ...
+
+        if mode == "session_label":
+            return pd.Timestamp(self.next_trading_day(ts.date(), 1))
+
+        if mode == "next_open":
+            d = self.next_trading_day(ts.date(), 1)
+            return pd.Timestamp(d).tz_localize(self.timezone).replace(hour=9, minute=30)
+
+        if mode == "prev_close":
+            d = self.prev_trading_day(ts.date(), 1)
+            close_hour = 16
+            close_minute = 0
+            if self.session_types is not None:
+                ts_d = pd.Timestamp(d)
+                if ts_d in self.session_types.index:
+                    if self.session_types.loc[ts_d] == SessionType.EARLY_CLOSE:
+                        close_hour = 13
+            return pd.Timestamp(d).tz_localize(self.timezone).replace(hour=close_hour, minute=close_minute)
+
+        raise ValueError("invalid align mode")
 
     def _normalize_date(self, x) -> date:
         ts = pd.Timestamp(x)
         if ts.tzinfo is not None:
             ts = ts.tz_convert(self.timezone)
-        return ts.date()
+        else:
+            ts = ts.tz_localize(self.timezone)
+        return ts.normalize().date()
 
     def _normalize_timestamp(self, x) -> pd.Timestamp:
         ts = pd.Timestamp(x)
         if ts.tzinfo is None:
             return ts.tz_localize(self.timezone)
         return ts.tz_convert(self.timezone)
-\end{lstlisting}
+~~~
 
-\section{Errores y política de fallos}
+15. Backend y factoría
 
-El módulo debe fallar de forma explícita cuando:
+La carga del calendario no debe hard-codearse dentro de la lógica de operaciones. Debe existir una factoría clara:
 
-\begin{itemize}
-    \item el mercado solicitado no está soportado;
-    \item el rango consultado cae fuera de cobertura;
-    \item la entrada no puede parsearse;
-    \item la convención de \texttt{inclusive} o \texttt{mode} es inválida;
-    \item \(n < 1\) en desplazamientos.
-\end{itemize}
+~~~python
+_calendars: dict[str, MarketCalendar] = {}
 
-No debe devolver resultados silenciosamente aproximados en estos casos. En infraestructura temporal, una excepción explícita es preferible a una corrección implícita no documentada.
+def load_market_calendar(
+    market: str = "US_EQ",
+    start_date: str = "2020-01-01",
+    end_date: str = "2035-12-31",
+) -> MarketCalendar:
+    key = f"{market}:{start_date}:{end_date}"
+    if key not in _calendars:
+        _calendars[key] = _build_calendar(market, start_date, end_date)
+    return _calendars[key]
+~~~
 
-\section{Pruebas mínimas recomendadas}
+La construcción interna puede apoyarse en:
+- exchange_calendars
+- pandas_market_calendars
+- backend equivalente
 
-El módulo debe ir acompañado, al menos, de las siguientes pruebas:
+pero esa decisión debe quedar encapsulada.
 
-\begin{lstlisting}
+16. Failure modes críticos
+
+El módulo debe detectar y tratar explícitamente:
+
+F1. Fecha en fin de semana.
+Debe saltar correctamente a sesión siguiente o previa.
+
+F2. Fecha en festivo de mercado.
+No debe tratarla como business day genérico.
+
+F3. n <= 0 en desplazamientos.
+Debe fallar explícitamente.
+
+F4. Rango invertido en between.
+Debe fallar explícitamente.
+
+F5. Timestamp naive ambiguo.
+Debe pasar por política cerrada de localización.
+
+F6. Fecha fuera de rango del calendario cargado.
+Debe fallar o extender rango de forma controlada.
+
+F7. DST discontinuity.
+No debe romper align_to_session ni inducir cambio de sesión erróneo.
+
+F8. Early close no modelado.
+Si el sistema expone session geometry, debe respetarla.
+
+17. Pruebas mínimas requeridas
+
+El módulo no debe considerarse listo sin pasar, como mínimo:
+
+~~~python
 def test_next_trading_day_skips_weekend():
     cal = load_market_calendar("US_EQ")
-    assert cal.next_trading_day("2026-01-16") > date(2026, 1, 16)
+    d = cal.next_trading_day("2026-01-16")
+    assert d > pd.Timestamp("2026-01-16").date()
 
-def test_prev_trading_day_moves_back_to_valid_session():
+def test_prev_trading_day_moves_to_valid_session():
     cal = load_market_calendar("US_EQ")
     d = cal.prev_trading_day("2026-01-20")
-    assert isinstance(d, date)
+    assert hasattr(d, "year")
 
-def test_trading_days_between_is_consistent():
+def test_trading_days_between_nonnegative():
     cal = load_market_calendar("US_EQ")
     n = cal.trading_days_between("2026-01-05", "2026-01-12")
     assert n >= 0
 
-def test_align_to_session_returns_tz_aware_timestamp():
+def test_align_to_session_returns_tz_aware():
     cal = load_market_calendar("US_EQ")
     ts = cal.align_to_session("2026-01-17 12:00:00", mode="next_open")
     assert ts.tzinfo is not None
@@ -392,30 +527,63 @@ def test_invalid_n_raises():
         assert False
     except ValueError:
         assert True
-\end{lstlisting}
+~~~
 
-Además, conviene mantener tests de regresión sobre fechas conocidas del calendario soportado, especialmente alrededor de festivos y cambios DST.
+Y además conviene cubrir:
+- Thanksgiving Friday;
+- Christmas-adjacent sessions;
+- DST transition dates;
+- rango fuera de cobertura;
+- convención inclusive en los cuatro modos.
 
-\section{Definition of Done}
+18. MVP y segunda fase
 
-\texttt{simons\_core/calendar.py} queda correctamente resuelto cuando:
+18.1. MVP obligatorio
 
-\begin{itemize}
-    \item existe una única fuente de verdad para sesiones válidas;
-    \item la API pública tiene semántica explícita y estable;
-    \item fines de semana, festivos y DST están resueltos de forma consistente;
-    \item los desplazamientos temporales usan trading days reales, no aproximaciones civiles;
-    \item el módulo es determinista, testeable y reusable por research, backtest y ejecución.
-\end{itemize}
+El MVP debe incluir:
+- MarketCalendar con sessions ordenadas;
+- timezone canónica America/New_York;
+- next_trading_day;
+- prev_trading_day;
+- trading_days_between;
+- align_to_session;
+- normalización explícita;
+- tests básicos de fines de semana, festivos y n inválido.
 
-\section{Conclusión}
+18.2. Segunda fase razonable
 
-La calidad de \texttt{calendar.py} no depende de sonar sofisticado, sino de fijar con precisión la geometría temporal del sistema. En un framework cuantitativo serio, el calendario no es un detalle utilitario: es la base que evita errores silenciosos de horizonte, alineación y conteo de sesiones.
+Como extensiones útiles:
+- SessionType enum completo;
+- soporte explícito de early_close y half_day;
+- range extension controlado;
+- vectorización batch;
+- cache invalidation o refresh policy;
+- semántica más rica de session_label intradía.
 
-Por eso, el estándar correcto para este módulo es: API mínima, semántica explícita, edge cases bien definidos y cero ambigüedad temporal.
+19. No-objetivos
 
-\end{document}
+No pertenece al alcance de este módulo:
+- lógica de features;
+- labels forward;
+- scheduling arbitrario de jobs;
+- execution logic;
+- modelling estadístico del tiempo;
+- inferencia sobre horarios óptimos.
 
-% =====================================================
-% Fin del copiado
-% =====================================================
+La misión aquí es geometría temporal de mercado, pequeña pero rigurosa.
+
+20. Criterios de aceptación
+
+El módulo sólo debe considerarse correcto si cumple simultáneamente:
+
+- existe una única fuente de verdad para sesiones válidas;
+- la API pública tiene semántica explícita y estable;
+- las fechas civiles se proyectan a sesiones válidas consistentemente;
+- fines de semana, festivos y DST quedan resueltos de forma coherente;
+- between no depende de restas civiles ingenuas;
+- align_to_session produce resultados timezone-aware y auditables;
+- el módulo es reusable por research, backtest y ejecución sin drift temporal.
+
+21. Conclusión
+
+simons_core/calendar.py es infraestructura temporal, no un helper cosmético. Su valor no está en “manejar fechas”, sino en fijar con precisión la geometría de sesiones del sistema y eliminar ambigüedades entre componentes. En un framework cuantitativo serio, eso es esencial: una capa de calendario buena no es la que parece cómoda, sino la que evita errores silenciosos de alineación, conteo y horizonte temporal. Ese es exactamente el estándar que este módulo debe imponer.

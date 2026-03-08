@@ -1,652 +1,638 @@
-\section{Módulo: \texttt{data/universe/build\_universe.py}}
-\label{sec:build_universe}
+Especificación Cuantitativa: data/universe/build_universe.py
 
-\subsection{Objetivo, mandato del módulo y filosofía de diseño}
-\label{sec:build_universe:objective}
+1. Propósito del módulo
 
-El módulo \texttt{build\_universe.py} construye el \textbf{universo invertible diario point-in-time (PIT) de small caps de EE.\ UU.} que servirá como base canónica para señales, portfolio construction, ejecución simulada, attribution y validación ex post. Su función no es meramente “filtrar acciones”, sino \textbf{definir de manera históricamente correcta qué activos eran realmente invertibles en cada fecha de decisión}, bajo reglas reproducibles, auditables y temporalmente causales.
+El módulo `data/universe/build_universe.py` implementa la capa formal de construcción del universo invertible diario point-in-time del sistema. Su función no es “filtrar acciones” de forma oportunista, sino definir con precisión histórica, causal y reproducible qué instrumentos eran realmente elegibles para investigación, ranking, portfolio construction y ejecución simulada en cada fecha de decisión. :contentReference[oaicite:0]{index=0}
 
-Más formalmente, el módulo debe producir, para cada sesión \( t \in \mathcal{D} \), un conjunto \(\mathcal{U}_t\) tal que:
+El principio rector del módulo es el siguiente:
 
-\begin{enumerate}
-    \item \(\mathcal{U}_t\) sea \textbf{causalmente construible} con información disponible en el instante de decisión definido por la convención temporal del sistema;
-    \item \(\mathcal{U}_t\) esté libre de \textbf{survivorship bias}, \textbf{look-ahead bias} y \textbf{backfill bias};
-    \item toda inclusión, exclusión, entrada, salida o cambio de estado pueda ser reconstruido \textbf{de forma determinista};
-    \item cualquier rerun con los mismos inputs versionados y la misma configuración produzca \textbf{exactamente el mismo output}.
-\end{enumerate}
+un universo cuantitativo serio no se define por los activos que hoy parecen razonables, sino por los activos que, en cada fecha histórica, podían haber sido observados, evaluados y operados bajo las reglas del sistema usando únicamente información disponible en ese momento. Si el universo se construye mal, todo lo demás —señales, IC, turnover, capacity, drawdowns y robustez— queda contaminado desde el origen. :contentReference[oaicite:1]{index=1}
 
-Este módulo se diseña con estándares análogos a los exigidos en plataformas institucionales de index construction, research PIT y backtesting industrial: la prioridad no es maximizar cobertura “aparente”, sino preservar la \textbf{verdad histórica invertible} del universo.
+Formalmente, el módulo define un operador de construcción de universo:
 
-\paragraph{Principios rectores}
-\label{par:build_universe:principles}
-
-\begin{itemize}
-    \item \textbf{Point-in-time estricto.} Ninguna variable de elegibilidad puede incorporar información publicada, corregida o consolidada con posterioridad al instante de decisión relevante.
-    \item \textbf{Determinismo total.} La secuencia de filtros, la resolución de conflictos, la codificación de motivos de exclusión y la serialización de outputs deben ser invariantes a orden físico de lectura, paralelización o proveedor.
-    \item \textbf{Trazabilidad institucional.} Toda exclusión debe dejar evidencia explícita mediante códigos estables, metadatos de ejecución y artefactos de auditoría.
-    \item \textbf{Separación entre hechos y reglas.} El maestro de instrumentos, corporate actions, calendarios y features PIT son datos; la definición del universo es política de inversión versionada.
-    \item \textbf{Seguridad frente a edge cases.} IPOs, delistings, mergers, ticker changes, relistings, halts, suspensions, missingness y conflictos de proveedores deben resolverse mediante políticas cerradas, no mediante interpretación implícita del implementador.
-\end{itemize}
-
-\subsection{Convención temporal obligatoria}
-\label{sec:build_universe:timing}
-
-Uno de los puntos más críticos del módulo es fijar sin ambigüedad la relación entre fecha de observación, fecha de decisión y fecha de ejecución. Este documento adopta una convención explícita y obligatoria.
-
-\paragraph{Convención por defecto}
-\label{par:build_universe:default_timing}
-
-Salvo que \texttt{universe\_config.yaml} especifique otra política, el sistema opera bajo convención:
-
-\[
-\texttt{decision\_time} = \texttt{close}(t-1), 
-\qquad
-\texttt{execution\_date} = t
-\]
-
-Esto implica que el universo invertible etiquetado como \(\mathcal{U}_t\) se construye usando exclusivamente información disponible y conocida al cierre de la sesión \(t-1\). En consecuencia:
-
-\begin{itemize}
-    \item \(\mathtt{price\_ref}(s,t)\) se computa a partir de precios observables a cierre de \(t-1\);
-    \item \(\mathtt{adv20}(s,t)\) se calcula con ventana histórica cerrada en \(t-1\);
-    \item \(\mathtt{market\_cap}(s,t)\) usa shares y precio PIT conocidos no más tarde de \(t-1\);
-    \item eventos con \(\mathtt{effective\_date}=t\) solo afectan a \(\mathcal{U}_t\) si eran conocidos y procesables antes de la decisión.
-\end{itemize}
-
-\paragraph{Extensión configurable}
-\label{par:build_universe:timing_config}
-
-La convención temporal se parametriza mediante:
-
-\begin{itemize}
-    \item \texttt{decision\_lag\_sessions} \(\in \{0,1,\dots\}\),
-    \item \texttt{price\_timestamp\_policy} \(\in\) \{\texttt{close\_t-1}, \texttt{open\_t}, \texttt{custom}\},
-    \item \texttt{feature\_availability\_policy} \(\in\) \{\texttt{strict\_asof}, \texttt{vendor\_lagged}\}.
-\end{itemize}
-
-No se permite mezclar políticas temporales implícitas entre distintos campos. Toda ejecución debe persistir estas decisiones en el \texttt{manifest} del run.
-
-\subsection{Definición formal del universo invertible}
-\label{sec:build_universe:formal}
-
-Sea \(\mathcal{T}\) el conjunto de instrumentos observados en el maestro de listados y \(\mathcal{E}\subseteq \mathcal{T}\) el subconjunto de instrumentos potencialmente elegibles tras aplicar filtros estructurales de tipo, domicilio de mercado y estatus operacional. Para cada sesión \(t\in\mathcal{D}\), el módulo produce un conjunto \(\mathcal{U}_t \subseteq \mathcal{E}\).
-
-\paragraph{Entradas canónicas}
-\label{par:build_universe:inputs}
-
-\begin{itemize}
-    \item \(\mathcal{D}\): calendario de sesiones válidas entre \texttt{start\_date} y \texttt{end\_date}.
-    \item \(\mathcal{L}\): maestro PIT de instrumentos, con al menos:
-    \begin{itemize}
-        \item \(\mathtt{symbol}\), \(\mathtt{instrument\_id}\), \(\mathtt{issuer\_id}\),
-        \item \(\mathtt{listing\_exchange}\), \(\mathtt{security\_type}\), \(\mathtt{share\_class}\),
-        \item \(\mathtt{list\_date}\), \(\mathtt{delist\_date}\),
-        \item \(\mathtt{trading\_status}\), \(\mathtt{is\_primary\_listing}\),
-        \item \(\mathtt{ticker\_start\_date}\), \(\mathtt{ticker\_end\_date}\) si existe historial de símbolos.
-    \end{itemize}
-    \item \(\mathcal{M}^{\text{asof}}_t\): market cap PIT como-of.
-    \item \(\mathcal{V}^{\text{asof}}_t\): liquidez PIT como-of, típicamente \(\mathtt{adv20\_usd}\).
-    \item \(\mathcal{P}^{\text{asof}}_t\): precio de referencia PIT.
-    \item \(\mathcal{A}^{\text{asof}}_t\): corporate actions PIT relevantes para continuidad de identidad, elegibilidad y correcta interpretación del lifecycle.
-    \item \(\mathcal{R}\): configuración versionada de reglas de elegibilidad.
-\end{itemize}
-
-\paragraph{Reglas estructurales}
-\label{par:build_universe:structural_rules}
-
-Sea \(r \in \mathcal{R}\) la política activa del run. Un instrumento \(s\) solo puede pertenecer al universo elegible si satisface simultáneamente:
-
-\[
-s \in \mathcal{E}
-\iff
-\begin{cases}
-\texttt{security\_type}(s) \in \mathcal{S}_{\mathrm{allow}}^r \\
-\texttt{security\_type}(s) \notin \mathcal{S}_{\mathrm{deny}}^r \\
-\texttt{listing\_exchange}(s) \in \mathcal{X}_{\mathrm{allow}}^r \\
-\texttt{is\_tradable\_common\_equity}(s)=1
-\end{cases}
-\]
-
-donde típicamente:
-
-\[
-\mathcal{S}_{\mathrm{deny}}^r
-=
-\{\texttt{ADR},\texttt{ETF},\texttt{ETN},\texttt{preferred},\texttt{warrant},\texttt{right},\texttt{unit},\texttt{SPAC}\}
-\]
-
-\paragraph{Ventana de vida económica}
-\label{par:build_universe:lifecycle}
-
-La elegibilidad temporal no se define sobre el ticker textual, sino sobre la identidad económica del instrumento. Para cada \(s\), se define la ventana de vida:
-
-\[
-I(s) = [\tau^{\text{list}}_s,\tau^{\text{death}}_s]
-\]
+`U_build : (L_pit, Cal, X_asof, Θ_univ, r, a) -> (U_hist, U_current, X_excl, S_stats, M_manifest)`
 
 donde:
-\begin{itemize}
-    \item \(\tau^{\text{list}}_s = \mathtt{list\_date}(s)\),
-    \item \(\tau^{\text{death}}_s\) es la mínima fecha entre \(\mathtt{delist\_date}\), fusión efectiva terminal, cancelación definitiva o cualquier evento que extinga la negociabilidad del instrumento.
-\end{itemize}
+
+- `L_pit` es el maestro PIT de instrumentos/listings;
+- `Cal` es el calendario oficial de sesiones;
+- `X_asof` es el conjunto de features de elegibilidad observables as-of;
+- `Θ_univ` es la configuración versionada de reglas y thresholds;
+- `r` es el `run_id`;
+- `a` es el `asof_ts_utc` o snapshot lógico del run;
+- `U_hist` es la historia diaria de elegibilidad;
+- `U_current` es el snapshot vigente de constituyentes;
+- `X_excl` es la tabla de exclusiones con razones formales;
+- `S_stats` es la capa de estadísticas de tamaño, churn, causas y coverage;
+- `M_manifest` es el manifest auditable de ejecución.
+
+El módulo constituye, por tanto, la frontera entre “tener un listing master” y “tener una verdad histórica invertible”. Si esta capa es incorrecta, no sólo aparece survivorship bias: también aparecen look-ahead, backfill bias, discontinuidades por ticker changes y universos falsamente estables. :contentReference[oaicite:2]{index=2}
+
+2. Papel dentro de la arquitectura
+
+`build_universe.py` se sitúa aguas abajo de:
+
+- maestro PIT de instrumentos y listings;
+- historia de identidad estable a nivel `instrument_id`;
+- calendario oficial de sesiones;
+- snapshots PIT de precio, liquidez, market cap y estado operacional;
+
+y aguas arriba de:
+
+- `data/price/*`
+- `features/*`
+- `labels/*`
+- `portfolio/*`
+- `validation/*`
+- cualquier capa que necesite saber qué activos eran elegibles en cada fecha
+
+Su responsabilidad es:
+
+- definir el dominio evaluable completo;
+- resolver elegibilidad estricta a nivel `instrument_id`;
+- imponer la convención temporal de decisión y ejecución;
+- dejar trazabilidad explícita de inclusiones y exclusiones;
+- persistir un historial diario canónico del universo.
+
+No debe:
+
+- construir señales;
+- corregir market data;
+- imputar arbitrariamente missingness crítica;
+- colapsar ticker changes en silencio;
+- permitir que módulos downstream reimplementen la lógica de elegibilidad por su cuenta.
+
+La filosofía correcta es: el universo es una política canónica del sistema, no una conveniencia local de cada módulo. :contentReference[oaicite:3]{index=3}
+
+3. Principios de diseño no negociables
+
+La especificación del módulo se rige por los siguientes principios:
+
+1. PIT estricto:
+   toda inclusión o exclusión debe poder justificarse con información observable en el instante de decisión.
+
+2. Determinismo total:
+   mismos inputs versionados y misma configuración producen exactamente el mismo output lógico.
+
+3. Primacía de `instrument_id`:
+   la identidad económica del activo prevalece sobre el ticker textual.
+
+4. Separación entre hechos y política:
+   listing master, market data y corporate actions son datos; la definición de elegibilidad es política versionada.
+
+5. Trazabilidad institucional:
+   toda exclusión debe dejar razón primaria y lista completa de fallos.
+
+6. Seguridad frente a edge cases:
+   IPOs, delistings, mergers, relistings, ticker changes, halts, suspensions y missingness deben resolverse mediante reglas cerradas.
+
+7. Panel evaluable completo:
+   el módulo debe construir no sólo constituyentes, sino también el dominio de instrumentos vivos y evaluables.
+
+8. Conservadurismo ante missing data:
+   un campo crítico ausente no puede resolverse con heurística silenciosa salvo política explícita y limitada.
+
+Estos principios convierten el módulo en una capa fundacional de verdad histórica y no en un screener de conveniencia. :contentReference[oaicite:4]{index=4}
+
+4. Convención temporal obligatoria
+
+La convención temporal oficial del sistema es:
+
+`decision_time = close(t-1)`
+`execution_date = t`
+
+Esto implica que el universo etiquetado como `U_t` se construye usando exclusivamente información disponible al cierre de la sesión `t-1`. En consecuencia:
+
+- `price_ref(s,t)` se calcula con información observable no más tarde de `t-1`;
+- `adv20_usd(s,t)` se calcula sobre ventana cerrada en `t-1`;
+- `market_cap_usd(s,t)` usa shares y precio PIT conocidos no más tarde de `t-1`;
+- cualquier evento con fecha efectiva `t` sólo afecta a `U_t` si era ya observable antes del instante de decisión.
+
+La convención debe persistirse explícitamente en el `manifest`. No se admite una mezcla implícita entre `close(t-1)`, `open(t)` o políticas híbridas según variable. :contentReference[oaicite:5]{index=5}
+
+5. Entradas y contrato mínimo
+
+Entradas mínimas requeridas:
+
+- `listing_master_pit_path`
+- `calendar_path`
+- `features_asof_path`
+- `config_path`
+- `run_id`
+- `asof_ts_utc`
+- `start_date`
+- `end_date`
+
+Notación formal:
+
+`I = {L_pit, Cal, X_asof, Θ_univ, r, a}`
+
+donde:
+
+- `L_pit` contiene el maestro PIT de instrumentos;
+- `Cal` define las sesiones válidas;
+- `X_asof` contiene precio, liquidez, mcap y estado as-of;
+- `Θ_univ` contiene reglas y thresholds;
+- `r` es el `run_id`;
+- `a` es el `asof_ts_utc`.
+
+El módulo debe exigir, como mínimo, en `L_pit`:
+
+- `instrument_id`
+- `issuer_id` nullable
+- `symbol`
+- `listing_exchange`
+- `security_type`
+- `share_class`
+- `list_date`
+- `delist_date`
+- `trading_status`
+- `is_primary_listing`
+
+Y en `X_asof`:
+
+- `date`
+- `instrument_id`
+- `price_ref`
+- `adv20_usd`
+- `market_cap_usd`
+
+Antes de comenzar, el módulo debe validar:
+
+- existencia y legibilidad de inputs;
+- unicidad mínima por `(date, instrument_id)` donde proceda;
+- parseabilidad de fechas;
+- validez sintáctica y semántica del archivo de configuración;
+- coherencia entre rango temporal, calendario y cobertura del listing master;
+- posibilidad de construir el dominio PIT sin solapamientos de identidad irresolubles.
+
+Si este contrato falla, el módulo no debe construir un universo parcial silencioso. Debe abortarse o degradarse formalmente según severidad. :contentReference[oaicite:6]{index=6}
+
+6. Modelo de identidad
+
+La clave primaria del universo no es `symbol`, sino `instrument_id`.
+
+Regla obligatoria:
+
+- toda tabla persistida debe contener `instrument_id`;
+- la unicidad lógica diaria es:
+  `(date, instrument_id)`
+- `symbol` se trata como atributo observable y versionado, no como identidad primaria.
+
+Esto es crítico porque:
+
+- un ticker puede cambiar sin que cambie la entidad económica;
+- un ticker puede reciclarse entre emisores;
+- un mismo emisor puede tener múltiples share classes;
+- el turnover a nivel ticker puede ser falso aunque a nivel instrumento sea nulo.
+
+En consecuencia, cualquier métrica de continuidad, entrada, salida y churn debe calcularse a nivel `instrument_id`, nunca a nivel de símbolo textual si existe historia de renombrados. :contentReference[oaicite:7]{index=7}
+
+7. Dominio evaluable completo
+
+El módulo no debe limitarse a construir constituyentes elegibles. Debe construir primero el panel evaluable completo:
+
+`P = {(t,s) | t in D, s in T, t in I(s)}`
+
+donde:
+
+- `D` es el conjunto de sesiones;
+- `T` es el conjunto de instrumentos observados;
+- `I(s) = [list_date_s, death_date_s]` es la ventana de vida económica del instrumento.
+
+Este panel contiene todos los instrumentos vivos y evaluables, incluso si luego resultan no elegibles. Esta decisión es esencial porque permite:
+
+- auditar exclusiones;
+- separar “no existe aún” de “existe pero no cumple reglas”;
+- medir turnover y churn correctamente;
+- eliminar survivorship bias de raíz.
+
+La salida final diaria debe ser una proyección etiquetada de este panel, no sólo una lista de constituyentes. :contentReference[oaicite:8]{index=8}
+
+8. Ventana de vida económica
+
+Para cada instrumento `s`, se define:
+
+`I(s) = [tau_list_s, tau_death_s]`
+
+donde:
+
+- `tau_list_s = list_date(s)`
+- `tau_death_s` es la mínima fecha entre:
+  - `delist_date`
+  - cancelación definitiva
+  - fusión terminal
+  - evento corporativo que extinga la negociabilidad del instrumento
 
 Entonces:
 
-\[
-s \text{ puede ser evaluado en } t \iff t \in I(s)
-\]
-
-y, bajo la convención temporal del sistema, la inclusión en \(\mathcal{U}_t\) se decide con información as-of \(t-1\).
-
-\paragraph{Reglas de elegibilidad dinámica}
-\label{par:build_universe:dynamic_rules}
-
-Una vez superados los filtros estructurales, el instrumento debe satisfacer reglas cuantitativas PIT:
-
-\[
-s \in \mathcal{U}_t
-\iff
-\begin{cases}
-s \in \mathcal{E} \\
-t \in I(s) \\
-p^{\mathrm{ref}}_{s,t} \ge p_{\min}^r \\
-\mathrm{ADV20}^{\mathrm{usd}}_{s,t} \ge v_{\min}^r \\
-\mathrm{MCAP}^{\mathrm{usd}}_{s,t} \in \mathcal{B}_{\mathrm{small}}^r \\
-\mathrm{age}_{s,t} \ge \Delta t_{\min}^r \quad \text{(si aplica)} \\
-\texttt{trading\_status}(s,t) \in \mathcal{Q}_{\mathrm{allow}}^r
-\end{cases}
-\]
-
-donde \(\mathcal{B}_{\mathrm{small}}^r\) puede definirse como banda absoluta o como regla relativa por percentil.
-
-\subsection{Modelo de identidad: ticker, instrumento e issuer}
-\label{sec:build_universe:identity_model}
-
-El universo no debe construirse sobre \texttt{symbol} como identificador primario, porque el ticker puede cambiar sin que cambie la entidad económica, y también puede reciclarse entre emisores distintos a lo largo del tiempo. Por ello:
-
-\begin{itemize}
-    \item \texttt{instrument\_id} es la clave primaria de elegibilidad;
-    \item \texttt{symbol} es un atributo observable y versionado;
-    \item \texttt{issuer\_id} se usa para auditorías de continuidad económica y eventos corporativos complejos.
-\end{itemize}
-
-\paragraph{Regla obligatoria}
-\label{par:build_universe:identity_rule}
+`s` puede evaluarse en `t` si y sólo si `t in I(s)`
 
-Toda tabla persistida debe contener, como mínimo, \texttt{instrument\_id} además de \texttt{symbol}. La unicidad lógica del panel es:
-
-\[
-(\mathtt{date}, \mathtt{instrument\_id})
-\]
+Consecuencias operativas:
 
-y no meramente \((\mathtt{date}, \mathtt{symbol})\).
+- antes de `list_date`, el instrumento no pertenece al panel evaluable;
+- después de `tau_death`, no puede ser elegible;
+- un halt o suspensión no extingue necesariamente `I(s)`, sino que cambia `membership_state`.
 
-\paragraph{Ticker changes y relabelings}
-\label{par:build_universe:ticker_changes}
-
-Si un instrumento mantiene identidad económica pero cambia de ticker, exchange o vendor symbol, entonces:
-
-\begin{itemize}
-    \item \textbf{no} se considera una salida y reentrada del universo;
-    \item se preserva la continuidad del \texttt{instrument\_id};
-    \item el cambio se registra como \texttt{corporate\_identity\_event};
-    \item cualquier métrica de turnover por constituents debe computarse a nivel \texttt{instrument\_id}.
-\end{itemize}
+Esta formalización es necesaria para distinguir “activo inexistente” de “activo vivo pero no invertible”. :contentReference[oaicite:9]{index=9}
 
-\subsection{Panel PIT y construcción del dominio evaluable}
-\label{sec:build_universe:panel}
+9. Filtros estructurales y precedencia obligatoria
 
-A partir del maestro de instrumentos y el calendario de mercado se construye el panel base evaluable:
+La elegibilidad debe evaluarse como una secuencia totalmente ordenada de filtros:
 
-\[
-\mathcal{P}
-=
-\left\{
-(t,s):
-t \in \mathcal{D},
-\;
-s \in \mathcal{T},
-\;
-t \in I(s)
-\right\}
-\]
+`F = (F_1, F_2, ..., F_k)`
 
-El panel base contiene \textbf{todos} los instrumentos cuya vida económica intersecta el rango temporal solicitado, incluso si resultan no elegibles por reglas de inversión. Esta decisión es esencial porque permite:
+El orden oficial por defecto es:
 
-\begin{itemize}
-    \item auditar exclusiones y no solo constituyentes;
-    \item distinguir entre “no existe todavía”, “ya no existe”, “existe pero no es elegible” y “existe pero falta información”;
-    \item medir turnover, drift y survivorship sobre el dominio correcto.
-\end{itemize}
-
-\paragraph{Invariante de existencia}
-\label{par:build_universe:existence_invariant}
-
-Para todo \((t,s)\in\mathcal{P}\), debe cumplirse exactamente uno de los siguientes estados de alto nivel:
-
-\[
-\mathtt{presence\_state}(t,s) \in
-\{
-\texttt{alive\_eligible},
-\texttt{alive\_ineligible},
-\texttt{alive\_unknown},
-\texttt{dead}
-\}
-\]
-
-En la tabla histórica diaria solo deben persistirse registros para estados \texttt{alive\_*}; el estado \texttt{dead} se representa implícitamente por ausencia fuera del intervalo \(I(s)\).
+1. identidad y vida económica
+2. tipo de instrumento
+3. exchange / listing venue
+4. estatus operacional
+5. edad mínima desde listing
+6. precio mínimo
+7. liquidez mínima
+8. banda de market cap
+9. reglas especiales
 
-\subsection{Enriquecimiento PIT y política de missing data}
-\label{sec:build_universe:enrichment}
+La definición matemática es:
 
-Cada fila \((t,s)\in\mathcal{P}\) se enriquece con features PIT necesarias para evaluar las reglas. El principio rector es:
+`is_eligible(t,s) = prod_{i=1}^k 1[F_i(t,s)=1]`
 
-\begin{quote}
-\textit{Missingness en un campo crítico de elegibilidad no puede resolverse silenciosamente mediante imputación salvo que exista una política explícita, versionada y limitada.}
-\end{quote}
+Esta precedencia no es estética. Define:
 
-\paragraph{Campos críticos}
-\label{par:build_universe:critical_fields}
+- el motivo primario de exclusión;
+- la comparabilidad entre runs;
+- la estabilidad del reporting;
+- y la resolución de múltiples fallos simultáneos.
 
-Se consideran críticos, por defecto:
+Nunca debe dejarse al orden accidental de implementación. :contentReference[oaicite:10]{index=10}
 
-\[
-\{
-\mathtt{price\_ref},
-\mathtt{adv20\_usd},
-\mathtt{market\_cap\_usd},
-\mathtt{security\_type},
-\mathtt{listing\_exchange},
-\mathtt{list\_date}
-\}
-\]
+10. Definición formal del universo elegible
 
-\paragraph{Política por defecto}
-\label{par:build_universe:missing_default}
+Una vez superados los filtros estructurales, un instrumento pertenece al universo si satisface simultáneamente:
 
-La política por defecto es:
-
-\[
-\texttt{missing\_critical\_policy} = \texttt{exclude}
-\]
-
-Es decir, si falta un dato crítico necesario para evaluar una regla, el instrumento se marca como no elegible con motivo explícito \texttt{MISSING\_<FIELD>}.
-
-\paragraph{Forward fill limitado}
-\label{par:build_universe:ffill}
-
-Si la configuración permite \texttt{forward\_fill}, el llenado hacia adelante debe satisfacer simultáneamente:
-
-\begin{itemize}
-    \item provenir del mismo \texttt{instrument\_id};
-    \item respetar un máximo de antigüedad \(\delta_{\max}^{r}\);
-    \item no atravesar eventos corporativos que invaliden la continuidad económica;
-    \item dejar traza del campo imputado mediante \texttt{field\_source\_flag}.
-\end{itemize}
-
-Queda prohibido cualquier backfill desde observaciones futuras.
-
-\subsection{Orden determinista de filtros y resolución de conflictos}
-\label{sec:build_universe:filter_order}
-
-La elegibilidad se evalúa mediante una secuencia totalmente ordenada de filtros:
-
-\[
-\mathcal{F} = (F_1, F_2, \dots, F_k)
-\]
-
-con precedencia obligatoria. Esta precedencia no es un detalle cosmético: define cómo se interpretan conflictos, cómo se codifica el motivo principal de exclusión y cómo se asegura reproducibilidad.
-
-\paragraph{Precedencia obligatoria}
-\label{par:build_universe:precedence}
-
-El orden por defecto es:
-
-\begin{enumerate}
-    \item \textbf{Identidad y vida económica}:
-    \begin{itemize}
-        \item instrumento existente en \(t\),
-        \item \texttt{instrument\_id} válido,
-        \item ventana \([ \mathtt{list\_date}, \tau^{\text{death}} ]\).
-    \end{itemize}
-    \item \textbf{Tipo de instrumento}:
-    common equity permitida.
-    \item \textbf{Mercado/listing}:
-    exchange permitido, primary listing si aplica.
-    \item \textbf{Estatus operacional}:
-    halted, suspended, OTC migration, bankrupt trading status, etc.
-    \item \textbf{Edad mínima desde IPO/listing}.
-    \item \textbf{Precio mínimo}.
-    \item \textbf{Liquidez mínima}.
-    \item \textbf{Small-cap band}.
-    \item \textbf{Reglas especiales}:
-    restricciones regulatorias, flags vendor específicos, exclusiones ad hoc formalizadas.
-\end{enumerate}
-
-\paragraph{Definición de elegibilidad}
-\label{par:build_universe:eligibility_math}
-
-Para cada \((t,s)\in\mathcal{P}\),
-
-\[
-\mathtt{is\_eligible}(t,s)
-=
-\prod_{i=1}^{k}
-\mathbb{I}\big(F_i(t,s)=1\big)
-\]
-
-\paragraph{Política de motivos de exclusión}
-\label{par:build_universe:reason_policy}
-
-El sistema distingue entre:
-
-\begin{itemize}
-    \item \(\mathtt{primary\_exclusion\_reason}\): \textbf{primer} filtro fallido según precedencia obligatoria;
-    \item \(\mathtt{all\_failed\_reasons}\): lista ordenada de \textbf{todos} los filtros fallidos.
-\end{itemize}
-
-Esta dualidad resuelve de forma estable el problema de múltiples fallos simultáneos. La regla obligatoria es:
-
-\begin{enumerate}
-    \item \(\mathtt{primary\_exclusion\_reason}\) se usa para reporting agregable, métricas por causa raíz y comparabilidad entre runs;
-    \item \(\mathtt{all\_failed\_reasons}\) se usa para auditoría fina y debugging;
-    \item nunca se permite una fila ineligible sin \(\mathtt{primary\_exclusion\_reason}\);
-    \item nunca se permite una fila eligible con motivos de exclusión no vacíos.
-\end{enumerate}
-
-\paragraph{Catálogo estable de razones}
-\label{par:build_universe:reason_catalog}
-
-Las razones deben codificarse como \texttt{enum} estable, no como texto libre. Ejemplo mínimo:
-
-\begin{itemize}
-    \item \texttt{NOT\_YET\_LISTED}
-    \item \texttt{DELISTED}
-    \item \texttt{BAD\_SECURITY\_TYPE}
-    \item \texttt{BAD\_EXCHANGE}
-    \item \texttt{HALTED}
-    \item \texttt{SUSPENDED}
-    \item \texttt{TOO\_YOUNG\_SINCE\_LISTING}
-    \item \texttt{PRICE\_BELOW\_MIN}
-    \item \texttt{ADV20\_BELOW\_MIN}
-    \item \texttt{MCAP\_OUT\_OF\_BAND}
-    \item \texttt{MISSING\_PRICE}
-    \item \texttt{MISSING\_ADV20}
-    \item \texttt{MISSING\_MCAP}
-    \item \texttt{SPECIAL\_RULE\_EXCLUSION}
-\end{itemize}
-
-\subsection{Tratamiento formal de edge cases}
-\label{sec:build_universe:edge_cases}
-
-\paragraph{Halts y suspensions}
-\label{par:build_universe:halts}
-
-Un \texttt{halt} o \texttt{suspension} no extingue necesariamente la identidad del instrumento. Por tanto:
-
-\begin{itemize}
-    \item el instrumento permanece en el panel \(\mathcal{P}\) mientras esté vivo económicamente;
-    \item su elegibilidad depende de \texttt{halt\_policy} configurada;
-    \item por defecto:
-    \[
-    \texttt{halt\_policy} = \texttt{exclude\_until\_tradable}
-    \]
-    \item el motivo primario será \texttt{HALTED} o \texttt{SUSPENDED}, no \texttt{MISSING\_PRICE}, salvo que el problema real sea la ausencia de datos sin flag operacional.
-\end{itemize}
-
-\paragraph{Relistings}
-\label{par:build_universe:relistings}
-
-Un relisting puede representar:
-\begin{enumerate}
-    \item continuación de la misma identidad económica;
-    \item nueva identidad tras reorganización material.
-\end{enumerate}
-
-La resolución debe realizarse a nivel \texttt{instrument\_id}. Si el proveedor no ofrece continuidad fiable, la política por defecto es conservadora:
-
-\[
-\texttt{relisting\_policy} = \texttt{new\_instrument\_unless\_proven\_same}
-\]
-
-\paragraph{Cambios de exchange o clasificación}
-\label{par:build_universe:reclassifications}
-
-Si un instrumento cambia de exchange o de clasificación a mitad de vida:
-
-\begin{itemize}
-    \item el cambio aplica desde su fecha efectiva PIT;
-    \item la elegibilidad en fechas anteriores no debe reescribirse retrospectivamente;
-    \item cualquier exclusión derivada de este cambio debe emerger exclusivamente a partir de la fecha efectiva.
-\end{itemize}
-
-\paragraph{Eventos corporativos compuestos}
-\label{par:build_universe:compound_events}
-
-Split, reverse split, ticker change, merger agreement, spinoff y delisting pueden coexistir temporalmente. La elegibilidad debe basarse en la tabla canónica de corporate actions ya resuelta aguas arriba. \texttt{build\_universe.py} no debe reinterpretar semánticamente eventos complejos; debe consumir la representación canónica y aplicar sus consecuencias sobre identidad, ventana de vida y tradabilidad.
-
-\subsection{Estados de membresía y semántica de transición}
-\label{sec:build_universe:states}
-
-Además de \(\mathtt{is\_eligible}\), el sistema persiste un estado de membresía interpretable:
-
-\[
-\mathtt{membership\_state}(t,s) \in \Omega_{\mathrm{state}}
-\]
-
-con catálogo mínimo:
-
-\begin{itemize}
-    \item \texttt{eligible}
-    \item \texttt{ineligible\_rule}
-    \item \texttt{ineligible\_missing}
-    \item \texttt{ineligible\_halted}
-    \item \texttt{ineligible\_suspended}
-    \item \texttt{inactive\_post\_death} \quad \text{(solo si se persiste explícitamente)}
-\end{itemize}
-
-\paragraph{Transiciones canónicas}
-\label{par:build_universe:transitions}
-
-Para auditoría se recomienda persistir:
-
-\[
-\mathtt{transition}(t,s)
-\in
-\{
-\texttt{ENTER},
-\texttt{EXIT},
-\texttt{STAY\_IN},
-\texttt{STAY\_OUT},
-\texttt{STATE\_CHANGE\_OUTSIDE\_UNIVERSE}
-\}
-\]
-
-definidas a nivel \texttt{instrument\_id}. Esto evita que un ticker change genere falsos \texttt{ENTER/EXIT}.
-
-\subsection{Outputs, particionado y artefactos de auditoría}
-\label{sec:build_universe:outputs}
-
-\paragraph{Historia diaria canónica}
-\label{par:build_universe:history_output}
-
-Ruta recomendada:
-
-\[
-\texttt{data/universe/history/date=\{yyyy-mm-dd\}/part-*.parquet}
-\]
-
-Schema mínimo recomendado:
-
-\begin{itemize}
-    \item \texttt{date}
-    \item \texttt{instrument\_id}
-    \item \texttt{issuer\_id} (nullable si no aplica)
-    \item \texttt{symbol}
-    \item \texttt{is\_eligible}
-    \item \texttt{membership\_state}
-    \item \texttt{primary\_exclusion\_reason}
-    \item \texttt{all\_failed\_reasons}
-    \item \texttt{market\_cap\_usd}
-    \item \texttt{adv20\_usd}
-    \item \texttt{price\_ref}
-    \item \texttt{listing\_exchange}
-    \item \texttt{security\_type}
-    \item \texttt{trading\_status}
-    \item \texttt{field\_source\_flags}
-    \item \texttt{run\_id}
-    \item \texttt{config\_hash}
-    \item \texttt{code\_version}
-    \item \texttt{input\_snapshot\_hash}
-    \item \texttt{built\_ts\_utc}
-\end{itemize}
-
-\paragraph{Artefactos auxiliares}
-\label{par:build_universe:artifacts}
-
-\begin{itemize}
-    \item \texttt{current.parquet}: snapshot del último día.
-    \item \texttt{constituents\_\{date\}.parquet}: constituyentes elegibles.
-    \item \texttt{exclusions\_\{date\}.parquet}: excluidos con razón primaria y razones completas.
-    \item \texttt{universe\_counts\_by\_day.parquet}: tamaño del universo y breakdown por motivo.
-    \item \texttt{universe\_turnover\_stats.parquet}: entradas, salidas, churn y turnover.
-    \item \texttt{universe\_manifest.json}: metadatos de run, hashes, counts y resultados QC.
-\end{itemize}
-
-\paragraph{Definición de turnover}
-\label{par:build_universe:turnover}
-
-El turnover debe calcularse a nivel de \texttt{instrument\_id}:
-
-\[
-\mathrm{turnover}(t)
-=
-\frac{
-|\mathcal{U}_t \setminus \mathcal{U}_{t-1}|
-+
-|\mathcal{U}_{t-1} \setminus \mathcal{U}_t|
-}{
-|\mathcal{U}_t \cup \mathcal{U}_{t-1}|
-}
-\]
-
-y nunca a nivel \texttt{symbol} si existe historial de renombrados.
-
-\subsection{Invariantes formales y criterios de aceptación}
-\label{sec:build_universe:invariants}
-
-Para que un run sea válido, deben cumplirse los siguientes invariantes.
-
-\paragraph{Invariantes duros}
-\label{par:build_universe:hard_invariants}
-
-\begin{enumerate}
-    \item \textbf{Unicidad lógica}
-    \[
-    \nexists (t,s) \neq (t',s') :
-    t=t' \wedge \mathtt{instrument\_id}(s)=\mathtt{instrument\_id}(s')
-    \]
-    \item \textbf{Consistencia binaria}
-    \[
-    \mathtt{is\_eligible} \in \{0,1\}
-    \]
-    \item \textbf{Motivo primario obligatorio}
-    \[
-    \mathtt{is\_eligible}=0 \iff \mathtt{primary\_exclusion\_reason} \neq \varnothing
-    \]
-    \item \textbf{Sin motivo en elegibles}
-    \[
-    \mathtt{is\_eligible}=1 \Rightarrow
-    \mathtt{primary\_exclusion\_reason}=\varnothing
-    \]
-    \item \textbf{No pre-listing}
-    \[
-    t < \mathtt{list\_date}(s) \Rightarrow (t,s)\notin\mathcal{P}
-    \]
-    \item \textbf{No post-death elegible}
-    \[
-    t > \tau^{\text{death}}_s \Rightarrow s \notin \mathcal{U}_t
-    \]
-    \item \textbf{Determinismo del run}
-    rerun con mismos inputs y configuración produce outputs bitwise-identical salvo metadatos de timestamp si así se define.
-\end{enumerate}
-
-\paragraph{Invariantes blandos}
-\label{par:build_universe:soft_invariants}
-
-Se monitorizan como \texttt{WARN} o \texttt{FAIL} según umbral configurado:
-
-\begin{itemize}
-    \item salto en tamaño del universo:
-    \[
-    \left| |\mathcal{U}_t| - |\mathcal{U}_{t-1}| \right| > \tau_{\mathrm{jump}}
-    \]
-    \item cambio abrupto en fracción de exclusión por una causa dada;
-    \item missingness crítica por encima de \(\gamma_{\mathrm{missing}}\);
-    \item turnover fuera del rango histórico esperado.
-\end{itemize}
-
-\paragraph{Jerarquía de severidad}
-\label{par:build_universe:severity}
-
-Cada check debe etiquetarse como:
-\[
-\texttt{PASS} < \texttt{WARN} < \texttt{FAIL}
-\]
-
-y el estado global del run se define como:
-
-\[
-\texttt{run\_status}
-=
-\max \{\texttt{severity of all checks}\}
-\]
-
-Un run con cualquier \texttt{FAIL} no debe promoverse a producción ni alimentar research downstream salvo override explícito y logueado.
-
-\subsection{Observabilidad, reproducibilidad y lineage}
-\label{sec:build_universe:observability}
-
-Cada ejecución debe persistir metadatos suficientes para reconstruir exactamente cómo se obtuvo el universo:
-
-\begin{itemize}
-    \item \texttt{run\_id}
-    \item \texttt{config\_hash}
-    \item \texttt{code\_version} o commit SHA
-    \item hashes de inputs materiales
-    \item convención temporal usada
-    \item políticas de missingness y halts
-    \item conteos por estado y razón de exclusión
-    \item checks QC ejecutados y severidad final
-\end{itemize}
-
-Esto convierte al universo en un artefacto de datos científicamente reproducible y no en una tabla efímera de screening.
-
-\subsection{Contrato de integración con módulos aguas abajo}
-\label{sec:build_universe:contracts}
-
-\texttt{build\_universe.py} entrega un contrato estable a módulos posteriores:
-
-\begin{itemize}
-    \item \texttt{signals/}: solo debe consumir \texttt{is\_eligible=1} o universos derivados explícitos;
-    \item \texttt{portfolio/}: debe interpretar turnover a nivel \texttt{instrument\_id};
-    \item \texttt{validation/}: debe poder reconciliar exclusiones con razones canónicas;
-    \item \texttt{survivorship.py} y \texttt{universe\_qc.py}: deben poder auditar tanto constituyentes como excluidos.
-\end{itemize}
-
-Queda expresamente prohibido que módulos downstream reimplementen lógica de elegibilidad mediante filtros ad hoc sobre precio, liquidez o market cap, ya que eso rompería la unicidad semántica del universo.
-
-\subsection{Resumen ejecutivo}
-\label{sec:build_universe:summary}
-
-\texttt{build\_universe.py} define la verdad histórica invertible del sistema. Su responsabilidad central es construir, para cada sesión, un universo small-cap de EE.\ UU. que sea:
-\begin{itemize}
-    \item \textbf{PIT estricto},
-    \item \textbf{libre de survivorship y look-ahead},
-    \item \textbf{determinista},
-    \item \textbf{auditable hasta nivel de causa raíz},
-    \item \textbf{robusto a corporate actions, ticker changes, halts y relistings},
-    \item \textbf{reproducible como artefacto de investigación y producción}.
-\end{itemize}
-
-En un stack cuantitativo serio, el universo no es una conveniencia operativa sino una capa fundacional del modelo de realidad. Si esta capa es incorrecta, todo resultado posterior ---alphas, backtests, capacity, attribution y riesgo--- queda contaminado desde el origen.
+`U_t = { s in E | t in I(s)
+                 and price_ref_(s,t) >= p_min
+                 and adv20_usd_(s,t) >= v_min
+                 and market_cap_usd_(s,t) in B_small
+                 and trading_status_(s,t) in Q_allow }`
+
+donde:
+
+- `p_min` es el precio mínimo;
+- `v_min` es la liquidez mínima;
+- `B_small` es la banda small-cap configurada;
+- `Q_allow` es el conjunto de estados operacionales permitidos.
+
+Regla institucional:
+todos estos campos deben ser observables as-of `t-1` bajo la convención temporal del sistema. No se admiten cálculos basados en snapshots corregidos posteriormente sin trazabilidad explícita. :contentReference[oaicite:11]{index=11}
+
+11. Política de missing data
+
+La política por defecto para campos críticos es:
+
+`missing_critical_policy = exclude`
+
+Se consideran críticos, como mínimo:
+
+- `price_ref`
+- `adv20_usd`
+- `market_cap_usd`
+- `security_type`
+- `listing_exchange`
+- `list_date`
+
+Si falta un campo crítico necesario para evaluar una regla, el instrumento se marca como no elegible con razón explícita:
+
+- `MISSING_PRICE`
+- `MISSING_ADV20`
+- `MISSING_MCAP`
+- etc.
+
+Sólo se admite `forward_fill` si se cumplen simultáneamente:
+
+- mismo `instrument_id`;
+- antigüedad menor que `delta_max`;
+- no atraviesa eventos corporativos que rompan continuidad;
+- deja traza en `field_source_flags`.
+
+Queda prohibido cualquier backfill desde observaciones futuras. Este punto es uno de los pilares del módulo y no puede relajarse informalmente. :contentReference[oaicite:12]{index=12}
+
+12. Razones de exclusión
+
+El sistema debe distinguir entre:
+
+- `primary_exclusion_reason`
+- `all_failed_reasons`
+
+Regla oficial:
+
+`primary_exclusion_reason = primer filtro fallido según precedencia`
+
+`all_failed_reasons = lista ordenada de todos los filtros fallidos`
+
+Esto resuelve correctamente el caso de múltiples fallos simultáneos. La razón primaria se usa para reporting agregado y análisis de causa raíz. La lista completa se usa para auditoría fina y debugging.
+
+Catálogo mínimo estable de razones:
+
+- `NOT_YET_LISTED`
+- `DELISTED`
+- `BAD_SECURITY_TYPE`
+- `BAD_EXCHANGE`
+- `HALTED`
+- `SUSPENDED`
+- `TOO_YOUNG_SINCE_LISTING`
+- `PRICE_BELOW_MIN`
+- `ADV20_BELOW_MIN`
+- `MCAP_OUT_OF_BAND`
+- `MISSING_PRICE`
+- `MISSING_ADV20`
+- `MISSING_MCAP`
+- `SPECIAL_RULE_EXCLUSION`
+
+Estas razones deben codificarse como enum estable, nunca como texto libre. :contentReference[oaicite:13]{index=13}
+
+13. Estados de membresía
+
+Además de `is_eligible`, el módulo debe persistir un estado interpretable:
+
+`membership_state(t,s) in {
+   eligible,
+   ineligible_rule,
+   ineligible_missing,
+   ineligible_halted,
+   ineligible_suspended
+}`
+
+Opcionalmente puede existir:
+
+- `inactive_post_death`
+
+pero el estándar mínimo es que los estados `alive_*` queden representados explícitamente en el panel diario.
+
+Además, para auditoría de transiciones, conviene persistir:
+
+`transition(t,s) in {
+   ENTER,
+   EXIT,
+   STAY_IN,
+   STAY_OUT,
+   STATE_CHANGE_OUTSIDE_UNIVERSE
+}`
+
+y esta transición debe calcularse a nivel `instrument_id`, no de ticker. :contentReference[oaicite:14]{index=14}
+
+14. Tratamiento formal de edge cases
+
+14.1. Halts y suspensions
+
+Un halt o suspensión no extingue automáticamente la identidad económica del instrumento. Por tanto:
+
+- el activo permanece en el panel evaluable mientras siga vivo;
+- por defecto:
+  `halt_policy = exclude_until_tradable`
+- el motivo primario debe ser `HALTED` o `SUSPENDED`, no `MISSING_PRICE`, salvo que ése sea realmente el problema observado.
+
+14.2. Relistings
+
+La política por defecto debe ser conservadora:
+
+`relisting_policy = new_instrument_unless_proven_same`
+
+Es decir, un relisting se trata como nueva identidad salvo evidencia fuerte y explícita de continuidad del `instrument_id`.
+
+14.3. Ticker changes
+
+Un ticker change no genera por sí solo `EXIT` + `ENTER`. Debe preservarse continuidad a nivel de `instrument_id`.
+
+14.4. Cambios de exchange o clasificación
+
+Los efectos aplican desde su fecha PIT efectiva. Queda prohibido reescribir retrospectivamente elegibilidad anterior.
+
+14.5. Corporate actions complejos
+
+Mergers, spin-offs y reorganizaciones deben consumirse ya resueltos desde la capa canónica de corporate actions. `build_universe.py` no debe reinterpretar libremente semántica corporativa compleja. :contentReference[oaicite:15]{index=15}
+
+15. Turnover y churn
+
+El turnover diario del universo debe calcularse a nivel `instrument_id`:
+
+`turnover_t = |U_t Δ U_(t-1)| / |U_t ∪ U_(t-1)|`
+
+donde `Δ` es la diferencia simétrica.
+
+Esto evita que ticker changes o relabelings se contabilicen como entradas y salidas espurias.
+
+Además deben persistirse:
+
+- `entries_t`
+- `exits_t`
+- `n_constituents_t`
+- `turnover_t`
+- breakdown por razón principal de exclusión
+
+Estas métricas son parte del contrato analítico del módulo y no simples estadísticas decorativas. :contentReference[oaicite:16]{index=16}
+
+16. Invariantes obligatorios
+
+Deben cumplirse, como mínimo, los siguientes invariantes duros:
+
+1. unicidad lógica por `(date, instrument_id)`;
+2. `is_eligible in {0,1}`;
+3. `is_eligible = 0` si y sólo si existe `primary_exclusion_reason`;
+4. `is_eligible = 1` implica `primary_exclusion_reason = null`;
+5. no puede haber elegibles antes de `list_date`;
+6. no puede haber elegibles después de `tau_death`;
+7. rerun con mismos inputs y configuración produce output lógicamente idéntico.
+
+Además, existen invariantes blandos monitorizados como `WARN` o `FAIL` según umbrales:
+
+- salto abrupto en tamaño del universo;
+- turnover fuera de rango histórico;
+- cambio excesivo en la fracción de exclusión por una causa;
+- missingness crítica agregada por encima de umbral.
+
+Estos checks deben quedar reflejados en el artefacto de QC del módulo. :contentReference[oaicite:17]{index=17}
+
+17. Flujo de ejecución oficial
+
+El flujo del módulo debe constar de nueve etapas:
+
+1. cargar listing master PIT, calendario, features as-of y configuración;
+2. validar schema, tipos y contratos mínimos;
+3. normalizar identidad y garantizar primacía de `instrument_id`;
+4. construir el panel evaluable completo `P`;
+5. enriquecer con features PIT de elegibilidad;
+6. aplicar filtros en orden determinista;
+7. resolver `is_eligible`, `membership_state`, `primary_exclusion_reason` y `all_failed_reasons`;
+8. calcular turnover, transitions y estadísticas diarias;
+9. persistir historia, current snapshot, exclusions, stats y manifest.
+
+Este flujo debe permanecer estable y versionado. Cambios en precedencia, thresholds o políticas de edge cases deben quedar reflejados en configuración y manifest. :contentReference[oaicite:18]{index=18}
+
+18. Contrato exacto de salida
+
+La historia diaria canónica debe contener, como mínimo:
+
+- `date`
+- `instrument_id`
+- `issuer_id`
+- `symbol`
+- `is_eligible`
+- `membership_state`
+- `primary_exclusion_reason`
+- `all_failed_reasons`
+- `market_cap_usd`
+- `adv20_usd`
+- `price_ref`
+- `listing_exchange`
+- `security_type`
+- `trading_status`
+- `field_source_flags`
+- `run_id`
+- `config_hash`
+- `code_version`
+- `input_snapshot_hash`
+- `built_ts_utc`
+
+Artefactos auxiliares obligatorios:
+
+- `current.parquet`
+- `constituents_{date}.parquet`
+- `exclusions_{date}.parquet`
+- `universe_counts_by_day.parquet`
+- `universe_turnover_stats.parquet`
+- `universe_manifest.json`
+
+Este contrato no es opcional. Sin él, el módulo no ofrece trazabilidad suficiente para un entorno de research-production serio. :contentReference[oaicite:19]{index=19}
+
+19. Manifest y observabilidad
+
+El manifest debe incluir, como mínimo:
+
+- `run_id`
+- `config_hash`
+- `code_version`
+- hashes de inputs materiales
+- convención temporal usada
+- política de missingness
+- política de halts / suspensions
+- número de constituyentes por día
+- conteos por razón de exclusión
+- severidad final del run
+- timestamps de inicio y fin
+
+La salida del módulo no es sólo una tabla; es un artefacto científico reproducible. Sin observabilidad completa, el universo no puede auditarse ni defenderse metodológicamente. :contentReference[oaicite:20]{index=20}
+
+20. Precedencia de errores y severidades
+
+La jerarquía correcta debe ser:
+
+`FAIL`
+- schema roto
+- ausencia de `instrument_id`
+- incoherencia severa del listing master
+- duplicados irresolubles
+- violación de invariantes duros
+- run no reproducible bajo mismos inputs
+
+`WARN`
+- salto excesivo en tamaño del universo
+- turnover fuera de rango
+- missingness crítica agregada elevada
+- causas de exclusión anómalamente concentradas
+
+`INFO`
+- cambios esperados por calendario o rebalance natural
+- coverage completa con pequeñas variaciones normales
+
+Regla de agregación:
+`run_status = max(severity of all checks)`
+
+Cualquier `FAIL` invalida la promoción del run a producción salvo override explícito y logueado. :contentReference[oaicite:21]{index=21}
+
+21. CLI y uso operativo
+
+La interfaz operativa recomendada es:
+
+`python -m data.universe.build_universe --listing-master-path data/reference/listing_master_pit.parquet --calendar-path data/reference/market_calendar.parquet --features-asof-path data/features/universe_inputs --config-path configs/data/build_universe.yaml --start-date 2014-01-01 --end-date 2026-03-05 --as-of-ts-utc 2026-03-05T23:59:59Z --run-id build_universe_20260305_001`
+
+El uso explícito de `asof_ts_utc` es recomendable para mantener coherencia con el resto del sistema y para poder reconstruir exactamente la convención temporal usada. :contentReference[oaicite:22]{index=22}
+
+22. Tests e invariantes mínimos
+
+La implementación debe incluir, como mínimo, tests sobre:
+
+1. exclusión correcta antes de `list_date`;
+2. exclusión correcta después de `delist_date` o `tau_death`;
+3. continuidad a nivel `instrument_id` pese a ticker change;
+4. política correcta ante `HALTED` y `SUSPENDED`;
+5. missingness crítica => exclusión con razón explícita;
+6. precedencia correcta entre múltiples fallos simultáneos;
+7. cálculo correcto de `primary_exclusion_reason` y `all_failed_reasons`;
+8. cálculo de turnover a nivel `instrument_id`;
+9. reproducibilidad bit a bit con mismos inputs y config;
+10. no posibilidad de filas elegibles sin razones vacías ni de filas ineligibles sin razón primaria.
+
+Estos tests no son cosméticos. Definen el contrato institucional del módulo. :contentReference[oaicite:23]{index=23}
+
+23. Definition of Done
+
+El módulo `build_universe.py` se considera terminado únicamente si:
+
+- construye un universo daily PIT con convención temporal explícita;
+- elimina survivorship, look-ahead y backfill bias a nivel de elegibilidad;
+- usa `instrument_id` como identidad primaria;
+- genera un panel evaluable completo, no sólo constituyentes;
+- resuelve elegibilidad mediante filtros deterministas y ordenados;
+- expone razón primaria y lista completa de exclusiones;
+- calcula turnover correctamente a nivel `instrument_id`;
+- persiste historia, snapshot actual, exclusiones, stats y manifest;
+- supera los tests mínimos de edge cases y reproducibilidad.
+
+En otras palabras, el módulo no está terminado cuando “genera una lista de small caps”, sino cuando fija la verdad histórica invertible del sistema con suficiente disciplina como para sostener señales, portfolio y backtests sin autoengaño metodológico. :contentReference[oaicite:24]{index=24}
+
+24. MVP vs versión avanzada
+
+MVP correcto:
+
+- convención temporal `close(t-1) -> execute(t)`;
+- primacía de `instrument_id`;
+- panel evaluable completo;
+- filtros deterministas con precedencia cerrada;
+- política conservadora de missingness;
+- razones de exclusión duales;
+- turnover a nivel `instrument_id`;
+- artefactos auditables y reproducibles;
+- suite mínima de tests con IPOs, delistings, halts, relistings y ticker changes.
+
+Versión avanzada justificable:
+
+- probabilistic eligibility como capa diagnóstica;
+- universe DAG causal;
+- dynamic quantile bands por régimen;
+- reconciliación multi-entidad más rica en mergers y spin-offs;
+- métricas de fidelidad tipo KL entre universo construido y referencia externa.
+
+No es obligatorio, en esta fase, introducir Bayesian eligibility o DAG causal complejo como núcleo del módulo oficial. Son extensiones plausibles y valiosas, pero la prioridad correcta aquí es cerrar perfectamente la capa determinista: identidad, PIT, filtros, razones de exclusión, turnover y trazabilidad. :contentReference[oaicite:25]{index=25}
+
+25. Interpretación correcta
+
+`data/universe/build_universe.py` no debe interpretarse como un screener histórico, sino como la capa fundacional de verdad invertible del sistema. Su función no es decidir qué activos “gustan”, sino fijar qué activos podían formar parte del dominio de decisión con información causalmente disponible y bajo reglas institucionalmente reproducibles. Un universo construido con ticker como identidad primaria, sin panel completo, sin razones de exclusión y sin disciplina PIT puede parecer cómodo, pero contamina silenciosamente todo el stack. Un universo conservador, historificado, auditable y definido a nivel `instrument_id` sí sirve, aunque resulte más exigente y más incómodo de mantener. :contentReference[oaicite:26]{index=26}
+
+26. Conclusión
+
+`data/universe/build_universe.py` debe quedar definido como una pieza institucional de construcción del universo PIT invertible, no como una rutina auxiliar de filtrado.
+
+La especificación correcta no es “aplicar price > x y ADV > y”, sino:
+
+- fijar qué entra;
+- fijar qué identidad manda;
+- fijar la convención temporal;
+- fijar el panel evaluable completo;
+- fijar el orden de filtros;
+- fijar cómo se resuelven múltiples fallos;
+- fijar qué artefactos auditables salen;
+- y fijar qué invariantes protegen al research de survivorship, look-ahead y contaminación temporal.
+
+Si cumple esta especificación, el módulo deja de ser un builder táctico y pasa a ser la base histórica invertible del stack cuantitativo. Si no la cumple, el riesgo no es sólo técnico: es invalidar silenciosamente todos los resultados downstream desde el nivel más fundamental del sistema. :contentReference[oaicite:27]{index=27}

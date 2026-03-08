@@ -1,757 +1,687 @@
-\documentclass{article}
-\usepackage[utf8]{inputenc}
-\usepackage[spanish]{babel}
-\usepackage{amsmath,amssymb,amsfonts}
-\usepackage{mathtools}
-\usepackage{booktabs}
-\usepackage{longtable}
-\usepackage{array}
-\usepackage{enumitem}
-\usepackage{hyperref}
-\usepackage[a4paper,margin=2.4cm]{geometry}
+Especificación Cuantitativa e Institucional: backtest/attribution.py
 
-\title{Especificación Cuantitativa e Institucional del Módulo \texttt{backtest/attribution.py}}
-\author{Sistema \texttt{simons\_smallcap\_swing}}
-\date{\today}
+0. Propósito y papel dentro del sistema
 
-\begin{document}
+backtest/attribution.py es la capa de descomposición económica y contable del backtest. Su función no es generar señales, ni ejecutar órdenes, ni embellecer el equity curve con gráficos cómodos de leer. Su responsabilidad real es reconciliar el P&L producido por el motor de backtest con una descomposición económica interpretable, persistible y auditada, de forma que el sistema pueda responder con precisión a la pregunta central de toda estrategia cuantitativa seria:
 
-\maketitle
+    de dónde viene exactamente el retorno neto,
+    qué parte es exposición sistemática,
+    qué parte es selección idiosincrática,
+    qué parte se pierde en fricciones,
+    y qué parte queda como residual no explicado.
 
-\begin{abstract}
-Este documento define de forma operativa, matemática y de ingeniería el módulo
-\texttt{backtest/attribution.py} del sistema \texttt{simons\_smallcap\_swing}.
-Su función es reconciliar y descomponer el P\&L neto del backtest en componentes
-económicamente interpretables y operacionalmente auditables: contribución por activo,
-sector, sleeve, factor de riesgo, costes explícitos, costes implícitos, financiación
-y residual de \textit{alpha}. La especificación no se limita al plano conceptual,
-sino que fija contratos de entrada y salida, convenciones temporales, invariantes
-contables, reglas \textit{point-in-time}, criterios de aceptación, tolerancias de
-reconciliación y \textit{failure modes} obligatorios. El objetivo no es producir una
-visualización agradable del rendimiento, sino construir una capa de atribución
-institucional que permita responder con precisión a la pregunta central de cualquier
-estrategia cuantitativa seria: \emph{de dónde procede exactamente el retorno neto,
-qué parte es estructuralmente repetible y qué parte es exposición accidental o
-artefacto de simulación}.
-\end{abstract}
+El documento base que has subido ya fija muy bien ese estándar: atribución por activo, sector, sleeve, factor, costes y residual alpha; reconciliación exacta con el engine; convención PIT estricta; persistencia institucional; y uso del módulo como firewall económico entre la curva de capital y la interpretación seria del rendimiento. :contentReference[oaicite:1]{index=1}
 
-\tableofcontents
+En un stack cuantitativo serio, este módulo no es reporting decorativo. Si falla, el sistema puede:
+- atribuir alpha a una simple exposición a mercado o tamaño;
+- esconder en el residual errores de alineación temporal;
+- doble contar o perder costes;
+- explicar mal drawdowns o concentraciones;
+- o aceptar un backtest rentable cuya fuente económica real es frágil o accidental.
 
-\section{Propósito institucional del módulo}
+La regla institucional debe ser esta:
 
-El módulo \texttt{backtest/attribution.py} existe para transformar la salida del motor
-de backtest en un objeto analítico auditable. No basta con conocer que la estrategia
-gana dinero; es necesario saber \emph{por qué}, \emph{dónde}, \emph{cuándo} y
-\emph{a costa de qué fricciones}. En un sistema cuantitativo profesional, la
-atribución cumple simultáneamente cinco funciones:
+    ningún backtest
+    debe considerarse plenamente confiable
+    si su P&L neto
+    no puede reconciliarse y descomponerse
+    en fuentes económicas verificables.
 
-\begin{enumerate}[label=\arabic*.]
-    \item \textbf{Diagnóstico económico}: separar \textit{alpha} propio de exposición
-    sistemática no deseada.
-    \item \textbf{Control de model risk}: detectar dependencia oculta de factores,
-    sectores, capitalización, liquidez o regímenes de mercado.
-    \item \textbf{Control de implementation shortfall}: cuantificar cuánto P\&L bruto
-    se pierde por costes, impacto, borrow, financiación o fricciones de turnover.
-    \item \textbf{Promoción o descarte de estrategias}: decidir si una señal es
-    promocionable a producción o si su rentabilidad proviene de una fuente frágil.
-    \item \textbf{Reproducibilidad institucional}: garantizar que la suma de
-    subcomponentes explica el P\&L del backtest dentro de tolerancias estrictas y
-    repetibles.
-\end{enumerate}
+1. Objetivo formal del módulo
 
-Por tanto, este módulo no es una utilidad cosmética de reporting; es una pieza de
-control interno del sistema. Si la atribución no reconcilia, el backtest no debe
-considerarse plenamente confiable.
+Sea el conjunto de posiciones, retornos, costes, clasificaciones y exposiciones PIT del run. El módulo debe implementar una transformación:
 
-\section{Pregunta económica que debe responder}
+    Attribution :
+    (Positions_{t-1}, Returns_t, Costs_t, Classifications_{t-1}, Factors_{t-1}, FactorReturns_t)
+    -> Decomposition_t
 
-La salida del módulo debe permitir responder, sin ambigüedad, a las siguientes preguntas:
+donde Decomposition_t contiene, al menos:
+- contribuciones por activo;
+- agregaciones por sector, industria y sleeve;
+- waterfall de costes;
+- atribución factorial;
+- residual bruto y neto;
+- reconciliación diaria con el engine;
+- y artefactos persistidos para auditoría.
 
-\begin{itemize}
-    \item ¿Cuánto del retorno neto procede de selección de activos y cuánto de
-    exposiciones sistemáticas?
-    \item ¿Qué fracción del P\&L bruto se erosiona por comisiones, slippage, impacto,
-    borrow o financiación?
-    \item ¿La estrategia gana por \textit{stock picking} o por sesgos accidentales a
-    tamaño, momentum, beta, iliquidez o concentración sectorial?
-    \item ¿Qué activos, sectores, fechas o sleeves explican la mayor parte del
-    rendimiento y del drawdown?
-    \item ¿La atribución se mantiene estable por ventana temporal y por régimen, o se
-    colapsa en episodios concretos?
-    \item ¿La estrategia sigue siendo atractiva después de neutralizar o explicar
-    explícitamente sus factores de riesgo?
-\end{itemize}
+La salida no debe ser una simple tabla bonita, sino una estructura formal que permita verificar identidades contables y extraer interpretación económica.
 
-Si el módulo no puede contestar estas preguntas con artefactos persistidos y
-reconciliación matemática, entonces la atribución es insuficiente.
+2. Principios no negociables
 
-\section{Alcance}
+P1. PIT estricto.
+Todas las exposiciones, pesos, clasificaciones sectoriales y betas deben ser las conocidas en t-1.
 
-\subsection{Incluido}
+P2. Reconciliación primero.
+Ninguna interpretación económica es válida si no cuadra con el P&L del engine.
 
-El módulo debe producir atribución al menos en los siguientes ejes:
+P3. Separación bruto/neto.
+No mezclar contribuciones brutas con costes ni residual neto sin etiquetado explícito.
 
-\begin{itemize}
-    \item \textbf{Por activo}: contribución diaria y acumulada de cada instrumento.
-    \item \textbf{Por sector e industria}: agregaciones jerárquicas.
-    \item \textbf{Por sleeve}: por ejemplo, subestrategias, familias de señal o
-    componentes del ensemble.
-    \item \textbf{Por factor}: mercado, tamaño, valor, momentum, calidad, low vol,
-    liquidez u otros factores definidos por el modelo de riesgo.
-    \item \textbf{Por costes}: comisión, fees, slippage, impacto, spread,
-    borrow, financiación y otros costes explícitos o implícitos modelados por el engine.
-    \item \textbf{Por régimen temporal}: agregación por mes, trimestre, año y, si se
-    proporcionan etiquetas, por estado de mercado.
-    \item \textbf{Residual alpha}: componente no explicado por factores ni fricciones.
-\end{itemize}
+P4. Persistencia total.
+Toda descomposición relevante debe poder reconstruirse desde artefactos persistidos.
 
-\subsection{Excluido}
+P5. Convención temporal única.
+El módulo no puede mezclar w_t con r_t si el engine opera con w_{t-1} x r_t.
 
-El módulo \textbf{no} estima de forma primaria el modelo factorial ni genera señales.
-Tampoco reemplaza al motor de backtest ni al módulo de ejecución. Sus inputs deben venir
-de capas upstream ya cerradas:
+P6. Costes explícitos.
+Las fricciones deben atribuirse con reglas claras y no quedar absorbidas ambiguamente en residual alpha.
 
-\begin{itemize}
-    \item \texttt{risk/factor\_model.py}: estimación de betas, factores y matrices de exposición.
-    \item \texttt{backtest/engine.py}: posiciones, fills, cash, equity, costes y P\&L.
-    \item \texttt{diagnostics.py}: alertas de calidad y salud global del run.
-    \item \texttt{report.py}: presentación final al usuario o investigador.
-\end{itemize}
+P7. Fallo ruidoso.
+Si la atribución no reconcilia materialmente, el módulo debe marcar ERROR y no degradar silenciosamente.
 
-\section{Principios de diseño}
+3. Ámbito y no-objetivos
 
-El módulo debe obedecer los principios siguientes:
+El módulo cubre:
+- atribución por activo;
+- agregación por sector, industria y sleeve;
+- atribución de costes;
+- atribución factorial;
+- residual alpha;
+- reconciliación contable;
+- artefactos persistidos;
+- métricas resumen;
+- severidades de calidad de atribución.
 
-\begin{enumerate}[label=\arabic*.]
-    \item \textbf{PIT estricto}: ninguna exposición, clasificación, universo o coste
-    puede utilizar información disponible sólo después del instante de decisión.
-    \item \textbf{Reconciliación primero, interpretación después}: no se admite
-    atribución elegante si no cuadra contablemente.
-    \item \textbf{Una única convención temporal}: todas las contribuciones deben
-    definirse con pesos/exposiciones en \(t-1\) y retornos/costes realizados en \(t\),
-    salvo que el engine haya fijado otra convención explícita y documentada.
-    \item \textbf{Separación entre bruto, neto y residual}: nunca mezclar en una misma
-    tabla componentes de distinta naturaleza sin marcas explícitas.
-    \item \textbf{Persistencia total}: todo resultado intermedio relevante debe quedar
-    almacenado para auditoría.
-    \item \textbf{Tolerancias explícitas}: la reconciliación no se deja a juicio visual.
-    \item \textbf{Fallo ruidoso}: discrepancias materiales deben lanzar error, no
-    simplemente advertencias silenciosas.
-\end{enumerate}
+Queda fuera de alcance:
+- generación de señales;
+- estimación primaria del modelo factorial;
+- ejecución de órdenes;
+- corrección del engine;
+- research de nuevas señales;
+- optimización de cartera;
+- explicación causal avanzada de por qué el residual existe.
 
-\section{Convención temporal y notación}
+La misión aquí es economic attribution with institutional control.
 
-Sea \(t\) el intervalo de valoración entre cierres \(t-1 \rightarrow t\).
+4. Convención temporal y notación
+
+Sea t el periodo de valoración t-1 -> t. Definimos:
+- w_{i,t-1}: peso económico del activo i conocido en t-1.
+- q_{i,t-1}: posición en unidades del activo i en t-1.
+- P_{i,t-1}, P_{i,t}: precios de valoración.
+- r_{i,t}: retorno total del activo i durante t.
+- AUM_{t-1}: capital base para convertir P&L monetario en retorno.
+- c_{k,t}: coste del tipo k realizado durante t.
+- β_{i,f,t-1}: exposición del activo i al factor f conocida en t-1.
+- F_{f,t}: retorno realizado del factor f durante t.
+- g(i)_{t-1}: clasificación PIT del activo i a sector/industria/sleeve en t-1.
+
+La convención obligatoria del módulo debe ser:
+
+    información de posición, clasificación y factor en t-1
+    combinada con retornos y costes realizados en t
+
+Cualquier atribución que use información posterior debe considerarse metodológicamente inválida.
+
+5. Jerarquía de P&L
+
+El módulo debe distinguir claramente entre:
+- P&L bruto;
+- P&L neto;
+- costes;
+- y retorno asociado.
+
+5.1. P&L bruto
+
+    P&L_gross_t =
+        Σ_i q_{i,t-1} (P_{i,t} - P_{i,t-1})
+        + cash_flows_economic_t
+
+donde cash_flows_economic_t puede incluir:
+- dividendos;
+- cupones;
+- ajustes por corporate actions;
+- manufacturados en cortos;
+- otros flujos económicos consistentes con el engine.
+
+5.2. P&L neto
+
+    P&L_net_t = P&L_gross_t - Σ_k c_{k,t}
+
+5.3. Retorno bruto y neto
+
+    r_gross_{p,t} = P&L_gross_t / AUM_{t-1}
+    r_net_{p,t}   = P&L_net_t   / AUM_{t-1}
+
+Esta separación no es cosmética. Es la base para distinguir:
+- calidad económica de la señal;
+- de su monetización final después de fricciones.
+
+6. Atribución por activo
+
+6.1. Contribución bruta por activo
+
+En retornos:
+
+    contrib_gross_{i,t} = w_{i,t-1} r_{i,t}
+
+En dinero:
+
+    pnl_gross_{i,t} =
+        q_{i,t-1}(P_{i,t} - P_{i,t-1})
+        + cash_flows_{i,t}
+
+Debe cumplirse:
+
+    Σ_i pnl_gross_{i,t} ≈ P&L_gross_t
+
+6.2. Contribución neta por activo
+
+Una vez asignados costes al activo:
+
+    pnl_net_{i,t} = pnl_gross_{i,t} - allocated_cost_{i,t}
+
+y debe cumplirse:
+
+    Σ_i pnl_net_{i,t} ≈ P&L_net_t
+
+La regla de asignación de costes no puede quedar implícita. Debe ser contractual y quedar persistida.
+
+7. Atribución por sector, industria y sleeve
+
+Sea g(i) la clasificación PIT del activo i. Entonces, para cualquier agrupación s:
+
+    pnl_{s,t} = Σ_{i : g(i)=s} pnl_{i,t}
+
+y deben cumplirse las identidades jerárquicas:
+
+    Σ_s pnl_{sector,s,t}   = Σ_i pnl_{i,t}
+    Σ_m pnl_{sleeve,m,t}   = Σ_i pnl_{i,t}
+    Σ_h pnl_{industry,h,t} = Σ_i pnl_{i,t}
+
+siempre que:
+- toda posición tenga mapping válido;
+- y el mapping sea completo y no superpuesto.
+
+La clasificación debe ser point-in-time. No se permite usar un security master reescrito con información posterior.
+
+8. Atribución de costes
+
+El módulo debe separar costes como mínimo en:
+- commission
+- fees_and_taxes
+- slippage
+- market_impact
+- borrow
+- financing
+- other_costs
+
 Definimos:
 
-\begin{itemize}
-    \item \(w_{i,t-1}\): peso económico del activo \(i\) al cierre de \(t-1\), ya
-    después de las operaciones ejecutadas en ese cierre si así lo define el engine.
-    \item \(r_{i,t}\): retorno total del activo \(i\) durante \(t-1 \rightarrow t\),
-    consistente con corporate actions, dividendos y ajustes del motor.
-    \item \(q_{i,t-1}\): número de títulos o exposición en unidades.
-    \item \(P_{i,t-1}, P_{i,t}\): precios de valoración.
-    \item \(AUM_{t-1}\): capital base de referencia para convertir P\&L monetario en retorno.
-    \item \(c_{k,t}\): coste del tipo \(k\) realizado durante el periodo \(t\).
-    \item \(\beta_{i,f,t-1}\): exposición del activo \(i\) al factor \(f\), conocida en \(t-1\).
-    \item \(F_{f,t}\): retorno del factor \(f\) en el periodo \(t\).
-\end{itemize}
-
-La convención obligatoria del módulo es:
-
-\[
-\text{información de posición/exposición en } t-1
-\quad \Longrightarrow \quad
-\text{retorno y costes realizados en } t.
-\]
-
-Esta convención impone disciplina anti-\textit{look-ahead} y hace compatible la
-atribución con un backtest event-driven serio.
-
-\section{Jerarquía de P\&L}
-
-El módulo debe distinguir, al menos, las siguientes magnitudes:
-
-\begin{align}
-\text{P\&L}^{\text{gross}}_t
-    &= \sum_i q_{i,t-1}\left(P_{i,t} - P_{i,t-1}\right)
-    + \text{cash\_flows}^{\text{econ}}_t \\
-\text{P\&L}^{\text{net}}_t
-    &= \text{P\&L}^{\text{gross}}_t
-    - \sum_k c_{k,t} \\
-r^{\text{gross}}_{p,t}
-    &= \frac{\text{P\&L}^{\text{gross}}_t}{AUM_{t-1}} \\
-r^{\text{net}}_{p,t}
-    &= \frac{\text{P\&L}^{\text{net}}_t}{AUM_{t-1}}
-\end{align}
-
-donde \(\text{cash\_flows}^{\text{econ}}_t\) incluye, si procede según la definición
-del engine, dividendos, cupones, manufacturados en cortos, ajustes por splits,
-fusiones u otros eventos económicos que formen parte del retorno del activo.
-
-Esta separación es obligatoria porque muchas atribuciones aparentemente correctas
-fracasan al mezclar:
-
-\begin{itemize}
-    \item P\&L mark-to-market,
-    \item costes de trading,
-    \item financiación del libro,
-    \item y cash drag residual.
-\end{itemize}
-
-\section{Capas de atribución}
+    C_total_t = Σ_k c_{k,t}
 
-\subsection{Atribución por activo}
-
-La contribución bruta por activo se define como:
+y debe cumplirse:
 
-\[
-\text{contrib}^{\text{gross}}_{i,t}
-=
-w_{i,t-1}\,r_{i,t}
-\]
-
-o, equivalentemente, en unidades monetarias,
-
-\[
-\text{pnl}^{\text{gross}}_{i,t}
-=
-q_{i,t-1}\left(P_{i,t} - P_{i,t-1}\right)
-+ \text{cash\_flows}_{i,t}.
-\]
-
-Debe cumplirse que:
-
-\[
-\sum_i \text{pnl}^{\text{gross}}_{i,t}
-\approx
-\text{P\&L}^{\text{gross}}_t
-\]
-
-dentro de una tolerancia explicitada en configuración. El símbolo \(\approx\) no
-significa permisividad conceptual, sino reconciliación numérica bajo tolerancias
-bien definidas por redondeo y convenciones del engine.
-
-\subsection{Atribución por sector/industria}
-
-Sea \(g(i)\) la clasificación sectorial o industrial PIT del activo \(i\). Entonces:
-
-\[
-\text{contrib}^{\text{gross}}_{s,t}
-=
-\sum_{i:\,g(i)=s}\text{contrib}^{\text{gross}}_{i,t}
-\]
-
-La clasificación sectorial debe ser \textbf{point-in-time}. No se permite usar
-clasificaciones retroajustadas o sobrevivientes si el sistema pretende simulación
-institucional realista.
+    Σ_k c_{k,t} ≈ Cost_total_engine_t
 
-\subsection{Atribución por sleeve}
+El coste asignado a activo, sleeve o sector puede seguir una de estas reglas, fijada por config:
+- trazabilidad directa por fill y activo;
+- prorrateo por notional negociado;
+- prorrateo por turnover absoluto;
+- regla jerárquica mixta.
 
-Si la cartera se construye como suma de sleeves \(m\) (por señal, familia o ensemble),
-entonces cada activo debe llevar una etiqueta de procedencia o una regla de asignación
-de notional. La atribución por sleeve debe reconciliar tanto a nivel bruto como neto.
+Lo importante no es solo elegir una regla, sino hacerla:
+- explícita;
+- estable;
+- reproducible;
+- y persistida en manifest.json.
+
+9. Atribución factorial
+
+El módulo debe poder descomponer el retorno del portfolio mediante un modelo factorial:
+
+    r_{p,t} = Σ_f β_{f,t-1} F_{f,t} + α_t
+
+donde la beta agregada del portfolio es:
+
+    β_{f,t-1} = Σ_i w_{i,t-1} β_{i,f,t-1}
+
+La contribución del factor f en t es:
+
+    contrib_factor_{f,t} = β_{f,t-1} F_{f,t}
+
+9.1. Residual bruto
+
+    α_gross_t = r_gross_{p,t} - Σ_f contrib_factor_{f,t}
+
+9.2. Residual neto
+
+    α_net_t = r_net_{p,t} - Σ_f contrib_factor_{f,t}
+
+Estas dos series no deben confundirse:
+- α_gross_t mide alpha antes de fricciones;
+- α_net_t mide alpha monetizable después de costes.
+
+10. Interpretación correcta del residual alpha
+
+El residual no debe interpretarse automáticamente como “edge puro”. Puede contener:
+- selección idiosincrática genuina;
+- timing no recogido por el modelo de riesgo;
+- factores omitidos;
+- problemas de cobertura factorial;
+- errores de alineación;
+- o clasificación económica incompleta.
+
+Por eso el módulo debe persistir métricas auxiliares como:
+- factor_coverage;
+- factor_r2;
+- porcentaje de notional sin betas;
+- residual por régimen;
+- residual por subperiodo.
+
+Sin estas métricas, el residual es demasiado ambiguo para ser institucionalmente confiable.
+
+11. Contratos de entrada
 
-\subsection{Atribución de costes}
+11.1. Inputs obligatorios
+- run_id
+- attribution_config_path
+- positions_path
+- returns_path
+- costs_path
+- engine_summary_path o equivalente
+- AUM base o capital de referencia coherente con el engine
 
-Los costes deben separarse como mínimo en:
+11.2. Inputs opcionales
+- factor_model_path
+- benchmark_path
+- regime_states_path
+- security_master_path
+- sleeve_mapping_path
+- borrow_details_path
 
-\begin{itemize}
-    \item \texttt{commission}
-    \item \texttt{fees\_and\_taxes}
-    \item \texttt{slippage}
-    \item \texttt{market\_impact}
-    \item \texttt{borrow}
-    \item \texttt{financing}
-    \item \texttt{other\_costs}
-\end{itemize}
-
-y deben cumplir:
+11.3. Precondiciones obligatorias
+Antes de ejecutar atribución deben verificarse:
+- unicidad por (date, asset_id);
+- compatibilidad de calendario;
+- misma moneda o conversión explícita;
+- mismo asset_id entre posiciones y retornos;
+- consistencia entre engine y datasets persistidos;
+- corporate actions ya integradas upstream.
 
-\[
-C^{\text{total}}_t = \sum_k c_{k,t}.
-\]
-
-La atribución neta por activo o sleeve puede realizarse repartiendo costes por:
-
-\begin{enumerate}[label=\alph*)]
-    \item coste directamente etiquetado por fill/activo, cuando exista trazabilidad;
-    \item prorrateo por notional negociado;
-    \item prorrateo por turnover absoluto;
-    \item regla jerárquica definida en configuración.
-\end{enumerate}
-
-El método de reparto debe quedar persistido en \texttt{manifest.json}. Un sistema
-institucional no deja implícito cómo asignó un coste.
-
-\subsection{Atribución factorial}
-
-El retorno neto o bruto del portfolio se descompone como:
-
-\[
-r_{p,t} = \sum_f \beta_{f,t-1}F_{f,t} + \alpha^{\text{resid}}_t
-\]
-
-con
-
-\[
-\beta_{f,t-1} = \sum_i w_{i,t-1}\beta_{i,f,t-1}.
-\]
-
-Por tanto, la contribución del factor \(f\) en \(t\) es:
-
-\[
-\text{contrib}^{\text{factor}}_{f,t} = \beta_{f,t-1}F_{f,t}.
-\]
-
-Si la atribución factorial se calcula sobre retorno bruto, el residual es:
-
-\[
-\alpha^{\text{gross}}_t
-=
-r^{\text{gross}}_{p,t}
--
-\sum_f \text{contrib}^{\text{factor}}_{f,t}.
-\]
-
-Si se calcula sobre retorno neto, entonces:
-
-\[
-\alpha^{\text{net}}_t
-=
-r^{\text{net}}_{p,t}
--
-\sum_f \text{contrib}^{\text{factor}}_{f,t}.
-\]
-
-Ambas series son útiles y no deben confundirse. La primera informa sobre capacidad
-predictiva antes de fricciones; la segunda, sobre monetización final de esa capacidad.
-
-\section{Residual de alpha: interpretación correcta}
-
-El residual de \textit{alpha} \textbf{no} debe interpretarse automáticamente como
-“genialidad del modelo”. Es, por definición, el componente no explicado por el
-modelo factorial y las fricciones introducidas. Puede contener:
-
-\begin{itemize}
-    \item selección de activos genuina;
-    \item timing no recogido por los factores;
-    \item especificación incompleta del risk model;
-    \item errores de alineación temporal;
-    \item clasificación sectorial pobre;
-    \item problemas de datos o de mapping de identificadores.
-\end{itemize}
-
-Por ello, el módulo debe producir no sólo el residual, sino también métricas auxiliares
-que permitan evaluar si dicho residual es económicamente creíble:
-\(R^2\) explicativo, cobertura del universo, porcentaje de activos sin betas,
-porcentaje de notional fuera de modelo y estabilidad temporal del residual.
-
-\section{Contratos de entrada}
-
-\subsection{Inputs obligatorios}
-
-\begin{longtable}{>{\ttfamily}p{4.2cm} p{9.8cm}}
-\toprule
-Campo & Descripción \\
-\midrule
-backtest\_run\_path & Ruta del run con posiciones, fills, equity curve, cash ledger, costes y metadatos del engine. \\
-run\_id & Identificador único e inmutable del backtest. \\
-attribution\_config\_path & Configuración YAML del módulo: tolerancias, niveles de agregación, factores, reglas de reparto, severidades. \\
-positions\_path & Snapshot PIT de posiciones por fecha y activo. \\
-returns\_path & Retornos por activo consistentes con el engine. \\
-costs\_path & Descomposición diaria de costes, idealmente trazable por fill y activo. \\
-\bottomrule
-\end{longtable}
-
-\subsection{Inputs opcionales}
-
-\begin{longtable}{>{\ttfamily}p{4.2cm} p{9.8cm}}
-\toprule
-Campo & Descripción \\
-\midrule
-factor\_model\_path & Exposiciones PIT por activo y retornos de factores. \\
-benchmark\_path & Serie del benchmark para atribución relativa o active return. \\
-regime\_states\_path & Etiquetas de régimen de mercado o de volatilidad. \\
-security\_master\_path & Mapeo de ticker/cusip/id interno, sector, industria, país, exchange. \\
-sleeve\_mapping\_path & Asignación de activos o fills a subestrategias. \\
-borrow\_details\_path & Costes de borrow y disponibilidad si la estrategia trabaja con cortos. \\
-\bottomrule
-\end{longtable}
-
-\subsection{Precondiciones obligatorias}
-
-Antes de ejecutar atribución, deben cumplirse estas condiciones:
-
-\begin{itemize}
-    \item No hay fechas duplicadas por \((date, asset\_id)\).
-    \item Las posiciones y retornos usan el mismo identificador de activo.
-    \item La moneda de valoración del P\&L está unificada o existe conversión explícita.
-    \item El calendario está alineado entre posiciones, retornos, factores y costes.
-    \item El engine ya ha aplicado corporate actions y ajustes de forma consistente.
-\end{itemize}
-
-Si alguna de estas precondiciones falla, el módulo debe abortar con error.
-
-\section{Contratos de salida}
-
-El módulo debe persistir, al menos, los siguientes artefactos:
-
-\begin{itemize}
-    \item \texttt{backtest/attribution/\{run\_id\}/asset\_contribution.parquet}
-    \item \texttt{backtest/attribution/\{run\_id\}/sector\_attribution.parquet}
-    \item \texttt{backtest/attribution/\{run\_id\}/sleeve\_attribution.parquet}
-    \item \texttt{backtest/attribution/\{run\_id\}/factor\_attribution.parquet}
-    \item \texttt{backtest/attribution/\{run\_id\}/cost\_waterfall.parquet}
-    \item \texttt{backtest/attribution/\{run\_id\}/daily\_reconciliation.parquet}
-    \item \texttt{backtest/attribution/\{run\_id\}/attribution\_summary.json}
-    \item \texttt{backtest/attribution/\{run\_id\}/manifest.json}
-\end{itemize}
-
-\subsection{Esquema mínimo de \texttt{asset\_contribution.parquet}}
-
-\begin{longtable}{>{\ttfamily}p{4.0cm} p{10cm}}
-\toprule
-Campo & Descripción \\
-\midrule
-date & Fecha \(t\) del retorno atribuido. \\
-asset\_id & Identificador interno único del activo. \\
-ticker & Ticker legible si existe. \\
-sector & Sector PIT. \\
-industry & Industria PIT. \\
-sleeve & Sleeve o subestrategia asignada. \\
-weight\_tminus1 & Peso económico en \(t-1\). \\
-quantity\_tminus1 & Posición en unidades en \(t-1\). \\
-asset\_return\_t & Retorno del activo durante \(t-1 \rightarrow t\). \\
-gross\_pnl & Contribución monetaria bruta. \\
-gross\_return\_contribution & Contribución bruta al retorno. \\
-allocated\_cost & Coste imputado al activo. \\
-net\_pnl & Contribución monetaria neta. \\
-net\_return\_contribution & Contribución neta al retorno. \\
-data\_quality\_flag & Bandera de calidad del registro. \\
-\bottomrule
-\end{longtable}
-
-\subsection{Esquema mínimo de \texttt{factor\_attribution.parquet}}
-
-\begin{longtable}{>{\ttfamily}p{4.0cm} p{10cm}}
-\toprule
-Campo & Descripción \\
-\midrule
-date & Fecha de valoración. \\
-factor\_name & Nombre del factor. \\
-portfolio\_beta\_tminus1 & Exposición agregada del portfolio al factor en \(t-1\). \\
-factor\_return\_t & Retorno del factor en \(t\). \\
-factor\_contribution\_gross & Contribución del factor al retorno bruto. \\
-factor\_contribution\_net & Contribución del factor al retorno neto si se publica también en neto. \\
-coverage\_notional & Proporción del notional cubierto por el modelo factorial. \\
-\bottomrule
-\end{longtable}
-
-\subsection{Esquema mínimo de \texttt{daily\_reconciliation.parquet}}
-
-\begin{longtable}{>{\ttfamily}p{4.0cm} p{10cm}}
-\toprule
-Campo & Descripción \\
-\midrule
-date & Fecha de control. \\
-gross\_pnl\_engine & P\&L bruto según engine. \\
-gross\_pnl\_sum\_assets & Suma de P\&L bruto atribuido por activo. \\
-cost\_total\_engine & Coste total según engine. \\
-cost\_total\_sum & Suma de costes imputados. \\
-net\_pnl\_engine & P\&L neto según engine. \\
-net\_pnl\_sum\_assets & Suma de P\&L neto atribuido. \\
-factor\_plus\_residual & Suma de factores más residual. \\
-recon\_error\_gross & Error de reconciliación bruto. \\
-recon\_error\_net & Error de reconciliación neto. \\
-severity & OK / WARNING / ERROR. \\
-\bottomrule
-\end{longtable}
-
-\section{Invariantes obligatorios}
-
-Los siguientes invariantes deben cumplirse en cada fecha \(t\), salvo excepciones
-explícitamente marcadas:
-
-\subsection{Invariante de suma bruta}
-
-\[
-\left|
-\text{P\&L}^{\text{gross}}_t
--
-\sum_i \text{pnl}^{\text{gross}}_{i,t}
-\right|
-\le \varepsilon^{\text{gross}}_{\text{money}}
-\]
-
-\subsection{Invariante de suma de costes}
-
-\[
-\left|
-\sum_k c_{k,t} - C^{\text{total}}_t
-\right|
-\le \varepsilon^{\text{cost}}_{\text{money}}
-\]
-
-\subsection{Invariante neto}
-
-\[
-\left|
-\text{P\&L}^{\text{net}}_t
--
-\sum_i \text{pnl}^{\text{net}}_{i,t}
-\right|
-\le \varepsilon^{\text{net}}_{\text{money}}
-\]
-
-\subsection{Invariante factorial}
-
-Si la atribución factorial cubre una fracción suficiente del notional, debe cumplirse:
-
-\[
-\left|
-r_{p,t}^{(\cdot)}
--
-\sum_f \text{contrib}^{\text{factor}}_{f,t}
--
-\alpha_t^{(\cdot)}
-\right|
-\le \varepsilon^{\text{factor}}_{\text{return}}
-\]
-
-donde \((\cdot)\) denota bruto o neto, según convención.
-
-\subsection{Invariante de agregación jerárquica}
-
-\[
-\sum_s \text{pnl}_{s,t}
-=
-\sum_i \text{pnl}_{i,t}
-\qquad\text{y}\qquad
-\sum_m \text{pnl}_{m,t}
-=
-\sum_i \text{pnl}_{i,t}
-\]
-
-siempre que todo activo esté completamente asignado a un sector y a un sleeve.
-
-\section{Tolerancias recomendadas}
-
-Las tolerancias deben configurarse explícitamente. Una parametrización razonable para
-backtesting diario sería:
-
-\begin{itemize}
-    \item \(\varepsilon^{\text{gross}}_{\text{money}} = \max(10^{-8}\cdot AUM_t,\; 0.01)\)
-    \item \(\varepsilon^{\text{net}}_{\text{money}} = \max(10^{-8}\cdot AUM_t,\; 0.01)\)
-    \item \(\varepsilon^{\text{factor}}_{\text{return}} = 10^{-10}\) a \(10^{-8}\),
-    según escala numérica
-    \item \texttt{coverage\_notional\_min} \(\ge 95\%\) para no degradar la interpretación factorial
-\end{itemize}
-
-No se recomienda codificar tolerancias duras mágicas sin dependencia del capital o de
-la escala de los datos.
-
-\section{Flujo operativo del módulo}
-
-El pipeline debe ejecutarse en el orden siguiente:
-
-\begin{enumerate}[label=\arabic*.]
-    \item Cargar configuración y verificar \texttt{run\_id}.
-    \item Leer posiciones, equity, cash, fills, costes, retornos y metadatos del engine.
-    \item Validar integridad de índices, identificadores, calendarios y moneda.
-    \item Construir contribución bruta por activo.
-    \item Construir agregaciones por sector, industria y sleeve.
-    \item Construir waterfall de costes y asignación de costes a entidades.
-    \item Calcular contribuciones netas por activo y por agregación.
-    \item Si existe modelo factorial, construir exposiciones agregadas y atribución por factor.
-    \item Calcular residual bruto y residual neto.
-    \item Ejecutar reconciliaciones e invariantes.
-    \item Asignar severidades a cada fecha y al run completo.
-    \item Persistir artefactos y \texttt{manifest.json}.
-\end{enumerate}
-
-El orden importa. La atribución factorial debe operar sobre una base ya reconciliada
-con el engine, no sobre series parciales o improvisadas.
-
-\section{Reglas PIT y anti-leakage}
-
-El módulo debe imponer las siguientes reglas:
-
-\begin{itemize}
-    \item Todos los pesos se toman en \(t-1\).
-    \item Todas las betas y clasificaciones sectoriales son las conocidas en \(t-1\).
-    \item No se permite usar universos filtrados retrospectivamente.
-    \item Si un activo entra en el universo en \(t\), su primera contribución sólo puede
-    computarse conforme a la convención exacta del engine.
-    \item Si existen restatements, el módulo debe consumir la versión congelada de datos
-    usada por el run, no una relectura viva del data lake.
-\end{itemize}
-
-El \texttt{manifest.json} debe registrar hashes o versiones de datasets para que
-cualquier atribución sea perfectamente reproducible.
-
-\section{Tratamiento de edge cases}
-
-Un documento serio de atribución debe explicitar cómo manejar los casos difíciles.
-Como mínimo:
-
-\subsection{Corporate actions}
-
-Splits, reverse splits, dividendos, spin-offs, mergers y delistings deben venir ya
-resueltos por el engine o por la capa de datos. El módulo de atribución no debe
-reconstruirlos de forma oportunista. Sí debe, en cambio, verificar que el retorno
-por activo sea consistente con la convención económica utilizada en el P\&L del engine.
-
-\subsection{Activos sin factor exposure}
-
-Si un activo carece de \(\beta_{i,f,t-1}\), debe marcarse con \texttt{missing\_factor\_data}
-y excluirse o imputarse según regla explícita. Su notional debe computar en la
-métrica de cobertura, nunca desaparecer silenciosamente.
-
-\subsection{Cambios de ticker o identificador}
-
-La atribución debe basarse en un \texttt{asset\_id} estable, no en ticker como clave
-primaria. El ticker es una etiqueta de conveniencia.
-
-\subsection{Posiciones cortas}
-
-En cortos deben reconciliarse adecuadamente:
-\begin{itemize}
-    \item signo de exposición,
-    \item borrow cost,
-    \item dividendos manufacturados si aplican,
-    \item financiación específica del libro.
-\end{itemize}
-
-\subsection{Halt, suspensión o precios faltantes}
-
-Si no existe precio válido para valorar una posición, el módulo no debe inventar
-retorno. Debe seguir la convención del engine y marcar el día/activo como valoración
-especial o missing, elevando severidad si afecta materialmente a la reconciliación.
-
-\subsection{Cash drag y residual contable}
-
-Si el engine incorpora cash o equivalentes como componente del portfolio, la atribución
-debe incluir explícitamente una línea \texttt{CASH} o una cuenta separada. De lo contrario,
-aparecerá un residual artificial.
-
-\section{Criterios de severidad}
-
-Cada fecha y el run total deben etiquetarse con severidad:
-
-\begin{itemize}
-    \item \textbf{OK}: todas las reconciliaciones dentro de tolerancia y cobertura suficiente.
-    \item \textbf{WARNING}: reconciliación correcta pero cobertura factorial insuficiente,
-    activos sin mapping, costes parcialmente imputados o metadata incompleta.
-    \item \textbf{ERROR}: cualquier violación material de invariantes contables, índices
-    duplicados, desfase temporal, o discrepancia persistente entre P\&L engine y suma atribuida.
-\end{itemize}
-
-Regla práctica de promoción del run:
-\begin{itemize}
-    \item No se promociona ningún run con \texttt{ERROR}.
-    \item Un run con más de \(x\%\) de fechas en \texttt{WARNING} requiere revisión manual.
-\end{itemize}
-
-El umbral \(x\) debe configurarse, por ejemplo en el rango \(1\%-5\%\) según severidad.
-
-\section{Métricas resumen obligatorias}
-
-El \texttt{attribution\_summary.json} debe incluir, como mínimo:
-
-\begin{itemize}
-    \item \texttt{gross\_return\_total}
-    \item \texttt{net\_return\_total}
-    \item \texttt{gross\_pnl\_total}
-    \item \texttt{net\_pnl\_total}
-    \item \texttt{total\_cost\_bps}
-    \item \texttt{top\_10\_assets\_gross}
-    \item \texttt{top\_10\_assets\_net}
-    \item \texttt{top\_sectors}
-    \item \texttt{top\_factors}
-    \item \texttt{residual\_alpha\_gross}
-    \item \texttt{residual\_alpha\_net}
-    \item \texttt{factor\_coverage\_mean}
-    \item \texttt{days\_warning}
-    \item \texttt{days\_error}
-    \item \texttt{max\_gross\_recon\_error}
-    \item \texttt{max\_net\_recon\_error}
-\end{itemize}
-
-\section{Manifest y reproducibilidad}
-
-El fichero \texttt{manifest.json} debe contener:
-
-\begin{itemize}
-    \item \texttt{run\_id}
-    \item versión del código o commit hash
-    \item versión del motor de backtest
-    \item hash o snapshot id de datasets
-    \item convención temporal usada
-    \item método de asignación de costes
-    \item lista de factores usados
-    \item tolerancias activas
-    \item timestamp de generación
-\end{itemize}
-
-Una atribución sin manifiesto reproducible es un artefacto de investigación débil.
-
-\section{Tests mínimos exigibles}
-
-Este módulo debe venir acompañado de tests unitarios y de integración. Como mínimo:
-
-\begin{enumerate}[label=\arabic*.]
-    \item \textbf{Test de reconciliación trivial}: cartera de un activo sin costes.
-    \item \textbf{Test de costes}: cartera simple con comisión y slippage conocidos.
-    \item \textbf{Test long/short}: verificación de signos y borrow.
-    \item \textbf{Test de agregación}: suma de activos igual a suma por sectores y sleeves.
-    \item \textbf{Test factorial}: caso sintético donde \(r_p = \beta F + \alpha\) exactamente.
-    \item \textbf{Test PIT}: fallo deliberado al usar pesos de \(t\) en vez de \(t-1\).
-    \item \textbf{Test de activos sin mapping}: cobertura reducida y warning esperado.
-    \item \textbf{Test de manifest}: persistencia íntegra de metadatos del run.
-\end{enumerate}
-
-\section{Failure modes conocidos}
-
-El módulo debe detectar y hacer visibles, al menos, los siguientes modos de fallo:
-
-\begin{itemize}
-    \item mezcla de precios ajustados con P\&L no ajustado;
-    \item desfase de un día entre posiciones y retornos;
-    \item pérdida silenciosa de activos por merge defectuoso;
-    \item costes netos que no suman al ledger del engine;
-    \item mapping sectorial no PIT;
-    \item beta exposures con \textit{forward fill} indebido;
-    \item doble conteo de dividendos o de corporate actions;
-    \item residual artificial por omitir cash o financiación.
-\end{itemize}
-
-Estas son precisamente las patologías que separan un prototipo académico de una
-infraestructura cuantitativa robusta.
-
-\section{Criterio de calidad para considerar el módulo ``institucional''}
-
-El módulo puede considerarse de nivel institucional si cumple simultáneamente:
-
-\begin{enumerate}[label=\arabic*.]
-    \item reconciliación diaria bruta y neta dentro de tolerancia;
-    \item cobertura factorial suficiente y explícitamente medida;
-    \item trazabilidad completa de costes;
-    \item persistencia reproducible de artefactos y manifest;
-    \item tests sintéticos y de integración superados;
-    \item ausencia de ambigüedad en convención temporal y contratos de datos.
-\end{enumerate}
-
-Sin estos seis puntos, cualquier lectura económica del P\&L sigue siendo vulnerable.
-
-\section{Conclusión}
-
-\texttt{backtest/attribution.py} no debe entenderse como un complemento accesorio del
-backtest, sino como la capa que convierte un equity curve en conocimiento utilizable.
-Su misión es cerrar el circuito entre simulación, economía del modelo y control de
-riesgo interpretativo. En un stack cuantitativo serio, una estrategia sólo merece
-capital si su retorno neto puede descomponerse, auditarse y explicarse con rigor.
-Eso exige una atribución que no sea solamente elegante en el papel, sino también
-contablemente exacta, \textit{point-in-time}, reproducible y hostil a la ambigüedad.
-
-\end{document}
+Si falla cualquiera de estas condiciones, el módulo debe abortar con ERROR.
+
+12. Contratos de salida
+
+El módulo debe persistir, al menos:
+- asset_contribution.parquet
+- sector_attribution.parquet
+- sleeve_attribution.parquet
+- factor_attribution.parquet
+- cost_waterfall.parquet
+- daily_reconciliation.parquet
+- attribution_summary.json
+- manifest.json
+
+13. Esquema mínimo de asset_contribution.parquet
+
+Campos mínimos recomendados:
+- date
+- asset_id
+- ticker
+- sector
+- industry
+- sleeve
+- weight_tminus1
+- quantity_tminus1
+- asset_return_t
+- gross_pnl
+- gross_return_contribution
+- allocated_cost
+- net_pnl
+- net_return_contribution
+- data_quality_flag
+
+14. Esquema mínimo de factor_attribution.parquet
+
+Campos mínimos recomendados:
+- date
+- factor_name
+- portfolio_beta_tminus1
+- factor_return_t
+- factor_contribution_gross
+- factor_contribution_net
+- coverage_notional
+
+15. Esquema mínimo de daily_reconciliation.parquet
+
+Campos mínimos recomendados:
+- date
+- gross_pnl_engine
+- gross_pnl_sum_assets
+- cost_total_engine
+- cost_total_sum
+- net_pnl_engine
+- net_pnl_sum_assets
+- factor_plus_residual
+- recon_error_gross
+- recon_error_net
+- severity
+
+16. Invariantes obligatorios
+
+16.1. Invariante de suma bruta
+
+    |P&L_gross_t - Σ_i pnl_gross_{i,t}| <= eps_gross_money
+
+16.2. Invariante de suma de costes
+
+    |Cost_total_engine_t - Σ_k c_{k,t}| <= eps_cost_money
+
+16.3. Invariante neto
+
+    |P&L_net_t - Σ_i pnl_net_{i,t}| <= eps_net_money
+
+16.4. Invariante factorial
+
+Si hay cobertura suficiente:
+
+    |r_{p,t}^{(.)} - Σ_f contrib_factor_{f,t} - α_t^{(.)}| <= eps_factor_return
+
+16.5. Invariante jerárquico
+
+    Σ_sector pnl_sector = Σ_i pnl_i
+    Σ_sleeve pnl_sleeve = Σ_i pnl_i
+    Σ_industry pnl_industry = Σ_i pnl_i
+
+17. Tolerancias recomendadas
+
+Las tolerancias deben configurarse explícitamente y depender de escala. Una parametrización prudente:
+- eps_gross_money = max(1e-8 * AUM_t, 0.01)
+- eps_net_money   = max(1e-8 * AUM_t, 0.01)
+- eps_factor_return entre 1e-10 y 1e-8
+- factor_coverage_min >= 0.95
+
+No es aceptable una reconciliación “visual” o basada en intuición.
+
+18. Flujo operativo del módulo
+
+El orden recomendado de ejecución es:
+
+1. Cargar config y validar run_id.
+2. Cargar posiciones, fills, cash, costes, retornos y metadata del engine.
+3. Validar índices, identifiers, calendario y moneda.
+4. Construir contribución bruta por activo.
+5. Construir agregaciones por sector, industria y sleeve.
+6. Construir waterfall de costes y reparto.
+7. Calcular contribuciones netas.
+8. Si existe factor model, calcular betas agregadas y atribución por factor.
+9. Calcular residual bruto y neto.
+10. Ejecutar reconciliaciones e invariantes.
+11. Asignar severidades.
+12. Persistir artefactos y manifest.
+
+El orden importa: la atribución factorial debe apoyarse sobre una base ya reconciliada.
+
+19. Reglas PIT y anti-leakage
+
+El módulo debe imponer:
+- pesos, clasificaciones y betas en t-1;
+- retornos y costes realizados en t;
+- universo y security master congelados para el run;
+- no usar restatements posteriores;
+- no usar mappings sectoriales futuros;
+- no usar forward-filled betas sin política explícita.
+
+Manifest.json debe registrar:
+- hashes de inputs;
+- versión de código;
+- factor set usado;
+- convención temporal;
+- método de asignación de costes;
+- tolerancias activas.
+
+20. Edge cases que el módulo debe resolver
+
+20.1. Corporate actions
+Deben venir resueltos por el engine o por la capa de datos. El módulo no debe rehacer splits o dividendos oportunistamente.
+
+20.2. Activos sin factor exposure
+Deben marcarse explícitamente y contar en coverage_notional. No pueden desaparecer silenciosamente.
+
+20.3. Cambios de ticker
+La clave primaria debe ser asset_id estable, no ticker.
+
+20.4. Posiciones cortas
+Debe reconciliar signo, borrow, dividendos manufacturados y financiación.
+
+20.5. Halt o precios faltantes
+No debe inventarse retorno. Debe seguirse la convención del engine y elevar severidad si afecta materialmente.
+
+20.6. Cash drag
+Debe existir línea explícita de cash o cuenta equivalente. Si no, aparecerá residual artificial.
+
+21. Brinson-Fachler como baseline institucional
+
+Para atribución relativa frente a benchmark, el módulo debe considerar como baseline institucional la descomposición Brinson-Fachler:
+
+    r_p - r_b =
+        allocation
+      + selection
+      + interaction
+
+Una forma estándar por sector s es:
+
+    allocation_s  = (w_{p,s} - w_{b,s}) (r_{b,s} - r_b)
+    selection_s   = w_{b,s} (r_{p,s} - r_{b,s})
+    interaction_s = (w_{p,s} - w_{b,s}) (r_{p,s} - r_{b,s})
+
+y:
+
+    active_return = Σ_s (allocation_s + selection_s + interaction_s)
+
+Este bloque es especialmente valioso cuando la estrategia se compara contra benchmark o universe neutral.
+
+22. Geometric linking para multi-period attribution
+
+Para horizontes superiores a un día, la suma aritmética simple puede distorsionar la interpretación acumulada. Por ello, el módulo debe dejar lista o incorporar una capa de geometric linking tipo Carino para combinar efectos diarios en horizontes largos.
+
+Sin linking geométrico:
+- la atribución acumulada puede ser económicamente engañosa;
+- especialmente en periodos volátiles o con retornos grandes.
+
+23. Significancia estadística de contribuciones
+
+El módulo no debe limitarse a decir “este factor aportó mucho”. Debe poder añadir, al menos en fase posterior razonable:
+- t-stats;
+- bootstrap confidence intervals;
+- estabilidad por ventana;
+- persistencia de signo.
+
+Esto es especialmente importante para:
+- top assets contributors;
+- residual alpha;
+- factor contributions acumuladas.
+
+Sin este control, una contribución grande en un tramo corto puede ser puro ruido.
+
+24. Pseudocódigo de referencia
+
+~~~python
+def main(
+    run_id: str,
+    attribution_config_path: str,
+    positions_path: str,
+    returns_path: str,
+    costs_path: str,
+    factor_model_path: str | None = None,
+    benchmark_path: str | None = None,
+    security_master_path: str | None = None,
+    sleeve_mapping_path: str | None = None,
+):
+    cfg = load_and_validate_config(attribution_config_path)
+
+    positions = load_positions(positions_path)
+    returns = load_returns(returns_path)
+    costs = load_costs(costs_path)
+    engine = load_engine_run(run_id)
+
+    validate_inputs(positions, returns, costs, engine, cfg)
+
+    asset_gross = compute_asset_gross_contrib(positions, returns, engine, cfg)
+    sector_gross = aggregate_by_sector(asset_gross, security_master_path, cfg)
+    sleeve_gross = aggregate_by_sleeve(asset_gross, sleeve_mapping_path, cfg)
+
+    cost_waterfall = compute_cost_waterfall(costs, cfg)
+    asset_net = allocate_costs_and_compute_net(asset_gross, cost_waterfall, cfg)
+
+    factor_attr = None
+    if factor_model_path is not None:
+        factor_data = load_factor_model(factor_model_path)
+        factor_attr = compute_factor_attribution(positions, factor_data, engine, cfg)
+
+    reconciliation = reconcile_with_engine(
+        engine=engine,
+        asset_gross=asset_gross,
+        asset_net=asset_net,
+        factor_attr=factor_attr,
+        costs=cost_waterfall,
+        cfg=cfg,
+    )
+
+    summary = build_attribution_summary(
+        asset_net=asset_net,
+        sector=sector_gross,
+        sleeve=sleeve_gross,
+        factor=factor_attr,
+        reconciliation=reconciliation,
+        cfg=cfg,
+    )
+
+    persist_artifacts(
+        run_id=run_id,
+        asset_contribution=asset_net,
+        sector_attribution=sector_gross,
+        sleeve_attribution=sleeve_gross,
+        factor_attribution=factor_attr,
+        cost_waterfall=cost_waterfall,
+        daily_reconciliation=reconciliation,
+        summary=summary,
+        manifest=build_manifest(run_id, cfg, engine, positions, returns, costs, factor_attr),
+    )
+
+    return summary
+~~~
+
+25. Severidades
+
+Cada fecha y el run agregado deben etiquetarse como:
+- OK
+- WARNING
+- ERROR
+
+25.1. OK
+- reconciliación dentro de tolerancia;
+- cobertura suficiente;
+- mappings completos;
+- factor model usable.
+
+25.2. WARNING
+- reconciliación correcta pero cobertura reducida;
+- activos sin mapping;
+- costes parcialmente imputados;
+- metadata incompleta;
+- residual sospechosamente grande pero no inválido.
+
+25.3. ERROR
+- violación material de invariantes;
+- desfase temporal;
+- duplicados o joins incorrectos;
+- inconsistencia monetaria relevante;
+- factor model roto cuando debía ser obligatorio.
+
+Regla operativa:
+- ningún run con ERROR debe promocionarse;
+- demasiados WARNINGs deben exigir revisión manual.
+
+26. Métricas resumen obligatorias
+
+attribution_summary.json debe incluir, como mínimo:
+- gross_return_total
+- net_return_total
+- gross_pnl_total
+- net_pnl_total
+- total_cost_bps
+- top_10_assets_gross
+- top_10_assets_net
+- top_sectors
+- top_factors
+- residual_alpha_gross
+- residual_alpha_net
+- factor_coverage_mean
+- days_warning
+- days_error
+- max_gross_recon_error
+- max_net_recon_error
+
+27. Failure modes críticos que debe detectar o evitar
+
+F1. Mezclar precios ajustados con P&L no ajustado.
+F2. Desfase de un día entre posiciones y retornos.
+F3. Pérdida silenciosa de activos por merge defectuoso.
+F4. Costes que no reconcilian con el ledger del engine.
+F5. Mapping sectorial no PIT.
+F6. Betas con forward fill indebido.
+F7. Doble conteo de corporate actions.
+F8. Residual artificial por omitir cash o financiación.
+F9. Ticker usado como PK cuando cambia en el tiempo.
+F10. Suma jerárquica que no coincide con la base por activo.
+
+28. MVP obligatorio
+
+El MVP del módulo debe incluir:
+- atribución por activo;
+- agregación por sector e industria;
+- agregación por sleeve si existe mapping;
+- waterfall de costes;
+- residual bruto y neto;
+- reconciliación diaria;
+- persistencia de artefactos;
+- manifest reproducible;
+- severidades OK/WARNING/ERROR.
+
+29. Fase 1 razonable
+
+Como ampliación ya muy valiosa:
+- atribución factorial robusta;
+- coverage_notional;
+- factor_r2;
+- residual por régimen;
+- significancia básica de contribuciones;
+- mejores reglas de asignación de costes.
+
+30. Fase 2 razonable
+
+Como ampliación institucional fuerte:
+- Brinson-Fachler completo;
+- geometric linking multi-periodo;
+- bootstrap o t-stats de contribuciones;
+- turnover attribution buy/sell;
+- robust factor betas con shrinkage.
+
+31. No-objetivos
+
+No pertenece al alcance del módulo:
+- estimar el modelo factorial desde cero;
+- generar señales;
+- arreglar el backtest;
+- reemplazar el risk model;
+- hacer causal discovery de factores;
+- ni sustituir la capa de reporting final.
+
+La misión aquí es reconciliar y explicar económicamente el P&L, no inventar nuevas fuentes de edge.
+
+32. Criterios de aceptación
+
+El módulo solo debe considerarse correcto si cumple simultáneamente:
+- reconciliación bruta y neta dentro de tolerancia;
+- cobertura factorial suficiente o warning explícito;
+- trazabilidad clara de costes;
+- persistencia reproducible de todos los artefactos;
+- convención PIT inequívoca;
+- tests sintéticos e integración superados;
+- ausencia de ambigüedad entre bruto, neto y residual.
+
+33. Conclusión
+
+backtest/attribution.py debe entenderse como la capa que convierte un equity curve en conocimiento económico verificable. Su valor no está en producir gráficos agradables, sino en obligar al sistema a demostrar, con rigor contable y convención PIT estricta, de dónde viene el retorno y qué parte de ese retorno es estructuralmente interpretable. En un stack cuantitativo serio, una estrategia no merece capital solo porque gana dinero en backtest: merece capital cuando ese dinero puede reconciliarse, descomponerse y explicarse sin ambigüedad. Ese es exactamente el estándar que este módulo debe imponer.

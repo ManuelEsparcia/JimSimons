@@ -1,790 +1,641 @@
-\documentclass{article}
-\usepackage[utf8]{inputenc}
-\usepackage[spanish]{babel}
-\usepackage{amsmath,amssymb,amsfonts}
-\usepackage{mathtools}
-\usepackage{booktabs}
-\usepackage{longtable}
-\usepackage{array}
-\usepackage{enumitem}
-\usepackage{hyperref}
-\usepackage[a4paper,margin=2.4cm]{geometry}
-
-\title{Especificación Cuantitativa e Institucional del Módulo \texttt{backtest/engine.py}}
-\author{Sistema \texttt{simons\_smallcap\_swing}}
-\date{\today}
-
-\begin{document}
-
-\maketitle
-
-\begin{abstract}
-Este documento define de forma operativa, matemática y de ingeniería el módulo
-\texttt{backtest/engine.py} del sistema \texttt{simons\_smallcap\_swing}. El motor
-de backtest debe ejecutar una simulación \textit{event-driven}, \textit{point-in-time}
-(PIT), reproducible y contablemente reconciliable para estrategias \textit{cross-sectional}
-de small caps con restricciones realistas de liquidez, costes, impacto, borrow,
-financiación y universo dinámico. La especificación no describe sólo la filosofía del
-motor, sino también el contrato exacto de entradas y salidas, el orden de eventos,
-las transiciones de estado, la semántica temporal, los invariantes contables, las
-reglas de ejecución, los \textit{failure modes}, los \textit{edge cases} obligatorios,
-las tolerancias de reconciliación y los tests mínimos exigibles. El principio rector
-es inequívoco: un backtest que no puede reconstruirse, reconciliarse y auditarse
-paso a paso no es investigación cuantitativa institucional, sino una aproximación
-incompleta.
-\end{abstract}
-
-\tableofcontents
-
-\section{Propósito institucional del motor}
-
-El módulo \texttt{backtest/engine.py} es la capa responsable de transformar señales
-y restricciones en una trayectoria simulada de posiciones, órdenes, fills, cash,
-NAV, P\&L y costes. Su misión no es producir un equity curve bonito, sino construir
-un entorno de simulación suficientemente riguroso como para que el rendimiento
-observado pueda interpretarse como una aproximación conservadora del comportamiento
-económico de la estrategia.
-
-En un stack cuantitativo serio, el motor debe responder simultáneamente a cinco exigencias:
-
-\begin{enumerate}[label=\arabic*.]
-    \item \textbf{Causalidad temporal}: ninguna decisión puede depender de información no disponible en el instante de decisión.
-    \item \textbf{Realismo de ejecución}: la transición entre cartera actual y cartera objetivo debe estar mediada por órdenes, restricciones de liquidez, costes e impacto.
-    \item \textbf{Contabilidad exacta}: cash, posiciones, NAV y P\&L deben reconciliar diariamente.
-    \item \textbf{Determinismo reproducible}: mismos inputs y misma configuración implican exactamente el mismo resultado.
-    \item \textbf{Auditabilidad total}: toda cifra del backtest debe poder reconstruirse desde artefactos persistidos.
-\end{enumerate}
-
-El motor es, por tanto, una pieza de infraestructura crítica. Si falla esta capa,
-todo el stack downstream ---atribución, diagnóstico, reporting y análisis de capacidad---
-hereda errores estructurales.
-
-\section{Pregunta económica que debe responder}
-
-El motor debe permitir responder sin ambigüedad a la siguiente pregunta:
-
-\begin{quote}
-\emph{Dadas unas señales y un conjunto de restricciones de cartera y ejecución,
-¿qué P\&L neto, qué trayectoria de riesgo y qué coste de implementación habría
-producido la estrategia si sólo hubiera podido operar con la información disponible
-en cada instante y bajo hipótesis de liquidez conservadoras?}
-\end{quote}
-
-La palabra clave aquí es \emph{neto}. Un motor institucional no trata el coste como
-un ajuste cosmético posterior, sino como parte constitutiva del resultado económico.
-
-\section{Alcance}
-
-\subsection{Incluido}
-
-El motor debe cubrir, como mínimo:
-
-\begin{itemize}
-    \item simulación por sesión de mercado sobre calendario explícito;
-    \item carga de universo PIT y snapshots de mercado por fecha;
-    \item ingestión de señales o pesos objetivo preliminares;
-    \item construcción de cartera objetivo bajo restricciones;
-    \item generación de órdenes a partir del gap entre cartera actual y cartera objetivo;
-    \item simulación de fills parciales o completos;
-    \item modelización de costes: comisiones, spread, slippage, impacto, borrow, financiación;
-    \item actualización del estado: posiciones, cash, NAV, exposiciones, P\&L;
-    \item persistencia de artefactos auditables;
-    \item reconciliación diaria e invariantes contables.
-\end{itemize}
-
-\subsection{Excluido}
-
-El módulo \textbf{no} debe asumir tareas ajenas a su responsabilidad:
-
-\begin{itemize}
-    \item no genera señales predictivas;
-    \item no optimiza hiperparámetros;
-    \item no conecta con brokers ni infraestructura live;
-    \item no reemplaza el análisis de atribución o diagnóstico downstream;
-    \item no recalibra el modelo de riesgo; consume sus outputs si existen.
-\end{itemize}
-
-\section{Principios de diseño}
-
-El motor debe obedecer estos principios:
-
-\begin{enumerate}[label=\arabic*.]
-    \item \textbf{PIT estricto}: toda decisión usa sólo información disponible hasta el \texttt{decision\_cut}.
-    \item \textbf{Neto o irrelevante}: la métrica primaria del motor es el rendimiento neto de fricciones.
-    \item \textbf{Estado explícito}: el portfolio es una máquina de estados, no una resta vectorial implícita.
-    \item \textbf{Una sola semántica temporal}: decisiones, ejecuciones y valoraciones deben tener una convención inequívoca.
-    \item \textbf{Reconciliación diaria}: posiciones, cash y NAV deben cuadrar cada fecha.
-    \item \textbf{Conservadurismo por defecto}: en small caps, cualquier ambigüedad de ejecución debe resolverse del lado pesimista.
-    \item \textbf{Fallo ruidoso}: inconsistencias materiales deben romper el run o elevar severidad crítica.
-    \item \textbf{Persistencia total}: el backtest no se considera válido si no deja trazas completas.
-\end{enumerate}
-
-\section{Modelo temporal}
-
-El motor debe trabajar sobre una secuencia ordenada de sesiones de mercado
-\(\mathcal{T}=\{t_1,t_2,\dots,t_T\}\), donde cada sesión representa una fecha efectiva
-de trading según un calendario explícito y versionado.
-
-Para cada fecha \(t\), deben distinguirse al menos los siguientes instantes conceptuales:
-
-\begin{itemize}
-    \item \texttt{data\_available\_cut}: último instante hasta el que los datos pueden considerarse observables.
-    \item \texttt{decision\_cut}: instante en el que se calculan señales utilizables y se toma la decisión de cartera.
-    \item \texttt{order\_submission\_time}: instante teórico de envío de órdenes.
-    \item \texttt{execution\_time}: instante o ventana en la que se simulan fills.
-    \item \texttt{valuation\_time}: instante en el que se marcan posiciones a mercado.
-\end{itemize}
-
-Toda configuración del motor debe escoger una convención temporal completa, por ejemplo:
-
-\begin{itemize}
-    \item \textbf{Convención A}: señal calculada al cierre de \(t\), orden enviada tras \texttt{close\_t}, ejecución en \texttt{open\_{t+1}}, valoración al cierre de \(t+1\).
-    \item \textbf{Convención B}: señal conocida antes de apertura, orden enviada en pre-market, ejecución en \texttt{open\_t}, valoración al cierre de \(t\).
-\end{itemize}
-
-Mezclar convenciones dentro del mismo run está prohibido salvo que la configuración
-lo soporte explícitamente y quede registrado en el manifiesto.
-
-\section{Notación y jerarquía contable}
-
-Sea:
-
-\begin{itemize}
-    \item \(q_{i,t}\): posición en unidades del activo \(i\) al final de la sesión \(t\).
-    \item \(P_{i,t}^{\mathrm{mark}}\): precio de valoración del activo \(i\) en \(t\).
-    \item \(P_{i,t}^{\mathrm{fill}}\): precio medio de ejecución de fills en \(t\).
-    \item \(C_t\): cash al final de \(t\).
-    \item \(V_t\): NAV o equity del portfolio al final de \(t\).
-    \item \(TC_t\): coste total de trading en \(t\).
-    \item \(BC_t\): borrow cost en \(t\).
-    \item \(FC_t\): financing cost en \(t\).
-\end{itemize}
-
-Entonces:
-
-\[
-V_t = C_t + \sum_i q_{i,t} P_{i,t}^{\mathrm{mark}} + A_t^{\mathrm{other}}
-\]
-
-donde \(A_t^{\mathrm{other}}\) recoge otros activos o ajustes explícitos, como cash
-segregado, intereses, manufacturados o cuentas auxiliares si el diseño los contempla.
-
-El P\&L neto diario debe poder escribirse como:
-
-\[
-\mathrm{PnL}^{\mathrm{net}}_t
-=
-\mathrm{PnL}^{\mathrm{gross}}_t
-- TC_t - BC_t - FC_t
-\]
-
-con
-
-\[
-\mathrm{PnL}^{\mathrm{gross}}_t
-=
-\sum_i q_{i,t-1}\big(P_{i,t}^{\mathrm{mark}}-P_{i,t-1}^{\mathrm{mark}}\big)
-+ \mathrm{cashflows}^{\mathrm{econ}}_t
-\]
-
-siempre de forma consistente con la convención temporal elegida.
-
-\section{Máquina de estados del portfolio}
-
-El motor debe modelar explícitamente el estado del portfolio. Como mínimo, el estado
-en cada fecha \(t\) debe incluir:
-
-\begin{itemize}
-    \item posiciones por activo;
-    \item cash disponible;
-    \item cash restringido o reservado si existe;
-    \item NAV;
-    \item gross exposure;
-    \item net exposure;
-    \item coste acumulado;
-    \item órdenes abiertas;
-    \item fills del día;
-    \item metadata del estado.
-\end{itemize}
-
-El cambio de estado entre \(t-1\) y \(t\) no puede inferirse sólo por diferencias
-de pesos; debe estar mediado por eventos persistidos y verificables.
-
-\section{Orden exacto de eventos por sesión}
-
-Uno de los puntos críticos para llevar el motor a nivel institucional es fijar sin
-ambigüedad el orden de eventos. Para cada sesión \(t\), el pipeline debe seguir
-exactamente esta secuencia conceptual:
-
-\begin{enumerate}[label=\arabic*.]
-    \item \textbf{Carga de calendario y metadata de sesión}. Verificar si la sesión está abierta, parcial o suspendida.
-    \item \textbf{Carga del snapshot PIT de universo}. Determinar qué activos son elegibles en \(t\).
-    \item \textbf{Carga de datos observables al \texttt{decision\_cut}}. Precios, volumen, señales, borrow, restricciones y cualquier dato permitido por la convención temporal.
-    \item \textbf{Aplicación de corporate actions efectivas antes de la decisión}, si la capa de datos las expresa como cambios de shares/cost basis.
-    \item \textbf{Construcción de cartera objetivo}. A partir de señales y restricciones.
-    \item \textbf{Conversión de target a órdenes}. Traducir \(\Delta q_i\) deseado en órdenes reales.
-    \item \textbf{Chequeos pre-trade}. Liquidez, límites de concentración, gross/net, cash buffer, borrow availability, halts, lot size.
-    \item \textbf{Simulación de ejecución}. Generar fills parciales o completos y sus costes asociados.
-    \item \textbf{Actualización de posiciones y cash}. Tras fills y costes explícitos.
-    \item \textbf{Aplicación de borrow y financing del día}. Según posiciones efectivamente mantenidas.
-    \item \textbf{Valoración de cierre}. Marcar posiciones a mercado usando el precio de valoración definido.
-    \item \textbf{Cálculo de P\&L y exposures}. Bruto, neto, gross, net, turnover y métricas auxiliares.
-    \item \textbf{Reconciliación diaria}. Verificar invariantes contables.
-    \item \textbf{Persistencia de artefactos del día}. Posiciones, órdenes, fills, ledger, P\&L, anomalías.
-\end{enumerate}
-
-Este orden debe ser estable y no negociable dentro de un run. Cambiar la secuencia
-cambia la semántica económica del backtest.
-
-\section{Dependencias upstream y downstream}
-
-\subsection{Upstream}
-
-El motor consume outputs de:
-
-\begin{itemize}
-    \item \texttt{models/predictions/*}: scores, señales o target weights preliminares;
-    \item \texttt{portfolio/*}: sizing, neutralización, constraints, optimizador;
-    \item \texttt{execution/*}: modelos de coste, impacto, fill simulation;
-    \item \texttt{data/*}: precios, volumen, corporate actions, universo PIT, borrow;
-    \item calendario de mercado versionado.
-\end{itemize}
-
-\subsection{Downstream}
-
-El motor alimenta a:
-
-\begin{itemize}
-    \item \texttt{backtest/attribution.py};
-    \item \texttt{backtest/diagnostics.py};
-    \item \texttt{backtest/report.py};
-    \item \texttt{validation/*};
-    \item \texttt{research/capacity\_analysis/*}.
-\end{itemize}
-
-\section{Contratos de entrada}
-
-\subsection{Entradas mínimas}
-
-\begin{longtable}{>{\ttfamily}p{4.2cm} p{9.8cm}}
-\toprule
-Campo & Descripción \\
-\midrule
-signals\_path & Tabla PIT con \texttt{date, asset\_id, score} o pesos objetivo preliminares. \\
-prices\_path & OHLCV y campos auxiliares con convención de ajuste explícita. \\
-universe\_path & Universo elegible PIT por fecha y activo. \\
-config\_path & YAML del run con parámetros y tolerancias. \\
-run\_id & Identificador único e inmutable del backtest. \\
-calendar\_path & Calendario de sesiones del mercado. \\
-\bottomrule
-\end{longtable}
-
-\subsection{Entradas opcionales}
-
-\begin{longtable}{>{\ttfamily}p{4.2cm} p{9.8cm}}
-\toprule
-Campo & Descripción \\
-\midrule
-borrow\_path & Coste y disponibilidad de borrow por activo y fecha. \\
-corporate\_actions\_path & Splits, mergers, dividends, delistings y otros eventos corporativos. \\
-benchmark\_path & Serie del benchmark. \\
-risk\_factor\_exposures\_path & Exposiciones a factores para control o persistencia downstream. \\
-halts\_path & Suspensiones y eventos de negociación restringida. \\
-liquidity\_overrides\_path & Ajustes manuales o reglas especiales de liquidez. \\
-\bottomrule
-\end{longtable}
-
-\subsection{Precondiciones obligatorias}
-
-Antes de correr, el motor debe verificar:
-
-\begin{itemize}
-    \item unicidad de \((date, asset\_id)\) en señales, universo y snapshots diarios;
-    \item consistencia de identificadores;
-    \item calendario monotónico y sin duplicados;
-    \item ausencia de NaNs críticos en campos esenciales;
-    \item convención homogénea de ajustes de precio;
-    \item moneda de valoración coherente o explícitamente convertida;
-    \item configuración completa y válida.
-\end{itemize}
-
-Cualquier fallo aquí debe producir \texttt{ERROR} y abortar el run.
-
-\section{Configuración mínima}
-
-La configuración del motor debe incluir, como mínimo:
-
-\begin{itemize}
-    \item \texttt{rebalance\_frequency}
-    \item \texttt{decision\_time}
-    \item \texttt{execution\_price\_model}
-    \item \texttt{valuation\_price\_field}
-    \item \texttt{max\_gross}
-    \item \texttt{max\_net}
-    \item \texttt{max\_position}
-    \item \texttt{turnover\_limit}
-    \item \texttt{cash\_buffer}
-    \item \texttt{transaction\_cost\_model}
-    \item \texttt{impact\_model\_params}
-    \item \texttt{borrow\_fee\_model}
-    \item \texttt{financing\_model}
-    \item \texttt{latency\_days}
-    \item \texttt{reconciliation\_tolerances}
-\end{itemize}
-
-Además, toda configuración debe congelarse y persistirse dentro del manifiesto final.
-
-\section{Construcción de cartera objetivo}
-
-Sea \(s_{i,t}\) una señal disponible en el instante de decisión. El motor puede recibir
-directamente pesos objetivo crudos o construirlos internamente mediante una función
-de transformación:
-
-\[
-\mathbf{w}^{\star}_t = \mathcal{P}\big(\mathbf{s}_t,\mathcal{U}_t,\Theta_t\big)
-\]
-
-donde \(\mathcal{P}\) representa el pipeline de portfolio construction y \(\Theta_t\)
-resume restricciones activas.
-
-La cartera objetivo debe cumplir, si aplica:
-
-\begin{align}
-\sum_i |w^{\star}_{i,t}| &\le G_{\max} \\
-\left| \sum_i w^{\star}_{i,t} \right| &\le N_{\max} \\
-|w^{\star}_{i,t}| &\le w^{\max}_i
-\end{align}
-
-y cualquier otra restricción de neutralidad, caps sectoriales o límites de liquidez.
-
-\section{Traducción target \texorpdfstring{\(\rightarrow\)}{} órdenes}
-
-Dado el estado actual \(q_{i,t^-}\) y el target deseado \(q^{\star}_{i,t}\), la orden
-bruta se define como:
-
-\[
-\Delta q^{\mathrm{raw}}_{i,t} = q^{\star}_{i,t} - q_{i,t^-}
-\]
-
-Esta orden puede transformarse en orden ejecutable tras aplicar:
-
-\begin{itemize}
-    \item redondeo a lot size;
-    \item límite por participación diaria;
-    \item límite por turnover agregado;
-    \item cancelación por activo no elegible o suspendido;
-    \item limitación por borrow availability en shorts;
-    \item restricción de cash disponible;
-    \item restricciones internas de riesgo.
-\end{itemize}
-
-La orden efectiva debe persistirse aunque luego reciba fill parcial o nulo.
-
-\section{Modelo de ejecución}
-
-El motor debe soportar al menos una ejecución simplificada pero causalmente coherente.
-Para cada orden, el fill ejecutado \(f_{i,t}\) debe satisfacer:
-
-\[
-|f_{i,t}| \le |\Delta q_{i,t}^{\mathrm{order}}|
-\]
-
-y, además, respetar una capacidad máxima diaria basada en volumen:
-
-\[
-|f_{i,t}| \le \phi_{\max} \cdot \mathrm{ADV}_{i,t}
-\]
-
-donde \(\phi_{\max}\) es el cap de participación y \(\mathrm{ADV}_{i,t}\) se calcula
-según la convención definida en configuración.
-
-El precio de ejecución puede modelarse como:
-
-\[
-P_{i,t}^{\mathrm{fill}}
-=
-P_{i,t}^{\mathrm{ref}}
-\left(1 + \mathrm{side}_{i,t}\cdot \mathrm{slippage}_{i,t}\right)
-\]
-
-donde \(\mathrm{side}_{i,t}\in\{-1,+1\}\), y el slippage puede depender de spread,
-participación, volatilidad o reglas más simples.
-
-\section{Costes y fricciones}
+Especificación Cuantitativa e Institucional: backtest/engine.py
+
+0. Propósito y función real del módulo
+
+backtest/engine.py es el núcleo de simulación económica del sistema. Su papel no es “aplicar pesos a retornos” ni producir una curva de equity cosmética, sino transformar señales y restricciones en una trayectoria causal, reconciliable y auditada de órdenes, fills, posiciones, cash, NAV, costes y P&L. El documento base que has subido ya sitúa muy bien este punto: el motor debe ser event-driven, point-in-time, contablemente estricto y lo bastante realista para small caps como para servir de fundamento a attribution, diagnostics y promotion downstream. :contentReference[oaicite:1]{index=1}
+
+Un motor de backtest institucional debe responder a una pregunta económica muy concreta:
+
+    dadas unas señales y unas restricciones,
+    ¿qué trayectoria neta de P&L,
+    qué exposición,
+    qué fricción de ejecución
+    y qué riesgo operativo
+    habría generado la estrategia
+    bajo información disponible en cada instante
+    y bajo una simulación prudente de liquidez y costes?
+
+Ésa es la frontera entre research decorativo y simulación económica seria.
+
+1. Objetivo formal del módulo
+
+Sea S_t el estado del portfolio al final de la sesión t y sea E_t el conjunto ordenado de eventos económicos y operativos ocurridos en t. El motor debe implementar una transición:
+
+    Engine : (S_{t-1}, E_t, Config) -> S_t
+
+con persistencia completa de las trazas intermedias relevantes.
+
+Sobre una secuencia de sesiones T = {t_1, ..., t_N}, el motor debe construir una trayectoria:
+
+    Trajectory = {S_t}_{t in T}
+
+donde cada estado incluye, como mínimo:
+- posiciones por activo;
+- cash;
+- NAV;
+- órdenes emitidas;
+- fills ejecutados;
+- costes explícitos;
+- P&L bruto y neto;
+- exposiciones gross y net;
+- reconciliación del día;
+- severidad del día.
+
+La condición institucional básica es:
+
+    mismos inputs,
+    misma configuración,
+    misma semántica temporal,
+    mismo estado inicial
+    =>
+    mismo resultado final.
+
+2. Principios no negociables
+
+P1. PIT estricto.
+Ninguna decisión puede usar información posterior al decision_cut definido.
+
+P2. Event-driven real.
+La secuencia signal -> target -> order -> fill -> state update no puede colapsarse en una sola multiplicación vectorial si eso destruye causalidad económica.
+
+P3. Contabilidad primero.
+El run no es válido si cash, posiciones y NAV no reconcilian.
+
+P4. Neto antes que bruto.
+El output central del motor es net P&L, no gross fantasy.
+
+P5. Conservadurismo por defecto.
+En small caps, cualquier ambigüedad de liquidez o fill debe resolverse del lado prudente.
+
+P6. Persistencia total.
+Sin órdenes, fills, ledger y manifest, no hay auditabilidad real.
+
+P7. Fail loudly.
+Una incoherencia material debe romper el run o elevar severidad crítica; nunca maquillarse.
+
+3. Papel dentro del sistema
+
+3.1. Upstream
+El motor consume:
+- señales o scores PIT;
+- universo elegible por fecha;
+- snapshots de mercado;
+- restricciones de cartera;
+- modelos de coste e impacto;
+- borrow y financing si aplica;
+- calendario de sesiones.
+
+3.2. Downstream
+El motor alimenta:
+- attribution.py;
+- diagnostics.py;
+- reporting;
+- validation;
+- capacity analysis;
+- monitoring y health gates.
+
+Sin un engine sólido, todo lo downstream se apoya en una base económica falsa.
+
+4. Pregunta institucional que debe responder
+
+El módulo debe permitir responder, para cada run, a esto:
+
+- qué cartera quería tener la estrategia;
+- qué parte de esa cartera pudo realmente ejecutar;
+- a qué precio y con qué fricciones;
+- cómo evolucionaron cash, posiciones y NAV;
+- cuánto del edge bruto sobrevivió neto;
+- y si todo ello reconcilia contablemente.
+
+Si no puede responder eso, el motor no está completo.
+
+5. Convención temporal y semántica de sesión
+
+Uno de los elementos más importantes del módulo es fijar sin ambigüedad la semántica temporal. Para cada sesión t deben distinguirse, como conceptos separados:
+
+- data_available_cut
+- decision_cut
+- order_submission_time
+- execution_window
+- valuation_time
+
+Toda configuración del motor debe fijar una convención temporal completa. Por ejemplo:
+
+Convención A:
+- señales calculadas con información hasta close_t;
+- órdenes enviadas tras close_t;
+- ejecución en open_{t+1};
+- valoración en close_{t+1}.
+
+Convención B:
+- señales disponibles antes de open_t;
+- órdenes enviadas pre-market;
+- ejecución en open_t;
+- valoración en close_t.
+
+Mezclar convenciones dentro del mismo run está prohibido salvo soporte explícito y persistido en manifest.
+
+6. Modelo de estado del portfolio
+
+El estado S_t debe ser explícito. Como mínimo:
+
+    S_t = (
+        positions_t,
+        cash_t,
+        nav_t,
+        open_orders_t,
+        fills_t,
+        daily_costs_t,
+        gross_exposure_t,
+        net_exposure_t,
+        metadata_t
+    )
+
+donde:
+- positions_t = {asset_i -> shares_i}
+- cash_t = cash liquidado o según convención de settlement
+- nav_t = valor total del portfolio
+- open_orders_t = órdenes no completadas o activas
+- fills_t = fills ejecutados en t
+- daily_costs_t = costes del día, desglosados
+- gross_exposure_t y net_exposure_t derivados de posiciones marcadas
+- metadata_t incluye severidades, timestamps y hashes si aplica
+
+7. Jerarquía de eventos por sesión
+
+El orden exacto de eventos es crítico y debe ser estable. Para cada fecha t, la secuencia conceptual debe ser:
+
+1. Cargar metadata de sesión y calendario.
+2. Cargar universo PIT elegible en t.
+3. Cargar snapshot de datos observable al decision_cut.
+4. Aplicar corporate actions efectivas previas a la decisión, si procede.
+5. Construir cartera objetivo.
+6. Traducir target en órdenes.
+7. Ejecutar pre-trade compliance.
+8. Simular fills bajo restricciones de liquidez y coste.
+9. Actualizar posiciones y cash.
+10. Aplicar borrow y financing del día.
+11. Valorar posiciones al precio de mark definido.
+12. Calcular P&L bruto y neto.
+13. Reconciliar estado.
+14. Persistir artefactos del día.
+
+Cambiar este orden cambia la semántica económica del backtest y por tanto invalida comparabilidad entre runs.
+
+8. Entradas mínimas
+
+El motor debe requerir, como mínimo:
+- signals_path
+- prices_path
+- universe_path
+- config_path
+- run_id
+- calendar_path
+
+Entradas opcionales, pero muy valiosas:
+- borrow_path
+- corporate_actions_path
+- benchmark_path
+- factor_exposures_path
+- halts_path
+- liquidity_overrides_path
+
+9. Precondiciones obligatorias
+
+Antes de iniciar la simulación, el motor debe verificar:
+- unicidad de (date, asset_id) en snapshots críticos;
+- consistencia de identificadores;
+- monotonicidad temporal del calendario;
+- ausencia de NaNs en campos esenciales;
+- política explícita de precios ajustados o no ajustados;
+- compatibilidad de moneda o FX si existiera;
+- integridad y completitud de configuración.
+
+Cualquier fallo aquí debe abortar el run con severidad alta.
+
+10. Configuración mínima esperable
+
+La configuración debe congelar, como mínimo:
+- rebalance_frequency
+- decision_time
+- execution_price_model
+- valuation_price_field
+- max_gross
+- max_net
+- max_position
+- turnover_limit
+- cash_buffer
+- transaction_cost_model
+- impact_model_params
+- borrow_fee_model
+- financing_model
+- latency_days
+- reconciliation_tolerances
+
+Nada de esto puede quedar implícito o depender de defaults invisibles.
+
+11. Construcción de cartera objetivo
+
+Sea s_{i,t} una señal válida al decision_cut. El motor puede recibir:
+- pesos objetivo ya calculados; o
+- scores que luego se traduzcan a pesos.
+
+En abstracto:
+
+    w*_t = P(s_t, U_t, Theta_t)
+
+donde:
+- U_t es el universo elegible en t;
+- Theta_t resume restricciones activas;
+- P es la lógica de portfolio construction upstream o interna.
+
+Los pesos objetivo deben cumplir, si aplica:
+
+    sum_i |w*_{i,t}| <= G_max
+
+    |sum_i w*_{i,t}| <= N_max
+
+    |w*_{i,t}| <= w_i_max
+
+y cualquier restricción adicional de neutralidad, caps o límites operativos.
+
+12. Target -> órdenes
+
+Dada la posición actual q_{i,t^-} y la posición objetivo q*_{i,t}, la orden bruta es:
+
+    Delta q_raw_{i,t} = q*_{i,t} - q_{i,t^-}
+
+Esa orden debe convertirse en orden ejecutable tras aplicar:
+- redondeo a lot size;
+- max participation sobre ADV;
+- límites de turnover;
+- cash buffer;
+- restricciones de borrow;
+- bloqueos por halt o activo no elegible;
+- caps internos de exposición o nombre.
+
+La orden efectiva debe persistirse siempre, incluso si termina en fill parcial o cero.
+
+13. Modelo de ejecución mínimo institucional
+
+Un módulo serio no puede asumir fill perfecto por defecto. Para cada orden, el fill f_{i,t} debe satisfacer:
+
+    |f_{i,t}| <= |order_{i,t}|
+
+y además:
+
+    |f_{i,t}| <= phi_max * ADV_{i,t}
+
+donde phi_max es la participación máxima diaria permitida.
+
+El precio de ejecución puede modelarse inicialmente como:
+
+    P_fill_{i,t} = P_ref_{i,t} * (1 + side_{i,t} * slippage_{i,t})
+
+con side_{i,t} en {-1, +1}.
+
+El slippage debe poder depender al menos de:
+- spread;
+- participación en ADV;
+- volatilidad;
+- urgencia;
+- o una combinación conservadora configurable.
+
+14. Costes y fricciones
 
 El coste total de trading debe descomponerse al menos en:
 
-\[
-TC_t = C_t^{\mathrm{commission}} + C_t^{\mathrm{fees}} + C_t^{\mathrm{spread}} + C_t^{\mathrm{impact}} + C_t^{\mathrm{slippage}}
-\]
+    TC_t =
+        C_commission_t
+      + C_fees_t
+      + C_spread_t
+      + C_impact_t
+      + C_slippage_t
 
-Además, deben modelarse separadamente:
+Además deben separarse explícitamente:
 
-\[
-BC_t = \sum_i \mathbf{1}_{\{q_{i,t}<0\}} \cdot \mathrm{BorrowRate}_{i,t} \cdot |q_{i,t}| \cdot P_{i,t}^{\mathrm{mark}} \cdot \Delta t
-\]
+    BC_t = borrow cost del día
 
-y
+    FC_t = financing cost del día
 
-\[
-FC_t = \mathrm{FinancingModel}(C_t,\text{gross}_t,\text{net}_t,\ldots)
-\]
+No vale meter todo en “costs_total” sin trazabilidad, porque downstream attribution y diagnostics necesitan saber de dónde viene el deterioro del edge.
 
-La separación de estos bloques es obligatoria para que attribution y diagnostics
-puedan reconstruir correctamente el deterioro económico del edge.
+15. Actualización de posiciones y cash
 
-\section{Actualización de estado}
+Tras la ejecución en t:
 
-Tras la ejecución en \(t\), el nuevo estado debe calcularse como:
+    q_{i,t} = q_{i,t^-} + f_{i,t}
 
-\[
-q_{i,t} = q_{i,t^-} + f_{i,t}
-\]
+y el cash debe actualizarse, con convención explícita de signos, como:
 
-\[
-C_t = C_{t^-} - \sum_i f_{i,t} P_{i,t}^{\mathrm{fill}} - TC_t - BC_t - FC_t + \mathrm{cashflows}_t
-\]
+    cash_t =
+        cash_{t^-}
+      - sum_i f_{i,t} * P_fill_{i,t}
+      - TC_t
+      - BC_t
+      - FC_t
+      + cashflows_t
 
-con signo consistente para compras y ventas. El sistema debe especificar de forma
-unívoca si los ingresos por ventas se registran en el mismo evento de fill o en una
-capa posterior de settlement. Si se modela settlement diferido, debe existir ledger
-explícito de cash pendiente.
+Si el motor modela settlement diferido, debe existir un ledger explícito de cash pendiente y no puede confundirse cash económico con cash liquidado.
 
-\section{P\&L, retorno y NAV}
+16. NAV, P&L y retornos
 
-El NAV final del día debe satisfacer:
+El NAV debe cumplir:
 
-\[
-V_t = C_t + \sum_i q_{i,t} P_{i,t}^{\mathrm{mark}} + A_t^{\mathrm{other}}
-\]
+    NAV_t = cash_t + sum_i q_{i,t} * P_mark_{i,t} + A_other_t
 
-El retorno diario del portfolio debe definirse de manera única, por ejemplo:
+donde A_other_t recoge cuentas auxiliares explícitas si existen.
 
-\[
-r_t = \frac{V_t - V_{t-1} - \mathrm{external\_flows}_t}{V_{t-1}}
-\]
+El P&L bruto diario debe representarse de forma coherente con la convención temporal:
 
-si no hay aportaciones externas, o con la convención equivalente definida en el engine.
-No se permite alternar distintas definiciones de retorno entre módulos.
+    PnL_gross_t =
+        sum_i q_{i,t-1} * (P_mark_{i,t} - P_mark_{i,t-1})
+      + cashflows_econ_t
 
-\section{Invariantes contables obligatorios}
+y el P&L neto:
 
-Ésta es una de las partes que más eleva el documento a nivel institucional.
-Deben cumplirse, al menos, los siguientes invariantes por fecha:
+    PnL_net_t = PnL_gross_t - TC_t - BC_t - FC_t
 
-\subsection{Invariante de NAV}
+El retorno diario debe definirse de manera única, por ejemplo:
 
-\[
-\left|
-V_t - \left(C_t + \sum_i q_{i,t} P_{i,t}^{\mathrm{mark}} + A_t^{\mathrm{other}}\right)
-\right|
-\le \varepsilon_{\mathrm{nav}}
-\]
+    r_t = (NAV_t - NAV_{t-1} - external_flows_t) / NAV_{t-1}
 
-\subsection{Invariante de posición}
+La definición elegida debe quedar congelada y persistida.
 
-\[
-q_{i,t} = q_{i,t-1} + \sum_{f \in \mathcal{F}_{i,t}} f
-\]
+17. Invariantes contables obligatorios
 
-para todo activo \(i\), dentro de tolerancia cero en unidades enteras si el activo
-es accionario ordinario.
+17.1. Invariante de NAV
 
-\subsection{Invariante de cash}
+    | NAV_t - (cash_t + sum_i q_{i,t} P_mark_{i,t} + A_other_t) | <= eps_nav
 
-El cash final debe reconciliar con cash inicial, fills, costes y cashflows:
+17.2. Invariante de posiciones
 
-\[
-\left|
-C_t - \Big(C_{t-1} - \sum_i f_{i,t}P_{i,t}^{\mathrm{fill}} - TC_t - BC_t - FC_t + \mathrm{cashflows}_t\Big)
-\right|
-\le \varepsilon_{\mathrm{cash}}
-\]
+    q_{i,t} = q_{i,t-1} + sum_{fills in i,t} fill
 
-\subsection{Invariante de P\&L}
+para todo activo i.
 
-El cambio de NAV debe cuadrar con el P\&L registrado:
+17.3. Invariante de cash
 
-\[
-\left|
-(V_t - V_{t-1}) - \mathrm{PnL}^{\mathrm{net}}_t
-\right|
-\le \varepsilon_{\mathrm{pnl}}
-\]
+    | cash_t - (cash_{t-1} - traded_notional_t - TC_t - BC_t - FC_t + cashflows_t) | <= eps_cash
 
-\subsection{Invariante de gross/net exposure}
+17.4. Invariante de P&L
 
-Las exposiciones persistidas deben coincidir con las calculadas desde posiciones:
+    | (NAV_t - NAV_{t-1}) - PnL_net_t | <= eps_pnl
 
-\[
-\mathrm{gross}_t = \sum_i \left|\frac{q_{i,t}P_{i,t}^{\mathrm{mark}}}{V_t}\right|,
-\qquad
-\mathrm{net}_t = \sum_i \frac{q_{i,t}P_{i,t}^{\mathrm{mark}}}{V_t}
-\]
+17.5. Invariante de exposiciones
+
+    gross_t = sum_i | q_{i,t} P_mark_{i,t} / NAV_t |
+
+    net_t = sum_i q_{i,t} P_mark_{i,t} / NAV_t
 
 dentro de tolerancias numéricas explícitas.
 
-\section{Tolerancias recomendadas}
+18. Tolerancias recomendadas
 
-Las tolerancias deben configurarse y registrarse. Una parametrización razonable:
+Las tolerancias deben ser configurables, pero una política razonable es:
 
-\begin{itemize}
-    \item \(\varepsilon_{\mathrm{nav}} = \max(10^{-8}V_t,\;0.01)\)
-    \item \(\varepsilon_{\mathrm{cash}} = \max(10^{-8}V_t,\;0.01)\)
-    \item \(\varepsilon_{\mathrm{pnl}} = \max(10^{-8}V_t,\;0.01)\)
-\end{itemize}
+    eps_nav  = max(1e-8 * NAV_t, 0.01)
+    eps_cash = max(1e-8 * NAV_t, 0.01)
+    eps_pnl  = max(1e-8 * NAV_t, 0.01)
 
-Nunca deben ocultarse discrepancias materiales bajo tolerancias arbitrariamente amplias.
+Nunca deben usarse tolerancias gigantes para esconder errores contables.
 
-\section{Reglas PIT y anti-leakage}
+19. Reglas PIT y anti-leakage
 
 El motor debe imponer explícitamente:
+- señales en t construidas sólo con info disponible hasta decision_cut;
+- universo PIT, no universo retrospectivo;
+- corporate actions según snapshots efectivos, no “knowledge from the future”;
+- delistings y halts aplicados desde fecha efectiva;
+- prohibitivamente cualquier forward fill que contamine decisión;
+- benchmarks o factores alineados sin mirar al futuro.
 
-\begin{itemize}
-    \item señales en \(t\) no pueden usar precios de ejecución futuros;
-    \item el universo se filtra usando \texttt{is\_eligible} conocido al \texttt{decision\_cut};
-    \item delistings y suspensiones sólo se aplican desde su fecha efectiva;
-    \item corporate actions deben consumirse como snapshots versionados;
-    \item features o betas con \textit{forward fill} indebido están prohibidas si contaminan la decisión.
-\end{itemize}
+Esto debe constar en el manifest final.
 
-En el manifiesto debe constar la convención exacta utilizada para \texttt{next\_open},
-\texttt{close\_to\_close}, \texttt{latency\_days} y cualquier retraso operacional.
+20. Corporate actions
 
-\section{Tratamiento de edge cases}
+El motor debe tener política explícita para:
+- splits
+- reverse splits
+- dividends
+- mergers
+- spin-offs
+- delistings
 
-Una spec de nivel alto debe explicitar cómo manejar los casos difíciles:
+Regla clave:
+no debe duplicar ajustes si los precios ya vienen adjusted. Cualquier corporate action debe modificar:
+- shares,
+- cost basis,
+- cashflows,
+- o precio de referencia,
+de manera coherente y auditada.
 
-\subsection{Partial fills}
+21. Edge cases obligatorios
 
-Si una orden no puede ejecutarse completamente por restricciones de liquidez, el remanente
-debe marcarse como:
+21.1. Partial fills
+La parte no ejecutada de una orden debe tratarse según política explícita:
+- cancelada,
+- arrastrada,
+- o time-in-force definida.
 
-\begin{itemize}
-    \item cancelado al final del día;
-    \item arrastrado a la siguiente sesión;
-    \item o gestionado por política \texttt{IOC/DAY/GTC},
-\end{itemize}
+21.2. Overnight gaps
+Bajo convención close_t -> open_{t+1}, el gap overnight es parte del resultado económico y no puede “suavizarse”.
 
-según configuración explícita. No se permite “asumir ejecución completa” por defecto.
+21.3. Delistings
+Un activo no puede desaparecer silenciosamente de la cartera. Debe liquidarse o marcarse según regla documentada.
 
-\subsection{Overnight gaps}
+21.4. Halts
+Activo suspendido no implica fill. Debe quedar rechazado, pendiente o cancelado.
 
-Bajo convención \texttt{close\_t} \(\rightarrow\) \texttt{open\_{t+1}}, los gaps overnight
-forman parte de la realidad económica y no deben eliminarse artificialmente. Deben quedar
-reflejados en el precio de fill y en el P\&L posterior.
+21.5. Borrow unavailable
+No se debe abrir un corto nuevo sin disponibilidad válida de borrow.
 
-\subsection{Corporate actions}
+21.6. Missing prices
+Si falta un precio crítico:
+- abortar si es material;
+- aplicar fallback sólo si la configuración lo permite;
+- registrar la anomalía.
 
-Splits, reverse splits, dividends, mergers, spin-offs y delistings deben afectar a shares,
-cost basis y cashflows de forma coherente. El motor no debe duplicar ajustes ya aplicados
-a los precios.
+21.7. Universe churn
+Un activo puede dejar de ser elegible para nuevas compras sin dejar de existir en cartera. Esa semántica debe estar clara.
 
-\subsection{Delistings}
-
-Si un activo deja de cotizar, la salida debe seguir la convención documentada:
-precio de última cotización válida, precio de evento corporativo o regla específica.
-Nunca debe desaparecer silenciosamente de la cartera.
-
-\subsection{Halts y suspensiones}
-
-Si un activo está suspendido, no debe asumir fill. La orden debe quedar rechazada,
-pendiente o cancelada según política explícita.
-
-\subsection{Borrow unavailable}
-
-No debe abrirse una nueva posición corta si no existe disponibilidad de borrow conforme
-a la política definida. Mantener un corto ya abierto sin borrow renovado debe tratarse
-como evento especial, no como detalle invisible.
-
-\subsection{Precios faltantes}
-
-Si falta el precio de valoración o ejecución, el motor debe:
-\begin{itemize}
-    \item abortar si el campo es crítico;
-    \item usar fallback explícito sólo si la configuración lo permite;
-    \item registrar la anomalía.
-\end{itemize}
-
-\subsection{Universe churn}
-
-Entradas y salidas del universo deben manejarse con cuidado. Un activo puede seguir en
-cartera aunque deje de ser elegible para nuevas compras, si la política de liquidación
-así lo define.
-
-\section{Criterios de severidad}
-
-Cada sesión y el run total deben etiquetarse con severidad:
-
-\begin{itemize}
-    \item \textbf{OK}: todos los invariantes dentro de tolerancia.
-    \item \textbf{WARNING}: run contablemente correcto pero con eventos anómalos no bloqueantes.
-    \item \textbf{ERROR}: discrepancias materiales de reconciliación o datos incompletos.
-    \item \textbf{CRITICAL}: violación estructural que invalida el backtest.
-\end{itemize}
-
-Reglas mínimas:
-\begin{itemize}
-    \item cualquier fallo de NAV o cash fuera de tolerancia material implica \texttt{CRITICAL};
-    \item precios críticos ausentes implican \texttt{ERROR} o \texttt{CRITICAL};
-    \item fills imposibles respecto a límites de volumen implican \texttt{CRITICAL};
-    \item un run con \texttt{CRITICAL} no es promocionable.
-\end{itemize}
-
-\section{Contratos de salida}
-
-El motor debe persistir, como mínimo:
-
-\begin{itemize}
-    \item \texttt{backtest/runs/\{run\_id\}/positions\_daily.parquet}
-    \item \texttt{backtest/runs/\{run\_id\}/orders.parquet}
-    \item \texttt{backtest/runs/\{run\_id\}/fills.parquet}
-    \item \texttt{backtest/runs/\{run\_id\}/cash\_ledger.parquet}
-    \item \texttt{backtest/runs/\{run\_id\}/pnl\_daily.parquet}
-    \item \texttt{backtest/runs/\{run\_id\}/exposures\_daily.parquet}
-    \item \texttt{backtest/runs/\{run\_id\}/daily\_reconciliation.parquet}
-    \item \texttt{backtest/runs/\{run\_id\}/summary.json}
-    \item \texttt{backtest/runs/\{run\_id\}/performance\_metrics.json}
-    \item \texttt{backtest/runs/\{run\_id\}/engine\_manifest.json}
-\end{itemize}
-
-\subsection{Esquema mínimo de \texttt{orders.parquet}}
-
-\begin{longtable}{>{\ttfamily}p{4.0cm} p{10cm}}
-\toprule
-Campo & Descripción \\
-\midrule
-date & Fecha de generación. \\
-asset\_id & Identificador estable del activo. \\
-order\_id & Identificador único de la orden. \\
-parent\_signal\_id & Identificador de la señal o target upstream. \\
-target\_shares & Posición objetivo en unidades. \\
-delta\_shares & Cambio deseado frente a posición actual. \\
-order\_type & Market, limit, custom. \\
-tif & IOC, DAY, GTC, etc. \\
-status & Created, PartiallyFilled, Filled, Cancelled, Rejected. \\
-reject\_reason & Motivo si existe. \\
-\bottomrule
-\end{longtable}
-
-\subsection{Esquema mínimo de \texttt{fills.parquet}}
-
-\begin{longtable}{>{\ttfamily}p{4.0cm} p{10cm}}
-\toprule
-Campo & Descripción \\
-\midrule
-date & Fecha de ejecución. \\
-asset\_id & Identificador del activo. \\
-order\_id & Orden asociada. \\
-fill\_id & Identificador único del fill. \\
-fill\_shares & Cantidad ejecutada. \\
-fill\_price & Precio medio de ejecución. \\
-reference\_price & Precio base para medir slippage. \\
-slippage\_bps & Slippage respecto a referencia. \\
-impact\_cost & Coste de impacto. \\
-commission\_cost & Comisión explícita. \\
-fee\_cost & Otros fees. \\
-\bottomrule
-\end{longtable}
-
-\subsection{Esquema mínimo de \texttt{pnl\_daily.parquet}}
-
-\begin{longtable}{>{\ttfamily}p{4.0cm} p{10cm}}
-\toprule
-Campo & Descripción \\
-\midrule
-date & Fecha. \\
-gross\_pnl & P\&L bruto. \\
-trading\_cost & Coste total de trading. \\
-borrow\_cost & Coste de borrow. \\
-financing\_cost & Coste de financiación. \\
-net\_pnl & P\&L neto. \\
-cash & Cash final. \\
-nav & NAV final. \\
-return\_daily & Retorno diario. \\
-severity & Máxima severidad del día. \\
-\bottomrule
-\end{longtable}
-
-\section{Manifest y reproducibilidad}
-
-El fichero \texttt{engine\_manifest.json} debe contener:
-
-\begin{itemize}
-    \item \texttt{run\_id}
-    \item commit hash o versión del código
-    \item hash o snapshot id de datasets
-    \item configuración congelada completa
-    \item convención temporal
-    \item modelo de costes activo
-    \item parámetros de impacto
-    \item tolerancias de reconciliación
-    \item timestamp de generación
-    \item seed si existe aleatoriedad controlada
-\end{itemize}
-
-Sin manifiesto reproducible, el run no debe considerarse institucionalmente válido.
-
-\section{Failure modes que el motor debe detectar}
+22. Failure modes que el motor debe detectar
 
 Como mínimo:
+- mezcla de adjusted prices con accounting incompatible;
+- desfase temporal entre señal y ejecución;
+- fills por encima del cap de participación;
+- cash negativo no permitido;
+- pérdida o duplicación de posiciones por merge defectuoso;
+- double counting de corporate actions;
+- borrow omitido en cortos;
+- NAV no reconciliable;
+- activo suspendido ejecutado como si nada;
+- universe leak por elegibilidad retrospectiva.
 
-\begin{itemize}
-    \item mezcla de precios ajustados con accounting no ajustado;
-    \item desfase de un día entre señales y ejecución;
-    \item fills superiores al límite de participación;
-    \item cash negativo no permitido por política de margen;
-    \item desaparición silenciosa de posiciones por merges defectuosos;
-    \item doble conteo de corporate actions;
-    \item borrow cost omitido en cortos;
-    \item NAV que no reconcilia con cash y posiciones;
-    \item activo suspendido que aparece como ejecutado;
-    \item universe leak por uso retrospectivo de elegibilidad.
-\end{itemize}
+23. Salidas obligatorias
 
-\section{Tests mínimos exigibles}
+El motor debe persistir, como mínimo:
+- positions_daily.parquet
+- orders.parquet
+- fills.parquet
+- cash_ledger.parquet
+- pnl_daily.parquet
+- exposures_daily.parquet
+- daily_reconciliation.parquet
+- summary.json
+- performance_metrics.json
+- engine_manifest.json
 
-Este módulo debe venir acompañado, como mínimo, de:
+24. orders.parquet: campos mínimos
 
-\begin{enumerate}[label=\arabic*.]
-    \item \textbf{Test trivial long-only}: un activo, sin costes, con P\&L exacto conocido.
-    \item \textbf{Test de costes}: compra/venta con comisión y slippage controlados.
-    \item \textbf{Test partial fill}: orden superior al límite de participación.
-    \item \textbf{Test overnight gap}: señal en cierre y ejecución en apertura siguiente.
-    \item \textbf{Test corporate action}: split o dividendo con reconciliación correcta.
-    \item \textbf{Test short/borrow}: posición corta con borrow aplicado.
-    \item \textbf{Test halt}: activo suspendido que no debe ejecutarse.
-    \item \textbf{Test de invariantes}: NAV, cash y posiciones cuadran tras cada sesión.
-    \item \textbf{Test PIT}: fallo deliberado si se usa dato no disponible al \texttt{decision\_cut}.
-    \item \textbf{Test de reproducibilidad}: mismo seed e inputs producen bitwise-identical outputs si la arquitectura lo permite.
-\end{enumerate}
+- date
+- asset_id
+- order_id
+- parent_signal_id
+- target_shares
+- delta_shares
+- order_type
+- tif
+- status
+- reject_reason
 
-\section{Criterio de calidad para considerar el motor ``institucional''}
+25. fills.parquet: campos mínimos
 
-El motor puede considerarse de nivel institucional si cumple simultáneamente:
+- date
+- asset_id
+- order_id
+- fill_id
+- fill_shares
+- fill_price
+- reference_price
+- slippage_bps
+- impact_cost
+- commission_cost
+- fee_cost
 
-\begin{enumerate}[label=\arabic*.]
-    \item semántica temporal única y documentada;
-    \item reconciliación diaria de NAV, cash y posiciones;
-    \item ejecución causal con restricciones de liquidez explícitas;
-    \item trazabilidad completa desde señal hasta fill y P\&L;
-    \item persistencia íntegra de artefactos;
-    \item cobertura explícita de edge cases relevantes de small caps;
-    \item tests sintéticos y de integración superados;
-    \item failure modes detectados de forma ruidosa.
-\end{enumerate}
+26. pnl_daily.parquet: campos mínimos
 
-\section{Conclusión}
+- date
+- gross_pnl
+- trading_cost
+- borrow_cost
+- financing_cost
+- net_pnl
+- cash
+- nav
+- return_daily
+- severity
 
-\texttt{backtest/engine.py} debe ser la pieza que transforma investigación cuantitativa
-en simulación económicamente interpretable. No basta con multiplicar pesos por retornos;
-hay que modelar causalidad temporal, transición de estado, ejecución incompleta,
-fricciones, restricciones y contabilidad. Ésa es precisamente la frontera entre una
-idea prometedora y una infraestructura cuantitativa seria. En el contexto de
-\texttt{simons\_smallcap\_swing}, donde small caps implican liquidez frágil, spreads
-anchos y alta sensibilidad al impacto, este motor debe operar como una capa
-conservadora, determinista y auditada. Sólo así el resto del stack ---atribución,
-diagnóstico, reporting y análisis de capacidad--- puede apoyarse en un fundamento
-realmente sólido.
+27. Manifest y reproducibilidad
 
-\end{document}
+engine_manifest.json debe incluir:
+- run_id
+- commit hash o versión de código
+- hash o snapshot id de datasets
+- configuración completa congelada
+- convención temporal
+- modelo de costes activo
+- parámetros de impacto
+- tolerancias de reconciliación
+- timestamp de generación
+- seed si existe aleatoriedad
+
+Sin esto, el run no debe considerarse institucionalmente válido.
+
+28. Sistema de severidades
+
+Cada sesión y el run global deben clasificarse como:
+- OK
+- WARNING
+- ERROR
+- CRITICAL
+
+Reglas mínimas:
+- fallo material de NAV o cash -> CRITICAL
+- precio crítico ausente -> ERROR o CRITICAL
+- fill imposible por volumen -> CRITICAL
+- un run con CRITICAL no es promocionable
+
+29. Tests mínimos exigibles
+
+El módulo debe venir acompañado al menos de:
+
+1. Test trivial long-only:
+   un activo, sin costes, P&L exacto conocido.
+
+2. Test de costes:
+   compra/venta con comisión y slippage controlados.
+
+3. Test partial fill:
+   orden superior al límite de participación.
+
+4. Test overnight gap:
+   señal en cierre y ejecución en apertura siguiente.
+
+5. Test corporate action:
+   split o dividendo con reconciliación correcta.
+
+6. Test short/borrow:
+   corto con borrow aplicado.
+
+7. Test halt:
+   activo suspendido que no debe ejecutarse.
+
+8. Test de invariantes:
+   NAV, cash y posiciones cuadran tras cada sesión.
+
+9. Test PIT:
+   debe fallar deliberadamente si usa dato no disponible al decision_cut.
+
+10. Test de reproducibilidad:
+    mismos inputs y misma semántica -> mismo resultado.
+
+30. MVP obligatorio
+
+El MVP del motor debe incluir:
+- semántica temporal fija;
+- target -> order -> fill -> state update;
+- límites básicos de liquidez por participación;
+- costes explícitos;
+- accounting diario;
+- persistencia completa;
+- reconciliación obligatoria;
+- fail loudly ante incoherencias.
+
+31. Fase 1 razonable
+
+Como mejora muy valiosa:
+- fills parciales más realistas;
+- mejores modelos de slippage e impacto;
+- settlement explícito;
+- borrow más fino;
+- cash buffer dinámico;
+- mejores edge cases de delisting y halts.
+
+32. No-objetivos
+
+No pertenece al alcance del módulo:
+- generar señales;
+- recalibrar modelos predictivos;
+- hacer attribution;
+- decidir promoción de estrategias;
+- hacer causal discovery del edge;
+- sustituir modelos de ejecución live.
+
+Su misión es simular de forma económica y contable consistente.
+
+33. Criterios de aceptación
+
+El motor sólo debe considerarse correcto si:
+- respeta PIT estricto;
+- tiene una semántica temporal única y documentada;
+- reconcilia cash, posiciones y NAV diariamente;
+- persiste toda la traza desde señal hasta P&L;
+- cubre edge cases relevantes de small caps;
+- falla ruidosamente ante inconsistencias materiales;
+- y es reproducible.
+
+34. Conclusión
+
+backtest/engine.py debe ser la pieza que convierte una idea cuantitativa en una trayectoria económica verificable. No basta con multiplicar señales por retornos: hay que modelar la cadena completa de decisión, órdenes, ejecución, fricción, cash, valoración y reconciliación. Ésa es la frontera real entre research naïf y simulación institucional. En un sistema de small caps como simons_smallcap_swing, donde liquidez, impacto y dispersión importan muchísimo, este motor debe comportarse como una capa conservadora, determinista y completamente auditable. Sólo así attribution.py, diagnostics.py y el resto del stack pueden apoyarse en una base realmente seria.

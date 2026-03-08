@@ -1,502 +1,433 @@
-\documentclass[11pt]{article}
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
-\usepackage[spanish]{babel}
-\usepackage{amsmath,amssymb,amsthm}
-\usepackage{graphicx}
-\usepackage{hyperref}
-\usepackage[margin=2.5cm]{geometry}
-\usepackage{booktabs}
-\usepackage{enumitem}
-\usepackage{array}
+Especificación Cuantitativa: data/borrow/borrow_cost_proxy.py
 
-\title{Especificación Research--Production del Proxy de Coste de Préstamo para \texttt{data/borrow/borrow\_cost\_proxy.py}}
-\author{}
-\date{}
+1. Propósito del módulo
 
-\begin{document}
-\maketitle
+El módulo `data/borrow/borrow_cost_proxy.py` construye, para cada símbolo `i` y fecha `t`, una estimación ex-ante, causal y operacional del coste de préstamo de acciones (`borrow fee`) y de la disponibilidad efectiva de inventario para posiciones cortas cuando no existe un feed completo, limpio y continuo de securities lending.
 
-\section{Objetivo del módulo}
+El objetivo no es producir una estimación “académicamente interesante” del fee, sino una variable de estado robusta, utilizable y conservadora que permita modelizar de forma realista las restricciones económicas del shorting dentro del pipeline cuantitativo. En particular, el módulo debe:
 
-El módulo \texttt{data/borrow/borrow\_cost\_proxy.py} construye, para cada símbolo $i$ y fecha $t$, una estimación \emph{ex ante}, causal y operacional del coste de préstamo de acciones (\emph{borrow fee}) y de la disponibilidad efectiva de inventario para posiciones cortas cuando no existe un feed completo, limpio y continuo de \emph{securities lending}.
+- imputar un coste anualizado de préstamo `B_hat_{i,t}` para el motor de backtest y para la construcción de retornos netos;
+- producir una métrica de disponibilidad `alpha_{i,t} in [0,1]` interpretable como intensidad relativa de acceso a inventario prestable;
+- activar una etiqueta de severidad de préstamo (`easy`, `medium`, `hard`, `blocked`) coherente con el resto de la arquitectura de `data/borrow`;
+- penalizar de forma sistemática nombres con características históricamente asociadas a fricción de préstamo, escasez de inventario, alta congestión en el lado corto o vulnerabilidad a squeezes;
+- garantizar que todas las salidas sean causales, reproducibles, trazables y estables en el tiempo.
 
-El objetivo no es producir una estimación ``académicamente interesante'' del fee, sino una variable de estado \textbf{robusta, utilizable y conservadora} que permita modelizar de forma realista las restricciones económicas del shorting dentro del pipeline cuantitativo. En particular, el módulo debe:
+La filosofía del módulo es deliberadamente asimétrica: cuando la verdad de mercado no es observable, el error admisible no es “ser optimista”, sino subestimar la facilidad del corto lo menos posible. Por tanto, en ausencia de evidencia suficiente, el proxy debe degradar elegibilidad y encarecer el coste antes que introducir un sesgo sistemático a favor del lado corto.
 
-\begin{itemize}[leftmargin=2em]
-    \item imputar un coste anualizado de préstamo $\widehat{B}_{i,t}$ para el motor de backtest y para la construcción de retornos netos;
-    \item producir una métrica de disponibilidad $\alpha_{i,t}\in[0,1]$ interpretable como intensidad relativa de acceso a inventario prestable;
-    \item activar una etiqueta de severidad de préstamo (\emph{easy}, \emph{medium}, \emph{hard}, \emph{blocked}) coherente con el resto de la arquitectura de \texttt{data/borrow};
-    \item penalizar de forma sistemática nombres con características históricamente asociadas a fricción de préstamo, escasez de inventario, alta congestión en el lado corto o vulnerabilidad a \emph{squeezes};
-    \item garantizar que todas las salidas sean \textbf{causales, reproducibles, trazables y estables en el tiempo}.
-\end{itemize}
+2. Alcance y papel dentro de la arquitectura
 
-La filosofía del módulo es deliberadamente asimétrica: cuando la verdad de mercado no es observable, el error admisible no es ``ser optimista'', sino \textbf{subestimar la facilidad del corto lo menos posible}. Por tanto, en ausencia de evidencia suficiente, el proxy debe degradar elegibilidad y encarecer el coste antes que introducir un sesgo sistemático a favor del lado corto.
+Este módulo pertenece a la capa de realismo operacional de la estrategia `simons_smallcap_swing`. Su misión es transformar información parcial de liquidez, tamaño, rotación, volatilidad, short interest, inventario prestable y señales parciales de hard-to-borrow en un conjunto compacto de variables que luego serán consumidas por:
 
-\section{Alcance y papel dentro de la arquitectura}
+- el motor de labeling neto de costes;
+- el portfolio construction con restricciones de tamaño de corto;
+- el universe filter para excluir nombres no operables;
+- los módulos de borrow QC y locate filtering, que validan consistencia y elegibilidad final.
 
-Este módulo pertenece a la capa de realismo operacional de la estrategia \texttt{simons\_smallcap\_swing}. Su misión es transformar información parcial de liquidez, tamaño, rotación, volatilidad, \emph{short interest}, inventario prestable y señales parciales de \emph{hard-to-borrow} en un conjunto compacto de variables que luego serán consumidas por:
+El módulo no pretende reconstruir el mercado completo de préstamo de títulos ni sustituir un feed institucional de lending. Su alcance es más pragmático:
 
-\begin{itemize}[leftmargin=2em]
-    \item el motor de \textbf{labeling neto de costes};
-    \item el \textbf{portfolio construction} con restricciones de tamaño de corto;
-    \item el \textbf{universe filter} para excluir nombres no operables;
-    \item los módulos de \textbf{borrow QC} y \textbf{locate filtering}, que validan consistencia y elegibilidad final.
-\end{itemize}
+1. inferir el nivel relativo de dificultad de préstamo;
+2. traducir esa inferencia a un coste anualizado conservador;
+3. imponer disciplina causal y estabilidad temporal a una variable que, en la práctica, es ruidosa, incompleta y muy dependiente del régimen de mercado.
 
-El módulo \textbf{no} pretende reconstruir el mercado completo de préstamo de títulos ni sustituir un feed institucional de lending. Su alcance es más pragmático:
-
-\begin{enumerate}[leftmargin=2em]
-    \item inferir el nivel relativo de dificultad de préstamo;
-    \item traducir esa inferencia a un coste anualizado conservador;
-    \item imponer disciplina causal y estabilidad temporal a una variable que, en la práctica, es ruidosa, incompleta y muy dependiente del régimen de mercado.
-\end{enumerate}
-
-\section{Principios de diseño no negociables}
+3. Principios de diseño no negociables
 
 La especificación se rige por los siguientes principios:
 
-\begin{enumerate}[leftmargin=2em]
-    \item \textbf{Causalidad estricta.} Ninguna feature utilizada en fecha $t$ puede incorporar información publicada o revisada después del cierre operativo definido para $t$.
-    \item \textbf{Conservadurismo operacional.} Ante ambigüedad, el sistema debe aproximar hacia mayor coste y menor disponibilidad.
-    \item \textbf{Estabilidad temporal.} El proxy no puede oscilar violentamente por ruido de inputs de baja calidad; debe existir suavizado, hysteresis y control de saltos.
-    \item \textbf{Monotonicidad económica.} A igualdad de condiciones, menor liquidez, menor capitalización, mayor volatilidad, mayor \emph{short interest} y mayor evidencia HTB no pueden producir un proxy más benigno.
-    \item \textbf{Separación entre inferencia y decisión.} Este módulo estima fricción; la decisión final de bloquear un nombre corresponde a \texttt{locate\_filter}, aunque debe entregar señales suficientemente estructuradas para hacerlo.
-    \item \textbf{Versionado completo.} Todo output debe identificar la versión de configuración, thresholds, ventanas, buckets y fallback policy utilizada.
-\end{enumerate}
+1. Causalidad estricta. Ninguna feature utilizada en fecha `t` puede incorporar información publicada o revisada después del cierre operativo definido para `t`.
+2. Conservadurismo operacional. Ante ambigüedad, el sistema debe aproximar hacia mayor coste y menor disponibilidad.
+3. Estabilidad temporal. El proxy no puede oscilar violentamente por ruido de inputs de baja calidad; debe existir suavizado, hysteresis y control de saltos.
+4. Monotonicidad económica. A igualdad de condiciones, menor liquidez, menor capitalización, mayor volatilidad, mayor short interest y mayor evidencia HTB no pueden producir un proxy más benigno.
+5. Separación entre inferencia y decisión. Este módulo estima fricción; la decisión final de bloquear un nombre corresponde a `locate_filter`, aunque debe entregar señales suficientemente estructuradas para hacerlo.
+6. Versionado completo. Todo output debe identificar la versión de configuración, thresholds, ventanas, buckets y fallback policy utilizada.
 
-\section{Convenciones temporales y anti-leakage}
+4. Convenciones temporales y anti-leakage
 
-El punto más importante de esta especificación es temporal. El módulo debe evitar explícitamente toda contaminación \emph{look-ahead}. Para ello:
+El punto más importante de esta especificación es temporal. El módulo debe evitar explícitamente toda contaminación look-ahead. Para ello:
 
-\begin{itemize}[leftmargin=2em]
-    \item Las variables de mercado diarias ($S_{i,t}$, $V_{i,t}$, volatilidad, ADV, turnover) se calculan con información disponible hasta el cierre de $t$ y se usan para decisiones ejecutadas no antes de $t+1$.
-    \item El \emph{short interest}, si llega con retraso regulatorio o proveedor, se alinea a su fecha efectiva de disponibilidad, no a su fecha económica de referencia.
-    \item Los flags de \emph{hard-to-borrow} e inventario parcial se usan únicamente desde la primera fecha en que están disponibles en el pipeline.
-    \item Los buckets se recalculan de forma causal, sin usar cuantiles globales del futuro. Todo bucket debe computarse con cuantiles fijos predefinidos o con cuantiles rolling causales.
-    \item Ninguna calibración puede entrenarse en una ventana que incluya fechas posteriores a las de inferencia.
-\end{itemize}
+- Las variables de mercado diarias (`S_{i,t}`, `V_{i,t}`, volatilidad, ADV, turnover) se calculan con información disponible hasta el cierre de `t` y se usan para decisiones ejecutadas no antes de `t+1`.
+- El short interest, si llega con retraso regulatorio o proveedor, se alinea a su fecha efectiva de disponibilidad, no a su fecha económica de referencia.
+- Los flags de hard-to-borrow e inventario parcial se usan únicamente desde la primera fecha en que están disponibles en el pipeline.
+- Los buckets se recalculan de forma causal, sin usar cuantiles globales del futuro. Todo bucket debe computarse con cuantiles fijos predefinidos o con cuantiles rolling causales.
+- Ninguna calibración puede entrenarse en una ventana que incluya fechas posteriores a las de inferencia.
 
-En particular, cualquier variable de tipo \texttt{short\_interest\_ratio}, \texttt{days\_to\_cover}, \texttt{utilization} o similar deberá ir acompañada de un campo auxiliar \texttt{asof\_date}; si ese campo no existe, el dato será tratado como \textbf{parcialmente no confiable} y degradará el nivel de confianza del proxy.
+En particular, cualquier variable de tipo `short_interest_ratio`, `days_to_cover`, `utilization` o similar deberá ir acompañada de un campo auxiliar `asof_date`; si ese campo no existe, el dato será tratado como parcialmente no confiable y degradará el nivel de confianza del proxy.
 
-\section{Notación}
+5. Notación
 
-Sea $\mathcal{U}_t$ el universo causalmente elegible en fecha $t$. Para cada símbolo $i\in\mathcal{U}_t$ definimos:
+Sea `U_t` el universo causalmente elegible en fecha `t`. Para cada símbolo `i in U_t` definimos:
 
-\begin{itemize}[leftmargin=2em]
-    \item $S_{i,t}$: precio de cierre ajustado.
-    \item $V_{i,t}$: volumen negociado.
-    \item $MC_{i,t}$: capitalización bursátil.
-    \item $ADV_{i,t}^{(n)}$: media móvil causal de volumen monetario o acciones negociadas en ventana de $n$ días.
-    \item $\sigma_{i,t}^{(n)}$: volatilidad histórica causal en ventana de $n$ días.
-    \item $TO_{i,t}^{(n)}$: turnover causal en ventana de $n$ días.
-    \item $SI_{i,t}$: \emph{short interest} alineado por fecha efectiva de disponibilidad.
-    \item $DTC_{i,t}$: \emph{days to cover}, si puede calcularse causalmente.
-    \item $u_{i,t}$: score interno de utilización / tensión en el lado corto.
-    \item $h_{i,t}$: evidencia parcial de \emph{hard-to-borrow} procedente de feeds directos o heurísticos.
-\end{itemize}
+- `S_{i,t}`: precio de cierre ajustado.
+- `V_{i,t}`: volumen negociado.
+- `MC_{i,t}`: capitalización bursátil.
+- `ADV_{i,t}^{(n)}`: media móvil causal de volumen monetario o acciones negociadas en ventana de `n` días.
+- `sigma_{i,t}^{(n)}`: volatilidad histórica causal en ventana de `n` días.
+- `TO_{i,t}^{(n)}`: turnover causal en ventana de `n` días.
+- `SI_{i,t}`: short interest alineado por fecha efectiva de disponibilidad.
+- `DTC_{i,t}`: days to cover, si puede calcularse causalmente.
+- `u_{i,t}`: score interno de utilización / tensión en el lado corto.
+- `h_{i,t}`: evidencia parcial de hard-to-borrow procedente de feeds directos o heurísticos.
 
 Las salidas del módulo son:
 
-\begin{itemize}[leftmargin=2em]
-    \item $\widehat{B}_{i,t}\in\mathbb{R}_{\ge 0}$: fee anualizado estimado, expresado en fracción anual.
-    \item $\widehat{b}_{i,t}=\widehat{B}_{i,t}/365$: coste diario equivalente.
-    \item $\alpha_{i,t}\in[0,1]$: score de disponibilidad.
-    \item $H_{i,t}\in\{0,1\}$: flag HTB.
-    \item $q_{i,t}\in\{\texttt{high},\texttt{medium},\texttt{low}\}$: calidad/confianza del proxy.
-    \item $\texttt{borrow\_tier}_{i,t}\in\{\texttt{easy},\texttt{medium},\texttt{hard},\texttt{blocked}\}$.
-    \item \texttt{proxy\_source}$_{i,t}$: fuente dominante usada en la inferencia.
-\end{itemize}
+- `B_hat_{i,t} >= 0`: fee anualizado estimado, expresado en fracción anual.
+- `b_hat_{i,t} = B_hat_{i,t} / 365`: coste diario equivalente.
+- `alpha_{i,t} in [0,1]`: score de disponibilidad.
+- `H_{i,t} in {0,1}`: flag HTB.
+- `q_{i,t} in {high, medium, low}`: calidad/confianza del proxy.
+- `borrow_tier_{i,t} in {easy, medium, hard, blocked}`.
+- `proxy_source_{i,t}`: fuente dominante usada en la inferencia.
 
-\section{Arquitectura del modelo}
+6. Arquitectura del modelo
 
 La especificación fija una arquitectura en tres capas. Esto elimina la ambigüedad de la versión anterior, donde coexistían varias alternativas sin jerarquía clara.
 
-\subsection{Capa 1: señales base normalizadas}
+6.1. Capa 1: señales base normalizadas
 
 Se construye un vector de features robustas:
-\[
-x_{i,t}=
-\Big(
-\log MC_{i,t},
-\log ADV_{i,t}^{(20)},
-\log(1+\sigma_{i,t}^{(20)}),
-\log(1+DTC_{i,t}),
-\log(1+SI_{i,t}^{\ast}),
-TO_{i,t}^{(20)},
-h_{i,t}
-\Big),
-\]
-donde $SI_{i,t}^{\ast}$ representa la mejor versión causalmente disponible de presión short, normalizada sobre \emph{float} cuando sea posible.
 
-Todas las features se winsorizan por fecha en percentiles fijos (por ejemplo, 1\% y 99\%) y luego se transforman a escalas robustas. Esta winsorización es obligatoria para evitar que un outlier microcap destruya la estabilidad del modelo.
+`x_{i,t} = (log MC_{i,t}, log ADV_{i,t}^{(20)}, log(1 + sigma_{i,t}^{(20)}), log(1 + DTC_{i,t}), log(1 + SI_{i,t}*), TO_{i,t}^{(20)}, h_{i,t})`
 
-\subsection{Capa 2: score latente de tensión de préstamo}
+donde `SI_{i,t}*` representa la mejor versión causalmente disponible de presión short, normalizada sobre float cuando sea posible.
+
+Todas las features se winsorizan por fecha en percentiles fijos, por ejemplo `1%` y `99%`, y luego se transforman a escalas robustas. Esta winsorización es obligatoria para evitar que un outlier microcap destruya la estabilidad del modelo.
+
+6.2. Capa 2: score latente de tensión de préstamo
 
 Se define un score latente de dificultad de préstamo:
-\[
-z_{i,t} = \beta_0
-+ \beta_1\,(-\widetilde{\log ADV}_{i,t})
-+ \beta_2\,(-\widetilde{\log MC}_{i,t})
-+ \beta_3\,\widetilde{\log(1+\sigma)}_{i,t}
-+ \beta_4\,\widetilde{\log(1+SI^\ast)}_{i,t}
-+ \beta_5\,\widetilde{\log(1+DTC)}_{i,t}
-+ \beta_6\,h_{i,t},
-\]
+
+`z_{i,t} = beta_0
+         + beta_1 * (-tilde(log ADV)_{i,t})
+         + beta_2 * (-tilde(log MC)_{i,t})
+         + beta_3 * tilde(log(1 + sigma))_{i,t}
+         + beta_4 * tilde(log(1 + SI*))_{i,t}
+         + beta_5 * tilde(log(1 + DTC))_{i,t}
+         + beta_6 * h_{i,t}`
+
 con restricciones de signo:
-\[
-\beta_1,\beta_2,\beta_3,\beta_4,\beta_5,\beta_6 \ge 0.
-\]
 
-Estas restricciones son parte de la especificación, no una sugerencia. El módulo no puede permitir una calibración donde un aumento de \emph{short interest} o una caída de liquidez reduzcan el coste estimado.
+`beta_1, beta_2, beta_3, beta_4, beta_5, beta_6 >= 0`
 
-\subsection{Capa 3: mapping determinista a fee y disponibilidad}
+Estas restricciones son parte de la especificación, no una sugerencia. El módulo no puede permitir una calibración donde un aumento de short interest o una caída de liquidez reduzcan el coste estimado.
 
-El score $z_{i,t}$ se transforma en:
+6.3. Capa 3: mapping determinista a fee y disponibilidad
 
-\[
-\alpha_{i,t} = \frac{1}{1+\exp(z_{i,t})},
-\]
+El score `z_{i,t}` se transforma en:
+
+`alpha_{i,t} = 1 / (1 + exp(z_{i,t}))`
+
 de forma que un mayor estrés de préstamo implica menor disponibilidad.
 
 El fee anualizado se define mediante un mapping monotónico por tramos:
 
-\[
-\widehat{B}_{i,t}=
-\begin{cases}
-B_{\min} & \text{si } z_{i,t}\le c_1,\\[4pt]
-B_{\min} + (B_{\text{med}}-B_{\min})\dfrac{z_{i,t}-c_1}{c_2-c_1} & \text{si } c_1< z_{i,t}\le c_2,\\[8pt]
-B_{\text{med}} + (B_{\text{hard}}-B_{\text{med}})\dfrac{z_{i,t}-c_2}{c_3-c_2} & \text{si } c_2< z_{i,t}\le c_3,\\[8pt]
-\min\!\Big(B_{\max},\, B_{\text{hard}}\exp\{\gamma(z_{i,t}-c_3)\}\Big) & \text{si } z_{i,t}>c_3.
-\end{cases}
-\]
+- `B_hat_{i,t} = B_min` si `z_{i,t} <= c1`
+- `B_hat_{i,t} = B_min + (B_med - B_min) * (z_{i,t} - c1) / (c2 - c1)` si `c1 < z_{i,t} <= c2`
+- `B_hat_{i,t} = B_med + (B_hard - B_med) * (z_{i,t} - c2) / (c3 - c2)` si `c2 < z_{i,t} <= c3`
+- `B_hat_{i,t} = min(B_max, B_hard * exp(gamma * (z_{i,t} - c3)))` si `z_{i,t} > c3`
 
-La elección de este mapping es \textbf{la especificación preferida y obligatoria}. No se dejan abiertas como equivalentes, para versión productiva, alternativas tipo Random Forest o XGBoost. Esos modelos quedan reservados para investigación comparativa, pero el output oficial del pipeline debe venir del mapping anterior por tres razones: interpretabilidad, monotonicidad garantizada y estabilidad de régimen.
+La elección de este mapping es la especificación preferida y obligatoria. No se dejan abiertas como equivalentes, para versión productiva, alternativas tipo Random Forest o XGBoost. Esos modelos quedan reservados para investigación comparativa, pero el output oficial del pipeline debe venir del mapping anterior por tres razones: interpretabilidad, monotonicidad garantizada y estabilidad de régimen.
 
-\section{Buckets estructurales}
+7. Buckets estructurales
 
 Aunque el modelo central es continuo, la calibración y las salvaguardas se organizan por buckets estructurales. Cada símbolo se clasifica, de forma causal, en:
 
-\begin{itemize}[leftmargin=2em]
-    \item bucket de tamaño: \texttt{mega/large/mid/small/micro};
-    \item bucket de liquidez: quintiles causales de $\log ADV^{(20)}$;
-    \item bucket de volatilidad: terciles causales de $\sigma^{(20)}$;
-    \item bucket de presión short: \texttt{none/low/medium/high/extreme}, en función del mejor proxy disponible.
-\end{itemize}
+- bucket de tamaño: `mega / large / mid / small / micro`;
+- bucket de liquidez: quintiles causales de `log ADV^{(20)}`;
+- bucket de volatilidad: terciles causales de `sigma^{(20)}`;
+- bucket de presión short: `none / low / medium / high / extreme`, en función del mejor proxy disponible.
 
-Los buckets \textbf{no sustituyen} al score continuo, pero sí determinan:
+Los buckets no sustituyen al score continuo, pero sí determinan:
 
-\begin{enumerate}[leftmargin=2em]
-    \item los valores iniciales de calibración $(B_{\min},B_{\text{med}},B_{\text{hard}},B_{\max})$;
-    \item los límites de saneamiento admisibles;
-    \item la política de fallback;
-    \item los umbrales de clasificación a \texttt{borrow\_tier}.
-\end{enumerate}
+1. los valores iniciales de calibración `(B_min, B_med, B_hard, B_max)`;
+2. los límites de saneamiento admisibles;
+3. la política de fallback;
+4. los umbrales de clasificación a `borrow_tier`.
 
-\section{Calibración}
+8. Calibración
 
 La versión anterior mencionaba calibración, pero no la cerraba. Aquí se fija el procedimiento.
 
-\subsection{Caso A: existe truth set parcial de borrow fees}
+8.1. Caso A: existe truth set parcial de borrow fees
 
 Si existe una muestra histórica razonable de fees reales o de tiers de préstamo, la calibración se realizará en dos etapas:
 
-\begin{enumerate}[leftmargin=2em]
-    \item estimación de los coeficientes $\beta$ mediante regresión monotónica o regresión logística ordinal con restricciones de signo;
-    \item ajuste de los parámetros $(c_1,c_2,c_3,\gamma,B_{\min},B_{\text{med}},B_{\text{hard}},B_{\max})$ minimizando una loss ponderada que combine:
-    \[
-    \mathcal{L}
-    = \lambda_1\,\mathrm{MAE}(\widehat{B},B)
-    + \lambda_2\,\mathrm{BCE}(H,\widehat{H})
-    + \lambda_3\,\mathrm{RankLoss}(\widehat{B},B)
-    + \lambda_4\,\mathrm{TVPenalty},
-    \]
-    donde \(\mathrm{TVPenalty}\) penaliza variación temporal excesiva del proxy.
-\end{enumerate}
+1. estimación de los coeficientes `beta` mediante regresión monotónica o regresión logística ordinal con restricciones de signo;
+2. ajuste de los parámetros `(c1, c2, c3, gamma, B_min, B_med, B_hard, B_max)` minimizando una loss ponderada que combine:
 
-\subsection{Caso B: no existe truth set suficiente}
+`L = lambda_1 * MAE(B_hat, B)
+   + lambda_2 * BCE(H, H_hat)
+   + lambda_3 * RankLoss(B_hat, B)
+   + lambda_4 * TVPenalty`
+
+donde `TVPenalty` penaliza variación temporal excesiva del proxy.
+
+8.2. Caso B: no existe truth set suficiente
 
 Si el truth set es insuficiente, se utiliza una calibración anclada por régimen:
 
-\begin{itemize}[leftmargin=2em]
-    \item \textbf{Easy-to-borrow}: $B_{\min}\in[0.0025,0.015]$ anual.
-    \item \textbf{Medium}: $B_{\text{med}}\in[0.02,0.10]$ anual.
-    \item \textbf{Hard}: $B_{\text{hard}}\in[0.10,0.60]$ anual.
-    \item \textbf{Extremo / squeeze-prone}: $B_{\max}\in[1.00,5.00]$ anual.
-\end{itemize}
+- Easy-to-borrow: `B_min in [0.0025, 0.015]` anual.
+- Medium: `B_med in [0.02, 0.10]` anual.
+- Hard: `B_hard in [0.10, 0.60]` anual.
+- Extremo / squeeze-prone: `B_max in [1.00, 5.00]` anual.
 
-La calibración exacta dentro de esos rangos deberá basarse en benchmarks por bucket de liquidez/tamaño y en evidencia de recurrencia HTB. Esta política no pretende clavar el fee ``verdadero'', sino obtener un coste conservador con ordenamiento económico correcto.
+La calibración exacta dentro de esos rangos deberá basarse en benchmarks por bucket de liquidez/tamaño y en evidencia de recurrencia HTB. Esta política no pretende clavar el fee “verdadero”, sino obtener un coste conservador con ordenamiento económico correcto.
 
-\section{Precedencia de fuentes y resolución de conflictos}
+9. Precedencia de fuentes y resolución de conflictos
 
 Uno de los defectos principales del texto anterior era dejar demasiado espacio a arbitraje informal. Aquí se fija una precedencia formal:
 
-\[
-\texttt{direct\_lending\_feed}
-\succ
-\texttt{explicit\_htb\_flag}
-\succ
-\texttt{short\_interest\_derived}
-\succ
-\texttt{liquidity\_volatility\_proxy}
-\succ
-\texttt{coarse\_fallback}.
-\]
+`direct_lending_feed
+ > explicit_htb_flag
+ > short_interest_derived
+ > liquidity_volatility_proxy
+ > coarse_fallback`
 
 Regla operativa:
-\begin{itemize}[leftmargin=2em]
-    \item Si una fuente de mayor precedencia existe y supera checks mínimos de calidad, domina.
-    \item Las fuentes de menor precedencia pueden complementar, pero no suavizar materialmente, una señal severa de una fuente superior.
-    \item Si una fuente superior sugiere estrés extremo y una inferior sugiere benignidad, prevalece la superior.
-    \item Si dos fuentes de igual nivel discrepan significativamente, se adopta la más conservadora y se degrada \texttt{proxy\_quality}.
-\end{itemize}
 
-Formalmente, si se obtienen varias propuestas de fee $\widehat{B}^{(k)}_{i,t}$, el agregador oficial será:
-\[
-\widehat{B}_{i,t}
-=
-\max_{k\in\mathcal{K}_{i,t}^{\text{valid}}}
-w_k\,\widehat{B}^{(k)}_{i,t},
-\]
-con pesos $w_k\in[0,1]$ crecientes con la precedencia y sujetos a la restricción de que una fuente de baja precedencia no pueda rebajar el cuantil conservador inducido por una fuente de alta precedencia.
+- Si una fuente de mayor precedencia existe y supera checks mínimos de calidad, domina.
+- Las fuentes de menor precedencia pueden complementar, pero no suavizar materialmente, una señal severa de una fuente superior.
+- Si una fuente superior sugiere estrés extremo y una inferior sugiere benignidad, prevalece la superior.
+- Si dos fuentes de igual nivel discrepan significativamente, se adopta la más conservadora y se degrada `proxy_quality`.
 
-\section{Hysteresis y suavizado temporal}
+Formalmente, si se obtienen varias propuestas de fee `B_hat_{i,t}^{(k)}`, el agregador oficial será:
 
-Para evitar cambios espurios entre \texttt{easy}, \texttt{medium} y \texttt{hard}, el módulo implementa hysteresis obligatoria. Sea $\tau_1<\tau_2<\tau_3$ el sistema base de umbrales sobre $\widehat{B}_{i,t}$.
+`B_hat_{i,t} = max_{k in K_{i,t}^{valid}} w_k * B_hat_{i,t}^{(k)}`
 
-La transición ascendente de tier se activa de inmediato cuando el proxy cruza el umbral superior correspondiente. La transición descendente exige persistencia mínima de $k$ días. Por ejemplo:
+con pesos `w_k in [0,1]` crecientes con la precedencia y sujetos a la restricción de que una fuente de baja precedencia no pueda rebajar el cuantil conservador inducido por una fuente de alta precedencia.
 
-\begin{itemize}[leftmargin=2em]
-    \item de \texttt{hard} a \texttt{medium}: requiere $k_{\downarrow}=3$ días consecutivos por debajo de $\tau_2^{\downarrow}$;
-    \item de \texttt{medium} a \texttt{easy}: requiere $k_{\downarrow}=5$ días consecutivos por debajo de $\tau_1^{\downarrow}$;
-    \item cualquier transición a \texttt{blocked}: inmediata si hay evidencia severa.
-\end{itemize}
+10. Hysteresis y suavizado temporal
+
+Para evitar cambios espurios entre `easy`, `medium` y `hard`, el módulo implementa hysteresis obligatoria. Sea `tau_1 < tau_2 < tau_3` el sistema base de umbrales sobre `B_hat_{i,t}`.
+
+La transición ascendente de tier se activa de inmediato cuando el proxy cruza el umbral superior correspondiente. La transición descendente exige persistencia mínima de `k` días. Por ejemplo:
+
+- de `hard` a `medium`: requiere `k_down = 3` días consecutivos por debajo de `tau_2_down`;
+- de `medium` a `easy`: requiere `k_down = 5` días consecutivos por debajo de `tau_1_down`;
+- cualquier transición a `blocked`: inmediata si hay evidencia severa.
 
 Además, el fee suavizado operacional se define como:
-\[
-\widehat{B}^{\,\text{sm}}_{i,t}
-=
-\lambda\,\widehat{B}_{i,t}
-+
-(1-\lambda)\,\widehat{B}^{\,\text{sm}}_{i,t-1},
-\qquad \lambda\in(0,1],
-\]
+
+`B_hat_{i,t}^{sm} = lambda * B_hat_{i,t} + (1 - lambda) * B_hat_{i,t-1}^{sm}`, con `lambda in (0,1]`
+
 con posibilidad de saltarse el suavizado si aparece evidencia HTB directa.
 
-\section{Reglas HTB y clasificación final}
+11. Reglas HTB y clasificación final
 
 El flag HTB oficial se define como:
-\[
-H_{i,t}
-=
-\mathbf{1}\Big(
-\widehat{B}_{i,t}\ge \theta_B
-\;\vee\;
-h_{i,t}=1
-\;\vee\;
-\alpha_{i,t}\le \theta_\alpha^{\text{HTB}}
-\Big).
-\]
+
+`H_{i,t} = 1( B_hat_{i,t} >= theta_B  or  h_{i,t} = 1  or  alpha_{i,t} <= theta_alpha_HTB )`
 
 La clasificación final de tier es:
 
-\begin{center}
-\begin{tabular}{>{\raggedright}p{3cm} >{\raggedright}p{10cm}}
-\toprule
-\textbf{Tier} & \textbf{Condición principal} \\
-\midrule
-\texttt{easy} & $\widehat{B}_{i,t}<\tau_1$ y $\alpha_{i,t}\ge a_1$ y sin evidencia HTB directa. \\
-\texttt{medium} & $\tau_1\le \widehat{B}_{i,t}<\tau_2$ o deterioro moderado de disponibilidad. \\
-\texttt{hard} & $\tau_2\le \widehat{B}_{i,t}<\tau_3$ o HTB recurrente o presión short extrema. \\
-\texttt{blocked} & $\widehat{B}_{i,t}\ge \tau_3$ o ausencia crítica de inventario o bandera explícita de no operable. \\
-\bottomrule
-\end{tabular}
-\end{center}
+- `easy`: `B_hat_{i,t} < tau_1` y `alpha_{i,t} >= a_1` y sin evidencia HTB directa.
+- `medium`: `tau_1 <= B_hat_{i,t} < tau_2` o deterioro moderado de disponibilidad.
+- `hard`: `tau_2 <= B_hat_{i,t} < tau_3` o HTB recurrente o presión short extrema.
+- `blocked`: `B_hat_{i,t} >= tau_3` o ausencia crítica de inventario o bandera explícita de no operable.
 
-La etiqueta \texttt{blocked} no significa necesariamente imposibilidad física universal, sino \textbf{no operabilidad bajo las reglas del sistema}.
+La etiqueta `blocked` no significa necesariamente imposibilidad física universal, sino no operabilidad bajo las reglas del sistema.
 
-\section{Política de fallback}
+12. Política de fallback
 
 La política de fallback queda fijada, no abierta.
 
-\subsection{Fallback F1: faltan variables de short interest, pero hay liquidez y tamaño}
+12.1. Fallback F1: faltan variables de short interest, pero hay liquidez y tamaño
 
 Si faltan variables de presión short, el proxy se estima desde liquidez, tamaño, volatilidad y evidencia HTB. En este caso:
-\begin{itemize}[leftmargin=2em]
-    \item la confianza máxima permitida es \texttt{medium};
-    \item el coste nunca podrá quedar en el percentil más benigno del bucket;
-    \item si el nombre es microcap y de baja liquidez, se impondrá un suelo conservador.
-\end{itemize}
 
-\subsection{Fallback F2: faltan también señales HTB}
+- la confianza máxima permitida es `medium`;
+- el coste nunca podrá quedar en el percentil más benigno del bucket;
+- si el nombre es microcap y de baja liquidez, se impondrá un suelo conservador.
+
+12.2. Fallback F2: faltan también señales HTB
 
 Si sólo se dispone de precio, volumen y capitalización:
-\begin{itemize}[leftmargin=2em]
-    \item el nombre se proyecta a un coste por bucket estructural;
-    \item si está en buckets de microcap + bajo ADV + alta volatilidad, se eleva automáticamente al menos a \texttt{medium};
-    \item la confianza se marca como \texttt{low}.
-\end{itemize}
 
-\subsection{Fallback F3: símbolo fuera de cobertura razonable}
+- el nombre se proyecta a un coste por bucket estructural;
+- si está en buckets de microcap + bajo ADV + alta volatilidad, se eleva automáticamente al menos a `medium`;
+- la confianza se marca como `low`.
+
+12.3. Fallback F3: símbolo fuera de cobertura razonable
 
 Si faltan inputs básicos o el símbolo entra/sale del universo sin historial mínimo:
-\begin{itemize}[leftmargin=2em]
-    \item se asigna \texttt{borrow\_tier=blocked};
-    \item se registra \texttt{proxy\_source=insufficient\_data};
-    \item no se permite uso para sizing de corto.
-\end{itemize}
 
-\section{Saneamiento y límites}
+- se asigna `borrow_tier = blocked`;
+- se registra `proxy_source = insufficient_data`;
+- no se permite uso para sizing de corto.
+
+13. Saneamiento y límites
 
 Se imponen las siguientes restricciones duras:
 
-\begin{align*}
-0 &\le \widehat{B}_{i,t} \le B_{\max}^{\text{global}},\\
-0 &\le \widehat{b}_{i,t} < 1,\\
-0 &\le \alpha_{i,t} \le 1.
-\end{align*}
+- `0 <= B_hat_{i,t} <= B_max_global`
+- `0 <= b_hat_{i,t} < 1`
+- `0 <= alpha_{i,t} <= 1`
 
 Además:
 
-\begin{itemize}[leftmargin=2em]
-    \item ningún símbolo puede pasar de \texttt{easy} a \texttt{blocked} por ruido si no existe al menos una de: evidencia HTB directa, desplome severo de liquidez, o salto extremo confirmado por múltiples señales;
-    \item todo salto diario mayor que un umbral de control debe etiquetarse con \texttt{jump\_flag};
-    \item si el salto no puede justificarse por inputs subyacentes, el valor se suaviza y se marca \texttt{warn}.
-\end{itemize}
+- ningún símbolo puede pasar de `easy` a `blocked` por ruido si no existe al menos una de: evidencia HTB directa, desplome severo de liquidez, o salto extremo confirmado por múltiples señales;
+- todo salto diario mayor que un umbral de control debe etiquetarse con `jump_flag`;
+- si el salto no puede justificarse por inputs subyacentes, el valor se suaviza y se marca `warn`.
 
-\section{Contrato exacto de outputs}
+14. Contrato exacto de outputs
 
 La salida diaria por símbolo debe contener, como mínimo, las siguientes columnas:
 
-\begin{center}
-\begin{tabular}{>{\ttfamily}p{4.3cm} p{8.4cm}}
-\toprule
-\textnormal{\textbf{Campo}} & \textbf{Descripción} \\
-\midrule
-symbol & ticker normalizado \\
-date & fecha efectiva del proxy \\
-borrow\_fee\_annual & $\widehat{B}_{i,t}$ \\
-borrow\_fee\_daily & $\widehat{b}_{i,t}$ \\
-borrow\_availability\_score & $\alpha_{i,t}$ \\
-htb\_flag & $H_{i,t}$ \\
-borrow\_tier & easy / medium / hard / blocked \\
-proxy\_quality & high / medium / low \\
-proxy\_source & fuente dominante \\
-stress\_score & score latente $z_{i,t}$ \\
-jump\_flag & salto temporal fuera de rango esperado \\
-stale\_input\_flag & inputs clave potencialmente obsoletos \\
-fallback\_flag & uso de fallback \\
-config\_version & versión de parámetros y thresholds \\
-asof\_timestamp & timestamp de construcción \\
-\bottomrule
-\end{tabular}
-\end{center}
+- `symbol`: ticker normalizado
+- `date`: fecha efectiva del proxy
+- `borrow_fee_annual`: `B_hat_{i,t}`
+- `borrow_fee_daily`: `b_hat_{i,t}`
+- `borrow_availability_score`: `alpha_{i,t}`
+- `htb_flag`: `H_{i,t}`
+- `borrow_tier`: `easy / medium / hard / blocked`
+- `proxy_quality`: `high / medium / low`
+- `proxy_source`: fuente dominante
+- `stress_score`: score latente `z_{i,t}`
+- `jump_flag`: salto temporal fuera de rango esperado
+- `stale_input_flag`: inputs clave potencialmente obsoletos
+- `fallback_flag`: uso de fallback
+- `config_version`: versión de parámetros y thresholds
+- `asof_timestamp`: timestamp de construcción
 
 Este contrato es obligatorio. Cualquier implementación que omita alguno de estos campos no cumple definición de completitud productiva.
 
-\section{Uso en labels, ranking y backtest}
+15. Uso en labels, ranking y backtest
 
 El coste de préstamo debe afectar el sistema en tres niveles.
 
-\subsection{Retornos netos}
+15.1. Retornos netos
 
-Para una posición corta mantenida desde $t$ hasta $t+h$:
-\[
-r^{\text{net}}_{i,t\rightarrow t+h}
-=
-r^{\text{gross}}_{i,t\rightarrow t+h}
--
-\sum_{u=t}^{t+h-1}\widehat{b}_{i,u}.
-\]
+Para una posición corta mantenida desde `t` hasta `t+h`:
 
-Para posiciones largas, el coste de préstamo es cero salvo que el motor de estrategia modele explícitamente estructuras financiadas o pares con componente de \emph{short rebate}; en ausencia de esa modelización, no debe imputarse coste de préstamo al largo.
+`r_{i,t->t+h}^{net} = r_{i,t->t+h}^{gross} - sum_{u=t}^{t+h-1} b_hat_{i,u}`
 
-\subsection{Sizing del lado corto}
+Para posiciones largas, el coste de préstamo es cero salvo que el motor de estrategia modele explícitamente estructuras financiadas o pares con componente de short rebate; en ausencia de esa modelización, no debe imputarse coste de préstamo al largo.
 
-El tamaño máximo de corto permitido por símbolo debe ser función creciente de $\alpha_{i,t}$ y decreciente de $\widehat{B}_{i,t}$. Una forma base es:
-\[
-w^{\max,\text{short}}_{i,t}
-=
-w_0 \cdot \alpha_{i,t}\cdot \exp(-\eta \widehat{B}_{i,t}),
-\]
-con $w_0$ definido por el motor de riesgo.
+15.2. Sizing del lado corto
 
-\subsection{Filtrado de universo}
+El tamaño máximo de corto permitido por símbolo debe ser función creciente de `alpha_{i,t}` y decreciente de `B_hat_{i,t}`. Una forma base es:
 
-Todo símbolo con \texttt{borrow\_tier=blocked} queda excluido del universo corto. Los símbolos \texttt{hard} pueden mantenerse únicamente bajo reglas explícitas del portfolio constructor.
+`w_{i,t}^{max,short} = w_0 * alpha_{i,t} * exp(-eta * B_hat_{i,t})`
 
-\section{Validación}
+con `w_0` definido por el motor de riesgo.
+
+15.3. Filtrado de universo
+
+Todo símbolo con `borrow_tier = blocked` queda excluido del universo corto. Los símbolos `hard` pueden mantenerse únicamente bajo reglas explícitas del portfolio constructor.
+
+16. Validación
 
 El módulo debe validarse en cuatro planos.
 
-\subsection{Validación económica}
+16.1. Validación económica
 
-\begin{itemize}[leftmargin=2em]
-    \item correlación monotónica entre estrés de préstamo y microcap/illiquidity;
-    \item mayor proporción de flags HTB en nombres pequeños, volátiles y con presión short;
-    \item ordenamiento coherente por buckets.
-\end{itemize}
+- correlación monotónica entre estrés de préstamo y microcap/illiquidity;
+- mayor proporción de flags HTB en nombres pequeños, volátiles y con presión short;
+- ordenamiento coherente por buckets.
 
-\subsection{Validación temporal}
+16.2. Validación temporal
 
-\begin{itemize}[leftmargin=2em]
-    \item ausencia de oscilación excesiva por ruido;
-    \item persistencia razonable de tiers;
-    \item sensibilidad a eventos reales de deterioro de liquidez o presión short.
-\end{itemize}
+- ausencia de oscilación excesiva por ruido;
+- persistencia razonable de tiers;
+- sensibilidad a eventos reales de deterioro de liquidez o presión short.
 
-\subsection{Validación operacional}
+16.3. Validación operacional
 
-\begin{itemize}[leftmargin=2em]
-    \item cobertura diaria del universo;
-    \item trazabilidad de \texttt{proxy\_source};
-    \item ausencia de NaNs en campos críticos;
-    \item coherencia entre \texttt{borrow\_fee\_annual}, \texttt{htb\_flag} y \texttt{borrow\_tier}.
-\end{itemize}
+- cobertura diaria del universo;
+- trazabilidad de `proxy_source`;
+- ausencia de NaNs en campos críticos;
+- coherencia entre `borrow_fee_annual`, `htb_flag` y `borrow_tier`.
 
-\subsection{Validación de utilidad para P\&L}
+16.4. Validación de utilidad para P&L
 
 El proxy debe demostrar valor en backtest realista:
-\begin{itemize}[leftmargin=2em]
-    \item reducción del sesgo optimista del lado corto;
-    \item caída de turnover en nombres no operables;
-    \item mejora de robustez fuera de muestra al penalizar nombres estructuralmente frágiles.
-\end{itemize}
 
-\section{Tests e invariantes}
+- reducción del sesgo optimista del lado corto;
+- caída de turnover en nombres no operables;
+- mejora de robustez fuera de muestra al penalizar nombres estructuralmente frágiles.
+
+17. Tests e invariantes
 
 La implementación debe incluir tests automáticos, como mínimo, sobre los siguientes invariantes:
 
-\begin{enumerate}[leftmargin=2em]
-    \item $\widehat{B}_{i,t}\ge 0$ para todo $(i,t)$;
-    \item $\alpha_{i,t}\in[0,1]$ para todo $(i,t)$;
-    \item si aumenta exógenamente la presión short y se mantiene todo lo demás constante, $\widehat{B}_{i,t}$ no puede bajar;
-    \item si cae exógenamente la liquidez y se mantiene todo lo demás constante, $\widehat{B}_{i,t}$ no puede bajar;
-    \item si \texttt{borrow\_tier=blocked}, entonces el símbolo no puede marcar \texttt{proxy\_quality=high} salvo que provenga de señal directa fiable;
-    \item si se usa fallback severo, debe activarse \texttt{fallback\_flag=1};
-    \item ningún dato con \texttt{asof\_date} futuro respecto de $t$ puede entrar en la inferencia.
-\end{enumerate}
+1. `B_hat_{i,t} >= 0` para todo `(i,t)`;
+2. `alpha_{i,t} in [0,1]` para todo `(i,t)`;
+3. si aumenta exógenamente la presión short y se mantiene todo lo demás constante, `B_hat_{i,t}` no puede bajar;
+4. si cae exógenamente la liquidez y se mantiene todo lo demás constante, `B_hat_{i,t}` no puede bajar;
+5. si `borrow_tier = blocked`, entonces el símbolo no puede marcar `proxy_quality = high` salvo que provenga de señal directa fiable;
+6. si se usa fallback severo, debe activarse `fallback_flag = 1`;
+7. ningún dato con `asof_date` futuro respecto de `t` puede entrar en la inferencia.
 
-\section{Definition of Done}
+18. Definition of Done
 
 El módulo se considera terminado únicamente si cumple simultáneamente:
 
-\begin{itemize}[leftmargin=2em]
-    \item genera outputs diarios completos con contrato de datos estable;
-    \item evita leakage temporal de forma verificable;
-    \item produce un ranking económico razonable de dificultad de préstamo;
-    \item integra hysteresis, smoothing y política de fallback conservadora;
-    \item permite ser consumido sin ambigüedad por \texttt{borrow\_qc.py}, \texttt{locate\_filter.py} y el backtester;
-    \item documenta versión de configuración, cobertura y calidad del proxy en el resumen diario.
-\end{itemize}
+- genera outputs diarios completos con contrato de datos estable;
+- evita leakage temporal de forma verificable;
+- produce un ranking económico razonable de dificultad de préstamo;
+- integra hysteresis, smoothing y política de fallback conservadora;
+- permite ser consumido sin ambigüedad por `borrow_qc.py`, `locate_filter.py` y el backtester;
+- documenta versión de configuración, cobertura y calidad del proxy en el resumen diario.
 
-En otras palabras, el módulo no está terminado cuando ``estima algo'', sino cuando estima algo \textbf{causal, estable, integrable y útil para evitar que el backtest mienta sobre la facilidad del corto}.
+En otras palabras, el módulo no está terminado cuando “estima algo”, sino cuando estima algo causal, estable, integrable y útil para evitar que el backtest mienta sobre la facilidad del corto.
 
-\section{Referencias conceptuales}
+19. MVP vs versión avanzada
 
-La intuición económica de esta especificación está alineada con la literatura sobre \emph{shorting frictions}, \emph{securities lending fees}, segmentación entre \emph{easy-to-borrow} y \emph{hard-to-borrow}, y uso de proxies cuando no existe observación completa del mercado de préstamo. El papel de estos referentes no es decorar la especificación, sino justificar las monotonicidades, los rangos de régimen y la necesidad de incorporar fricción realista al lado corto.
+MVP correcto:
+- features causales robustas;
+- score latente monotónico;
+- mapping piecewise determinista;
+- source precedence;
+- hysteresis;
+- smoothing;
+- fallback policy conservadora;
+- contrato exacto de outputs;
+- integración con returns netos y sizing short.
 
-\bibliographystyle{plain}
-\bibliography{borrow_cost_proxy_refs}
+Versión avanzada justificable:
+- overlay de régimen normal vs stressed para borrow stress;
+- calibración con truth set parcial mediante loss compuesta;
+- factor sistemático cross-sectional de HTB / scarcity;
+- stale-data penalization explícita;
+- jump diagnostics más refinados.
 
-\end{document}
+No es obligatorio, en esta fase, incorporar Hawkes inventory, RL de asignación o simulación agent-based del lending market. Esas extensiones sólo tienen sentido con dataset real y suficientemente rico de lending. Sin esa base, añaden complejidad aparente pero no robustez productiva.
+
+20. Interpretación correcta
+
+Este módulo no debe interpretarse como “estimador exacto del borrow fee verdadero”, sino como capa de realismo económico del lado corto.
+
+Su función correcta es:
+
+- ordenar símbolos por dificultad de préstamo;
+- impedir optimismo artificial en microcaps e ilíquidos;
+- traducir señales parciales en una penalización operativa usable;
+- suministrar un input estable y conservador al resto del stack.
+
+Un borrow proxy que a veces “prediga bien” pero viole causalidad, monotonicidad o estabilidad no sirve. Un borrow proxy conservador, trazable y coherente con la economía del short sí sirve, aunque no vea el fee exacto de mercado.
+
+21. Referencias orientativas
+
+La intuición económica de esta especificación está alineada con la literatura sobre shorting frictions, securities lending fees, segmentación entre easy-to-borrow y hard-to-borrow, y uso de proxies cuando no existe observación completa del mercado de préstamo.
+
+El papel de estos referentes no es decorar la especificación, sino justificar:
+
+- las monotonicidades exigidas;
+- los rangos de régimen;
+- la necesidad de hysteresis y smoothing;
+- la integración del borrow cost en returns netos y sizing;
+- y la obligación de ser conservador cuando la observación de lending es incompleta.
+
+22. Conclusión
+
+`data/borrow/borrow_cost_proxy.py` debe quedar definido como un módulo de research-production serio, no como una heurística suelta.
+
+La especificación correcta no es “estimar borrow con algunas señales”, sino:
+
+- fijar qué entra;
+- fijar cómo entra;
+- fijar qué está prohibido;
+- fijar qué sale;
+- fijar cómo se resuelven conflictos entre fuentes;
+- fijar cómo se integra con labels, sizing y backtest;
+- y fijar qué salvaguardas evitan que el lado corto quede artificialmente embellecido.
+
+Si cumple esta especificación, el módulo deja de ser un proxy informal y pasa a ser una pieza institucional del stack. Si no la cumple, el riesgo no es sólo técnico: es contaminar todo el research del short book con un sesgo optimista estructural.

@@ -1,578 +1,556 @@
-\documentclass[11pt]{article}
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
-\usepackage[spanish]{babel}
-\usepackage{amsmath,amssymb,amsthm}
-\usepackage{graphicx}
-\usepackage{hyperref}
-\usepackage[margin=2.5cm]{geometry}
-\usepackage{booktabs}
-\usepackage{array}
-\usepackage{enumitem}
+Especificación Cuantitativa: data/borrow/locate_filter.py
 
-\title{Especificación Research--Production del Filtro de Locate para \texttt{data/borrow/locate\_filter.py}}
-\author{}
-\date{}
+1. Propósito del módulo
 
-\begin{document}
-\maketitle
+El módulo `data/borrow/locate_filter.py` determina, para cada símbolo `i` y fecha `t`, si una posición corta debe considerarse operable, penalizable o bloqueada bajo una representación causal y conservadora de la disponibilidad de inventario, del coste de préstamo y de las restricciones efectivas de locate.
 
-\section{Objetivo del módulo}
-
-El módulo \texttt{data/borrow/locate\_filter.py} determina, para cada símbolo $i$ y fecha $t$, si una posición corta debe considerarse \textbf{operable}, \textbf{penalizable} o \textbf{bloqueada} bajo una representación causal y conservadora de la disponibilidad de inventario, del coste de préstamo y de las restricciones efectivas de \emph{locate}.
-
-La finalidad del módulo no es simplemente ``filtrar nombres difíciles'', sino convertir fricciones de \emph{securities lending} en una \textbf{decisión operacional explícita} que pueda ser consumida sin ambigüedad por el backtester, el portfolio constructor y la capa de control de riesgo. En otras palabras, este módulo traduce una realidad microestructural incierta y parcialmente observable en un contrato de elegibilidad reproducible.
+La finalidad del módulo no es simplemente “filtrar nombres difíciles”, sino convertir fricciones de securities lending en una decisión operacional explícita que pueda ser consumida sin ambigüedad por el backtester, el portfolio constructor y la capa de control de riesgo. En otras palabras, este módulo traduce una realidad microestructural incierta y parcialmente observable en un contrato de elegibilidad reproducible.
 
 Sus objetivos concretos son:
 
-\begin{itemize}[leftmargin=2em]
-    \item determinar un flag binario de elegibilidad de corto \texttt{short\_eligible\_flag};
-    \item clasificar cada símbolo en un \texttt{locate\_tier} operativo (\texttt{easy}, \texttt{medium}, \texttt{hard}, \texttt{blocked});
-    \item documentar, con precedencia formal, la razón dominante de rechazo o degradación;
-    \item impedir que el backtest asuma ejecuciones cortas ficticiamente accesibles;
-    \item preservar estabilidad temporal suficiente para que pequeños movimientos de inputs no generen oscilación espuria de estados.
-\end{itemize}
+- determinar un flag binario de elegibilidad de corto `short_eligible_flag`;
+- clasificar cada símbolo en un `locate_tier` operativo (`easy`, `medium`, `hard`, `blocked`);
+- documentar, con precedencia formal, la razón dominante de rechazo o degradación;
+- impedir que el backtest asuma ejecuciones cortas ficticiamente accesibles;
+- preservar estabilidad temporal suficiente para que pequeños movimientos de inputs no generen oscilación espuria de estados.
 
-La filosofía del módulo es asimétrica: en caso de ambigüedad, el error tolerable es \textbf{bloquear o penalizar en exceso antes que permitir cortos inviables}. Esto es consistente con el hecho de que el principal riesgo de modelización en el lado corto no es ser demasiado prudente, sino inflar artificialmente la capacidad de ejecución.
+La filosofía del módulo es asimétrica: en caso de ambigüedad, el error tolerable es bloquear o penalizar en exceso antes que permitir cortos inviables. Esto es consistente con el hecho de que el principal riesgo de modelización en el lado corto no es ser demasiado prudente, sino inflar artificialmente la capacidad de ejecución. :contentReference[oaicite:0]{index=0}
 
-\section{Papel dentro de la arquitectura}
+2. Papel dentro de la arquitectura
 
-\texttt{locate\_filter.py} se sitúa aguas abajo de \texttt{borrow\_cost\_proxy.py} y aguas arriba del portfolio constructor y del motor de backtest. Su función no es estimar el coste de préstamo, sino \textbf{decidir la usabilidad del corto} a partir de ese coste estimado, de la disponibilidad proxy y de reglas explícitas de política de riesgo.
+`locate_filter.py` se sitúa aguas abajo de `borrow_cost_proxy.py` y aguas arriba del portfolio constructor y del motor de backtest. Su función no es estimar el coste de préstamo, sino decidir la usabilidad del corto a partir de ese coste estimado, de la disponibilidad proxy y de reglas explícitas de política de riesgo.
 
 La secuencia lógica es:
 
-\begin{enumerate}[leftmargin=2em]
-    \item \texttt{borrow\_cost\_proxy.py} estima fricción, disponibilidad y severidad de préstamo;
-    \item \texttt{locate\_filter.py} transforma esas señales en elegibilidad y tiers operativos;
-    \item \texttt{borrow\_qc.py} audita que esa transformación sea coherente, estable y suficientemente cubierta.
-\end{enumerate}
+1. `borrow_cost_proxy.py` estima fricción, disponibilidad y severidad de préstamo;
+2. `locate_filter.py` transforma esas señales en elegibilidad y tiers operativos;
+3. `borrow_qc.py` audita que esa transformación sea coherente, estable y suficientemente cubierta.
 
-Esta separación es deliberada. Un error habitual en sistemas inmaduros es mezclar inferencia de borrow con decisión de operabilidad. Aquí ambas capas quedan desacopladas: el proxy estima, el locate decide.
+Esta separación es deliberada. Un error habitual en sistemas inmaduros es mezclar inferencia de borrow con decisión de operabilidad. Aquí ambas capas quedan desacopladas: el proxy estima, el locate decide. :contentReference[oaicite:1]{index=1}
 
-\section{Principios de diseño no negociables}
+3. Principios de diseño no negociables
 
 El módulo se rige por los siguientes principios:
 
-\begin{enumerate}[leftmargin=2em]
-    \item \textbf{Causalidad estricta.} Todas las decisiones en $t$ deben basarse únicamente en información disponible al cierre operativo de $t$ o antes.
-    \item \textbf{Conservadurismo operacional.} Si una combinación de señales admite múltiples interpretaciones plausibles, se elige la más restrictiva.
-    \item \textbf{Precedencia formal.} Si varias reglas disparan simultáneamente, la razón final y el tier final se resuelven mediante un orden jerárquico explícito y no por arbitraje informal del programador.
-    \item \textbf{Estabilidad temporal.} La transición entre tiers no debe oscilar por ruido diario; debe existir hysteresis y control de persistencia.
-    \item \textbf{Explicabilidad.} Todo símbolo bloqueado o degradado debe poder auditarse mediante \texttt{reject\_reason}, \texttt{dominant\_rule} y metadatos de configuración.
-    \item \textbf{Integrabilidad.} La salida debe poder consumirse directamente por backtest, portfolio construction y reporting sin reinterpretación semántica.
-\end{enumerate}
+1. Causalidad estricta. Todas las decisiones en `t` deben basarse únicamente en información disponible al cierre operativo de `t` o antes.
+2. Conservadurismo operacional. Si una combinación de señales admite múltiples interpretaciones plausibles, se elige la más restrictiva.
+3. Precedencia formal. Si varias reglas disparan simultáneamente, la razón final y el tier final se resuelven mediante un orden jerárquico explícito y no por arbitraje informal del programador.
+4. Estabilidad temporal. La transición entre tiers no debe oscilar por ruido diario; debe existir hysteresis y control de persistencia.
+5. Explicabilidad. Todo símbolo bloqueado o degradado debe poder auditarse mediante `reject_reason`, `dominant_rule` y metadatos de configuración.
+6. Integrabilidad. La salida debe poder consumirse directamente por backtest, portfolio construction y reporting sin reinterpretación semántica.
 
-\section{Entradas y dependencias}
+Además, el módulo debe respetar un principio adicional que conviene fijar ya en la especificación: la decisión de locate es una capa de política operativa, no una nueva capa de estimación probabilística. Por tanto, el output oficial debe ser rule-based, trazable y monotónico; extensiones futuras como Bayesian eligibility o regime thresholds pueden existir como overlays auxiliares, pero no deben sustituir la lógica principal en esta fase. :contentReference[oaicite:2]{index=2}
+
+4. Entradas y dependencias
 
 Entradas obligatorias:
 
-\begin{itemize}[leftmargin=2em]
-    \item \texttt{borrow\_proxy\_path}: salida de \texttt{borrow\_cost\_proxy.py};
-    \item \texttt{universe\_path}: universo efectivo de activos elegibles por fecha;
-    \item \texttt{locate\_rules\_config\_path}: configuración versionada con thresholds, overrides y políticas de hysteresis;
-    \item \texttt{run\_id}: identificador único del job.
-\end{itemize}
+- `borrow_proxy_path`: salida de `borrow_cost_proxy.py`;
+- `universe_path`: universo efectivo de activos elegibles por fecha;
+- `locate_rules_config_path`: configuración versionada con thresholds, overrides y políticas de hysteresis;
+- `run_id`: identificador único del job.
 
-El módulo asume que el \texttt{borrow\_proxy} contiene al menos:
+El módulo asume que el `borrow_proxy` contiene al menos:
 
-\begin{center}
-\begin{tabular}{>{\ttfamily}p{4.2cm} p{8.4cm}}
-\toprule
-\textnormal{\textbf{Campo}} & \textbf{Descripción} \\
-\midrule
-symbol & ticker normalizado \\
-date & fecha efectiva \\
-borrow\_fee\_annual & fee anualizado estimado \\
-borrow\_fee\_daily & fee diario estimado \\
-borrow\_availability\_score & score de disponibilidad en $[0,1]$ \\
-htb\_flag & flag hard-to-borrow \\
-borrow\_tier & tier del proxy de borrow \\
-proxy\_quality & calidad del proxy \\
-proxy\_source & fuente dominante \\
-stress\_score & score latente de fricción \\
-fallback\_flag & indica uso de fallback upstream \\
-stale\_input\_flag & input potencialmente obsoleto \\
-config\_version & versión del proxy upstream \\
-\bottomrule
-\end{tabular}
-\end{center}
+- `symbol`
+- `date`
+- `borrow_fee_annual`
+- `borrow_fee_daily`
+- `borrow_availability_score`
+- `htb_flag`
+- `borrow_tier`
+- `proxy_quality`
+- `proxy_source`
+- `stress_score`
+- `fallback_flag`
+- `stale_input_flag`
+- `config_version`
 
-Si faltan columnas obligatorias, el módulo debe abortar con error estructural. No está permitido ``adivinar'' defaults silenciosos dentro de \texttt{locate\_filter.py}.
+Si faltan columnas obligatorias, el módulo debe abortar con error estructural. No está permitido “adivinar” defaults silenciosos dentro de `locate_filter.py`. Éste es un punto crítico: el locate no repara carencias del proxy; las hereda y, cuando son materiales, bloquea. :contentReference[oaicite:3]{index=3}
 
-\section{Representación formal}
+5. Representación formal
 
-Sea $\mathcal{U}_t$ el universo efectivo en fecha $t$. Para cada $i\in\mathcal{U}_t$, el módulo opera sobre:
+Sea `U_t` el universo efectivo en fecha `t`. Para cada `i in U_t`, el módulo opera sobre:
 
-\[
-\mathcal{D}_t
-=
-\left\{
-(i,t,\widehat{B}_{i,t},\widehat{b}_{i,t},\alpha_{i,t},H_{i,t},Q_{i,t},F_{i,t})
-\right\}_{i\in\mathcal{U}_t^\ast},
-\]
+`D_t = {(i,t,B_hat_{i,t},b_hat_{i,t},alpha_{i,t},H_{i,t},Q_{i,t},F_{i,t})}_{i in U_t*}`
 
 donde:
-\begin{itemize}[leftmargin=2em]
-    \item $\widehat{B}_{i,t}$ es el fee anualizado estimado;
-    \item $\widehat{b}_{i,t}$ es el fee diario;
-    \item $\alpha_{i,t}\in[0,1]$ es el score de disponibilidad;
-    \item $H_{i,t}\in\{0,1\}$ es el flag HTB;
-    \item $Q_{i,t}\in\{\texttt{high},\texttt{medium},\texttt{low}\}$ es la calidad del proxy;
-    \item $F_{i,t}\in\{0,1\}$ denota si el proxy upstream ha usado fallback severo.
-\end{itemize}
+
+- `B_hat_{i,t}` es el fee anualizado estimado;
+- `b_hat_{i,t}` es el fee diario;
+- `alpha_{i,t} in [0,1]` es el score de disponibilidad;
+- `H_{i,t} in {0,1}` es el flag HTB;
+- `Q_{i,t} in {high, medium, low}` es la calidad del proxy;
+- `F_{i,t} in {0,1}` denota si el proxy upstream ha usado fallback severo.
 
 La salida principal del módulo será:
 
-\[
-\mathcal{L}_t
-=
-\left\{
-(i,t,\eta_{i,t},\tau_{i,t},r_{i,t},d_{i,t})
-\right\}_{i\in\mathcal{U}_t},
-\]
+`L_t = {(i,t,eta_{i,t},tau_{i,t},r_{i,t},d_{i,t})}_{i in U_t}`
 
 donde:
-\begin{itemize}[leftmargin=2em]
-    \item $\eta_{i,t}\in\{0,1\}$ es el flag de elegibilidad de corto;
-    \item $\tau_{i,t}\in\{\texttt{easy},\texttt{medium},\texttt{hard},\texttt{blocked}\}$ es el tier final;
-    \item $r_{i,t}$ es la razón dominante de rechazo o degradación;
-    \item $d_{i,t}$ es el detalle completo de reglas activadas.
-\end{itemize}
 
-\section{Semántica exacta de los tiers}
+- `eta_{i,t} in {0,1}` es el flag de elegibilidad de corto;
+- `tau_{i,t} in {easy, medium, hard, blocked}` es el tier final;
+- `r_{i,t}` es la razón dominante de rechazo o degradación;
+- `d_{i,t}` es el detalle completo de reglas activadas.
 
-La versión anterior describía bien la intuición de los tiers, pero no fijaba una semántica suficientemente cerrada. Aquí se definen de manera operativa:
+Conviene fijar además una semántica práctica adicional:
 
-\begin{itemize}[leftmargin=2em]
-    \item \textbf{\texttt{easy}}: corto permitido sin restricciones extraordinarias; coste y disponibilidad en zona benigna; sizing estándar permitido.
-    \item \textbf{\texttt{medium}}: corto permitido, pero sujeto a penalización moderada de tamaño, rebalanceo o confianza operativa.
-    \item \textbf{\texttt{hard}}: corto permitido sólo bajo reglas restrictivas; sizing severamente recortado; elegibilidad condicionada a política explícita del portfolio constructor.
-    \item \textbf{\texttt{blocked}}: corto no operable bajo la política del sistema; el nombre queda excluido del universo corto.
-\end{itemize}
+- `eta_{i,t}=1` no implica “coste bajo” ni “riesgo bajo”, sólo que el nombre permanece operable bajo la política actual;
+- `tau_{i,t}` resume severidad operativa, no expectativa de alpha;
+- `r_{i,t}` debe existir siempre que `eta_{i,t}=0`, y puede existir también si `eta_{i,t}=1` pero el nombre ha sido degradado a `medium` o `hard`. :contentReference[oaicite:4]{index=4}
 
-Importante: \texttt{hard} no equivale a \texttt{blocked}. Un sistema serio debe poder distinguir entre nombres penalizables y nombres directamente no operables.
+6. Semántica exacta de los tiers
 
-\section{Jerarquía de reglas y precedencia formal}
+La versión conceptual previa describía bien la intuición de los tiers, pero no fijaba una semántica suficientemente cerrada. Aquí se definen de manera operativa:
 
-Éste es el punto central que más eleva el documento a nivel institucional. Cuando múltiples reglas disparan simultáneamente, el módulo resolverá el estado final con la siguiente precedencia estricta:
+- `easy`: corto permitido sin restricciones extraordinarias; coste y disponibilidad en zona benigna; sizing estándar permitido.
+- `medium`: corto permitido, pero sujeto a penalización moderada de tamaño, rebalanceo o confianza operativa.
+- `hard`: corto permitido sólo bajo reglas restrictivas; sizing severamente recortado; elegibilidad condicionada a política explícita del portfolio constructor.
+- `blocked`: corto no operable bajo la política del sistema; el nombre queda excluido del universo corto.
 
-\[
-\texttt{structural\_missing}
-\succ
-\texttt{explicit\_block\_override}
-\succ
-\texttt{availability\_critical}
-\succ
-\texttt{fee\_critical}
-\succ
-\texttt{htb\_severe}
-\succ
-\texttt{proxy\_quality\_too\_low}
-\succ
-\texttt{fallback\_severe}
-\succ
-\texttt{tier\_mapping\_soft}.
-\]
+Importante: `hard` no equivale a `blocked`. Un sistema serio debe poder distinguir entre nombres penalizables y nombres directamente no operables. También debe evitar el error inverso: usar `hard` como cajón de sastre para todos los casos dudosos. Si una regla dura de bloqueo dispara, el resultado correcto es `blocked`, no `hard`. :contentReference[oaicite:5]{index=5}
+
+7. Jerarquía de reglas y precedencia formal
+
+Éste es el punto central del módulo. Cuando múltiples reglas disparan simultáneamente, el sistema resolverá el estado final con la siguiente precedencia estricta:
+
+`structural_missing
+ > explicit_block_override
+ > availability_critical
+ > fee_critical
+ > htb_severe
+ > proxy_quality_too_low
+ > fallback_severe
+ > tier_mapping_soft`
 
 Regla de interpretación:
-\begin{itemize}[leftmargin=2em]
-    \item La regla de mayor precedencia activa determina \texttt{reject\_reason}.
-    \item Las reglas de menor precedencia se conservan en \texttt{all\_triggered\_rules}, pero no sustituyen la dominante.
-    \item Ninguna regla de nivel inferior puede suavizar o revertir una de nivel superior.
-\end{itemize}
 
-Esto elimina el mayor riesgo del texto anterior: dejar a criterio del implementador qué razón debe prevalecer cuando fee, availability y HTB disparan a la vez.
+- la regla de mayor precedencia activa determina `reject_reason`;
+- las reglas de menor precedencia se conservan en `all_triggered_rules`, pero no sustituyen la dominante;
+- ninguna regla de nivel inferior puede suavizar o revertir una de nivel superior.
 
-\section{Reglas duras de bloqueo}
+Esto elimina el mayor riesgo del diseño ingenuo: dejar a criterio del implementador qué razón debe prevalecer cuando fee, availability y HTB disparan a la vez.
 
-\subsection{Bloqueo por ausencia crítica de datos}
+Desde el punto de vista institucional, esta precedencia fija la política del sistema y evita arbitraje semántico. Dos implementaciones distintas no deberían devolver resultados distintos si respetan esta jerarquía. :contentReference[oaicite:6]{index=6}
+
+8. Reglas duras de bloqueo
+
+8.1. Bloqueo por ausencia crítica de datos
 
 Si un símbolo del universo no dispone de campos mínimos críticos del proxy:
-\[
-\mathcal{K}=\{\widehat{b}_{i,t},\alpha_{i,t},H_{i,t},Q_{i,t}\},
-\]
+
+`K = {b_hat_{i,t}, alpha_{i,t}, H_{i,t}, Q_{i,t}}`
+
 entonces:
 
-\[
-\eta_{i,t}=0,\qquad \tau_{i,t}=\texttt{blocked},
-\]
+`eta_{i,t}=0, tau_{i,t}=blocked`
+
 y:
-\[
-r_{i,t}=\texttt{structural\_missing}.
-\]
+
+`r_{i,t}=structural_missing`
 
 La política es deliberadamente dura: el sistema no debe permitir cortos sobre símbolos cuyo estado de préstamo sea desconocido de forma material.
 
-\subsection{Bloqueo por disponibilidad crítica}
+8.2. Bloqueo por disponibilidad crítica
 
-Sea $\theta_\alpha^{\text{block}}$ el umbral duro de disponibilidad mínima. Entonces:
+Sea `theta_alpha_block` el umbral duro de disponibilidad mínima. Entonces:
 
-\[
-\eta_{i,t}^{(\alpha)}
-=
-\mathbb{1}\left(\alpha_{i,t}\ge \theta_\alpha^{\text{block}}\right).
-\]
+`eta_{i,t}^{(alpha)} = 1(alpha_{i,t} >= theta_alpha_block)`
 
-Si $\alpha_{i,t}<\theta_\alpha^{\text{block}}$:
-\[
-\eta_{i,t}=0,\qquad \tau_{i,t}=\texttt{blocked},\qquad r_{i,t}=\texttt{availability\_critical}.
-\]
+Si `alpha_{i,t} < theta_alpha_block`:
 
-\subsection{Bloqueo por fee crítico}
+`eta_{i,t}=0, tau_{i,t}=blocked, r_{i,t}=availability_critical`
 
-Sea $\theta_b^{\text{block}}$ el fee diario máximo tolerable para operabilidad. Entonces:
+8.3. Bloqueo por fee crítico
 
-\[
-\eta_{i,t}^{(b)}
-=
-\mathbb{1}\left(\widehat{b}_{i,t}\le \theta_b^{\text{block}}\right).
-\]
+Sea `theta_b_block` el fee diario máximo tolerable para operabilidad. Entonces:
 
-Si $\widehat{b}_{i,t}>\theta_b^{\text{block}}$:
-\[
-\eta_{i,t}=0,\qquad \tau_{i,t}=\texttt{blocked},\qquad r_{i,t}=\texttt{fee\_critical}.
-\]
+`eta_{i,t}^{(b)} = 1(b_hat_{i,t} <= theta_b_block)`
 
-\subsection{Bloqueo por HTB severo}
+Si `b_hat_{i,t} > theta_b_block`:
 
-El HTB no debe tratarse como mera etiqueta decorativa. Si la política de configuración marca que un nombre con $H_{i,t}=1$ debe bloquearse, entonces:
+`eta_{i,t}=0, tau_{i,t}=blocked, r_{i,t}=fee_critical`
 
-\[
-\eta_{i,t}=0,\qquad \tau_{i,t}=\texttt{blocked},\qquad r_{i,t}=\texttt{htb\_severe}.
-\]
+8.4. Bloqueo por HTB severo
 
-\subsection{Bloqueo por baja confianza operativa}
+El HTB no debe tratarse como mera etiqueta decorativa. Si la política de configuración marca que un nombre con `H_{i,t}=1` debe bloquearse, entonces:
+
+`eta_{i,t}=0, tau_{i,t}=blocked, r_{i,t}=htb_severe`
+
+8.5. Bloqueo por baja confianza operativa
 
 Si:
-\[
-Q_{i,t}=\texttt{low}
-\]
-y la configuración indica \texttt{block\_on\_low\_quality=True}, entonces el símbolo puede bloquearse aunque fee y availability no sean formalmente extremos. Esto refleja un principio prudencial: una señal benigna pero poco fiable no debe equipararse a una señal benigna sólida.
 
-\section{Reglas blandas de tiering}
+`Q_{i,t}=low`
+
+y la configuración indica `block_on_low_quality=True`, entonces el símbolo puede bloquearse aunque fee y availability no sean formalmente extremos. Esto refleja un principio prudencial: una señal benigna pero poco fiable no debe equipararse a una señal benigna sólida.
+
+8.6. Bloqueo por override explícito
+
+Un símbolo puede bloquearse por lista explícita (`manual_blocklist`, restricciones regulatorias, suspensiones, eventos corporativos, compliance). Este override tiene precedencia máxima tras fallos estructurales y debe quedar siempre auditado. :contentReference[oaicite:7]{index=7}
+
+9. Reglas blandas de tiering
 
 Si un símbolo no ha sido bloqueado por reglas duras, se clasifica por una función de tiering determinista. Se definen umbrales ordenados:
 
-\[
-\theta_\alpha^{(e)} > \theta_\alpha^{(m)} > \theta_\alpha^{(h)} > \theta_\alpha^{\text{block}},
-\]
-\[
-\theta_b^{(e)} < \theta_b^{(m)} < \theta_b^{(h)} < \theta_b^{\text{block}}.
-\]
+`theta_alpha^(e) > theta_alpha^(m) > theta_alpha^(h) > theta_alpha_block`
+
+`theta_b^(e) < theta_b^(m) < theta_b^(h) < theta_b_block`
 
 La asignación base es:
 
-\subsection*{\texttt{easy}}
-\[
-\tau_{i,t}=\texttt{easy}
-\quad \text{si} \quad
-\alpha_{i,t}\ge \theta_\alpha^{(e)}
-\;\wedge\;
-\widehat{b}_{i,t}\le \theta_b^{(e)}
-\;\wedge\;
-H_{i,t}=0.
-\]
+`easy`
+si
+`alpha_{i,t} >= theta_alpha^(e) and b_hat_{i,t} <= theta_b^(e) and H_{i,t}=0`
 
-\subsection*{\texttt{medium}}
-\[
-\tau_{i,t}=\texttt{medium}
-\]
-si no es \texttt{easy} ni \texttt{hard}, y el símbolo permanece en una zona intermedia de fee/disponibilidad.
+`medium`
+si no es `easy` ni `hard`, y el símbolo permanece en una zona intermedia de fee/disponibilidad.
 
-\subsection*{\texttt{hard}}
-\[
-\tau_{i,t}=\texttt{hard}
-\]
+`hard`
 si:
-\[
-\alpha_{i,t}< \theta_\alpha^{(h)}
-\quad \vee \quad
-\widehat{b}_{i,t}> \theta_b^{(h)}
-\quad \vee \quad
-H_{i,t}=1 \text{ bajo política de penalización y no bloqueo}.
-\]
 
-Si $\tau_{i,t}\in\{\texttt{easy},\texttt{medium},\texttt{hard}\}$, entonces:
-\[
-\eta_{i,t}=1.
-\]
+`alpha_{i,t} < theta_alpha^(h) or b_hat_{i,t} > theta_b^(h) or H_{i,t}=1`
+bajo política de penalización y no bloqueo.
 
-\section{Función de decisión oficial}
+Si `tau_{i,t} in {easy, medium, hard}`, entonces:
 
-La elegibilidad final no queda ya abierta como ``AND/OVERRIDE según config'' de forma genérica. Se fija una lógica oficial:
+`eta_{i,t}=1`
 
-\[
-\eta_{i,t}
-=
-\mathbb{1}\Big(
-\neg R^{\text{hard}}_{i,t}
-\Big),
-\]
+Este tiering debe ser monotónico. A igualdad de todo lo demás, una caída de disponibilidad o una subida del coste nunca puede mejorar el tier. Éste es un invariante estructural, no un detalle de implementación. :contentReference[oaicite:8]{index=8}
+
+10. Función de decisión oficial
+
+La elegibilidad final no queda abierta como “AND/OVERRIDE según config” de forma genérica. Se fija una lógica oficial:
+
+`eta_{i,t} = 1( not R_hard_{i,t} )`
+
 donde:
-\[
-R^{\text{hard}}_{i,t}
-=
-R^{\text{missing}}_{i,t}
-\vee
-R^{\alpha}_{i,t}
-\vee
-R^{b}_{i,t}
-\vee
-R^{H}_{i,t}
-\vee
-R^{Q}_{i,t}
-\vee
-R^{\text{override}}_{i,t}.
-\]
+
+`R_hard_{i,t}
+ = R_missing_{i,t}
+ or R_alpha_{i,t}
+ or R_b_{i,t}
+ or R_H_{i,t}
+ or R_Q_{i,t}
+ or R_override_{i,t}`
 
 Es decir: la decisión oficial es una unión de reglas duras de bloqueo. Las reglas blandas sólo determinan el tier entre los símbolos permitidos.
 
-\section{Overrides controlados}
+Esta fijación es importante porque evita una deriva peligrosa: usar ponderaciones o scores compensatorios en una capa que debe ser, ante todo, de política operativa. El locate no es un clasificador probabilístico; es una frontera ejecutable. :contentReference[oaicite:9]{index=9}
+
+11. Overrides controlados
 
 Se admiten overrides, pero de forma muy restringida.
 
-\subsection{Override explícito de bloqueo}
-Un símbolo puede bloquearse por lista explícita (\texttt{manual\_blocklist}, restricciones regulatorias, símbolos suspendidos, eventos corporativos graves). Este override tiene precedencia máxima tras fallos estructurales.
+11.1. Override explícito de bloqueo
 
-\subsection{Override explícito de permiso}
+Un símbolo puede bloquearse por lista explícita (`manual_blocklist`, restricciones regulatorias, símbolos suspendidos, eventos corporativos graves). Este override tiene precedencia máxima tras fallos estructurales.
+
+11.2. Override explícito de permiso
+
 Sólo se admite un permiso excepcional si:
-\begin{itemize}[leftmargin=2em]
-    \item existe justificación documentada en config;
-    \item no se violan reglas estructurales ni availability crítica;
-    \item el override queda reflejado en \texttt{override\_flag=1}.
-\end{itemize}
 
-Importante: no se permite override manual para convertir un caso \texttt{structural\_missing} o \texttt{availability\_critical} en elegible. Esto evita que el sistema se degrade por intervenciones oportunistas.
+- existe justificación documentada en config;
+- no se violan reglas estructurales ni availability crítica;
+- el override queda reflejado en `override_flag=1`.
 
-\section{Hysteresis y persistencia temporal}
+Importante: no se permite override manual para convertir un caso `structural_missing` o `availability_critical` en elegible. Esto evita que el sistema se degrade por intervenciones oportunistas.
 
-Para evitar cambios espurios \texttt{medium} $\leftrightarrow$ \texttt{hard} o \texttt{hard} $\leftrightarrow$ \texttt{blocked}, el módulo implementa hysteresis obligatoria.
+11.3. Trazabilidad obligatoria del override
 
-Sea $\tau_{i,t}^{\star}$ el tier instantáneo inducido por reglas del día. El tier final $\tau_{i,t}$ se define a partir de $\tau_{i,t}^{\star}$ y del estado anterior $\tau_{i,t-1}$ con las siguientes reglas:
+Todo override debe dejar:
 
-\begin{itemize}[leftmargin=2em]
-    \item transiciones hacia estados más severos: inmediatas;
-    \item transiciones hacia estados menos severos: requieren persistencia mínima de $k_{\downarrow}$ días;
-    \item toda transición a \texttt{blocked} por regla dura crítica es inmediata y no suavizable;
-    \item un símbolo nuevo o reincorporado tras ausencia larga no hereda automáticamente el tier histórico.
-\end{itemize}
+- identificador de regla;
+- motivo;
+- fecha de vigencia;
+- versión de config;
+- evidencia mínima auditada.
 
-Ejemplo formal:
-\[
-\tau_{i,t}=
-\begin{cases}
-\tau_{i,t}^{\star} & \text{si } \tau_{i,t}^{\star}\text{ es más severo que }\tau_{i,t-1},\\
-\tau_{i,t-1} & \text{si la mejora no ha persistido lo suficiente},\\
-\tau_{i,t}^{\star} & \text{si la mejora cumple persistencia}.
-\end{cases}
-\]
+Un override no trazable equivale a deuda técnica operativa y no debe permitirse en producción. :contentReference[oaicite:10]{index=10}
 
-Esto ataca uno de los vacíos principales del documento previo: que un nombre pudiera entrar y salir de \texttt{blocked} por ruido diario del proxy.
+12. Hysteresis y persistencia temporal
 
-\section{Tratamiento de missing data, símbolos nuevos y cambios de universo}
+Para evitar cambios espurios `medium <-> hard` o `hard <-> blocked`, el módulo implementa hysteresis obligatoria.
 
-\subsection{Missing data}
+Sea `tau_star_{i,t}` el tier instantáneo inducido por reglas del día. El tier final `tau_{i,t}` se define a partir de `tau_star_{i,t}` y del estado anterior `tau_{i,t-1}` con las siguientes reglas:
+
+- transiciones hacia estados más severos: inmediatas;
+- transiciones hacia estados menos severos: requieren persistencia mínima de `k_down` días;
+- toda transición a `blocked` por regla dura crítica es inmediata y no suavizable;
+- un símbolo nuevo o reincorporado tras ausencia larga no hereda automáticamente el tier histórico.
+
+Formalmente:
+
+`tau_{i,t} =
+    tau_star_{i,t}                      si tau_star es más severo que tau_{i,t-1}
+    tau_{i,t-1}                         si la mejora no ha persistido lo suficiente
+    tau_star_{i,t}                      si la mejora cumple persistencia`
+
+Esto ataca uno de los vacíos principales de un diseño ingenuo: que un nombre pudiera entrar y salir de `blocked` por ruido diario del proxy.
+
+Además, la hysteresis no puede usarse para retrasar un bloqueo duro. Sirve para estabilizar mejoras, no para tolerar deterioros críticos. :contentReference[oaicite:11]{index=11}
+
+13. Tratamiento de missing data, símbolos nuevos y cambios de universo
+
+13.1. Missing data
+
 Si falta el join con el proxy de borrow para un símbolo presente en el universo:
-\begin{itemize}[leftmargin=2em]
-    \item el símbolo se marca \texttt{blocked};
-    \item \texttt{reject\_reason = structural\_missing};
-    \item \texttt{data\_quality\_flag = missing\_borrow\_join}.
-\end{itemize}
 
-\subsection{Símbolos nuevos}
+- el símbolo se marca `blocked`;
+- `reject_reason = structural_missing`;
+- `data_quality_flag = missing_borrow_join`.
+
+13.2. Símbolos nuevos
+
 Un símbolo recién incorporado al universo puede no tener histórico suficiente de proxy. En ese caso:
-\begin{itemize}[leftmargin=2em]
-    \item si el proxy actual está completo y de calidad suficiente, se aplica decisión normal;
-    \item si no lo está, se bloquea por prudencia;
-    \item no se usa tier previo inexistente.
-\end{itemize}
 
-\subsection{Cambios de universo}
-Toda métrica de cobertura y elegibilidad se calcula respecto de $\mathcal{U}_t$ y no respecto de un universo retrospectivo fijo. Esto evita confundir cambios legítimos del universo con fallos del filtro.
+- si el proxy actual está completo y de calidad suficiente, se aplica decisión normal;
+- si no lo está, se bloquea por prudencia;
+- no se usa tier previo inexistente.
 
-\section{Contrato exacto de outputs}
+13.3. Cambios de universo
+
+Toda métrica de cobertura y elegibilidad se calcula respecto de `U_t` y no respecto de un universo retrospectivo fijo. Esto evita confundir cambios legítimos del universo con fallos del filtro.
+
+13.4. Símbolos reincorporados
+
+Si un símbolo reaparece tras una ausencia prolongada, no debe heredar automáticamente el estado operativo antiguo. Debe tratarse como nueva observación salvo que exista una regla explícita de continuidad temporal. :contentReference[oaicite:12]{index=12}
+
+14. Contrato exacto de outputs
 
 La salida diaria debe contener, como mínimo:
 
-\begin{center}
-\begin{tabular}{>{\ttfamily}p{4.5cm} p{8.0cm}}
-\toprule
-\textnormal{\textbf{Campo}} & \textbf{Descripción} \\
-\midrule
-date & fecha efectiva \\
-symbol & ticker normalizado \\
-run\_id & identificador del job \\
-short\_eligible\_flag & 1 si corto permitido, 0 si bloqueado \\
-locate\_tier & easy / medium / hard / blocked \\
-locate\_tier\_code & 0/1/2/3 o codificación equivalente fija \\
-reject\_reason & razón dominante del rechazo, si aplica \\
-dominant\_rule & regla de precedencia que decidió el estado \\
-all\_triggered\_rules & lista serializada de reglas disparadas \\
-borrow\_fee\_daily & fee diario propagado \\
-borrow\_fee\_annual & fee anual propagado \\
-availability\_score & score de disponibilidad propagado \\
-htb\_flag & flag HTB propagado \\
-proxy\_quality & calidad del proxy \\
-fallback\_flag & si el proxy upstream usó fallback \\
-override\_flag & indica override explícito \\
-data\_quality\_flag & incidencias de join o completitud \\
-locate\_config\_version & versión de thresholds y reglas \\
-upstream\_proxy\_version & versión del proxy de borrow \\
-asof\_timestamp & timestamp de construcción \\
-\bottomrule
-\end{tabular}
-\end{center}
+- `date`
+- `symbol`
+- `run_id`
+- `short_eligible_flag`
+- `locate_tier`
+- `locate_tier_code`
+- `reject_reason`
+- `dominant_rule`
+- `all_triggered_rules`
+- `borrow_fee_daily`
+- `borrow_fee_annual`
+- `availability_score`
+- `htb_flag`
+- `proxy_quality`
+- `fallback_flag`
+- `override_flag`
+- `data_quality_flag`
+- `locate_config_version`
+- `upstream_proxy_version`
+- `asof_timestamp`
 
 Este contrato no es opcional. Sin estos campos, el módulo no ofrece trazabilidad suficiente para un entorno de research-production serio.
 
-\section{Resumen diario y métricas obligatorias}
+Además, `locate_tier_code` debe tener una codificación fija y versionada, por ejemplo:
+
+- `easy = 0`
+- `medium = 1`
+- `hard = 2`
+- `blocked = 3`
+
+o equivalente, siempre que permanezca estable entre versiones. :contentReference[oaicite:13]{index=13}
+
+15. Resumen diario y métricas obligatorias
 
 Además de la tabla por símbolo, el módulo debe generar un resumen diario con al menos:
 
-\begin{itemize}[leftmargin=2em]
-    \item tamaño del universo efectivo;
-    \item porcentaje de \texttt{short\_eligible};
-    \item distribución por \texttt{locate\_tier};
-    \item porcentaje bloqueado por cada \texttt{reject\_reason};
-    \item porcentaje de overrides;
-    \item porcentaje con \texttt{proxy\_quality=low};
-    \item porcentaje con \texttt{fallback\_flag=1};
-    \item concentración de bloqueos en small/micro caps si ese metadato existe;
-    \item cambios netos de distribución de tiers respecto del día anterior.
-\end{itemize}
+- tamaño del universo efectivo;
+- porcentaje de `short_eligible`;
+- distribución por `locate_tier`;
+- porcentaje bloqueado por cada `reject_reason`;
+- porcentaje de overrides;
+- porcentaje con `proxy_quality=low`;
+- porcentaje con `fallback_flag=1`;
+- concentración de bloqueos en small/micro caps si ese metadato existe;
+- cambios netos de distribución de tiers respecto del día anterior.
 
 Estas métricas son críticas para distinguir si el filtro está operando de forma razonable o si, por ejemplo, una degradación del upstream está colapsando la capacidad del lado corto.
 
-\section{Validaciones de consistencia}
+Conviene añadir también, cuando exista soporte upstream, una métrica de concentración de exposición potencial en `hard`, porque un locate correcto no sólo decide símbolo a símbolo; también ayuda a evitar que la cartera dependa excesivamente de nombres frágiles. Este punto mejora la especificación sin exigir todavía optimización dinámica compleja. :contentReference[oaicite:14]{index=14}
+
+16. Validaciones de consistencia
 
 La implementación debe incluir, como mínimo, las siguientes validaciones:
 
-\subsection{Consistencia de rechazo}
-\[
-\eta_{i,t}=0 \;\Rightarrow\; r_{i,t}\neq \varnothing.
-\]
+Consistencia de rechazo
+
+`eta_{i,t}=0 => r_{i,t} != vacío`
 
 Todo símbolo bloqueado debe tener razón dominante no vacía.
 
-\subsection{Consistencia de permiso}
-\[
-\eta_{i,t}=1 \;\Rightarrow\; \tau_{i,t}\in\{\texttt{easy},\texttt{medium},\texttt{hard}\}.
-\]
+Consistencia de permiso
 
-\subsection{Consistencia de bloqueo}
-\[
-\tau_{i,t}=\texttt{blocked} \;\Rightarrow\; \eta_{i,t}=0.
-\]
+`eta_{i,t}=1 => tau_{i,t} in {easy, medium, hard}`
 
-\subsection{Consistencia con el universo}
-\[
-\eta_{i,t}=1 \;\Rightarrow\; i\in\mathcal{U}_t.
-\]
+Consistencia de bloqueo
 
-\subsection{Consistencia con availability crítica}
-\[
-\alpha_{i,t}<\theta_\alpha^{\text{block}}
-\;\Rightarrow\;
-\eta_{i,t}=0.
-\]
+`tau_{i,t}=blocked => eta_{i,t}=0`
+
+Consistencia con el universo
+
+`eta_{i,t}=1 => i in U_t`
+
+Consistencia con availability crítica
+
+`alpha_{i,t} < theta_alpha_block => eta_{i,t}=0`
 
 No se admite ninguna excepción silenciosa a esta regla.
 
-\section{Integración con portfolio construction y backtest}
+Consistencia con precedencia
 
-La salida del módulo debe consumirse con una semántica precisa:
+Si una regla de bloqueo de precedencia superior dispara, ninguna regla inferior puede producir un estado final más benigno.
 
-\subsection{Filtrado del universo corto}
-El conjunto operable de cortos en fecha $t$ es:
-\[
-\mathcal{S}_t^{\text{short}}
-=
-\{i\in\mathcal{U}_t : \eta_{i,t}=1\}.
-\]
+Consistencia con override
 
-\subsection{Sizing por tier}
+Todo override debe quedar reflejado explícitamente en campos de salida; no pueden existir permisos o bloqueos implícitos fuera del contrato de datos. :contentReference[oaicite:15]{index=15}
+
+17. Integración con portfolio construction y backtest
+
+La salida del módulo debe consumirse con una semántica precisa.
+
+17.1. Filtrado del universo corto
+
+El conjunto operable de cortos en fecha `t` es:
+
+`S_t^short = {i in U_t : eta_{i,t}=1}`
+
+17.2. Sizing por tier
+
 El tamaño máximo permitido en cortos debe decrecer con la severidad del tier:
-\[
-w_{i,t}^{\max,\text{short}}
-=
-w_0 \cdot \omega(\tau_{i,t}),
-\]
+
+`w_{i,t}^{max,short} = w_0 * omega(tau_{i,t})`
+
 donde:
-\[
-\omega(\texttt{easy}) > \omega(\texttt{medium}) > \omega(\texttt{hard}) > \omega(\texttt{blocked})=0.
-\]
 
-\subsection{Coste neto}
+`omega(easy) > omega(medium) > omega(hard) > omega(blocked)=0`
+
+17.3. Coste neto
+
 El coste de préstamo debe reflejarse en el retorno neto:
-\[
-r_{i,t}^{\text{net}}
-=
-r_{i,t}^{\text{raw}}
--
-\widehat{b}_{i,t}\cdot \mathbb{1}(\text{short position}_{i,t}).
-\]
 
-No es correcto multiplicar el coste por \(\eta_{i,t}\) una vez la posición ya existe; la elegibilidad determina si la posición puede abrirse o mantenerse bajo política, pero el coste pertenece a la existencia efectiva de la posición corta. Esta precisión corrige una pequeña ambigüedad conceptual del texto previo.
+`r_{i,t}^{net} = r_{i,t}^{raw} - b_hat_{i,t} * 1(short_position_{i,t})`
 
-\subsection{Límite agregado de inventario difícil}
+No es correcto multiplicar el coste por `eta_{i,t}` una vez la posición ya existe; la elegibilidad determina si la posición puede abrirse o mantenerse bajo política, pero el coste pertenece a la existencia efectiva de la posición corta. Esta precisión corrige una ambigüedad conceptual frecuente.
+
+17.4. Límite agregado de inventario difícil
+
 Puede imponerse:
-\[
-\sum_{i:\tau_{i,t}=\texttt{hard}}
-|w_{i,t}^{\text{short}}|
-\le
-\Theta_{\text{hard}},
-\]
+
+`sum_{i: tau_{i,t}=hard} |w_{i,t}^{short}| <= Theta_hard`
+
 para contener exposición a nombres operables pero estructuralmente frágiles.
 
-\section{Uso analítico y de governance}
+Esta restricción de concentración sí es una mejora ya justificable en versión seria, porque añade control de riesgo real sin obligar todavía a introducir un MDP o un policy optimizer completo. :contentReference[oaicite:16]{index=16}
 
-Los outputs de \texttt{locate\_filter.py} deben servir también para:
+18. Uso analítico y de governance
 
-\begin{itemize}[leftmargin=2em]
-    \item analizar si el alpha del lado corto depende desproporcionadamente de nombres difícilmente prestables;
-    \item evaluar si un cambio en thresholds destruye cobertura útil del universo corto;
-    \item detectar degradaciones del proxy upstream cuando aumenta abruptamente el porcentaje bloqueado;
-    \item comparar regímenes de política de locate mediante \texttt{locate\_config\_version}.
-\end{itemize}
+Los outputs de `locate_filter.py` deben servir también para:
 
-Un sistema maduro no usa el locate sólo para ``dejar pasar o no'', sino como instrumento para medir cuánto de su supuesto alpha corto depende de fricción no capturada.
+- analizar si el alpha del lado corto depende desproporcionadamente de nombres difícilmente prestables;
+- evaluar si un cambio en thresholds destruye cobertura útil del universo corto;
+- detectar degradaciones del proxy upstream cuando aumenta abruptamente el porcentaje bloqueado;
+- comparar regímenes de política de locate mediante `locate_config_version`.
 
-\section{Tests e invariantes obligatorios}
+Un sistema maduro no usa el locate sólo para “dejar pasar o no”, sino como instrumento para medir cuánto de su supuesto alpha corto depende de fricción no capturada.
+
+También debe permitir auditoría retrospectiva: si una versión del sistema gana mucho más porque permitió más `hard`, esa mejora debe poder atribuirse a política de locate y no confundirse con alpha genuino. :contentReference[oaicite:17]{index=17}
+
+19. Tests e invariantes obligatorios
 
 La implementación debe incluir tests automáticos sobre los siguientes invariantes:
 
-\begin{enumerate}[leftmargin=2em]
-    \item ningún símbolo con \texttt{locate\_tier=blocked} puede tener \texttt{short\_eligible\_flag=1};
-    \item todo símbolo con \texttt{short\_eligible\_flag=0} debe tener \texttt{reject\_reason} no nulo;
-    \item una caída exógena de \(\alpha_{i,t}\) manteniendo lo demás constante no puede mejorar el tier;
-    \item un aumento exógeno de \(\widehat{b}_{i,t}\) manteniendo lo demás constante no puede mejorar el tier;
-    \item si una regla de bloqueo de mayor precedencia dispara, ninguna regla inferior puede producir \texttt{easy}/\texttt{medium}/\texttt{hard};
-    \item símbolos fuera del universo no pueden aparecer como elegibles;
-    \item un cambio de configuración debe reflejarse en \texttt{locate\_config\_version};
-    \item la hysteresis no puede impedir un bloqueo inmediato por disponibilidad crítica o fallo estructural.
-\end{enumerate}
+1. ningún símbolo con `locate_tier=blocked` puede tener `short_eligible_flag=1`;
+2. todo símbolo con `short_eligible_flag=0` debe tener `reject_reason` no nulo;
+3. una caída exógena de `alpha_{i,t}` manteniendo lo demás constante no puede mejorar el tier;
+4. un aumento exógeno de `b_hat_{i,t}` manteniendo lo demás constante no puede mejorar el tier;
+5. si una regla de bloqueo de mayor precedencia dispara, ninguna regla inferior puede producir `easy`, `medium` o `hard`;
+6. símbolos fuera del universo no pueden aparecer como elegibles;
+7. un cambio de configuración debe reflejarse en `locate_config_version`;
+8. la hysteresis no puede impedir un bloqueo inmediato por disponibilidad crítica o fallo estructural;
+9. un símbolo sin join crítico con el proxy debe terminar bloqueado;
+10. todo override debe quedar materializado en el output.
 
-\section{Definition of Done}
+Estos tests no son opcionales: definen el comportamiento contractual del módulo. :contentReference[oaicite:18]{index=18}
 
-El módulo \texttt{locate\_filter.py} se considera terminado únicamente si:
+20. Definition of Done
 
-\begin{itemize}[leftmargin=2em]
-    \item convierte el proxy de borrow en una decisión de operabilidad causal y trazable;
-    \item implementa reglas duras y blandas con precedencia formal cerrada;
-    \item documenta razón dominante, reglas activadas y versión de configuración;
-    \item gestiona missing data, símbolos nuevos y cambios de universo sin ambigüedad;
-    \item incorpora hysteresis para evitar oscilación espuria de tiers;
-    \item puede ser consumido directamente por portfolio construction, backtest y QC;
-    \item impide que el lado corto del sistema descanse sobre inventario ficticio o artificialmente benigno.
-\end{itemize}
+El módulo `locate_filter.py` se considera terminado únicamente si:
 
-En otras palabras, el módulo no está terminado cuando ``clasifica símbolos'', sino cuando impone una frontera operativa creíble entre cortos ejecutables, cortos penalizables y cortos que sólo existen en backtests ingenuos.
+- convierte el proxy de borrow en una decisión de operabilidad causal y trazable;
+- implementa reglas duras y blandas con precedencia formal cerrada;
+- documenta razón dominante, reglas activadas y versión de configuración;
+- gestiona missing data, símbolos nuevos y cambios de universo sin ambigüedad;
+- incorpora hysteresis para evitar oscilación espuria de tiers;
+- puede ser consumido directamente por portfolio construction, backtest y QC;
+- impide que el lado corto del sistema descanse sobre inventario ficticio o artificialmente benigno.
 
-\section{Referencias conceptuales}
+En otras palabras, el módulo no está terminado cuando “clasifica símbolos”, sino cuando impone una frontera operativa creíble entre cortos ejecutables, cortos penalizables y cortos que sólo existen en backtests ingenuos. :contentReference[oaicite:19]{index=19}
 
-La lógica económica de esta especificación se alinea con la práctica de \emph{locates}, \emph{hard-to-borrow lists}, gestión de inventario de préstamo, restricciones de Reg SHO y modelización conservadora de short selling en contextos cuantitativos. El papel de estas referencias no es ornamentar el documento, sino justificar que la elegibilidad del corto debe tratarse como una restricción de primer orden y no como un detalle cosmético del backtest.
+21. MVP vs versión avanzada
 
-\bibliographystyle{plain}
-\bibliography{locate_filter_refs}
+MVP correcto:
 
-\end{document}
+- reglas duras de bloqueo;
+- tiering determinista para símbolos permitidos;
+- precedencia formal cerrada;
+- manejo prudencial de missing data;
+- overrides trazables;
+- hysteresis para mejoras;
+- contrato exacto de outputs;
+- integración explícita con sizing y net returns.
+
+Versión avanzada justificable:
+
+- límites agregados de exposición en `hard`;
+- thresholds adaptativos por régimen de mercado;
+- probabilidad auxiliar de operabilidad como score diagnóstico;
+- reporting comparativo por política de locate;
+- stress tests del universo corto ante endurecimiento de thresholds.
+
+No es obligatorio, en esta fase, incorporar MDP, deep RL o Kelly optimization dentro del módulo oficial. Esas extensiones pueden ser útiles en investigación avanzada, pero no son prerequisito para una capa productiva seria de locate. Sin dataset y loop de ejecución suficientemente ricos, añadirlas aquí sería más complejidad aparente que robustez real. :contentReference[oaicite:20]{index=20}
+
+22. Interpretación correcta
+
+Este módulo no debe interpretarse como “clasificador elegante de tiers”, sino como frontera de ejecutabilidad del short book.
+
+Su función correcta es:
+
+- impedir que el sistema trate como operables cortos estructuralmente dudosos;
+- traducir fricción de borrow en una política de admisión clara;
+- separar bloqueo duro de simple penalización;
+- suministrar un output estable, trazable y consumible por el resto del stack.
+
+Un locate que sea flexible pero semánticamente ambiguo no sirve. Un locate conservador, monotónico y con precedencia formal sí sirve, aunque deje pasar menos nombres. En el lado corto, el principal error no es perder alguna oportunidad, sino permitir como ejecutable lo que sólo era posible sobre el papel. :contentReference[oaicite:21]{index=21}
+
+23. Referencias conceptuales
+
+La lógica económica de esta especificación se alinea con la práctica de locates, hard-to-borrow lists, gestión de inventario de préstamo, restricciones de Reg SHO y modelización conservadora de short selling en contextos cuantitativos.
+
+El papel de estas referencias no es ornamentar el documento, sino justificar que la elegibilidad del corto debe tratarse como una restricción de primer orden y no como un detalle cosmético del backtest.
+
+En particular, esta especificación toma como ideas rectoras:
+
+- prioridad de reglas duras sobre scoring blando;
+- asimetría conservadora ante incertidumbre;
+- estabilidad temporal mediante hysteresis;
+- separación entre inferencia de fricción y decisión de operabilidad;
+- control de concentración en nombres frágiles como mejora posterior natural. :contentReference[oaicite:22]{index=22}
+
+24. Conclusión
+
+`data/borrow/locate_filter.py` debe quedar definido como un módulo de research-production serio, no como una capa ligera de postprocesado del borrow proxy.
+
+La especificación correcta no es “aplicar unas cuantas reglas al proxy”, sino:
+
+- fijar qué entra;
+- fijar qué bloquea;
+- fijar qué sólo degrada;
+- fijar qué precede a qué;
+- fijar cómo se documenta la decisión;
+- fijar cómo se integra con sizing, coste neto y universo corto;
+- y fijar qué salvaguardas evitan que el lado corto quede artificialmente embellecido.
+
+Si cumple esta especificación, el módulo deja de ser un filtro informal y pasa a ser una pieza institucional del stack. Si no la cumple, el riesgo no es sólo técnico: es permitir que un backtest o una cartera crean ejecutable un corto que, en realidad, nunca debió pasar el filtro de locate. :contentReference[oaicite:23]{index=23}

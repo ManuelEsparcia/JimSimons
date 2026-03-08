@@ -1,491 +1,508 @@
-\section{Módulo: \texttt{features/build\_features.py}}
+Especificación Cuantitativa: features/build_features.py
 
-\paragraph{Objetivo general}
-Este módulo implementa la construcción de una \textbf{matriz de features point-in-time (PIT)} destinada a modelado \textit{cross-sectional} sobre el universo de \textit{small caps}. Su función no es únicamente generar indicadores, sino establecer una \textbf{capa de representación del alpha} rigurosamente controlada: reproducible, libre de \textit{temporal leakage}, trazable a nivel de fuente y fecha de disponibilidad, y estable bajo heterogeneidad de cobertura, liquidez y calidad contable.
+1. Propósito del módulo
 
-Desde el punto de vista estratégico, el módulo transforma series de precios ajustados, volumen, fundamentales PIT, proxies de borrow y variables derivadas de microestructura en señales numéricas aptas para:
-\begin{itemize}
-    \item selección \textit{cross-sectional} de títulos,
-    \item entrenamiento de modelos predictivos,
-    \item construcción de rankings multifactor,
-    \item simulación \textit{walk-forward},
-    \item y validación estadística fuera de muestra.
-\end{itemize}
+El módulo `features/build_features.py` implementa la capa formal de construcción de la matriz de representación del alpha del sistema. Su función no es “añadir indicadores” sobre precios y fundamentales, sino transformar un conjunto heterogéneo de fuentes point-in-time —precios ajustados, volumen, fundamentales PIT, proxies de borrow y universe history— en una matriz de features canónica, reproducible, auditable y estrictamente libre de leakage temporal. Esta capa actúa como la interfaz entre la verdad histórica de datos y el espacio de señales que consumen labels, modelos, rankings multifactor y backtests. :contentReference[oaicite:0]{index=0}
 
-La premisa central es que, en \textit{small caps}, la ventaja no procede de acumular indicadores, sino de imponer una disciplina estricta sobre \textbf{qué información era observable}, \textbf{cuándo era observable} y \textbf{cómo se transforma en una señal comparable entre activos}. En consecuencia, \texttt{build\_features.py} debe entenderse como una especificación de ingeniería cuantitativa para producir un \textbf{dataset canónico de investigación y producción}, no como un simple ensamblador de columnas.
+El principio rector del módulo es el siguiente: una feature no es válida porque “suene razonable” ni porque tenga tradición en la literatura, sino porque puede demostrarse que fue construida únicamente con información observable en la fecha de decisión, que su transformación cross-sectional es estable, que su cobertura es suficiente dentro del universo elegible y que su semántica económica permanece intacta después de winsorización, ranking, normalización e imputación permitida. En small caps, esta disciplina no es opcional: la heterogeneidad de liquidez, la irregularidad contable y la fragilidad de cobertura hacen que una mala capa de features destruya la validez del research aunque las señales parezcan sofisticadas. :contentReference[oaicite:1]{index=1}
 
-\paragraph{Rol dentro de la arquitectura}
-Este módulo ocupa una posición central en el sistema:
-\begin{itemize}
-    \item consume universos PIT, precios ajustados, fundamentales PIT y señales auxiliares de liquidez/borrow;
-    \item aplica reglas de elegibilidad, alineamiento temporal y control de calidad;
-    \item construye familias de features homogéneas;
-    \item impone transformaciones \textit{cross-sectional} robustas;
-    \item y persiste un \textbf{snapshot inmutable} consumible por modelos, backtests y rutinas de validación.
-\end{itemize}
+2. Papel dentro de la arquitectura
 
-Por tanto, su contrato es doble:
-\begin{enumerate}
-    \item \textbf{contrato estadístico}: las features deben ser informativas, robustas y comparables;
-    \item \textbf{contrato temporal}: ninguna observación en \( (t,s) \) puede incorporar información no disponible a fecha de decisión.
-\end{enumerate}
+`build_features.py` se sitúa aguas abajo de:
 
-\subsection{Contexto de investigación}
+- `data/universe/build_universe.py`
+- `data/price/adjust_prices.py`
+- `data/edgar/point_in_time.py`
+- `data/borrow/*`
+- proxies auxiliares de liquidez, microestructura y contexto de mercado
 
-La construcción disciplinada de features PIT enlaza con varias líneas clásicas y modernas de investigación cuantitativa:
+y aguas arriba de:
 
-\begin{itemize}
-    \item La literatura de \textit{asset pricing} basada en características, desde Fama y French, formaliza la idea de que variables observables a nivel de firma contienen estructura predictiva sistemática en retornos esperados. \cite{fama1992, fama2015}
-    \item La evidencia en momentum, reversión, calidad y \textit{value} muestra que el valor económico de una señal depende tanto de su formulación como de la limpieza de su implementación empírica. \cite{asness2013}
-    \item La microestructura de mercado sugiere que proxies de rango, spread implícito, turnover e iliquidez no solo capturan coste de ejecución, sino también fricciones informacionales y segmentación de liquidez especialmente relevantes en universos de pequeña capitalización. \cite{roll1984, glosten1985, nber30917, novy2023}
-    \item La literatura sobre \textit{factor zoo}, \textit{multiple testing} y sobreajuste obliga a tratar el diseño de features como un problema de gobernanza estadística, no de creatividad irrestricta. \cite{harvey2017}
-\end{itemize}
+- `labels/build_labels.py`
+- `models/*`
+- `portfolio/*`
+- `backtest/*`
+- rutinas de validación estadística, ablation y selección de señales
 
-En \textit{small caps}, estas exigencias son todavía más severas por cuatro razones estructurales:
-\begin{enumerate}
-    \item cobertura contable irregular y \textit{staleness} prolongado;
-    \item fuerte dispersión de liquidez y mayor sensibilidad a outliers;
-    \item mayor probabilidad de sesgos de supervivencia, elegibilidad y disponibilidad;
-    \item y costes de transacción suficientemente altos como para invalidar señales aparentemente atractivas si no se modelan de forma PIT.
-\end{enumerate}
+Su responsabilidad es:
 
-\subsection{Marco formal y notación}
+- alinear temporalmente todas las fuentes bajo una convención PIT única;
+- construir familias de señales homogéneas a nivel `(date, instrument_id)` o `(date, symbol)` según la identidad operativa del sistema;
+- aplicar una política canónica de transformación cross-sectional;
+- clasificar y gobernar missingness, staleness y observabilidad;
+- persistir un snapshot inmutable de features listo para uso downstream.
 
-Sea \( \mathcal{T} \) el conjunto ordenado de fechas de trading y \( \mathcal{S}_t \) el universo elegible de símbolos en fecha \( t \), definido \textbf{point-in-time}. El objetivo del módulo es construir una aplicación:
-\[
-\Phi: ( \mathcal{D}^{\text{price}}, \mathcal{D}^{\text{fund}}, \mathcal{D}^{\text{borrow}}, \mathcal{D}^{\text{universe}} ) \mapsto X,
-\]
-donde \( X \) es una matriz tridimensional de observaciones:
-\[
-X \in \mathbb{R}^{|\mathcal{T}| \times |\mathcal{S}| \times F},
-\]
-y cada elemento \( X_{t,s}^{(f)} \) representa la feature \( f \) del activo \( s \) utilizable en la decisión correspondiente a la fecha \( t \).
+No debe:
 
-\paragraph{Variables base}
-Para \( s \in \mathcal{S} \) y \( t \in \mathcal{T} \):
-\begin{itemize}
-    \item \( p_t^{(s)} \): precio ajustado de cierre;
-    \item \( o_t^{(s)}, h_t^{(s)}, l_t^{(s)}, c_t^{(s)} \): precios ajustados OHLC;
-    \item \( v_t^{(s)} \): volumen ajustado;
-    \item \( \mathrm{adv}_t^{(s)} \): volumen medio negociado en USD;
-    \item \( r_t^{(s)} = \log p_t^{(s)} - \log p_{t-1}^{(s)} \): retorno logarítmico;
-    \item \( f_{t,k}^{(s)} \): valor PIT del campo fundamental \( k \);
-    \item \( a_{t,k}^{(s)} \): fecha efectiva de disponibilidad (\textit{as-of date}) del fundamental \( k \);
-    \item \( b_t^{(s)} \): proxy PIT de borrow, disponibilidad o crowding;
-    \item \( u_t^{(s)} \in \{0,1\} \): indicador PIT de elegibilidad en universo.
-\end{itemize}
+- redefinir el universo elegible;
+- corregir precios o fundamentales upstream;
+- inferir observabilidad futura por conveniencia;
+- ni permitir que modelos downstream apliquen transformaciones manuales no auditadas sobre la build oficial.
 
-\paragraph{Regla temporal fundamental}
-Para cada feature \( f \), el módulo debe garantizar:
-\[
-X_{t,s}^{(f)} = \phi_t^{(f)} \Big( \mathcal{I}_{\leq t-\delta}^{(s)} ; \theta^{(f)} \Big),
-\]
+En otras palabras, el módulo debe comportarse como una fábrica de representación canónica del alpha, no como un script flexible de feature hacking. :contentReference[oaicite:2]{index=2}
+
+3. Principios de diseño no negociables
+
+La especificación del módulo se rige por los siguientes principios:
+
+1. PIT estricto:
+   toda observación `X_{t,s}^f` debe depender exclusivamente de información observable a fecha de decisión.
+
+2. Primacía del universo PIT:
+   sólo se construyen features para activos elegibles en la fecha correspondiente.
+
+3. Separación entre build canónica y build experimental:
+   las features oficiales de producción no pueden mezclarse con señales exploratorias sin taxonomía explícita.
+
+4. Determinismo:
+   mismos inputs, misma configuración y mismo `run_id` producen exactamente la misma build lógica.
+
+5. Gobernanza de missingness:
+   los nulos deben clasificarse y tratarse según causa, no sólo según presencia/ausencia.
+
+6. Trazabilidad total:
+   toda columna final debe poder reconstruirse hasta fórmula, fuentes, ventanas, transformaciones y reglas PIT.
+
+7. Transformación cross-sectional estable:
+   el orden `raw -> validación -> winsor -> rank/z` debe ser explícito y versionado.
+
+8. Inmutabilidad de snapshots:
+   una vez persistida una build, no se reescribe parcialmente; se genera un nuevo `run_id`.
+
+Estos principios convierten al módulo en infraestructura cuantitativa central y no en un generador oportunista de columnas. :contentReference[oaicite:3]{index=3}
+
+4. Convención temporal obligatoria
+
+La regla temporal formal del módulo es:
+
+`X_{t,s}^f = phi_t^f( I_{<= t-delta}^s ; theta_f )`
+
 donde:
-\begin{itemize}
-    \item \( \mathcal{I}_{\leq t-\delta}^{(s)} \) es el conjunto de información observable para \( s \) hasta \( t-\delta \),
-    \item \( \delta = \texttt{decision\_lag\_days} \in \{0,1\} \),
-    \item \( \theta^{(f)} \) agrupa ventanas, umbrales, reglas de \textit{clipping}, imputación y normalización.
-\end{itemize}
 
-La restricción crítica es:
-\[
-a_{t,k}^{(s)} \leq t-\delta \quad \Longrightarrow \quad f_{t,k}^{(s)} \text{ puede utilizarse en } X_{t,s}^{(f)},
-\]
-y si esta condición no se cumple, el valor debe tratarse como \texttt{NaN} o no elegible para construcción.
+- `I_{<= t-delta}^s` es la información observable para el activo `s` hasta el instante permitido;
+- `delta = decision_lag_days`, con valor canónico por defecto `1`;
+- `theta_f` agrupa ventanas, umbrales, políticas de clipping, imputación y normalización de la feature `f`.
 
-\paragraph{Unidad de observación}
+La convención oficial del sistema es:
+
+`decision_time = close(t-1)`
+`feature_date = t`
+
+Esto implica que ninguna feature de fecha `t` puede usar datos publicados, ajustados o conocidos después del cierre de `t-1`, salvo que la configuración declare explícitamente `decision_lag_days = 0` para una build experimental. La build canónica de investigación y producción debe usar `decision_lag_days = 1`. :contentReference[oaicite:4]{index=4}
+
+5. Unidad de observación y dominio válido
+
 La unidad mínima válida del módulo es el par:
-\[
-(t,s) \in \mathcal{T} \times \mathcal{S}_t.
-\]
-No deben existir filas construidas para símbolos fuera del universo PIT de esa fecha. Esto evita fugas derivadas de usar retrospectivamente el universo actual sobre periodos pasados.
 
-\subsection{Principios de diseño}
+`(t,s) in T x S_t`
 
-\paragraph{1. PIT estricto}
-Toda transformación debe depender exclusivamente de información observable en fecha de decisión. La corrección PIT no es un atributo opcional de algunas fuentes; es la restricción dominante del módulo completo.
+donde:
 
-\paragraph{2. Separación entre features canónicas y experimentales}
-El módulo debe distinguir explícitamente entre:
-\begin{itemize}
-    \item \textbf{familias canónicas}: incluidas por defecto en la build oficial;
-    \item \textbf{familias experimentales}: disponibles bajo activación explícita y sujetas a validación adicional.
-\end{itemize}
-La build canónica no puede depender de señales aún no estabilizadas metodológicamente.
+- `T` es el conjunto ordenado de fechas de trading;
+- `S_t` es el conjunto de símbolos o instrumentos elegibles point-in-time en `t`.
 
-\paragraph{3. Determinismo}
-Dados los mismos inputs, configuración, calendario y \texttt{run\_id}, la salida debe ser idéntica bit a bit salvo metadatos no materiales. No se permiten resoluciones implícitas distintas entre ejecuciones.
+Regla fundamental:
 
-\paragraph{4. Gobernanza de missingness}
-Los nulos deben clasificarse como:
-\begin{itemize}
-    \item \textbf{estructurales}: la información no existe o aún no ha sido reportada;
-    \item \textbf{operativos}: fallo de ingestión, partición incompleta o corrupción de fuente;
-    \item \textbf{económicos}: el ratio no es interpretable (por ejemplo, denominador no válido).
-\end{itemize}
-Cada clase requiere un tratamiento diferenciado.
+si `u_t^s = 0`, no debe existir fila final para `(t,s)` en el artefacto canónico de features.
 
-\paragraph{5. Trazabilidad}
-Toda columna final debe ser auditable mediante:
-\begin{itemize}
-    \item familia,
-    \item fórmula,
-    \item ventanas,
-    \item fuentes dependientes,
-    \item reglas de elegibilidad,
-    \item política de transformación,
-    \item y \textit{as-of cut} efectivo.
-\end{itemize}
+Esto es crítico para evitar:
 
-\subsection{Familias de features}
+- leakage de universo;
+- reconstrucción retrospectiva con supervivientes actuales;
+- y señales definidas sobre activos que el sistema no podía operar en esa fecha.
 
-\subsubsection{Momentum y reversión}
+El universo manda sobre la validez aislada de una señal. Si una feature es computable pero el activo no pertenece al universo PIT de la fecha, la fila se elimina del snapshot final. :contentReference[oaicite:5]{index=5}
 
-\paragraph{Momentum multi-horizonte}
-Para horizontes \( h \in \{5,10,20,63,126,252\} \):
-\[
-R_{t,h}^{(s)} = \sum_{i=1}^{h} r_{t-i+1}^{(s)}.
-\]
-Las transformaciones de momentum deben calcularse sobre datos ajustados y alineados temporalmente con la regla de decisión. La versión cruda no debe consumirse aguas abajo salvo para auditoría; la señal operativa debe ser una transformación \textit{cross-sectional} robusta.
+6. Entradas y contrato mínimo
 
-Las normalizaciones admitidas son:
-\begin{itemize}
-    \item \textbf{rank percentil}:
-    \[
-    q_{t,h}^{(s)} = \frac{\mathrm{rank}(R_{t,h}^{(s)}) - 0.5}{N_t},
-    \]
-    donde \( N_t = |\{s \in \mathcal{S}_t : R_{t,h}^{(s)} \text{ válido}\}| \);
-    \item \textbf{rank-Gauss}:
-    \[
-    z_{t,h}^{(s)} = \Phi^{-1}\!\left( \min\!\left(\max(q_{t,h}^{(s)}, \varepsilon), 1-\varepsilon\right)\right);
-    \]
-    \item \textbf{z-score robusto}, únicamente cuando la cobertura de la sección cruzada lo permita.
-\end{itemize}
+Entradas mínimas requeridas:
 
-\paragraph{Política de empates}
-Cuando existan \textit{ties} por discretización, iliquidez o series constantes, el ranking debe resolverse con regla determinista (\textit{average rank} o equivalente), nunca de forma dependiente del orden físico en disco.
+- `universe_history_path`
+- `prices_adjusted_path`
+- `fundamentals_pit_path`
+- `borrow_proxy_path` opcional pero recomendado
+- `market_proxies_path` opcional
+- `config_path`
+- `run_id`
+- `start_date`
+- `end_date`
 
-\paragraph{Reversión a corto plazo}
-Para horizontes cortos:
-\[
-\mathrm{rev}_{t,h}^{(s)} = -R_{t,h}^{(s)}.
-\]
-Esta señal captura efectos de sobrerreacción, rebote técnico o reversión de shocks de liquidez. Debe tratarse como familia distinta de momentum, no como simple signo invertido a nivel de catálogo, a fin de permitir QC y atribución separadas.
+Notación formal:
 
-\subsubsection{Volatilidad, liquidez y microestructura}
+`I = { U_hist, P_adj, F_pit, B_pit, M_ctx, Theta_feat, r }`
 
-\paragraph{Volatilidad realizada}
-Para una ventana \( h \):
-\[
-\sigma_{t,h}^{(s)} = \sqrt{\frac{1}{h-1} \sum_{i=1}^{h} \left(r_{t-i+1}^{(s)} - \bar r_{t,h}^{(s)}\right)^2 }.
-\]
-La volatilidad puede actuar como feature predictiva, filtro de riesgo o modulador de otras familias. Por ello, el módulo debe distinguir entre:
-\begin{itemize}
-    \item volatilidad como \textbf{señal autónoma},
-    \item volatilidad como \textbf{insumo de interacción},
-    \item volatilidad como \textbf{métrica auxiliar de QC}.
-\end{itemize}
+donde:
 
-\paragraph{Proxies de microestructura}
-En ausencia de datos intradía completos, el módulo construye aproximaciones diarias:
-\[
-\mathrm{range}_t^{(s)} = \log\!\left(\frac{h_t^{(s)}}{l_t^{(s)}}\right),
-\qquad
-\mathrm{gap}_t^{(s)} = \log\!\left(\frac{o_t^{(s)}}{c_{t-1}^{(s)}}\right),
-\]
-\[
-\mathrm{amihud}_{t,h}^{(s)} = \frac{1}{h}\sum_{i=1}^{h}\frac{|r_{t-i+1}^{(s)}|}{\mathrm{dollar\_vol}_{t-i+1}^{(s)} + \epsilon}.
-\]
+- `U_hist` es la historia del universo PIT;
+- `P_adj` contiene precios ajustados y magnitudes derivadas;
+- `F_pit` contiene fundamentales observables point-in-time;
+- `B_pit` contiene borrow/crowding o fricciones equivalentes;
+- `M_ctx` contiene proxies de mercado o contexto, si se usan;
+- `Theta_feat` es la configuración versionada;
+- `r` es el `run_id`.
 
-Estas proxies deben tratarse como aproximaciones de fricción, no como estimadores exactos de spread. El módulo debe documentar esta limitación y evitar etiquetarlas de forma excesivamente fuerte si la proxy no identifica el objeto económico de manera unívoca.
+El módulo debe exigir, como mínimo, en las distintas fuentes:
 
-\paragraph{Control de jornadas anómalas}
-Deben excluirse o marcarse observaciones con:
-\begin{itemize}
-    \item \( h_t < l_t \),
-    \item precios no positivos,
-    \item volumen nulo persistente,
-    \item gaps derivados de splits no ajustados,
-    \item o rangos incompatibles con integridad básica de OHLC.
-\end{itemize}
+en universo:
+- `date`
+- `symbol` o `instrument_id`
+- `is_eligible`
 
-\subsubsection{Fundamentales PIT}
+en precios:
+- `date`
+- `symbol`
+- `open_adj`
+- `high_adj`
+- `low_adj`
+- `close_adj`
+- `volume_adj`
 
-\paragraph{Principio general}
-Los fundamentales no se consumen como datos contables brutos, sino como \textbf{transformaciones económicas PIT-compatibles}. Para cada ratio o magnitud derivada, el módulo debe fijar:
-\begin{itemize}
-    \item numerador,
-    \item denominador,
-    \item regla de signo,
-    \item política ante denominadores degenerados,
-    \item horizonte de \textit{staleness},
-    \item y condición exacta de observabilidad.
-\end{itemize}
+en fundamentales PIT:
+- `date`
+- `symbol`
+- `field_name`
+- `value`
+- `asof_date`
 
-\paragraph{Regla de disponibilidad}
-Un fundamental solo puede entrar en la build si:
-\[
-a_{t,k}^{(s)} \le t-\delta.
-\]
-No se permite \textit{forward fill} indefinido. Toda persistencia temporal debe respetar un \texttt{max\_staleness\_days} específico por familia o campo.
+Si falta este contrato mínimo, la build no debe seguir. No se permite una matriz de features aparentemente válida construida sobre fuentes estructuralmente incompletas. :contentReference[oaicite:6]{index=6}
 
-\paragraph{Política de staleness}
-Sea \( \tau_{t,k}^{(s)} \) la última fecha efectiva disponible del campo \( k \). Entonces:
-\[
-\mathrm{staleness}_{t,k}^{(s)} = t - \tau_{t,k}^{(s)}.
-\]
-Si
-\[
-\mathrm{staleness}_{t,k}^{(s)} > H_k^{\max},
-\]
-el valor deja de ser válido y debe convertirse en \texttt{NaN}. Los umbrales \( H_k^{\max} \) deben definirse por configuración y no quedar implícitos en el código.
+7. Familias canónicas de features
 
-\paragraph{Deltas PIT-safe}
-Para capturar cambio fundamental:
-\[
-\Delta f_{t,k}^{(s)} = f_{t,k}^{(s)} - f_{t-l,k}^{(s)}.
-\]
-La comparación solo es válida si ambos términos proceden de observaciones PIT comparables y aceptadas bajo la misma política de \textit{staleness}. No deben mezclarse reportes trimestrales y anuales sin normalización explícita.
+La build oficial debe distinguir claramente entre familias canónicas y experimentales.
 
-\subsubsection{Borrow, crowding e interacciones}
+Familias canónicas mínimas:
 
-\paragraph{Borrow / crowding}
-Sea \( b_t^{(s)} \) una medida PIT de coste de préstamo, disponibilidad o presión de crowding. La transformación operativa recomendada es ordinal:
-\[
-q_t^{(s,\mathrm{borrow})} = \frac{\mathrm{rank}(b_t^{(s)}) - 0.5}{N_t}.
-\]
-Según la convención económica del modelo, la señal final podrá conservar signo positivo, invertirse o mapearse a rank-Gauss. Esa convención debe fijarse en el catálogo y no resolverse \textit{ad hoc} aguas abajo.
+1. momentum multi-horizonte
+2. reversión a corto plazo
+3. volatilidad realizada
+4. liquidez y microestructura básica
+5. fundamentales PIT core
+6. borrow / crowding / friction proxies
+7. metadatos de cobertura, staleness y calidad
 
-\paragraph{Interacciones}
-Las interacciones admitidas deben ser \textbf{escasas, económicamente motivadas y metodológicamente gobernadas}. Una interacción genérica toma la forma:
-\[
-X_t^{(f_1 \times f_2)}(s) = \psi\!\left(X_t^{(f_1)}(s), X_t^{(f_2)}(s)\right),
-\]
-con \( \psi \) tipicamente producto, \textit{gating}, \textit{masking} por régimen o ratio estabilizado.
+Familias experimentales permitidas bajo `opt-in`:
 
-No se permite una expansión combinatoria libre. Toda interacción debe superar previamente:
-\begin{itemize}
-    \item unicidad económica,
-    \item baja redundancia con las señales base,
-    \item estabilidad temporal razonable,
-    \item y mejora incremental demostrable en validación.
-\end{itemize}
+- interacciones complejas
+- ventanas optimizadas dinámicamente
+- proxies derivados de régimen
+- embeddings o compresiones latentes
+- señales con evidencia empírica aún inestable
 
-\subsection{Transformaciones cross-sectional}
+Regla de gobernanza:
 
-\paragraph{Orden canónico de transformación}
-Salvo excepción explícita por familia, el orden operativo debe ser:
-\[
-\text{raw} \rightarrow \text{validación} \rightarrow \text{clipping/winsor} \rightarrow \text{normalización} \rightarrow \text{persistencia}.
-\]
-Este orden debe ser único y estable. No se permite que unas familias winsoricen antes del ranking y otras después sin documentación explícita.
+la build canónica no puede depender de features experimentales para ser considerada snapshot oficial. Esto evita deriva metodológica y facilita comparación entre runs. :contentReference[oaicite:7]{index=7}
 
-\paragraph{Winsorización}
-Para una feature cruda \( X_t^{(f)} \), la winsorización por fecha se define mediante percentiles:
-\[
-X_{t,\mathrm{win}}^{(f)} = \min\!\left(\max\!\left(X_t^{(f)}, Q_{p_{\min}}(X_t^{(f)})\right), Q_{p_{\max}}(X_t^{(f)})\right).
-\]
-Los parámetros \( p_{\min}, p_{\max} \) deben ser configurables por familia y quedar registrados en metadata.
+8. Momentum y reversión
 
-\paragraph{Z-score robusto}
-\[
-Z_t^{(f)} = \frac{X_t^{(f)} - \mathrm{med}(X_t^{(f)})}{1.4826 \cdot \mathrm{MAD}(X_t^{(f)}) + \epsilon}.
-\]
-El término \( \epsilon \) evita inestabilidad numérica cuando la dispersión colapsa.
+8.1. Momentum acumulado
 
-\paragraph{Caso degenerado de MAD casi nula}
-Si
-\[
-\mathrm{MAD}(X_t^{(f)}) < \tau_{\mathrm{mad}},
-\]
-la fecha debe marcarse como degenerada para esa feature. La política permitida es una de las siguientes, definida por configuración:
-\begin{itemize}
-    \item devolver vector nulo,
-    \item degradar a ranking ordinal,
-    \item o marcar la observación como inválida.
-\end{itemize}
-La política elegida debe ser única y determinista.
+Para horizontes canónicos `h in {5,10,20,63,126,252}`:
 
-\paragraph{Tamaño mínimo de sección cruzada}
-Si
-\[
-N_t < \texttt{min\_cross\_section\_size},
-\]
-la transformación no debe tratarse como estadísticamente equivalente a una fecha normal. Debe registrarse en observabilidad como fecha de baja confianza y, si procede, impedir promoción a dataset canónico.
+`R_{t,h}^s = sum_{i=1}^h r_{t-i+1}^s`
 
-\subsection{Manejo de nulos y casos frontera}
+donde `r_t^s` es el retorno logarítmico o la convención elegida en config, pero una vez elegida debe ser estable en toda la build.
 
-\paragraph{Jerarquía de tratamiento}
-La política de missingness debe seguir la siguiente precedencia:
-\begin{enumerate}
-    \item invalidar valores con violación PIT;
-    \item invalidar valores con fallo de integridad numérica;
-    \item invalidar valores económicamente no interpretables;
-    \item aplicar política de \textit{staleness};
-    \item solo después considerar imputación permitida.
-\end{enumerate}
+La señal operativa no debe consumirse cruda por defecto. Debe transformarse cross-sectionalmente. Las transformaciones admitidas y canónicas son:
 
-\paragraph{Políticas permitidas}
-\begin{itemize}
-    \item \texttt{keep\_null}: el \textit{downstream} debe manejar missing explícitamente;
-    \item \texttt{impute\_cross\_section\_median}: imputación por fecha, solo en familias autorizadas;
-    \item \texttt{drop\_feature\_if\_coverage\_below}: descarte automático cuando la cobertura cae por debajo de un umbral.
-\end{itemize}
+percentil rank:
+`q_{t,h}^s = ( rank(R_{t,h}^s) - 0.5 ) / N_t`
 
-\paragraph{Prohibiciones}
-No se permite:
-\begin{itemize}
-    \item imputación usando información futura;
-    \item medias globales multi-fecha sin justificación;
-    \item imputación silenciosa de fallos operativos como si fueran missing estructurales.
-\end{itemize}
+rank-Gauss:
+`z_{t,h}^s = Phi^{-1}( min(max(q_{t,h}^s, epsilon), 1-epsilon) )`
 
-\subsection{Contratos de elegibilidad y conflictos}
+y, opcionalmente, z-score robusto si la familia lo permite.
 
-\paragraph{Universo PIT}
-Toda fila debe satisfacer:
-\[
-u_t^{(s)} = 1.
-\]
-Si un símbolo pierde elegibilidad en una fecha próxima al corte, la fila correspondiente debe seguir la regla PIT vigente en esa fecha, sin reinterpretaciones retrospectivas.
+8.2. Reversión corta
 
-\paragraph{Conflictos entre validez de feature y elegibilidad}
-Si una feature es válida pero el símbolo no pertenece al universo PIT de \( t \), la fila debe excluirse del dataset final. La elegibilidad del universo domina sobre la validez aislada de una señal.
+Para horizontes cortos, la señal puede definirse como:
 
-\paragraph{Subset canónico mínimo}
-La build oficial debe especificar, al menos, qué familias son obligatorias:
-\begin{itemize}
-    \item retornos/momentum,
-    \item reversión corta,
-    \item volatilidad,
-    \item liquidez/microestructura básica,
-    \item fundamentales PIT core,
-    \item y metadatos de cobertura/calidad.
-\end{itemize}
-Las interacciones y proxies menos estables deben ser opt-in, no parte implícita del núcleo.
+`rev_{t,h}^s = - R_{t,h}^s`
 
-\subsection{Validación, observabilidad y control de calidad}
+pero debe persistirse como familia separada, no simplemente como “momentum con signo invertido”, para permitir atribución, QC y ablation específicas. :contentReference[oaicite:8]{index=8}
 
-\paragraph{Validaciones estructurales obligatorias}
-\begin{itemize}
-    \item unicidad de la clave \texttt{(date, symbol)};
-    \item monotonicidad temporal por símbolo;
-    \item ausencia de \texttt{inf}, \texttt{-inf} y valores no finitos;
-    \item consistencia de calendario;
-    \item integridad de esquema y tipos;
-    \item alineamiento con universo PIT.
-\end{itemize}
+9. Volatilidad y microestructura
 
-\paragraph{Validaciones estadísticas mínimas}
-\begin{itemize}
-    \item cobertura por feature y por fecha;
-    \item tasa de nulos global y por familia;
-    \item dispersión suficiente post-transformación;
-    \item detección de columnas constantes o casi constantes;
-    \item flags de outliers extremos persistentes;
-    \item correlaciones casi unitarias entre features duplicadas o redundantes.
-\end{itemize}
+9.1. Volatilidad realizada
 
-\paragraph{Observabilidad}
+Para ventana `h`:
+
+`vol_{t,h}^s = sqrt( sum_{i=1}^h (r_{t-i+1}^s - mean_{t,h}^s)^2 / (h-1) )`
+
+donde `mean_{t,h}^s` es la media de retornos en la ventana.
+
+Esta familia puede consumirse como:
+
+- señal autónoma;
+- interacción;
+- o metadato auxiliar de QC/risk.
+
+9.2. Rango y gap
+
+Proxies básicos de microestructura:
+
+`range_t^s = log( high_t^s / low_t^s )`
+
+`gap_t^s = log( open_t^s / close_{t-1}^s )`
+
+9.3. Amihud o iliquidez proxy
+
+Para ventana `h`:
+
+`amihud_{t,h}^s = (1/h) * sum_{i=1}^h |r_{t-i+1}^s| / (dollar_vol_{t-i+1}^s + epsilon)`
+
+Estas proxies deben tratarse como aproximaciones de fricción de liquidez, no como medidas exactas de spread o impacto. La nomenclatura del catálogo debe reflejar ese carácter proxy. :contentReference[oaicite:9]{index=9}
+
+10. Fundamentales PIT
+
+10.1. Regla de observabilidad
+
+Un fundamental sólo puede usarse en fecha `t` si:
+
+`a_{t,k}^s <= t - delta`
+
+donde `a_{t,k}^s` es la fecha efectiva de disponibilidad del campo `k`.
+
+Si no se cumple, el valor es inválido para construcción y debe tratarse como missing PIT, no como missing genérico.
+
+10.2. Política de staleness
+
+Sea `tau_{t,k}^s` la última fecha de actualización válida del fundamental `k`. Se define:
+
+`staleness_{t,k}^s = t - tau_{t,k}^s`
+
+y el valor sólo es usable si:
+
+`staleness_{t,k}^s <= H_k^max`
+
+donde `H_k^max` es configurable por campo o familia.
+
+Si se excede el máximo, el valor debe pasar a `NaN`. El forward fill indefinido queda prohibido. :contentReference[oaicite:10]{index=10}
+
+10.3. Deltas fundamentales
+
+Los cambios fundamentales PIT-safe se definen como:
+
+`Delta f_{t,k}^s = f_{t,k}^s - f_{t-l,k}^s`
+
+pero sólo si ambos términos son observables bajo la misma política PIT y de staleness. El módulo no debe mezclar implícitamente observaciones trimestrales y anuales sin una regla explícita de comparabilidad. :contentReference[oaicite:11]{index=11}
+
+11. Borrow, crowding e interacciones
+
+11.1. Borrow / crowding
+
+Sea `b_t^s` una proxy PIT de coste de préstamo o presión de crowding. La transformación operativa recomendada es ordinal:
+
+`q_t^{s,borrow} = ( rank(b_t^s) - 0.5 ) / N_t`
+
+El signo económico final debe fijarse en catálogo. No debe resolverse ad hoc dentro del modelo.
+
+11.2. Interacciones
+
+Las interacciones permitidas deben ser pocas, motivadas económicamente y formalmente gobernadas:
+
+`X_t^{f1xf2}(s) = psi( X_t^{f1}(s), X_t^{f2}(s) )`
+
+donde `psi` puede ser producto, gating o ratio estabilizado.
+
+No se permite una explosión combinatoria libre. Toda interacción debe pertenecer a catálogo explícito o a modo experimental. :contentReference[oaicite:12]{index=12}
+
+12. Pipeline cross-sectional canónico
+
+El orden operativo por defecto debe ser:
+
+`raw -> validación -> clipping/winsor -> normalización -> persistencia`
+
+Este orden debe ser único salvo excepción documentada por familia. La build canónica no puede tener unas familias que winsorizan antes del ranking y otras después sin quedar reflejado explícitamente en su metadata.
+
+12.1. Winsorización
+
+Para una feature `X_t^f`:
+
+`X_{t,win}^f = min( max(X_t^f, Q_{p_min}(X_t^f)), Q_{p_max}(X_t^f) )`
+
+con percentiles configurables por familia. Por defecto, un rango razonable es `[1%, 99%]`, pero debe persistirse el valor exacto usado.
+
+12.2. Z-score robusto
+
+`Z_t^f = ( X_t^f - med(X_t^f) ) / ( 1.4826 * MAD(X_t^f) + epsilon )`
+
+12.3. Caso degenerado de MAD
+
+Si:
+
+`MAD(X_t^f) < tau_mad`
+
+la fecha se considera degenerada para esa feature. La política permitida debe ser una de:
+
+- vector nulo
+- degradación a ranking
+- invalidación
+
+y debe estar fijada por configuración. :contentReference[oaicite:13]{index=13}
+
+13. Missingness y políticas permitidas
+
+La missingness debe clasificarse en:
+
+- estructural
+- operativa
+- económica
+
+El orden de tratamiento correcto es:
+
+1. invalidar por violación PIT
+2. invalidar por fallo numérico
+3. invalidar por no interpretabilidad económica
+4. aplicar política de staleness
+5. solo después considerar imputación permitida
+
+Políticas permitidas:
+
+- `keep_null`
+- `impute_cross_section_median`
+- `drop_feature_if_coverage_below`
+
+Prohibiciones absolutas:
+
+- imputación con información futura
+- medias globales multi-fecha sin justificación
+- imputación silenciosa de fallos operativos como si fueran missing estructurales
+
+Estas reglas son esenciales para que la matriz resultante sea metodológicamente defendible. :contentReference[oaicite:14]{index=14}
+
+14. Invariantes obligatorios
+
+Deben cumplirse, como mínimo, los siguientes invariantes:
+
+1. no existen filas para símbolos fuera del universo PIT de la fecha;
+2. toda feature respeta `decision_lag_days`;
+3. no existen valores infinitos ni no finitos en el artefacto final salvo política explícita documentada;
+4. el orden de transformación es determinista y estable;
+5. toda columna final tiene metadata suficiente para reconstrucción;
+6. misma entrada + mismo config + mismo run_id => misma build lógica;
+7. una ejecución fallida no deja un snapshot marcado como válido.
+
+Estos invariantes no son decorativos. Definen la frontera entre una feature store de producción y un notebook experimental. :contentReference[oaicite:15]{index=15}
+
+15. Validación y observabilidad
+
 El módulo debe emitir, como mínimo:
-\begin{itemize}
-    \item \( n_{\mathrm{rows}} \), \( n_{\mathrm{features}} \), \( n_{\mathrm{dates}} \), \( n_{\mathrm{symbols}} \);
-    \item cobertura global y por familia;
-    \item percentiles de cobertura por fecha;
-    \item número de fechas degeneradas;
-    \item número de features descartadas;
-    \item distribución de \textit{staleness} para fundamentales;
-    \item y resumen de decisiones de imputación.
-\end{itemize}
 
-\paragraph{Lineage}
-Cada feature persistida debe acompañarse de metadata suficiente para reconstruir:
-\begin{itemize}
-    \item fuente primaria,
-    \item transformación aplicada,
-    \item parámetros,
-    \item dependencia temporal,
-    \item y versión de configuración.
-\end{itemize}
+- `n_rows`
+- `n_features`
+- `n_dates`
+- `n_symbols`
+- cobertura global y por familia
+- percentiles de cobertura por fecha
+- número de fechas degeneradas
+- número de features descartadas
+- distribución de staleness de fundamentales
+- resumen de imputaciones realizadas
 
-\subsection{Persistencia y salida}
+Validaciones estructurales obligatorias:
 
-\paragraph{Artefacto de salida}
+- unicidad de clave `(date, symbol)` o `(date, instrument_id)` según diseño del store;
+- monotonicidad temporal por activo;
+- consistencia con calendario;
+- alineamiento con universo PIT;
+- ausencia de columnas constantes o casi constantes no esperadas;
+- detección de correlaciones casi perfectas entre features duplicadas.
+
+La observabilidad no es un extra de reporting. Es parte del contrato del módulo. :contentReference[oaicite:16]{index=16}
+
+16. Persistencia y artefactos de salida
+
 La salida del módulo debe consistir en:
-\begin{itemize}
-    \item un \textbf{snapshot inmutable} del dataset de features;
-    \item un \textbf{diccionario de features} con definiciones y parámetros;
-    \item un \textbf{manifest} de ejecución;
-    \item y un bloque de \textbf{métricas de observabilidad/QC}.
-\end{itemize}
 
-\paragraph{Principio de inmutabilidad}
-Una vez escrito un \texttt{run\_id}, sus outputs no deben reescribirse parcialmente. Cualquier reconstrucción debe generar un nuevo \texttt{run\_id}. Esto evita corrupción silenciosa y favorece reproducibilidad experimental.
+1. snapshot inmutable de la matriz de features;
+2. diccionario de features con definiciones, familias y parámetros;
+3. manifest de ejecución;
+4. bloque de métricas de observabilidad y QC.
 
-\paragraph{Atomicidad}
-La persistencia debe completarse de forma atómica en la medida de lo posible: una ejecución fallida no debe dejar un estado ambiguo que pueda confundirse con un snapshot válido.
+Artefactos mínimos recomendados:
 
-\subsection{Estructura operativa recomendada}
+- `features_store.parquet`
+- `features_dictionary.json`
+- `build_metrics.json`
+- `manifest.json`
 
-\paragraph{CLI de referencia}
-\begin{verbatim}
-python -m features.build_features ^
-  --universe-history-path data/universe/history ^
-  --prices-adjusted-path data/price/adjusted/mode=dual_output ^
-  --fundamentals-pit-path data/edgar/point_in_time ^
-  --borrow-proxy-path data/borrow/current.parquet ^
-  --start-date 2014-01-01 ^
-  --end-date 2026-03-01 ^
-  --config-path configs/features/base.yaml ^
-  --run-id build_features_20260305_001
-\end{verbatim}
+El snapshot debe ser inmutable. Una reconstrucción nunca debe sobrescribir parcialmente una build previa; debe generar un nuevo `run_id`. Además, la persistencia debe ser atómica en la medida de lo posible: una ejecución interrumpida no debe dejar un estado ambiguo. :contentReference[oaicite:17]{index=17}
 
-\paragraph{Descomposición funcional sugerida}
-\begin{itemize}
-    \item \texttt{load\_feature\_config()}
-    \item \texttt{load\_universe\_history()}
-    \item \texttt{load\_prices\_adjusted()}
-    \item \texttt{load\_fundamentals\_pit()}
-    \item \texttt{load\_borrow\_proxy()}
-    \item \texttt{build\_price\_features()}
-    \item \texttt{build\_liquidity\_features()}
-    \item \texttt{build\_microstructure\_features()}
-    \item \texttt{build\_fundamental\_features()}
-    \item \texttt{build\_borrow\_features()}
-    \item \texttt{build\_interaction\_features()}
-    \item \texttt{apply\_decision\_lag()}
-    \item \texttt{apply\_family\_specific\_missing\_policy()}
-    \item \texttt{standardize\_cross\_section()}
-    \item \texttt{validate\_feature\_matrix()}
-    \item \texttt{persist\_feature\_store()}
-    \item \texttt{emit\_build\_manifest()}
-    \item \texttt{main()}
-\end{itemize}
+17. CLI y descomposición funcional
 
-\subsection{Definition of Done}
+CLI de referencia:
 
-\paragraph{El módulo se considerará terminado únicamente si cumple simultáneamente lo siguiente:}
-\begin{enumerate}
-    \item produce una matriz de features PIT verificablemente libre de \textit{look-ahead};
-    \item toda observación está alineada con el universo elegible de su fecha;
-    \item las políticas de \textit{staleness}, winsorización, ranking e imputación son explícitas y trazables;
-    \item la build canónica queda separada de features experimentales;
-    \item la salida es reproducible por \texttt{config + inputs + run\_id};
-    \item el artefacto resultante supera los \textit{quality gates} de \texttt{feature\_qc.py};
-    \item y el snapshot puede consumirse directamente por \texttt{labels/build\_labels.py}, modelado y backtesting sin transformaciones manuales no auditadas.
-\end{enumerate}
+`python -m features.build_features --universe-history-path data/universe/history --prices-adjusted-path data/price/adjusted/mode=dual_output --fundamentals-pit-path data/edgar/point_in_time --borrow-proxy-path data/borrow/current.parquet --start-date 2014-01-01 --end-date 2026-03-01 --config-path configs/features/base.yaml --run-id build_features_20260305_001`
 
-\subsection{Casos de prueba mínimos}
+Descomposición funcional sugerida:
 
-\begin{itemize}
-    \item Verificación exacta de retornos acumulados y volatilidad en series sintéticas controladas.
-    \item Prueba de no fuga con \texttt{decision\_lag\_days = 1}.
-    \item Confirmación de que un fundamental con \texttt{asof\_date} tardío no aparece antes de su disponibilidad.
-    \item Validación del comportamiento con \texttt{MAD} degenerada y secciones cruzadas pequeñas.
-    \item Validación de exclusión de símbolos fuera del universo PIT histórico.
-    \item Confirmación de que una ejecución interrumpida no deja un snapshot marcado como válido.
-    \item Verificación de que metadata, diccionario de features y manifest coinciden con la build efectiva.
-\end{itemize}
+- `load_feature_config()`
+- `load_universe_history()`
+- `load_prices_adjusted()`
+- `load_fundamentals_pit()`
+- `load_borrow_proxy()`
+- `build_price_features()`
+- `build_liquidity_features()`
+- `build_microstructure_features()`
+- `build_fundamental_features()`
+- `build_borrow_features()`
+- `build_interaction_features()`
+- `apply_decision_lag()`
+- `apply_family_specific_missing_policy()`
+- `standardize_cross_section()`
+- `validate_feature_matrix()`
+- `persist_feature_store()`
+- `emit_build_manifest()`
+- `main()`
 
-\paragraph{Síntesis final}
-\texttt{features/build\_features.py} define la fábrica central de representación del sistema. Si esta capa falla, el resto del \textit{stack} ---etiquetas, modelos, validación y ejecución--- queda contaminado por ruido metodológico, leakage o irreproducibilidad. Si, por el contrario, esta capa está correctamente blindada, el sistema obtiene una base coherente para convertir datos heterogéneos y asíncronos en señales comparables, auditables y estadísticamente utilizables. En un motor multifactor de \textit{small caps}, esa disciplina no es una mejora cosmética: es una condición necesaria para que el alpha observado en investigación tenga alguna probabilidad de sobrevivir a producción.
+Esta separación no es sólo estilística: facilita trazabilidad, testing, gobernanza y aislamiento de errores por familia. :contentReference[oaicite:18]{index=18}
+
+18. Tests mínimos obligatorios
+
+La implementación debe incluir, como mínimo, tests sobre:
+
+1. cálculo exacto de retornos acumulados y volatilidad en series sintéticas controladas;
+2. no fuga temporal con `decision_lag_days = 1`;
+3. exclusión de fundamentales cuyo `asof_date` es posterior al permitido;
+4. comportamiento correcto bajo `MAD` degenerada;
+5. exclusión de símbolos fuera del universo PIT;
+6. ejecución interrumpida que no deja snapshot válido;
+7. coincidencia entre manifest, diccionario de features y build efectiva;
+8. reproducibilidad bit a bit con mismos inputs y configuración.
+
+Estos tests no son cosméticos. Definen el contrato institucional del módulo y blindan exactamente la parte más delicada: la conversión de datos heterogéneos en señales comparables sin violar causalidad temporal. :contentReference[oaicite:19]{index=19}
+
+19. Definition of Done
+
+El módulo `features/build_features.py` se considera terminado únicamente si cumple simultáneamente:
+
+1. produce una matriz de features PIT verificablemente libre de look-ahead;
+2. toda observación está alineada con el universo elegible de su fecha;
+3. las políticas de staleness, winsorización, ranking e imputación son explícitas y trazables;
+4. la build canónica queda separada de las features experimentales;
+5. la salida es reproducible mediante `config + inputs + run_id`;
+6. el artefacto resultante supera los quality gates de QC de features;
+7. el snapshot puede consumirse directamente por `labels/build_labels.py`, modelado y backtesting sin transformaciones manuales no auditadas. :contentReference[oaicite:20]{index=20}
+
+En otras palabras, el módulo no está terminado cuando “genera muchas columnas”, sino cuando fija una ontología de señales PIT, robusta y reproducible, lo suficientemente disciplinada como para sostener investigación cuantitativa seria en small caps. :contentReference[oaicite:21]{index=21}
+
+20. Interpretación correcta
+
+`features/build_features.py` no debe interpretarse como un ensamblador de indicadores, sino como la fábrica central de representación del alpha del sistema. Su función es transformar datos asincrónicos, heterogéneos y ruidosos en un espacio de señales comparable entre activos y fechas, respetando universo, causalidad, cobertura y semántica económica. Un módulo que “saca features” pero mezcla observabilidad futura, ignora staleness, no separa build canónica de experimental o deja transformaciones implícitas no sirve. Un módulo conservador, trazable, PIT-safe e institucionalmente gobernado sí sirve, aunque produzca menos columnas y exija más disciplina metodológica. :contentReference[oaicite:22]{index=22}
+
+21. Conclusión
+
+`features/build_features.py` debe quedar definido como una pieza institucional de alpha representation engineering, no como una rutina táctica de preprocesado.
+
+La especificación correcta no es “construir features sobre precios y fundamentales”, sino:
+
+- fijar qué entra;
+- fijar qué universo se usa;
+- fijar qué significan observabilidad y decision lag;
+- fijar qué familias son canónicas;
+- fijar cómo se robustifican y estandarizan las señales;
+- fijar cómo se gobiernan missingness y staleness;
+- fijar qué artefactos auditables salen;
+- y fijar qué invariantes protegen al resto del stack.
+
+Si cumple esta especificación, el módulo deja de ser un generador de columnas y pasa a ser la base canónica de representación del alpha del sistema. Si no la cumple, el riesgo no es sólo técnico: es contaminar labels, modelos y backtests con una matriz de señales que parece sofisticada, pero no es históricamente válida. :contentReference[oaicite:23]{index=23}

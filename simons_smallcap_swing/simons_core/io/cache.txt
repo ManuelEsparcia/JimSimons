@@ -1,300 +1,448 @@
-\documentclass{article}
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
-\usepackage[spanish]{babel}
-\usepackage{amsmath,amssymb,amsthm}
-\usepackage{mathtools}
-\usepackage{listings}
-\usepackage{xcolor}
-\usepackage{hyperref}
-\usepackage{booktabs}
-\usepackage{enumitem}
-\usepackage[a4paper,margin=2.2cm]{geometry}
+Especificación Cuantitativa: simons_core/io/cache.py
 
-\lstset{
-  language=Python,
-  basicstyle=\ttfamily\small,
-  frame=single,
-  breaklines=true,
-  showstringspaces=false
-}
+0. Propósito y papel dentro del stack
 
-\title{Especificación de Caché Determinista para Investigación y Producción\\
-\large \texttt{simons\_core/io/cache.py}}
-\author{Research Engineering Specification}
-\date{Marzo 2026}
+simons_core/io/cache.py define la capa institucional de caché local determinista del stack. Su función no es modificar la lógica estadística de trading ni “mejorar” el alpha, sino acelerar recomputaciones preservando equivalencia semántica estricta entre lectura válida de caché y recomputación del objeto productor.
 
-\begin{document}
-\maketitle
+El módulo debe entenderse como una capa de aceleración y control operacional. Su valor no está en “guardar cosas rápido”, sino en permitir que investigación y producción reutilicen artefactos computacionales sin introducir ambigüedad, escrituras parciales, corrupción silenciosa ni colisiones semánticas. En un sistema cuantitativo serio, una caché correcta no cambia la distribución de retornos; cambia el coste, la reproducibilidad y la estabilidad operativa del ciclo de trabajo.
 
-\section{Propósito}
+La regla institucional debe ser esta:
 
-Este módulo define una caché local determinista para acelerar cálculos repetitivos y reducir coste computacional en flujos de investigación, validación y producción dentro de un sistema de \emph{small-cap swing trading}. Su función no es alterar la lógica estadística de las estrategias ni mejorar por sí misma métricas de rentabilidad; su función es estrictamente infraestructural: evitar recomputaciones, estabilizar tiempos de ejecución, facilitar reproducibilidad operativa y hacer explícita la semántica de reutilización de artefactos computacionales.
+    una lectura válida de caché
+    debe ser semánticamente equivalente
+    a recomputar el productor canónico
+    con las mismas entradas lógicas y el mismo contrato.
 
-La caché debe tratarse como una capa de aceleración y no como una fuente primaria de verdad. En consecuencia, toda lectura desde caché debe ser semánticamente equivalente a recomputar el objeto desde sus entradas canónicas, salvo en los casos en que la política de invalidación exija refresco explícito.
-
-\section{Ámbito}
-
-El módulo cubre los siguientes casos de uso:
-
-\begin{itemize}[leftmargin=1.5em]
-    \item memoización de resultados de funciones puras o cuasi-puras;
-    \item persistencia temporal de artefactos intermedios de investigación;
-    \item reutilización de universos, features, snapshots y metadatos derivados;
-    \item almacenamiento local de objetos costosos de reconstruir;
-    \item inspección operativa del estado de la caché.
-\end{itemize}
-
-Quedan fuera de alcance:
-
-\begin{itemize}[leftmargin=1.5em]
-    \item consistencia distribuida entre nodos;
-    \item replicación remota;
-    \item garantías transaccionales multiobjeto;
-    \item uso de la caché como sustituto de bases de datos, lagos de datos o stores versionados de largo plazo.
-\end{itemize}
-
-\section{Modelo formal}
+1. Objetivo formal del módulo
 
 Sea
-\[
-f : \Theta \to \mathcal{Y}
-\]
-una transformación determinista sobre un espacio de parámetros $\Theta$. Definimos una clave canónica
-\[
-k = \mathcal{K}(n, v, \iota_f, \theta, c),
-\]
+
+    f : Θ -> 𝓨
+
+una transformación determinista o cuasi-determinista sobre un espacio de parámetros Θ. Definimos una clave canónica
+
+    k = 𝒦(namespace, fn_id, params_digest, version, context_digest)
+
+y una caché parcial
+
+    𝒞 : k ↦ (y, m),
+
 donde:
+- y es el payload serializado;
+- m son metadatos estructurados de validez, linaje y control.
 
-\begin{itemize}[leftmargin=1.5em]
-    \item $n$ es el \emph{namespace};
-    \item $v$ es la versión lógica del contrato de caché;
-    \item $\iota_f$ identifica la función o pipeline productor;
-    \item $\theta$ representa los argumentos normalizados;
-    \item $c$ representa contexto operativo relevante (por ejemplo, versión de datos, calendario, universo, dependencias críticas).
-\end{itemize}
+La semántica correcta de lectura es:
 
-La caché implementa una aplicación parcial
-\[
-\mathcal{C} : k \mapsto (y, m),
-\]
-donde $y \in \mathcal{Y}$ es el valor serializado y $m$ son sus metadatos.
+    get(k) =
+      y      si k existe, no está expirado y supera validaciones
+      ∅      en caso contrario.
 
-La semántica correcta es:
-\[
-\texttt{get}(k)=
-\begin{cases}
-y, & \text{si } k \text{ existe, no está expirado y supera validaciones;}\\
-\varnothing, & \text{en caso contrario.}
-\end{cases}
-\]
+La propiedad fundamental del módulo debe ser:
 
-Si $p_{\mathrm{hit}}$ denota la probabilidad de acierto, $L_{\mathrm{hit}}$ la latencia de lectura, $L_{\mathrm{miss}}$ la penalización de fallo y $C_f$ el coste medio de recomputación, el coste esperado por petición es:
-\[
-\mathbb{E}[T]
-=
-p_{\mathrm{hit}}\,L_{\mathrm{hit}}
-+
-(1-p_{\mathrm{hit}})\,(L_{\mathrm{miss}} + C_f).
-\]
+    get(k) ≡ f(θ_k)
 
-El objetivo operativo del módulo es minimizar $\mathbb{E}[T]$ sujeto a restricciones de coherencia, almacenamiento y validez temporal, no modificar la distribución estadística de los resultados de trading.
+siempre que la entrada sea válida bajo su política de expiración, versión e integridad.
 
-\section{Principios de diseño}
+La caché no es fuente primaria de verdad. Es una optimización semánticamente conservadora.
 
-\begin{enumerate}[leftmargin=1.7em]
-    \item \textbf{Determinismo de clave.} La misma entrada lógica debe producir la misma clave.
-    \item \textbf{Equivalencia semántica.} Un \emph{cache hit} válido debe ser equivalente a recomputar.
-    \item \textbf{Invalidación explícita.} Toda reutilización debe descansar en reglas auditables.
-    \item \textbf{Aislamiento ante corrupción.} Una entrada corrupta no debe comprometer el resto del store.
-    \item \textbf{Atomicidad de escritura a nivel de entrada.} Nunca debe exponerse una entrada parcialmente escrita como válida.
-    \item \textbf{Observabilidad.} Toda decisión relevante debe dejar trazabilidad operativa suficiente.
-    \item \textbf{Sobriedad estadística.} La caché acelera cómputo; no se atribuyen al módulo mejoras de Sharpe, CAGR o drawdown.
-\end{enumerate}
+2. Principios no negociables
 
-\section{Invariantes}
+P1. Determinismo de clave.
+La misma entrada lógica debe producir exactamente la misma clave.
 
-El módulo debe respetar, como mínimo, los siguientes invariantes:
+P2. Equivalencia semántica.
+Un hit válido debe equivaler a recomputar el objeto productor.
 
-\begin{enumerate}[label=\textbf{I\arabic*.},leftmargin=1.7em]
-    \item Una clave identifica de forma unívoca una entrada lógica dentro de un \emph{namespace} y versión dados.
-    \item Ninguna entrada se considera válida sin metadatos íntegros y checksum verificable, si dicha validación está habilitada.
-    \item Ninguna lectura devuelve una entrada expirada.
-    \item Ninguna escritura debe reemplazar una entrada existente salvo política explícita.
-    \item Un fallo durante escritura no debe dejar un artefacto visible como entrada válida.
-    \item La política de expiración y la política de expulsión deben ser distinguibles conceptualmente: expirar no es lo mismo que evacuar por presión de almacenamiento.
-\end{enumerate}
+P3. Inmutabilidad por clave.
+Una entrada existente no debe mutar silenciosamente salvo overwrite explícito y controlado.
 
-\section{Semántica de clave}
+P4. Escritura atómica por entrada.
+Ningún lector debe observar una entrada parcialmente escrita como válida.
 
-La construcción mínima de clave debe evitar colisiones semánticas entre ejecuciones que comparten nombre pero no contexto. Una forma recomendada es:
+P5. Expiración lógica separada de expulsión física.
+TTL e invalidación no son lo mismo que eviction por presión de almacenamiento.
 
-\begin{lstlisting}
+P6. Fail-closed ante corrupción.
+Un payload corrupto o metadata inconsistente no debe servirse.
+
+P7. Observabilidad suficiente.
+Hits, misses, expiraciones, corrupciones y eviction deben quedar medidos y trazables.
+
+3. Ámbito y no-objetivos
+
+El módulo cubre:
+
+- memoización de funciones puras o cuasi-puras;
+- persistencia temporal de artefactos intermedios;
+- reutilización local de universos, features, snapshots y estructuras costosas;
+- aceleración de pipelines de research y producción.
+
+Queda fuera de alcance:
+
+- consistencia distribuida multi-nodo;
+- replicación remota;
+- consenso distribuido;
+- uso como sustituto de stores versionados de largo plazo;
+- políticas avanzadas de admisión tipo TinyLFU o equivalentes.
+
+Esto debe quedar explícito para evitar sobrediseñar una caché local como si fuera un sistema distribuido.
+
+4. Semántica de clave canónica
+
+La construcción de la clave debe impedir colisiones semánticas entre ejecuciones que comparten nombre pero no contexto.
+
+4.1. Componentes mínimos
+
+La clave lógica debe incorporar:
+
+- namespace
+- fn_id
+- params_digest
+- version
+- context_digest
+
+Interpretación:
+- namespace separa dominios lógicos;
+- fn_id distingue productores distintos;
+- params_digest resume argumentos canónicos;
+- version permite invalidación estructural;
+- context_digest incorpora dependencias externas relevantes.
+
+4.2. Implementación recomendada
+
+No basta con concatenar strings con separadores. Para eliminar el riesgo práctico de colisiones de parsing y reforzar unicidad, la clave persistida debe derivarse de un hash criptográfico sobre una serialización canónica del payload lógico.
+
+~~~python
+import hashlib
+import json
+from typing import Optional, Mapping, Any
+
 def cache_key(
     namespace: str,
     fn_id: str,
-    params_digest: str,
+    params: Mapping[str, Any],
     version: str = "v1",
-    context_digest: str | None = None,
+    context: Optional[Mapping[str, Any]] = None,
 ) -> str:
-    parts = [namespace, version, fn_id, params_digest]
-    if context_digest:
-        parts.append(context_digest)
-    return ":".join(parts)
-\end{lstlisting}
+    payload = {
+        "namespace": namespace,
+        "version": version,
+        "fn_id": fn_id,
+        "params": params,
+        "context": context or {},
+    }
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+~~~
 
-\noindent
-Requisitos:
+4.3. Garantía práctica de colisión
 
-\begin{itemize}[leftmargin=1.5em]
-    \item \texttt{namespace} separa dominios lógicos (\texttt{features}, \texttt{universe}, \texttt{signals}, \texttt{backtests}, etc.).
-    \item \texttt{fn\_id} distingue productores distintos con igual espacio de parámetros.
-    \item \texttt{params\_digest} debe derivarse de una serialización canónica de argumentos.
-    \item \texttt{version} permite invalidación masiva por cambio de contrato.
-    \item \texttt{context\_digest} incorpora dependencias externas relevantes cuando el resultado no depende solo de argumentos directos.
-\end{itemize}
+Debe asumirse como requisito de ingeniería que la clave persistida use SHA-256 o equivalente fuerte. Operativamente, esto hace despreciable la probabilidad de colisión accidental y evita el failure mode catastrófico:
 
-\section{Metadatos mínimos}
+    k1 != k2  pero  cache_key(k1) = cache_key(k2)
 
-Cada entrada debe persistirse junto con metadatos estructurados. Como mínimo:
+La especificación no necesita teoría formal profunda de colisiones, pero sí debe exigir que esa probabilidad sea operativamente despreciable.
 
-\begin{center}
-\begin{tabular}{ll}
-\toprule
-Campo & Descripción \\
-\midrule
-\texttt{key} & clave lógica completa \\
-\texttt{namespace} & dominio funcional \\
-\texttt{version} & versión del contrato \\
-\texttt{created\_at} & instante de creación \\
-\texttt{expires\_at} & instante de expiración o \texttt{null} \\
-\texttt{serializer} & codec utilizado \\
-\texttt{payload\_bytes} & tamaño del payload \\
-\texttt{checksum} & hash del contenido serializado \\
-\texttt{producer} & identificador del productor \\
-\texttt{context} & contexto relevante resumido \\
-\texttt{tags} & etiquetas opcionales para invalidación selectiva \\
-\bottomrule
-\end{tabular}
-\end{center}
+5. Modelo de coste y justificación operacional
 
-\section{Serialización}
+Si:
+- p_hit es la probabilidad de acierto,
+- L_hit la latencia de lectura válida,
+- L_miss la penalización de fallo,
+- C_f el coste de recomputación,
 
-La serialización debe ser explícita y tipada. No debe asumirse un único formato universal para todos los objetos. La política recomendada es:
+entonces:
 
-\begin{itemize}[leftmargin=1.5em]
-    \item tipos escalares, diccionarios pequeños y estructuras simples: \texttt{json} o \texttt{msgpack};
-    \item arrays numéricos: formato binario estable;
-    \item tablas: preferencia por formatos columnares cuando la escala lo justifique;
-    \item objetos arbitrarios de Python: permitirlos solo bajo política explícita, pues reducen portabilidad y aumentan superficie de riesgo.
-\end{itemize}
+    E[T] = p_hit · L_hit + (1 - p_hit) · (L_miss + C_f)
 
-La caché debe registrar siempre qué serializador produjo cada entrada. Leer una entrada con serializador desconocido debe fallar de forma controlada.
+El objetivo del módulo es minimizar E[T] sujeto a:
+- equivalencia semántica;
+- validez temporal;
+- integridad de payload;
+- presupuesto de almacenamiento.
 
-\section{Escritura atómica}
+No existe objetivo financiero directo. Cualquier mejora downstream de productividad o estabilidad es consecuencia operativa, no edge estadístico.
 
-La escritura de una entrada debe seguir un protocolo del tipo:
+6. Metadatos mínimos por entrada
 
-\begin{enumerate}[leftmargin=1.7em]
-    \item construir payload serializado y metadatos en memoria;
-    \item escribir a fichero temporal privado;
-    \item verificar tamaño y checksum;
-    \item hacer \emph{flush} y, si procede, \emph{fsync};
-    \item renombrar de forma atómica al path final;
-    \item publicar índice o manifest local si el diseño lo requiere.
-\end{enumerate}
+Cada entrada debe persistirse junto con metadata estructurada suficiente para auditoría y validación.
 
-Con ello, el sistema evita que un lector observe una entrada parcialmente escrita. Si el proceso falla antes del renombrado final, el fichero temporal puede limpiarse posteriormente sin afectar a la validez lógica del store.
+Campos mínimos recomendados:
 
-\section{Expiración e invalidación}
+- key
+- namespace
+- version
+- fn_id
+- created_at_utc
+- expires_at_utc o null
+- serializer
+- payload_bytes
+- checksum
+- producer
+- context_digest
+- tags opcionales
 
-El módulo debe distinguir entre cuatro mecanismos:
+6.1. Checksum obligatorio
 
-\subsection{TTL}
+Toda entrada persistida debe llevar checksum del payload serializado. Esto permite:
+- detectar corrupción en disco;
+- invalidar entradas dañadas;
+- no confiar ciegamente en la existencia física del fichero.
 
-Una entrada con TTL es válida mientras
-\[
-t_{\mathrm{now}} < t_{\mathrm{expires}}.
-\]
-El TTL es apropiado para artefactos cuyo valor decrece con el tiempo o cuyo contexto operativo cambia de forma previsible.
+7. Invariantes formales obligatorios
 
-\subsection{Versionado lógico}
+El módulo debe respetar, como mínimo, los siguientes invariantes:
 
-Cambios en el contrato del productor, esquema de features, universo o reglas de negocio deben reflejarse en la versión de clave. Esta es la forma más limpia de invalidación estructural.
+INV1. Unicidad semántica de clave
+Dentro de un namespace y versión dados, una clave identifica una única entrada lógica.
 
-\subsection{Invalidación por etiquetas}
+INV2. Integridad verificable
+Ninguna entrada se considera válida sin metadata íntegra y checksum consistente, si la validación está habilitada.
 
-Debe ser posible invalidar por \texttt{namespace}, \texttt{tag}, prefijo o productor. Esto permite purgar subconjuntos sin destruir el store completo.
+INV3. Expiración correcta
+Una entrada expirada no puede devolverse por get.
 
-\subsection{Invalidación manual}
+INV4. Atomicidad por entrada
+Una escritura interrumpida no debe producir una entrada visible como válida.
 
-Debe existir operación explícita para invalidar entradas individuales o grupos de entradas, con trazabilidad del motivo.
+INV5. Presupuesto de bytes
+El tamaño agregado de caché bajo política byte-LRU no debe exceder persistentemente B_max tras eviction.
 
-\section{Política de expulsión}
+INV6. Separación de conceptos
+Expired != evicted. La expiración es lógica; la expulsión es física.
 
-La expulsión responde a presión de almacenamiento, no a validez lógica. La política recomendada para una primera implementación robusta es \textbf{LRU por presupuesto de bytes}, con métricas separadas de expiración.
+8. Serialización y contrato de codec
 
-Sea $B_{\max}$ el presupuesto máximo de bytes y $B(t)$ el tamaño actual. Cuando
-\[
-B(t) > B_{\max},
-\]
-el sistema debe expulsar entradas en orden creciente de recencia hasta recuperar un nivel operativo seguro.
+La caché no debe asumir un único serializador universal.
 
-Extensiones futuras razonables:
-\begin{itemize}[leftmargin=1.5em]
-    \item LRU ponderado por coste de recomputación;
-    \item políticas híbridas con frecuencia de acceso;
-    \item separación por tiers según criticidad del artefacto.
-\end{itemize}
+Política recomendada:
+- estructuras simples: json o msgpack;
+- arrays numéricos: binario estable;
+- tablas: formatos columnares o binarios reproducibles;
+- objetos arbitrarios de Python: sólo bajo política explícita.
 
-\section{Concurrencia}
+Toda entrada debe registrar qué serializer la produjo. Si el serializer no es soportado por el runtime lector, la entrada debe fallar de forma controlada. La portabilidad y trazabilidad del codec forman parte del contrato.
 
-La versión base del módulo puede declararse \emph{single-writer / multi-reader} sobre filesystem local, siempre que esta restricción quede documentada con claridad. Si se habilita concurrencia entre escritores, deben introducirse mecanismos explícitos de exclusión o leasing.
+9. Escritura atómica
 
-El contrato mínimo debe especificar:
+Este es uno de los núcleos del módulo y debe quedar completamente implementable.
 
-\begin{itemize}[leftmargin=1.5em]
-    \item si dos procesos pueden intentar poblar la misma clave simultáneamente;
-    \item qué proceso gana la carrera;
-    \item si el segundo proceso reutiliza la entrada ya escrita o recomputa;
-    \item cómo se evita exponer entradas corruptas en carreras de escritura.
-\end{itemize}
+9.1. Protocolo obligatorio
 
-Una política razonable es: \emph{first successful atomic writer wins}; el resto revalida y lee.
+La escritura de una entrada debe seguir:
 
-\section{Tratamiento de corrupción}
+1. serializar payload y metadata en fichero temporal privado;
+2. flush del descriptor;
+3. fsync del fichero temporal;
+4. validar tamaño y checksum;
+5. rename atómico al path final;
+6. fsync opcional del directorio padre si la política de durabilidad lo exige;
+7. actualizar índice/LRU sólo después del rename exitoso.
 
-La corrupción debe tratarse como evento recuperable. El comportamiento correcto es:
+9.2. Propiedad resultante
 
-\begin{enumerate}[leftmargin=1.7em]
-    \item detectar la corrupción por lectura fallida, checksum inválido o metadatos inconsistentes;
-    \item marcar la entrada como inválida;
-    \item impedir que vuelva a servirse;
-    \item registrar el evento;
-    \item opcionalmente eliminar el artefacto y forzar recomputación.
-\end{enumerate}
+    partial_write(k) -> !visible_as_valid(k)
 
-La corrupción de una entrada no debe escalar a fallo del namespace completo salvo política explícita de seguridad.
+Es decir, un fallo a mitad de escritura puede dejar basura temporal, pero nunca una entrada visible como hit válido.
 
-\section{API sugerida}
+9.3. Pseudocódigo recomendado
 
-\begin{lstlisting}
-from __future__ import annotations
+~~~python
+def set(key: str, value: object, ttl_seconds: int | None = None) -> None:
+    meta = build_metadata(key=key, value=value, ttl_seconds=ttl_seconds)
+    tmp_path = make_temp_path(key)
+    final_path = make_final_path(key)
+
+    write_serialized(tmp_path, value, meta)
+    fsync_file(tmp_path)
+    verify_checksum(tmp_path, meta["checksum"])
+    atomic_rename(tmp_path, final_path)
+    touch_lru(key, meta["payload_bytes"])
+~~~
+
+10. Lectura y validación en get()
+
+Una lectura válida debe realizar como mínimo:
+
+1. comprobar existencia física;
+2. cargar metadata;
+3. validar expiración;
+4. validar checksum si está habilitado;
+5. deserializar;
+6. registrar hit y tocar LRU;
+7. devolver payload.
+
+Si cualquiera de estas fases falla:
+- devolver miss lógico o error controlado según política;
+- opcionalmente eliminar o cuarentenar la entrada corrupta;
+- registrar el evento de corrupción/invalidación.
+
+Pseudocódigo recomendado:
+
+~~~python
+def get(key: str):
+    path = make_final_path(key)
+    if not exists(path):
+        record_miss(key, reason="not_found")
+        return None
+
+    meta = load_metadata(path)
+    if expired(meta):
+        record_miss(key, reason="expired")
+        invalidate_file(path)
+        return None
+
+    if not verify_checksum(path, meta["checksum"]):
+        record_corruption(key)
+        invalidate_file(path)
+        return None
+
+    value = deserialize(path, meta["serializer"])
+    touch_lru(key, meta["payload_bytes"])
+    record_hit(key)
+    return value
+~~~
+
+11. Expiración, versionado e invalidación
+
+El módulo debe distinguir cuatro mecanismos conceptualmente separados.
+
+11.1. TTL
+Una entrada con TTL es válida mientras:
+
+    now < expires_at
+
+TTL sirve para artefactos cuyo valor se degrada con tiempo o contexto operativo.
+
+11.2. Versionado lógico
+Cambios en contrato, esquema, universo o productor deben reflejarse en version de clave. Esta es la forma más limpia de invalidación estructural.
+
+11.3. Invalidación selectiva
+Debe existir invalidación por:
+- namespace
+- tag
+- prefijo
+- productor
+
+11.4. Invalidación manual
+Debe existir una operación explícita y trazable para purgar una clave o un conjunto de claves.
+
+Regla crítica:
+la invalidación debe ser una acción auditable, no una consecuencia opaca de implementación.
+
+12. Política de expulsión: byte-LRU
+
+La política por defecto del MVP debe ser LRU por presupuesto de bytes.
+
+12.1. Invariante operativo
+
+Sea B(t) el tamaño total ocupado y B_max el presupuesto máximo. El sistema debe garantizar que, tras ejecutar eviction cuando corresponde:
+
+    B(t) <= B_max
+
+salvo transitorios breves durante una escritura en curso.
+
+12.2. Implementación recomendada
+
+~~~python
+from collections import OrderedDict
+
+class ByteLRU:
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max_bytes
+        self.entries = OrderedDict()
+        self.total_bytes = 0
+
+    def touch(self, key: str, size: int) -> None:
+        if key in self.entries:
+            self.total_bytes -= self.entries[key]
+            self.entries.move_to_end(key)
+        self.entries[key] = size
+        self.total_bytes += size
+        self._evict_if_needed()
+
+    def _evict_if_needed(self) -> None:
+        while self.total_bytes > self.max_bytes and self.entries:
+            old_key, old_size = self.entries.popitem(last=False)
+            delete_cache_file(old_key)
+            self.total_bytes -= old_size
+~~~
+
+12.3. Regla conceptual
+
+La eviction no invalida la semántica del dato. Sólo elimina una copia material para respetar presupuesto.
+
+13. Concurrencia: single-writer / multi-reader
+
+13.1. Modelo mínimo soportado
+
+- un solo escritor lógico por store;
+- múltiples lectores concurrentes;
+- rename atómico como frontera de visibilidad.
+
+13.2. Política de carrera razonable
+
+Si dos procesos intentan poblar la misma clave y el sistema realmente permite esa situación, la política recomendada es:
+
+    first successful atomic writer wins;
+    los demás revalidan y leen.
+
+13.3. Límite del MVP
+
+No se promete linearizability completa multi-writer. Si se requiere, pertenece a una fase posterior con locking o leases explícitos.
+
+14. Tratamiento de corrupción
+
+La corrupción debe tratarse como failure mode recuperable y aislable.
+
+Flujo correcto:
+1. detectar fallo de lectura, checksum o metadata;
+2. marcar la entrada como inválida;
+3. impedir servirla de nuevo;
+4. registrar el evento;
+5. opcionalmente eliminarla o moverla a cuarentena.
+
+Regla crítica:
+una entrada corrupta no debe contaminar el namespace completo ni provocar comportamiento ambiguo.
+
+15. Observabilidad y métricas
+
+Métricas mínimas recomendadas:
+- hits
+- misses
+- hit_rate
+- expired_misses
+- corruption_detected
+- bytes_used
+- n_entries
+- eviction_count
+- bytes_evicted
+- mean_get_latency_ms
+- mean_set_latency_ms
+- recompute_time_saved_est
+- per_namespace_stats
+
+La caché debe exponer estas métricas por namespace siempre que sea posible. Eso permite distinguir:
+- namespaces útiles con hit rate alta;
+- namespaces con thrashing o mala granularidad de clave;
+- espacios que sólo acumulan coste y casi nunca se reutilizan.
+
+16. API recomendada
+
+~~~python
 from typing import Any, Optional, Mapping, Iterable
 
 def cache_key(
     namespace: str,
     fn_id: str,
-    params_digest: str,
+    params: Mapping[str, Any],
     version: str = "v1",
-    context_digest: Optional[str] = None,
+    context: Optional[Mapping[str, Any]] = None,
 ) -> str:
     ...
 
 def get(key: str, default: Any = None) -> Any:
-    """
-    Devuelve el valor si existe, no está expirado y supera validaciones.
-    """
+    ...
 
 def set(
     key: str,
@@ -304,9 +452,7 @@ def set(
     serializer: str = "auto",
     overwrite: bool = False,
 ) -> None:
-    """
-    Persiste una entrada de forma atómica.
-    """
+    ...
 
 def exists(key: str, validate_expiry: bool = True) -> bool:
     ...
@@ -324,65 +470,86 @@ def clear(expired_only: bool = False) -> int:
     ...
 
 def stats() -> dict[str, Any]:
-    """
-    Métricas agregadas del store.
-    """
-\end{lstlisting}
+    ...
+~~~
 
-\section{Observabilidad}
+17. CLI y tooling operativo
 
-La caché debe exponer métricas suficientes para auditoría operativa. Como mínimo:
+El módulo debe poder inspeccionarse y operarse sin abrir código. Comandos razonables:
 
-\begin{itemize}[leftmargin=1.5em]
-    \item \texttt{hits}, \texttt{misses}, \texttt{hit\_rate};
-    \item latencia de lectura y escritura;
-    \item bytes totales, número de entradas y distribución por namespace;
-    \item expiraciones, invalidaciones, corrupciones detectadas;
-    \item ahorro estimado de tiempo de recomputación;
-    \item ratio de reutilización por productor.
-\end{itemize}
-
-\noindent
-Ejemplo CLI:
-
-\begin{lstlisting}
+~~~bash
 python -m simons_core.io.cache stats
 python -m simons_core.io.cache ls --namespace features
 python -m simons_core.io.cache invalidate --namespace universe
 python -m simons_core.io.cache clear --expired-only
-\end{lstlisting}
+~~~
 
-\section{Criterios de aceptación}
+Esto no es accesorio. En producción y research, una caché invisible es una caché peligrosa.
 
-El módulo no debe considerarse listo para producción sin pasar, como mínimo, las siguientes pruebas:
+18. Pruebas mínimas requeridas
 
-\begin{enumerate}[leftmargin=1.7em]
-    \item misma entrada lógica $\Rightarrow$ misma clave;
-    \item entrada expirada $\Rightarrow$ no se sirve;
-    \item escritura interrumpida $\Rightarrow$ no aparece como válida;
-    \item checksum incorrecto $\Rightarrow$ entrada inválida;
-    \item invalidación por namespace y por tag funciona de forma exacta;
-    \item política de expulsión respeta el presupuesto de bytes;
-    \item estadísticas reflejan correctamente hits, misses y expiraciones;
-    \item dos lecturas consecutivas de una misma entrada válida devuelven objetos equivalentes.
-\end{enumerate}
+El módulo no debe considerarse listo sin pasar, como mínimo:
 
-\section{Notas de arquitectura}
+- misma entrada lógica -> misma clave;
+- distinta entrada lógica relevante -> distinta clave;
+- entrada expirada -> no se sirve;
+- checksum corrupto -> no se sirve;
+- escritura interrumpida -> no aparece como válida;
+- invalidación por namespace y tag funciona exactamente;
+- byte-LRU respeta B_max;
+- lecturas sucesivas de la misma entrada válida devuelven objetos equivalentes;
+- overwrite=False protege contra reemplazo silencioso;
+- stats reflejan correctamente hits, misses, expiraciones y eviction.
 
-En un stack cuantitativo serio, el caché bien diseñado aporta principalmente:
+19. MVP y segunda fase
 
-\begin{itemize}[leftmargin=1.5em]
-    \item reducción del tiempo de ciclo de investigación;
-    \item mejor utilización de recursos de cómputo;
-    \item mayor estabilidad operativa entre iteraciones;
-    \item reproducibilidad más fuerte de artefactos intermedios;
-    \item menor fricción entre investigación y producción.
-\end{itemize}
+19.1. MVP obligatorio
 
-Eso es suficiente justificación de negocio. No hace falta atribuir a la caché mejoras directas de calidad predictiva o de performance financiera, porque esas mejoras pertenecen al dominio del modelo, los datos y la ejecución, no al del subsistema de persistencia temporal.
+El MVP debe incluir:
+- claves SHA-256 sobre serialización canónica;
+- metadata estructurada con checksum;
+- set() atómico vía temp -> fsync -> rename;
+- get() con validación de expiración y corrupción;
+- invalidación explícita;
+- byte-LRU por presupuesto;
+- observabilidad básica;
+- contrato single-writer / multi-reader documentado.
 
-\section{Resumen}
+19.2. Segunda fase razonable
 
-\texttt{simons\_core/io/cache.py} debe implementarse como una caché local determinista, auditable y operativamente sobria, con semántica de clave bien definida, invalidación explícita, escritura atómica, manejo de corrupción, política de expulsión clara y métricas útiles. La calidad del módulo no vendrá de su retórica, sino de la precisión de sus contratos y de la facilidad con la que permita acelerar investigación sin comprometer consistencia.
+Como extensiones razonables:
+- locking o leases para multi-writer controlado;
+- read-repair o cuarentena de corrupción;
+- warming explícito de namespaces;
+- budgets por namespace;
+- métricas de hit-rate target por namespace;
+- análisis competitivo o admission policy más sofisticada si realmente hace falta.
 
-\end{document}
+20. No-objetivos
+
+No pertenece al alcance de este módulo:
+- TinyLFU o admission ML como requisito base;
+- caches distribuidas multi-datacenter;
+- Paxos, Raft o 2PC;
+- optimización de alpha;
+- versionado largo plazo de artefactos de investigación;
+- inferencia causal o estadística sobre el efecto de la caché en trading.
+
+La misión aquí es acelerar sin comprometer consistencia.
+
+21. Criterios de aceptación
+
+El módulo sólo debe considerarse correcto si cumple simultáneamente:
+
+- get(k) válido es semánticamente equivalente a recomputación;
+- la clave es determinista y prácticamente libre de colisiones accidentales;
+- una escritura interrumpida no deja una entrada válida visible;
+- entradas expiradas no se sirven;
+- corrupción se detecta y aísla;
+- B(t) queda controlado por B_max tras eviction;
+- las invalidaciones son explícitas y auditables;
+- la instrumentación permite diagnosticar hit-rate, thrashing y corrupción.
+
+22. Conclusión
+
+simons_core/io/cache.py debe entenderse como una capa institucional de aceleración determinista, no como una conveniencia menor. Su valor no reside en ahorrar unos milisegundos aislados, sino en imponer una semántica fuerte de reutilización de trabajo computacional bajo contratos claros de clave, validez, integridad y atomicidad. En un laboratorio cuantitativo serio, esa diferencia es importante: una caché buena no es la que “parece funcionar”, sino la que nunca devuelve un resultado equivocado por colisión, nunca expone partial writes como válidas y nunca degrada silenciosamente la reproducibilidad del sistema. Ese es exactamente el estándar que este módulo debe imponer.

@@ -1,547 +1,600 @@
-\section{Módulo \texttt{models/inference/model\_registry.py}}
-
-\subsection{Objetivo}
-
-El módulo \texttt{models/inference/model\_registry.py} implementa el \textbf{registro canónico de modelos}
-del sistema. Su función no es únicamente almacenar versiones, sino actuar como
-\textbf{fuente única de verdad operacional} para responder, de forma determinista y auditable, a la pregunta:
-
-\begin{quote}
-\textit{¿Qué modelo exacto está autorizado para ser usado en inferencia, bajo qué condiciones,
-con qué trazabilidad y con qué historia de decisiones?}
-\end{quote}
-
-En un sistema cuantitativo serio, esta pregunta no es administrativa; es una cuestión de
-\textbf{control de riesgo de modelo}. El registro debe garantizar que toda predicción en producción
-pueda enlazarse sin ambigüedad con:
-
-\begin{itemize}
-    \item la versión exacta del modelo desplegado;
-    \item el \texttt{training\_run\_id} que generó esa versión;
-    \item el \texttt{training\_data\_hash} y el \texttt{feature\_set\_hash};
-    \item la configuración de entrenamiento e inferencia;
-    \item el \texttt{code\_commit} del código que produjo el artefacto;
-    \item la decisión formal de validación y el historial de promociones, overrides y rollbacks.
-\end{itemize}
-
-Por tanto, el módulo debe resolver simultáneamente cuatro funciones:
-
-\begin{enumerate}
-    \item \textbf{Registro}: alta de nuevas versiones con metadatos completos e invariantes de integridad.
-    \item \textbf{Gobernanza}: control de estados, promociones y restricciones de despliegue.
-    \item \textbf{Resolución}: mapeo determinista de referencias lógicas (\texttt{production}, \texttt{staging}, alias, versión)
-    a una versión única y ejecutable.
-    \item \textbf{Auditoría}: preservación \textit{append-only} de la historia de decisiones y cambios de estado.
-\end{enumerate}
-
-\subsection{Principio de diseño}
-
-El diseño del registro sigue un principio conservador:
-
-\begin{quote}
-\textit{El registry no es un catálogo descriptivo de modelos, sino un sistema de control transaccional sobre el ciclo
-de vida de los artefactos predictivos.}
-\end{quote}
-
-De este principio se derivan tres consecuencias:
-
-\begin{itemize}
-    \item el registro no debe aceptar estados ambiguos;
-    \item la resolución de la versión activa debe ser determinista incluso bajo concurrencia, fallos parciales o múltiples promociones;
-    \item la historia nunca se reescribe: toda mutación operacional debe representarse como un evento auditable.
-\end{itemize}
-
-\subsection{Contexto en Trading Cuantitativo}
-
-En estrategias de \textit{small-cap swing trading}, la gestión de versiones de modelo debe tratarse con el mismo rigor
-que la gestión de órdenes o la gestión de riesgo. No basta con “guardar un \texttt{.pkl}” o etiquetar una versión como
-\texttt{prod}. El verdadero problema es garantizar que:
-
-\begin{itemize}
-    \item el modelo activo es exactamente el que se cree que está activo;
-    \item una promoción no puede dejar el sistema en un estado incoherente;
-    \item un rollback puede ejecutarse rápidamente sin destruir la trazabilidad histórica;
-    \item la evidencia de validación que justificó el despliegue permanece enlazada a la versión servida.
-\end{itemize}
-
-Esto es especialmente importante cuando conviven múltiples iteraciones del mismo modelo, varios pipelines de entrenamiento
-o distintos entornos de validación y producción. El registry debe, por tanto, operar como una capa de
-\textbf{gobernanza formal del riesgo de modelo}.
-
-\subsection{Alcance Funcional}
-
-\subsubsection{Incluye}
-
-\begin{itemize}
-    \item alta de nuevas versiones de modelo;
-    \item persistencia de metadatos, hashes, métricas y referencias a artefactos;
-    \item definición de etapas de ciclo de vida;
-    \item resolución de alias y referencias lógicas a una versión concreta;
-    \item promociones y rollbacks auditables;
-    \item consulta de historial y estado actual;
-    \item validaciones de integridad previas a toda transición crítica.
-\end{itemize}
-
-\subsubsection{No incluye}
-
-\begin{itemize}
-    \item entrenamiento de modelos;
-    \item almacenamiento binario pesado del artefacto en sí;
-    \item scoring o inferencia;
-    \item evaluación de mercado o sizing;
-    \item decisión automática de promoción basada únicamente en una métrica aislada.
-\end{itemize}
-
-\subsection{Dependencias}
-
-\subsubsection{Upstream}
-
-\begin{itemize}
-    \item \textbf{Training pipeline}:
-    produce el artefacto, \texttt{training\_run\_id}, hashes, métricas y manifiesto de entrenamiento.
-    \item \textbf{Validation suite}:
-    determina si la versión tiene estatus \texttt{pass}, \texttt{fail} o \texttt{override}.
-    \item \textbf{Artifact store}:
-    almacena el artefacto serializado y sus manifiestos asociados.
-\end{itemize}
-
-\subsubsection{Downstream}
-
-\begin{itemize}
-    \item \texttt{models/inference/predict}: resuelve el modelo exacto que debe usarse para inferencia;
-    \item \texttt{models/inference/explain}: vincula explicaciones a una versión registrada;
-    \item \texttt{backtest/run\_walkforward}: recupera versiones históricas por fecha, alias o versión fija;
-    \item \texttt{ops/monitoring}: supervisa el modelo activo y sus cambios de etapa;
-    \item \texttt{audit/compliance}: reconstruye la historia de decisiones y despliegues.
-\end{itemize}
-
-\subsection{Entidades Fundamentales}
-
-\subsubsection{Modelo lógico}
-
-El objeto \texttt{Model} representa una familia estable de predictor, identificada por:
-
-\begin{itemize}
-    \item \texttt{model\_id}: identificador lógico único;
-    \item \texttt{task\_type}: tipo de problema (\texttt{regression\_returns}, \texttt{binary\_signal}, etc.);
-    \item \texttt{algo\_family}: familia algorítmica (\texttt{gbdt}, \texttt{linear}, \texttt{nn}, \texttt{ensemble});
-    \item \texttt{owner} u origen opcional del pipeline;
-    \item \texttt{status}: activo/inactivo a nivel lógico, independiente de las versiones.
-\end{itemize}
-
-\subsubsection{Versión}
-
-Cada versión \((m,v)\) representa un artefacto entrenado e inmutable. Para cada una se almacena al menos:
-
-\begin{itemize}
-    \item \texttt{model\_id}
-    \item \texttt{model\_version}
-    \item \texttt{artifact\_uri}
-    \item \texttt{artifact\_hash}
-    \item \texttt{training\_run\_id}
-    \item \texttt{training\_data\_hash}
-    \item \texttt{feature\_set\_hash}
-    \item \texttt{config\_hash}
-    \item \texttt{code\_commit}
-    \item \texttt{metrics\_snapshot}
-    \item \texttt{validation\_decision}
-    \item \texttt{stage}
-    \item \texttt{created\_ts\_utc}
-    \item \texttt{registered\_by}
-\end{itemize}
-
-\subsubsection{Alias}
-
-Los alias son referencias lógicas a versiones activas:
-
-\begin{itemize}
-    \item \texttt{latest\_candidate}
-    \item \texttt{staging}
-    \item \texttt{production}
-\end{itemize}
-
-Un alias nunca es una versión en sí misma; es una \textbf{asignación mutable y auditable} que apunta a una versión concreta.
-La historia de esa asignación debe mantenerse como eventos.
-
-\subsubsection{Evento de lifecycle}
-
-Toda mutación relevante del registry se modela como un evento \textit{append-only}, por ejemplo:
-
-\begin{itemize}
-    \item \texttt{REGISTER\_VERSION}
-    \item \texttt{PROMOTE\_TO\_STAGING}
-    \item \texttt{PROMOTE\_TO\_PRODUCTION}
-    \item \texttt{ROLLBACK\_PRODUCTION}
-    \item \texttt{ARCHIVE\_VERSION}
-    \item \texttt{OVERRIDE\_PROMOTION}
-\end{itemize}
-
-Cada evento debe llevar:
-
-\begin{itemize}
-    \item \texttt{event\_id}
-    \item \texttt{event\_ts\_utc}
-    \item \texttt{event\_type}
-    \item \texttt{model\_id}
-    \item \texttt{from\_version} y/o \texttt{to\_version}
-    \item \texttt{actor}
-    \item \texttt{reason}
-    \item \texttt{approval\_ref} opcional
-    \item \texttt{event\_payload\_hash}
-\end{itemize}
-
-\subsection{Invariantes Formales del Registry}
-
-Para que el sistema sea operacionalmente seguro, el registry debe mantener siempre los siguientes invariantes:
-
-\begin{enumerate}
-    \item \textbf{Unicidad de versión}: no pueden existir dos registros con la misma clave
-    \[
-    (\texttt{model\_id},\ \texttt{model\_version}).
-    \]
-
-    \item \textbf{Inmutabilidad de artefacto}: una vez registrada una versión, los campos
-    \texttt{artifact\_uri}, \texttt{artifact\_hash}, \texttt{training\_run\_id},
-    \texttt{training\_data\_hash}, \texttt{feature\_set\_hash}, \texttt{config\_hash} y \texttt{code\_commit}
-    no pueden modificarse.
-
-    \item \textbf{Unicidad de alias activo por modelo}: para cada \texttt{model\_id} y para cada alias lógico
-    crítico (\texttt{production}, \texttt{staging}) debe existir como máximo una versión activa.
-
-    \item \textbf{Consistencia entre validación y promoción}: ninguna versión con
-    \texttt{validation\_decision=fail} puede ocupar \texttt{production} salvo evento explícito de override.
-
-    \item \textbf{Historial no reescribible}: el estado actual puede derivarse de los eventos, pero los eventos
-    nunca deben editarse retroactivamente.
-
-    \item \textbf{Resolución determinista}: toda llamada a \texttt{resolve\_model(ref)} debe devolver
-    exactamente una versión o fallar de forma explícita; nunca debe devolver múltiples candidatas ni elegir
-    implícitamente por heurística no registrada.
-\end{enumerate}
-
-\subsection{Modelo de Estados}
-
-La etapa \texttt{stage} de una versión pertenece al conjunto:
-
-\[
-\{\texttt{candidate},\ \texttt{staging},\ \texttt{production},\ \texttt{archived}\}.
-\]
-
-Estas etapas deben interpretarse así:
-
-\begin{itemize}
-    \item \texttt{candidate}: versión registrada pero no necesariamente desplegable;
-    \item \texttt{staging}: versión autorizada para pruebas de preproducción;
-    \item \texttt{production}: versión actualmente servida por el sistema de inferencia;
-    \item \texttt{archived}: versión preservada solo con fines de reproducibilidad o análisis histórico.
-\end{itemize}
-
-La transición entre estados no es libre. La política recomendada es:
-
-\[
-\texttt{candidate} \rightarrow \texttt{staging} \rightarrow \texttt{production} \rightarrow \texttt{archived},
-\]
-
-permitiendo rollback a una versión anterior ya conocida. Las transiciones inválidas deben fallar.
-
-\subsection{Semántica Operativa de Alias}
-
-La semántica de alias debe quedar cerrada:
-
-\begin{itemize}
-    \item \texttt{latest\_candidate} no significa “la última versión registrada”, sino
-    \textbf{la última versión candidata elegible bajo la política vigente}.
-    \item \texttt{staging} apunta a una única versión activa de prueba.
-    \item \texttt{production} apunta a una única versión activa y servible.
-\end{itemize}
-
-En caso de múltiples versiones candidatas aprobadas, el registry no debe resolver por fecha sin más.
-La política de desempate debe estar fijada, por ejemplo:
-
-\begin{enumerate}
-    \item prioridad por \texttt{validation\_decision};
-    \item después, prioridad por \texttt{promotion\_score} o criterio explícito de validación;
-    \item después, \texttt{created\_ts\_utc};
-    \item después, fallo explícito si persiste la ambigüedad.
-\end{enumerate}
-
-\subsection{Contrato de Entrada}
-
-\subsubsection{Operaciones mínimas}
-
-\begin{itemize}
-    \item \texttt{register\_model\_version(payload)}
-    \item \texttt{promote\_model(model\_id, version, target\_alias)}
-    \item \texttt{rollback\_model(model\_id, to\_version)}
-    \item \texttt{resolve\_model(ref)}
-    \item \texttt{list\_models(filters)}
-    \item \texttt{get\_history(model\_id)}
-\end{itemize}
-
-\subsubsection{Payload mínimo de registro}
-
-\begin{itemize}
-    \item \texttt{model\_id}
-    \item \texttt{model\_version}
-    \item \texttt{artifact\_uri}
-    \item \texttt{artifact\_hash}
-    \item \texttt{training\_run\_id}
-    \item \texttt{training\_data\_hash}
-    \item \texttt{feature\_set\_hash}
-    \item \texttt{config\_hash}
-    \item \texttt{code\_commit}
-    \item \texttt{metrics\_snapshot}
-    \item \texttt{validation\_decision}
-    \item \texttt{created\_ts\_utc}
-    \item \texttt{registered\_by}
-\end{itemize}
-
-\subsection{Contrato de Salida}
-
-\subsubsection{Persistencia recomendada}
-
-\begin{itemize}
-    \item \texttt{models/registry/versions.parquet}:
-    tabla materializada con el estado actual por versión;
-    \item \texttt{models/registry/aliases.parquet}:
-    asignación actual de alias;
-    \item \texttt{models/registry/history/events.parquet}:
-    historial \textit{append-only};
-    \item \texttt{models/registry/model\_cards/\{model\_id\}\_\{version\}.json}:
-    documentación por versión;
-    \item \texttt{models/registry/manifests/\{model\_id\}\_\{version\}.json}:
-    metadatos completos de reproducibilidad.
-\end{itemize}
-
-\subsubsection{Respuesta de \texttt{resolve\_model}}
-
-La operación \texttt{resolve\_model(ref)} debe devolver un objeto completo y ejecutable, por ejemplo:
-
-\begin{itemize}
-    \item \texttt{model\_id}
-    \item \texttt{model\_version}
-    \item \texttt{artifact\_uri}
-    \item \texttt{artifact\_hash}
-    \item \texttt{feature\_set\_hash}
-    \item \texttt{config\_hash}
-    \item \texttt{code\_commit}
-    \item \texttt{validation\_decision}
-    \item \texttt{resolved\_from\_ref}
-    \item \texttt{resolved\_ts\_utc}
-\end{itemize}
-
-\subsection{Resolución Determinista}
-
-La función \texttt{resolve\_model(ref)} es el corazón operativo del módulo. Debe aceptar referencias como:
-
-\begin{itemize}
-    \item alias (\texttt{production}, \texttt{staging}, \texttt{latest\_candidate});
-    \item versión exacta;
-    \item combinación \texttt{model\_id + alias};
-    \item referencia histórica por fecha, si se soporta.
-\end{itemize}
-
-La resolución sigue el siguiente orden:
-
-\begin{enumerate}
-    \item validar sintaxis del \texttt{ref};
-    \item expandir a una consulta explícita;
-    \item recuperar el candidato o candidatos elegibles;
-    \item aplicar política de unicidad;
-    \item verificar integridad del artefacto;
-    \item devolver una única versión;
-    \item si no existe una única respuesta válida, fallar.
-\end{enumerate}
-
-Bajo ningún caso debe usarse una política del tipo “devolver la primera fila encontrada”.
-La resolución debe ser estable, reproducible y registrable en logs.
-
-\subsection{Atomicidad de Promociones}
-
-Uno de los puntos más críticos del registry es la promoción a \texttt{staging} o \texttt{production}.
-La promoción debe ser \textbf{atómica}. Conceptualmente, una promoción contiene tres subpasos:
-
-\begin{enumerate}
-    \item verificación previa de elegibilidad e integridad;
-    \item actualización de alias;
-    \item escritura del evento de promoción.
-\end{enumerate}
-
-Estos tres pasos deben ejecutarse como una única transacción lógica. Si cualquiera falla, el sistema debe quedar
-en el estado anterior. Nunca debe ocurrir una situación donde el alias cambie pero el evento no se registre,
-o donde el evento exista pero el alias no refleje ese cambio.
-
-La política correcta es:
-
-\begin{itemize}
-    \item \textbf{precheck} completo;
-    \item \textbf{compare-and-swap} o mecanismo equivalente bajo lock/txn;
-    \item escritura de estado y evento en compromiso único;
-    \item confirmación final de lectura tras escritura.
-\end{itemize}
-
-\subsection{Validación de Artefactos}
-
-Antes de permitir registro o promoción, el registry debe verificar:
-
-\begin{itemize}
-    \item existencia física de \texttt{artifact\_uri};
-    \item legibilidad del artefacto;
-    \item coincidencia entre \texttt{artifact\_hash} almacenado y hash calculado;
-    \item presencia del manifiesto asociado;
-    \item compatibilidad mínima con la clase de modelo declarada.
-\end{itemize}
-
-Si el artefacto falta, está corrupto o el hash no coincide, la versión debe marcarse como no servible y
-no puede resolverse como \texttt{production}. Esto es especialmente importante porque un artefacto “registrado”
-pero ilegible destruye la utilidad operativa del registry.
-
-\subsection{Política de Promoción}
-
-La promoción de una versión a \texttt{production} solo debe permitirse si:
-
-\begin{itemize}
-    \item la versión existe;
-    \item el artefacto es íntegro y accesible;
-    \item el \texttt{validation\_decision} es \texttt{pass}, o bien existe override auditado;
-    \item la versión es compatible con el contrato de inferencia vigente;
-    \item la transición solicitada es válida según la máquina de estados.
-\end{itemize}
-
-Cuando varias versiones compiten por promoción, el registry no decide por una sola métrica aislada.
-La decisión debe venir ya resuelta por \texttt{validation\_suite} o por un \texttt{promotion\_decision} explícito.
-El registry registra la decisión; no inventa la preferencia.
-
-\subsection{Semántica Precisa de Rollback}
-
-El rollback no debe entenderse como “deshacer historia”, sino como
-\textbf{crear un nuevo evento que reasigna el alias \texttt{production} a una versión anterior conocida y servible}.
-
-Formalmente, si en el instante \(t\) el alias \texttt{production} apunta a \(v_t\), un rollback a \(v_k\) con \(k<t\)
-debe cumplir:
-
-\begin{itemize}
-    \item \(v_k\) sigue existiendo en el registry;
-    \item \(v_k\) conserva integridad de artefacto;
-    \item la historia de promociones previas no se borra;
-    \item se registra un nuevo evento \texttt{ROLLBACK\_PRODUCTION}.
-\end{itemize}
-
-Además, el rollback debe capturar:
-
-\begin{itemize}
-    \item \texttt{from\_version}
-    \item \texttt{to\_version}
-    \item motivo del rollback
-    \item actor y aprobador
-    \item snapshot del estado de alias antes y después
-\end{itemize}
-
-Si el alias \texttt{production} ha cambiado múltiples veces, el rollback nunca debe inferirse como “volver al estado anterior”
-sin especificar \texttt{to\_version}; eso sería ambiguo. Debe indicarse explícitamente la versión destino o una política muy
-formal de “última versión estable conocida”.
-
-\subsection{Failover y Fallback Policy}
-
-El módulo debe especificar qué hacer si \texttt{production} no puede resolverse:
-
-\begin{itemize}
-    \item si el alias no existe, fallar;
-    \item si la versión existe pero el artefacto está corrupto, fallar;
-    \item solo si existe una política explícita de \texttt{fallback\_to\_previous\_production}, podrá intentarse un fallback;
-    \item todo fallback debe registrarse como evento operativo.
-\end{itemize}
-
-La política por defecto debe ser \textbf{fail-closed}, no “servir cualquier cosa razonable”.
-
-\subsection{Flujo Operativo}
-
-\begin{enumerate}
-    \item \textbf{Registro}
-    \begin{itemize}
-        \item validar campos obligatorios;
-        \item verificar unicidad de \((\texttt{model\_id},\texttt{model\_version})\);
-        \item validar artefacto y hashes;
-        \item registrar versión como \texttt{candidate};
-        \item persistir evento \texttt{REGISTER\_VERSION}.
-    \end{itemize}
-
-    \item \textbf{Promoción}
-    \begin{itemize}
-        \item verificar elegibilidad;
-        \item adquirir lock/transacción;
-        \item actualizar alias objetivo;
-        \item registrar evento de promoción;
-        \item confirmar consistencia post-escritura.
-    \end{itemize}
-
-    \item \textbf{Resolución}
-    \begin{itemize}
-        \item recibir referencia;
-        \item expandir y desambiguar;
-        \item verificar servibilidad;
-        \item devolver versión única.
-    \end{itemize}
-
-    \item \textbf{Rollback}
-    \begin{itemize}
-        \item validar versión destino;
-        \item tomar snapshot del estado actual;
-        \item reasignar alias \texttt{production};
-        \item registrar evento de rollback.
-    \end{itemize}
-\end{enumerate}
-
-\subsection{Validaciones Mínimas}
-
-\begin{itemize}
-    \item unicidad de \((\texttt{model\_id}, \texttt{model\_version})\);
-    \item no nulidad de campos obligatorios;
-    \item validez del \texttt{stage};
-    \item accesibilidad y hash correcto de \texttt{artifact\_uri};
-    \item coherencia entre \texttt{validation\_decision} y promoción solicitada;
-    \item integridad de alias activos;
-    \item resolución unívoca de referencias;
-    \item rechazo explícito de estados ambiguos.
-\end{itemize}
-
-\subsection{Observabilidad}
-
-\subsubsection{Logging}
-
-\begin{itemize}
-    \item \texttt{INFO}: registro exitoso, promoción válida, resolución correcta;
-    \item \texttt{WARNING}: override auditado, fallback explícito, rollback no planificado;
-    \item \texttt{ERROR}: artefacto faltante, hash inconsistente, conflicto de alias, resolución ambigua, fallo transaccional.
-\end{itemize}
-
-\subsubsection{Métricas}
-
-\begin{itemize}
-    \item \texttt{n\_models\_total}
-    \item \texttt{n\_versions\_total}
-    \item \texttt{n\_promotions\_production}
-    \item \texttt{n\_rollbacks}
-    \item \texttt{n\_override\_promotions}
-    \item \texttt{resolve\_failures}
-    \item \texttt{artifact\_integrity\_failures}
-    \item \texttt{avg\_candidate\_to\_production\_latency}
-\end{itemize}
-
-\subsection{Resumen}
-
-\texttt{models/inference/model\_registry.py} debe entenderse como una pieza de infraestructura crítica,
-no como un simple índice de modelos. Su responsabilidad real es imponer estructura y disciplina al ciclo de vida
-de los artefactos predictivos. Un registry de nivel institucional debe:
-
-\begin{itemize}
-    \item garantizar trazabilidad completa;
-    \item imponer invariantes fuertes;
-    \item resolver versiones sin ambigüedad;
-    \item ejecutar promociones de forma atómica;
-    \item tratar rollback como evento auditable y no como borrado de historia;
-    \item fallar de forma conservadora ante corrupción, ambigüedad o inconsistencia.
-\end{itemize}
-
-Este enfoque es el adecuado para una plataforma cuantitativa seria: el registry no solo recuerda qué modelos existen,
-sino que determina, con reglas formales y auditablemente, cuáles pueden vivir de verdad en producción.
+Especificación Cuantitativa: models/inference/model_registry.py
+
+1. Propósito del módulo
+
+El objetivo de model_registry.py no es guardar una lista de modelos entrenados ni actuar como catálogo descriptivo de artefactos. Su función es mucho más crítica: definir la fuente única de verdad operacional sobre el ciclo de vida de los modelos del sistema.
+
+La pregunta correcta del módulo es:
+
+“¿Qué modelo exacto está autorizado para servir inferencia en este instante, bajo qué decisión formal, con qué artefacto íntegro, con qué trazabilidad completa y con qué historial auditable de promociones, overrides y rollbacks?”
+
+En un stack cuantitativo serio, esta pregunta no es administrativa. Es control de riesgo de modelo. Si el sistema no puede responder de forma determinista y auditable qué versión exacta está activa, toda predicción producida downstream queda epistemológicamente debilitada.
+
+Por eso este módulo no debe entenderse como un inventario de versiones, sino como infraestructura transaccional de gobernanza. Su misión es eliminar ambigüedad operacional, garantizar atomicidad de promociones, imponer invariantes de integridad y preservar la historia completa del lifecycle de cada artefacto predictivo.
+
+2. Alcance y no-objetivos
+
+2.1 Alcance
+
+El módulo:
+- registra nuevas versiones de modelo con metadatos completos;
+- persiste referencias a artefactos, hashes, métricas y lineage operativo;
+- gobierna estados como candidate, staging, production y archived;
+- resuelve alias lógicos como production o staging a una versión única;
+- ejecuta promociones y rollbacks auditables;
+- mantiene historial append-only de eventos;
+- valida integridad mínima de artefactos antes de resolver o promocionar;
+- y expone una interfaz determinista para inferencia, auditoría y monitoring.
+
+2.2 Fuera de alcance
+
+El módulo no:
+- entrena modelos;
+- no almacena necesariamente el binario pesado del artefacto;
+- no decide por sí solo qué modelo “es mejor” desde el punto de vista cuantitativo;
+- no ejecuta inferencia ni scoring;
+- no sustituye a validation_suite ni a la capa de promotion decision;
+- no debe convertirse en un data catalog genérico;
+- ni debe promocionar una versión solo porque exista o porque sea la última registrada.
+
+3. Objeto formal del módulo
+
+El módulo gobierna cuatro entidades lógicas principales:
+
+- Model
+- Version
+- Alias
+- Event
+
+3.1 Model
+
+Representa una familia lógica estable de predictor, identificada por model_id y metadatos estructurales como task_type, algo_family y status lógico.
+
+3.2 Version
+
+Cada versión (model_id, version) representa un artefacto entrenado e inmutable, asociado a:
+- artifact_uri
+- artifact_hash
+- training_run_id
+- training_data_hash
+- feature_hash o feature_set_hash
+- config_hash
+- code_commit
+- metrics_snapshot
+- validation_decision
+- stage
+- created_ts
+- registered_by
+
+3.3 Alias
+
+Un alias no es un modelo, sino una referencia lógica mutable y auditable hacia una versión concreta. Ejemplos:
+- latest_candidate
+- staging
+- production
+
+3.4 Event
+
+Toda mutación relevante del lifecycle se representa como evento append-only, por ejemplo:
+- REGISTER_VERSION
+- PROMOTE_TO_STAGING
+- PROMOTE_TO_PRODUCTION
+- ROLLBACK_PRODUCTION
+- ARCHIVE_VERSION
+- OVERRIDE_PROMOTION
+
+4. Principio central: gobernanza transaccional, no catálogo
+
+La regla estructural del módulo es:
+
+el registry no describe modelos; gobierna el derecho operacional de una versión a existir, resolverse y servir.
+
+Eso implica que:
+- no puede haber resolución ambigua;
+- no puede haber promoción parcial;
+- no puede reescribirse la historia;
+- no puede asumirse que “latest” equivale a “eligible”;
+- y no puede servirse un artefacto cuyo estado o integridad sea incierto.
+
+La ausencia de ambigüedad es aquí más importante que la comodidad. El módulo debe fallar de forma conservadora antes que resolver “algo razonable”.
+
+5. Invariantes fundamentales
+
+El módulo debe imponer, al menos, los siguientes invariantes:
+
+5.1 Unicidad de versión
+
+No pueden existir dos registros con la misma clave:
+
+(model_id, version)
+
+5.2 Inmutabilidad de artefacto
+
+Una vez registrada una versión, no pueden mutarse:
+- artifact_uri
+- artifact_hash
+- training_run_id
+- training_data_hash
+- feature_hash
+- config_hash
+- code_commit
+
+5.3 Unicidad de alias activo
+
+Para cada model_id y cada alias crítico, especialmente staging y production, debe existir como máximo una versión activa.
+
+5.4 Consistencia entre validación y promoción
+
+Ninguna versión con validation_decision=fail puede ocupar production salvo override explícito, auditado y trazable.
+
+5.5 Historial no reescribible
+
+Los eventos son append-only. El estado actual puede derivarse de ellos, pero los eventos pasados no deben editarse ni borrarse.
+
+5.6 Resolución determinista
+
+Toda llamada a resolve(ref) debe devolver exactamente una versión o fallar de forma explícita. Nunca debe devolver múltiples candidatas ni elegir heurísticamente sin política registrada.
+
+6. Modelo de estados
+
+La máquina de estados mínima recomendada es:
+
+candidate → staging → production → archived
+
+Interpretación:
+
+- candidate: versión registrada pero todavía no necesariamente desplegable
+- staging: versión habilitada para preproducción o smoke checks finales
+- production: versión actualmente autorizada para inferencia real
+- archived: versión preservada solo para reproducibilidad o histórico
+
+La transición entre estados no es libre. Debe respetar una política explícita. Las transiciones inválidas deben fallar.
+
+7. Semántica de alias
+
+Los alias deben tener semántica cerrada y estable.
+
+7.1 latest_candidate
+
+No significa “la última versión por timestamp”.
+Debe significar:
+la última versión candidata elegible bajo la política vigente.
+
+7.2 staging
+
+Debe apuntar a una única versión activa de preproducción.
+
+7.3 production
+
+Debe apuntar a una única versión servible y autorizada.
+
+Si varias versiones son potencialmente elegibles para un alias, el registry no debe desempatar implícitamente. Debe aplicar una política explícita o fallar.
+
+8. Esquema relacional mínimo recomendado
+
+El módulo se beneficia claramente de una formulación relacional formal.
+
+8.1 Tabla models
+
+Campos mínimos:
+- model_id (PK)
+- task_type
+- algo_family
+- status
+- created_ts
+
+8.2 Tabla versions
+
+Campos mínimos:
+- model_id (FK)
+- version
+- artifact_uri
+- artifact_hash
+- training_run_id
+- data_hash
+- feature_hash
+- config_hash
+- code_commit
+- metrics_json
+- validation_decision
+- stage
+- created_ts
+- registered_by
+
+Restricción principal:
+UNIQUE(model_id, version)
+
+8.3 Tabla aliases
+
+Campos mínimos:
+- model_id (FK)
+- alias
+- version (FK)
+- set_ts
+
+Debe imponerse unicidad por (model_id, alias).
+
+8.4 Tabla events
+
+Campos mínimos:
+- event_id (PK)
+- event_ts
+- event_type
+- model_id (FK)
+- from_version
+- to_version
+- actor
+- reason
+- approval_ref
+- payload_hash
+
+8.5 Constraints mínimos
+
+- CHECK(stage IN ('candidate','staging','production','archived'))
+- CHECK(validation_decision IN ('pass','fail','override'))
+- FK versions.model_id → models.model_id
+- FK aliases.version → versions.version con clave compuesta correcta
+- ON DELETE RESTRICT en entidades críticas
+
+9. Registro de versión
+
+La operación register_version(payload) debe:
+
+1. validar campos obligatorios;
+2. verificar unicidad de (model_id, version);
+3. validar que el artefacto exista y sea legible;
+4. verificar artifact_hash;
+5. persistir la versión como candidate;
+6. registrar evento REGISTER_VERSION;
+7. dejar el sistema en estado consistente incluso si falla cualquier subpaso.
+
+El registro no debe aceptar versiones “a medio documentar”. Un artefacto sin hashes ni trazabilidad suficiente no merece entrar en la capa oficial.
+
+10. Resolución determinista
+
+La función resolve(ref) es el corazón operativo del módulo.
+
+Debe aceptar referencias del tipo:
+- alias
+- versión exacta
+- model_id + alias
+- model_id + version
+- opcionalmente referencia histórica por fecha
+
+La secuencia correcta es:
+
+1. validar sintaxis del ref;
+2. expandir a consulta explícita;
+3. recuperar candidatos elegibles;
+4. aplicar política de unicidad;
+5. verificar servibilidad e integridad del artefacto;
+6. devolver una única versión;
+7. si no existe una única respuesta válida, fallar.
+
+La política prohibida es:
+“devolver la primera fila encontrada”.
+
+11. SQL explícito de resolución
+
+Conviene cerrar semánticamente resolve() con consultas explícitas.
+
+11.1 Resolve production
+
+SELECT v.*
+FROM versions v
+JOIN aliases a
+  ON v.model_id = a.model_id
+ AND v.version = a.version
+WHERE a.model_id = ?
+  AND a.alias = 'production'
+LIMIT 1;
+
+11.2 Resolve version exacta
+
+SELECT *
+FROM versions
+WHERE model_id = ?
+  AND version = ?;
+
+11.3 Ambigüedad
+
+Si la consulta devuelve:
+- cero filas → FAIL_NOT_FOUND
+- más de una fila cuando debería haber una → FAIL_AMBIGUOUS
+
+12. Atomicidad de promociones
+
+La promoción a staging o production debe ser una transacción lógica indivisible.
+
+Los tres subpasos críticos son:
+1. precheck de elegibilidad;
+2. actualización del alias;
+3. escritura del evento de promoción.
+
+Estos tres pasos deben ejecutarse como una única operación consistente.
+No puede ocurrir:
+- que cambie el alias y no exista el evento;
+- que exista el evento y no haya cambiado el alias;
+- o que el alias apunte a una versión no íntegra.
+
+13. CAS y concurrencia
+
+El módulo debería especificar explícitamente una estrategia compare-and-swap o equivalente bajo transacción/lock.
+
+Pseudocódigo conceptual:
+
+def promote(model_id, version, target_alias):
+    with txn:
+        v = load_version(model_id, version)
+        assert v exists
+        assert v.validation_decision in {'pass', 'override'}
+        assert artifact_hash_matches(v)
+
+        old_version = load_alias(model_id, target_alias)
+
+        success = compare_and_set_alias(
+            model_id=model_id,
+            alias=target_alias,
+            expected_old=old_version,
+            new_version=version
+        )
+
+        if not success:
+            raise ConcurrencyError()
+
+        append_event(
+            event_type="PROMOTE",
+            model_id=model_id,
+            from_version=old_version,
+            to_version=version
+        )
+
+        confirm_post_write_consistency()
+
+Aunque el módulo no necesite teoría distribuida avanzada, sí debe cerrar:
+- retry policy;
+- backoff;
+- conflicto esperado;
+- y política fail-closed bajo concurrencia.
+
+14. Integridad de artefactos
+
+Una versión registrada pero no servible destruye el valor operacional del registry.
+Por ello, antes de permitir registro, promoción o resolución a production, el módulo debe verificar:
+
+- existencia física de artifact_uri;
+- legibilidad del artefacto;
+- coincidencia entre artifact_hash y hash calculado;
+- presencia del manifiesto asociado;
+- compatibilidad mínima con la clase de modelo declarada.
+
+Si falla cualquiera de estos checks, la versión puede existir en histórico, pero no debe resolverse como production.
+
+15. Política de promoción
+
+La promoción a production solo debe permitirse si:
+- la versión existe;
+- el artefacto es íntegro;
+- validation_decision es pass o existe override explícito;
+- la transición de stage es válida;
+- la versión cumple el contrato de inferencia vigente;
+- y la promoción queda registrada como evento auditable.
+
+La decisión de “esta versión merece promotion” debe venir de validation_suite o de una decision layer explícita. El registry ejecuta y gobierna la decisión; no la inventa.
+
+16. Rollback semánticamente correcto
+
+El rollback no es borrar historia.
+Es crear un nuevo evento que reasigna un alias, normalmente production, a una versión anterior conocida y servible.
+
+Un rollback correcto debe:
+- especificar to_version de forma explícita;
+- verificar que esa versión sigue existiendo;
+- verificar integridad de su artefacto;
+- registrar from_version y to_version;
+- conservar intacta la historia de promociones previas;
+- y dejar evidencia de actor, motivo y aprobación si aplica.
+
+La política incorrecta es:
+“volver al estado anterior” sin identificar formalmente la versión destino.
+
+17. Event sourcing y reconstrucción de estado
+
+El módulo encaja bien con un esquema híbrido de estado materializado + eventos append-only.
+
+Conceptualmente:
+
+state(model_id) = foldl(initial_state, ordered_events(model_id), apply_event)
+
+Esto aporta:
+- auditabilidad fuerte;
+- reconstrucción histórica;
+- explicación de cómo se llegó al estado actual;
+- y mayor resiliencia frente a dudas sobre mutaciones pasadas.
+
+No hace falta convertir todo en event sourcing puro, pero sí garantizar que el estado actual sea compatible con el historial.
+
+18. Failure modes frecuentes
+
+El módulo debe capturar explícitamente:
+
+18.1 Duplicate version key
+Dos versiones con la misma clave lógica.
+
+18.2 Alias ambiguity
+Un alias apuntando a múltiples versiones o sin política de unicidad.
+
+18.3 Artifact corruption
+artifact_uri existe pero hash no coincide o el artefacto no es legible.
+
+18.4 Concurrent promotion race
+Dos promociones simultáneas compiten y dejan el alias en estado incierto si no existe CAS/txn correcto.
+
+18.5 Event loss
+Se actualiza el alias pero no se escribe el evento, o viceversa.
+
+18.6 FK violation
+Referencias colgantes entre aliases, versions y models.
+
+18.7 Invalid override
+Una versión fail llega a production sin aprobación formal trazable.
+
+18.8 Ambiguous resolve
+resolve(ref) devuelve varias candidatas o depende del orden físico de lectura.
+
+19. Flags y salidas mínimas recomendadas
+
+El output del módulo debería incluir algo del tipo:
+
+{
+  "model_id": "...",
+  "version": "...",
+  "gate": "PASS|WARN|FAIL",
+  "stage": "candidate|staging|production|archived",
+  "artifact_integrity": {
+      "artifact_exists": true,
+      "hash_match": true,
+      "manifest_exists": true
+  },
+  "resolution": {
+      "resolved_from_ref": "...",
+      "resolved_uniquely": true
+  },
+  "governance": {
+      "validation_decision": "pass|fail|override",
+      "override_ref": "...",
+      "promotion_eligible": true
+  },
+  "hard_failures": [...],
+  "soft_flags": [...],
+  "binding_failure": "...",
+  "recommended_action": "...",
+  "notes": [...]
+}
+
+Cada fallo relevante debe indicar:
+- operación afectada;
+- entidad afectada;
+- severidad;
+- causa concreta;
+- y acción recomendada.
+
+20. Observabilidad
+
+20.1 Logging
+
+- INFO: registro correcto, promoción correcta, rollback correcto, resolución correcta
+- WARNING: override, fallback explícito, retry por concurrencia
+- ERROR: hash inconsistente, artefacto ausente, resolución ambigua, fallo transaccional, violación de invariantes
+
+20.2 Métricas
+
+El módulo debería emitir al menos:
+- n_models_total
+- n_versions_total
+- n_promotions_production
+- n_rollbacks
+- n_override_promotions
+- resolve_failures
+- artifact_integrity_failures
+- avg_candidate_to_production_latency
+- cas_conflicts
+- promotion_retries
+
+21. Qué ya está muy bien en esta especificación
+
+La especificación base ya acierta en piezas importantes:
+
+- visión del módulo como control de riesgo de modelo;
+- estados candidate → staging → production → archived;
+- metadatos fuertes de versión como artifact_hash, training_data_hash y code_commit;
+- aliases lógicos que resuelven a una versión única;
+- historial append-only de eventos;
+- promociones y rollbacks auditables;
+- inmutabilidad conceptual de artefactos;
+- y atomicidad entendida como requisito estructural.
+
+Eso da una base institucional sólida, aunque no sea un módulo de densidad matemática extrema.
+
+22. Qué falta para empujarlo al techo realista
+
+Dado el tipo de módulo, el techo realista no es 95+ matemático. Es más bien 82–85 con excelencia infra.
+
+Para acercarse a ese techo, faltan sobre todo:
+
+22.1 ERD formal completo
+Con PK, FK, CHECK, índices y claves compuestas bien especificadas.
+
+22.2 SQL explícito de operaciones críticas
+Especialmente resolve(), list_history() y transitions.
+
+22.3 Política de concurrencia cerrada
+CAS, retries, backoff y failover bajo conflicto.
+
+22.4 Reconstrucción formal desde eventos
+Para reforzar auditabilidad.
+
+22.5 Bounds operativos
+No teoría pesada, pero sí métricas de conflict rate, resolve failure rate y promotion safety.
+
+23. MVP vs versión avanzada
+
+23.1 MVP
+
+- esquema relacional formal;
+- unicidad de (model_id, version);
+- aliases únicos;
+- resolve determinista;
+- validación de integridad de artefacto;
+- promoción atómica;
+- rollback auditable;
+- eventos append-only;
+- output conservador fail-closed.
+
+23.2 Versión avanzada
+
+- event sourcing más formal;
+- version vectors o metadata extra de concurrencia si hace falta;
+- dependency graph modelo→features→data;
+- réplicas de lectura con garantías explícitas;
+- monitorización de conflictos de promoción;
+- validación de integridad también en resolve de forma periódica.
+
+24. Interpretación correcta
+
+La lectura correcta de model_registry.py es:
+
+“este módulo gobierna transaccionalmente qué versión exacta de un modelo puede vivir operativamente en staging o production, con integridad, trazabilidad y resolución determinista.”
+
+La lectura incorrecta es:
+
+“este módulo lista modelos y guarda metadatos para consultarlos después.”
+
+No está para consultar cómodamente.
+Está para impedir ambigüedad operacional sobre el modelo activo.
+
+25. Referencias orientativas
+
+- Codd, por modelo relacional y normalización
+- Gray, por concepto transaccional y atomicidad
+- literatura de artifact registries y ML lineage
+- patrones append-only y event sourcing
+- prácticas institucionales de model governance y model risk management
+
+26. Conclusión
+
+model_registry.py es una pieza de infraestructura crítica y su valor está en la disciplina operacional, no en la complejidad matemática.
+
+La combinación de:
+- metadatos inmutables por versión,
+- aliases lógicos,
+- promociones atómicas,
+- rollbacks auditables,
+- historial append-only,
+- y resolución determinista
+
+define una base muy seria de gobernanza de modelos.
+
+No necesita sobreingeniería distribuida para ser excelente. Lo que necesita es cerrar bien invariantes, esquema relacional, semántica de concurrencia y trazabilidad de artefactos.
+
+Como transactional model governance layer, la especificación es buena y con esos cierres puede quedar institucionalmente muy sólida.

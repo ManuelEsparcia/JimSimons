@@ -1,695 +1,597 @@
-\documentclass[12pt,a4paper]{article}
+Especificación Cuantitativa: models/baselines/train_logistic.py
 
-\usepackage[utf8]{inputenc}
-\usepackage[spanish,es-nodecimaldot]{babel}
-\usepackage[T1]{fontenc}
-\usepackage{lmodern}
-\usepackage[
-  lmargin=2.5cm,
-  rmargin=2.5cm,
-  tmargin=2.5cm,
-  bmargin=2.5cm
-]{geometry}
-\usepackage{amsmath,amssymb,amsthm,mathtools}
-\usepackage{bm}
-\usepackage{booktabs}
-\usepackage{array}
-\usepackage{float}
-\usepackage{enumitem}
-\usepackage{csquotes}
-\usepackage{xcolor}
-\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
+0. Propósito y papel dentro del stack
 
-\title{\textbf{Análisis de \texttt{train\_logistic.py}}\\
-Especificación research-industrial de una baseline logística\\
-para señales binarias en trading temporal}
-\author{Baseline de clasificación probabilística con validación temporal \textit{purged}}
-\date{\today}
+train_logistic.py define la baseline institucional de clasificación binaria con salida probabilística del stack de research. Su función no es aportar complejidad algorítmica, sino establecer una referencia científicamente limpia, interpretable y auditabile para etiquetas binarias en small-cap swing trading. Debe servir simultáneamente como benchmark de discriminación, motor básico de probabilidades calibrables y pieza de control metodológico frente a modelos más complejos.
 
-\begin{document}
+En este contexto, la regresión logística no debe verse como un clasificador “simple”, sino como una baseline probabilística de primer orden. Si un modelo no lineal no supera de forma robusta a esta baseline bajo los mismos datos, mismos splits purged, mismas reglas de preprocesado y misma disciplina de calibración, entonces no ha demostrado valor incremental suficiente. La especificación base que me has pasado ya cerraba correctamente este rol general, la estructura de entradas, el esquema de validación temporal, el tratamiento de class imbalance, las métricas de discriminación/calibración y la persistencia de artefactos por run_id. :contentReference[oaicite:0]{index=0}
 
-\maketitle
+1. Objetivo formal del módulo
 
-\begin{abstract}
-Este documento especifica el módulo \texttt{models/baselines/train\_logistic.py}, encargado de entrenar una baseline de \textbf{regresión logística regularizada} para etiquetas binarias dentro de un sistema de \emph{small-cap swing trading}. El propósito del módulo no es únicamente clasificar la dirección de una señal, sino construir una referencia probabilística interpretable, estable y auditada, capaz de servir como benchmark metodológico frente a modelos más complejos. La especificación cubre formulación matemática, validación temporal \emph{purged}, tratamiento del desequilibrio de clases, preprocesado estrictamente \emph{train-only}, calibración de probabilidades, gobernanza de hiperparámetros, métricas de discriminación y calibración, y persistencia de artefactos reproducibles por \texttt{run\_id}.
-\end{abstract}
+Para cada fold temporal purged k, el módulo debe aproximar la probabilidad condicional
 
-\tableofcontents
+    P(y = 1 | x)
 
-\section{Propósito del módulo}
+mediante un score lineal regularizado y producir:
+- probabilidades no calibradas,
+- probabilidades calibradas si la política lo exige,
+- métricas discriminativas y probabilísticas OOF,
+- estadísticas de estabilidad estructural,
+- artefactos totalmente trazables bajo run_id.
 
-El módulo \texttt{train\_logistic.py} implementa una baseline de clasificación binaria con salida probabilística. Su papel dentro del sistema es estructuralmente más importante de lo que su simplicidad aparente sugiere. Debe cumplir simultáneamente cuatro funciones:
+El objetivo operativo del módulo no es maximizar una métrica aislada, sino producir una baseline simultáneamente:
+- discriminativa fuera de muestra,
+- bien calibrada o al menos calibrable,
+- estable entre folds,
+- reproducible,
+- comparable con el resto del stack.
 
-\begin{enumerate}[label=\arabic*)]
-    \item \textbf{Servir como referencia interpretable} para labels direccionales binarios, permitiendo entender si existe o no señal lineal económicamente aprovechable.
-    \item \textbf{Producir probabilidades out-of-fold calibrables}, no solo etiquetas \(\{0,1\}\), de modo que puedan consumirse por capas posteriores de ranking, \emph{position sizing}, \emph{stacking} o filtrado de señales.
-    \item \textbf{Establecer un benchmark científicamente limpio} frente a modelos no lineales; si éstos no superan de forma robusta a la logística bajo el mismo régimen experimental, su complejidad no está justificada.
-    \item \textbf{Aportar trazabilidad completa} del proceso de entrenamiento, tuning, calibración y evaluación mediante artefactos reproducibles por \texttt{run\_id}.
-\end{enumerate}
+2. Formulación matemática
 
-Por tanto, la regresión logística no debe verse aquí como un clasificador elemental, sino como una \textbf{baseline institucional de control} del pipeline de clasificación.
+2.1. Modelo logístico
 
-\section{Contexto cuantitativo}
+Sea x_i ∈ R^p y y_i ∈ {0,1}. El modelo define
 
-En problemas de predicción binaria en \emph{small caps} suelen aparecer varias dificultades estructurales:
+    p_i = P(y_i = 1 | x_i) = σ(β_0 + x_i^⊤ β),
 
-\begin{itemize}[leftmargin=1.5em]
-    \item señales débiles con relación señal-ruido baja;
-    \item fuerte correlación entre grupos de features técnicas, fundamentales y cross-sectional;
-    \item prevalencias de clase no necesariamente estables en el tiempo;
-    \item cambio de régimen, que altera la base-rate de la clase positiva;
-    \item necesidad de distinguir entre dos conceptos distintos pero complementarios:
-    \begin{itemize}
-        \item \textbf{discriminación}: ordenar correctamente positivos y negativos;
-        \item \textbf{calibración}: que una probabilidad de \(0.70\) signifique aproximadamente un \(70\%\) de frecuencia empírica.
-    \end{itemize}
-\end{itemize}
+donde σ(z) = 1 / (1 + exp(-z)) es la sigmoide.
 
-En trading, un modelo puede tener AUC razonable y estar mal calibrado, o estar bien calibrado pero discriminar poco. Ambas dimensiones importan. La primera afecta a la capacidad de ranking o selección; la segunda afecta a cualquier downstream que dependa explícitamente de probabilidades, incluyendo control de riesgo y dimensionamiento de posiciones.
+Equivalentemente, en términos de log-odds,
 
-\section{Formulación matemática}
+    log( p_i / (1 - p_i) ) = β_0 + x_i^⊤ β.
 
-Sea:
-\begin{itemize}[leftmargin=1.5em]
-    \item \(X \in \mathbb{R}^{n\times p}\) la matriz de features;
-    \item \(y \in \{0,1\}^n\) la etiqueta binaria;
-    \item \(\beta \in \mathbb{R}^{p}\) el vector de coeficientes;
-    \item \(\beta_0 \in \mathbb{R}\) el intercepto.
-\end{itemize}
+Esto proporciona una interpretación lineal en espacio logit, útil para inspección estructural y comparación entre folds, aunque no debe confundirse con interpretación causal.
 
-El modelo define la probabilidad condicional:
+2.2. Verosimilitud y pérdida regularizada
 
-\begin{equation}
-\hat{p}_i
-=
-P(y_i=1 \mid x_i)
-=
-\sigma(\beta_0 + x_i^\top \beta)
-=
-\frac{1}{1+\exp[-(\beta_0 + x_i^\top \beta)]}.
-\end{equation}
+La verosimilitud Bernoulli condicional del conjunto de entrenamiento es
 
-La pérdida negativa log-verosímil regularizada puede escribirse como:
+    L(β_0, β) = Π_i p_i^{y_i} (1 - p_i)^{1 - y_i}.
 
-\begin{equation}
-\min_{\beta_0,\beta}
-\left\{
--\frac{1}{n}\sum_{i=1}^{n}
-\left[
-y_i \log(\hat{p}_i)
-+
-(1-y_i)\log(1-\hat{p}_i)
-\right]
-+
-\lambda \, \Omega(\beta)
-\right\},
-\label{eq:logistic_obj}
-\end{equation}
+Maximizar log L equivale a minimizar la log-loss. Con regularización, el problema general es
 
-donde \(\Omega(\beta)\) representa la penalización elegida.
+    min_{β_0,β}
+      [ -(1/n) Σ_i { y_i log p_i + (1-y_i) log(1-p_i) } + λ Ω(β) ].
 
-\subsection{Penalizaciones}
+Si Ω es convexa, el problema sigue siendo convexo. Por tanto, bajo penalizaciones convexas estándar, el entrenamiento tiene un único mínimo global salvo degeneraciones numéricas o separabilidad patológica. Este punto conviene dejarlo explícito: la baseline logística es una pieza especialmente valiosa también porque su problema de optimización está bien comportado y no depende de mínimos locales arbitrarios.
 
-El módulo debe soportar, con compatibilidad explícita con el \texttt{solver}:
+2.3. Penalizaciones soportadas
 
-\begin{itemize}[leftmargin=1.5em]
-    \item \textbf{L1}: \(\Omega(\beta)=\|\beta\|_1\), útil para inducir sparsidad.
-    \item \textbf{L2}: \(\Omega(\beta)=\frac{1}{2}\|\beta\|_2^2\), útil para estabilizar bajo multicolinealidad.
-    \item \textbf{Elastic-net}: combinación convexa de ambas, permitiendo equilibrio entre parsimonia y robustez.
-\end{itemize}
+El módulo debe soportar, con compatibilidad explícita con el solver:
 
-En implementaciones estilo \texttt{scikit-learn}, el parámetro \texttt{C} es inversamente proporcional a la intensidad de regularización:
-\[
-\lambda \propto \frac{1}{C}.
-\]
+- L1:
+  Ω(β) = ||β||_1
+
+- L2:
+  Ω(β) = ||β||_2^2 / 2
+
+- Elastic-net:
+  Ω(β) = ρ ||β||_1 + (1-ρ) ||β||_2^2 / 2
+
+En convención tipo scikit-learn, el parámetro C es inversamente proporcional a la intensidad de regularización:
+
+    λ ∝ 1 / C.
 
 Por tanto:
-\begin{itemize}[leftmargin=1.5em]
-    \item \(C\) pequeño \(\Rightarrow\) regularización fuerte;
-    \item \(C\) grande \(\Rightarrow\) regularización débil.
-\end{itemize}
+- C pequeño implica regularización fuerte,
+- C grande implica regularización débil.
 
-\subsection{Interpretación cuantitativa}
+Este convenio debe quedar congelado como invariante del módulo.
 
-La logística convierte un score lineal en probabilidad acotada en \([0,1]\). Esa propiedad la hace particularmente útil cuando el sistema downstream no quiere únicamente una clasificación dura, sino un \textbf{grado de convicción}. Sin embargo, el hecho de que el modelo produzca probabilidades no implica automáticamente que éstas estén bien calibradas. Por ello, la calibración no debe tratarse como un detalle cosmético, sino como parte integral de la especificación.
+3. Racional cuantitativo en small caps
 
-\section{Objetivo exacto del entrenamiento}
+En small caps es habitual encontrar:
+- señal débil,
+- multicolinealidad entre familias de features,
+- base-rates variables en el tiempo,
+- desbalance de clases por régimen,
+- necesidad de distinguir entre ranking y probabilidad.
 
-El objetivo del módulo no es optimizar una métrica aislada de clasificación, sino producir una baseline simultáneamente:
+La baseline logística está especialmente bien situada en este entorno porque:
+- produce probabilidades directamente utilizables downstream,
+- permite inspección estructural de coeficientes,
+- es rápida y robusta como benchmark,
+- separa limpiamente dos ejes que en trading conviene no mezclar:
+  discriminación y calibración.
 
-\begin{enumerate}[label=\alph*)]
-    \item \textbf{discriminativa}, con capacidad de separar positivos y negativos fuera de muestra;
-    \item \textbf{calibrable}, de modo que las probabilidades tengan significado operativo;
-    \item \textbf{estable}, con coeficientes y métricas razonablemente consistentes entre folds;
-    \item \textbf{reproducible}, con trazabilidad completa de inputs, tuning, calibración y outputs;
-    \item \textbf{comparable}, usando exactamente el mismo esquema temporal y los mismos \emph{splits} que el resto de modelos.
-\end{enumerate}
+Un modelo puede ordenar relativamente bien positivos y negativos y, sin embargo, asignar probabilidades mal calibradas. Eso es suficiente para algunos usos de ranking, pero insuficiente para sizing, filtrado probabilístico o agregación bayesiana simple. Por ello, la calibración no puede tratarse como un extra cosmético.
 
-\section{Entradas del módulo}
+4. Principios no negociables
 
-El contrato de entrada debe quedar completamente cerrado. El módulo espera:
+P1. Validación temporal estricta.
+No se permite KFold aleatorio ni ningún esquema que viole causalidad temporal.
 
-\begin{itemize}[leftmargin=1.5em]
-    \item \texttt{features\_path}: dataset versionado de features;
-    \item \texttt{labels\_path}: dataset de etiquetas binarias alineadas temporalmente;
-    \item \texttt{splits\_path}: archivo con \emph{splits} temporales \emph{purged} y embargo si aplica;
-    \item \texttt{config\_path}: configuración YAML del experimento;
-    \item \texttt{run\_id}: identificador único de la corrida;
-    \item selector explícito de columnas, si el entrenamiento usa un subconjunto de features.
-\end{itemize}
+P2. Preprocesado train-only por fold.
+Toda imputación, winsorization, escalado y calibración deben ajustarse exclusivamente con datos internos al entrenamiento del fold externo.
 
-\subsection{Validaciones previas obligatorias}
+P3. Tuning sin acceso al bloque OOF externo.
+Ni hiperparámetros del clasificador, ni tipo de calibración, ni threshold operativo pueden elegirse mirando el fold externo.
+
+P4. Comparabilidad transversal.
+Todos los modelos comparados deben usar exactamente los mismos splits purged y embargo.
+
+P5. Auditabilidad completa.
+Toda corrida debe ser reconstruible mediante run_id, config, datos, splits, grid, calibración, métricas y artefactos.
+
+P6. Separación explícita entre discriminación y calibración.
+AUC y ranking no sustituyen a logloss/Brier/ECE, ni viceversa.
+
+P7. Fallo explícito ante incoherencias.
+Cualquier incompatibilidad de solver/penalty, leakage o fold degenerado debe provocar abort o invalidación controlada del run.
+
+5. Contrato de entrada
+
+El contrato mínimo del módulo es:
+
+    I = (features_path, labels_path, splits_path, config_path, run_id, feature_list).
+
+5.1. Entradas obligatorias
+
+- features_path:
+  dataset versionado de features.
+
+- labels_path:
+  dataset versionado de etiquetas binarias.
+
+- splits_path:
+  definición de folds temporales purged y embargo.
+
+- config_path:
+  configuración congelada del experimento.
+
+- run_id:
+  identificador único y trazable.
+
+- feature_list:
+  subconjunto explícito de columnas si aplica.
+
+5.2. Validaciones previas obligatorias
 
 Antes del entrenamiento, el módulo debe verificar:
+- alineación exacta entre features y labels,
+- unicidad del índice lógico,
+- consistencia temporal de splits,
+- ausencia de columnas no numéricas tras selección final,
+- ausencia de folds degenerados sin ambas clases en train o test,
+- ausencia de leakage obvio por variables derivadas del futuro,
+- cobertura mínima suficiente de la clase minoritaria por fold.
 
-\begin{enumerate}[label=\arabic*)]
-    \item alineación uno a uno entre features y labels;
-    \item unicidad del índice lógico \((date, asset)\) o equivalente;
-    \item ausencia de columnas no numéricas en la matriz final de entrenamiento;
-    \item ausencia de folds degenerados con una sola clase en train o test;
-    \item consistencia temporal de los \emph{splits};
-    \item ausencia de fuga obvia por columnas derivadas del futuro;
-    \item cobertura suficiente de la clase minoritaria por fold.
-\end{enumerate}
+La base que me has pasado ya recogía correctamente esta disciplina de integridad previa y la necesidad de abortar o marcar explícitamente folds inválidos. :contentReference[oaicite:1]{index=1}
 
-Si un fold no contiene ambas clases en el entrenamiento o en el tramo de evaluación, el módulo debe abortar o marcar explícitamente el fold como inválido según la política definida en configuración.
+6. Validación temporal purged y embargo
 
-\section{Preprocesado: reglas no negociables}
+6.1. Definición operativa
 
-Uno de los puntos clave para elevar el módulo a nivel \emph{research-industrial} es especificar exactamente el preprocesado. Todo transformador estadístico debe ajustarse \textbf{exclusivamente con el conjunto de entrenamiento del fold}.
+Para cada fold k se definen índices
 
-\subsection{Pipeline por fold}
+    I_train^(k), I_test^(k),
 
-Para cada fold externo, el pipeline recomendado es:
+de forma que
 
-\begin{enumerate}[label=\arabic*)]
-    \item seleccionar features válidas sobre el train del fold;
-    \item imputar \emph{missing values} con parámetros aprendidos solo en train;
-    \item opcionalmente aplicar clipping robusto o \emph{winsorization} solo con estadísticas de train;
-    \item estandarizar las columnas si la configuración lo requiere;
-    \item entrenar el clasificador logístico sobre la matriz transformada;
-    \item calibrar probabilidades usando únicamente información interna al bloque de entrenamiento;
-    \item aplicar el pipeline y el calibrador ya fijados al tramo externo del fold.
-\end{enumerate}
+    I_train^(k) ∩ InfoSet(I_test^(k)) = ∅.
 
-\subsection{Imputación}
+Si las labels dependen de un horizonte H o existen features con ventanas móviles, el purging debe excluir cualquier observación de entrenamiento cuyo conjunto informacional se solape con el del bloque test. Si la política exige embargo, éste debe aplicarse adicionalmente tras el bloque test.
 
-La política de imputación debe estar declarada en el manifiesto. Como baseline institucional, el módulo debe admitir al menos:
+6.2. Invariante metodológico
 
-\begin{itemize}[leftmargin=1.5em]
-    \item imputación por mediana de train;
-    \item imputación por cero cuando la semántica económica de la feature lo justifique;
-    \item descarte de variables si la tasa de \emph{missingness} en train supera un umbral;
-    \item indicadores de \emph{missingness} opcionales si se considera informativo.
-\end{itemize}
+Los mismos splits_path deben reutilizarse para Logistic, ElasticNet, Ridge y cualquier otro modelo benchmark. Cambiar splits entre modelos destruye la validez de la comparación.
 
-Nunca debe imputarse usando estadísticas globales del dataset.
+6.3. Tuning y calibración internos
 
-\subsection{Escalado}
+Toda búsqueda de hiperparámetros y toda calibración deben realizarse dentro de sub-folds temporales construidos sobre I_train^(k), no sobre el bloque test externo.
 
-Para regresión logística regularizada, la estandarización no es decorativa. Afecta directamente al significado de la penalización y a la comparabilidad de los coeficientes. La regla por defecto debe ser:
+7. Preprocesado por fold
 
-\[
-X^{\text{std}}_j
-=
-\frac{X_j - \mu_j^{\text{train}}}{\sigma_j^{\text{train}}+\varepsilon}.
-\]
+7.1. Pipeline base obligatorio
 
-Sin escalado consistente, el tuning de \texttt{C} y la interpretación relativa de coeficientes quedan distorsionados.
+Para cada fold externo, el flujo mínimo debe ser:
 
-\section{Validación temporal \emph{purged}}
+1. seleccionar columnas válidas sobre el train;
+2. imputar missing values con estadísticas del train;
+3. aplicar winsorization o clipping robusto train-only si está activado;
+4. estandarizar columnas train-only;
+5. entrenar el clasificador logístico;
+6. ajustar calibrador interno si está habilitado;
+7. aplicar pipeline y calibrador congelados al test externo.
 
-\subsection{Justificación}
+7.2. Imputación
 
-En clasificación financiera con labels binarios construidos a partir de retornos futuros o eventos a horizonte \(h\), no es válido usar CV aleatoria. La razón es doble:
+Se deben admitir al menos:
+- imputación por mediana,
+- imputación por cero con justificación económica,
+- descarte de variables con missingness excesivo,
+- indicadores de missingness opcionales.
 
-\begin{enumerate}[label=\arabic*)]
-    \item existe dependencia temporal entre observaciones vecinas;
-    \item la construcción de labels y algunas features puede implicar solapamiento informacional entre train y test.
-\end{enumerate}
+Nunca se permiten estadísticas globales del dataset para imputar.
 
-Por ello, la validación debe respetar orden temporal, \emph{purging} y, cuando proceda, embargo.
+7.3. Escalado
 
-\subsection{Definición operativa}
+La estandarización es metodológicamente obligatoria salvo justificación muy fuerte. La forma recomendada es
 
-Para cada fold \(k\):
-\begin{itemize}[leftmargin=1.5em]
-    \item se define un bloque temporal externo de validación/test \(\mathcal{I}^{(k)}_{\text{test}}\);
-    \item el conjunto de entrenamiento \(\mathcal{I}^{(k)}_{\text{train}}\) excluye observaciones cuyo conjunto informacional se solape con \(\mathcal{I}^{(k)}_{\text{test}}\);
-    \item opcionalmente se aplica un embargo adicional posterior al bloque de test.
-\end{itemize}
+    X_std,j = (X_j - μ_train,j) / (σ_train,j + ε).
 
-Formalmente:
-\[
-\mathcal{I}^{(k)}_{\text{train}}
-\cap
-\mathrm{InfoSet}\bigl(\mathcal{I}^{(k)}_{\text{test}}\bigr)
-=
-\varnothing.
-\]
+Sin escalado consistente, la penalización pierde comparabilidad entre features y el parámetro C deja de tener interpretación estable entre corridas.
 
-\subsection{Comparabilidad}
+8. Desbalance de clases y class_weight
 
-Los mismos \texttt{splits\_path} deben emplearse para Logistic, Ridge, ElasticNet y cualquier modelo posterior que quiera compararse de forma científicamente válida. Cambiar \emph{splits} entre modelos invalida la comparación.
+8.1. Soporte mínimo
 
-\section{Tratamiento del desequilibrio de clases}
+El módulo debe soportar:
+- class_weight = None,
+- class_weight = balanced,
+- pesos explícitos definidos en configuración.
 
-\subsection{Motivación}
+8.2. Interpretación metodológica
 
-En muchos labels direccionales la proporción entre clases positivas y negativas no es exactamente \(50/50\), y puede variar entre folds o regímenes de mercado. Ignorar esta realidad puede producir clasificadores que optimizan la base-rate y no la señal.
+Si se introducen pesos w_i, la pérdida optimizada pasa a ser
 
-\subsection{\texttt{class\_weight}}
+    ℓ_w(β_0,β)
+      = - [1 / Σ_i w_i] Σ_i w_i { y_i log p_i + (1-y_i) log(1-p_i) }
+        + λ Ω(β).
 
-El módulo debe soportar al menos:
+Esto cambia la medida efectiva bajo la que el modelo ajusta probabilidades. En particular, cuando se usan class weights, la salida del clasificador deja de coincidir limpiamente con una probabilidad “física” bajo la prevalencia empírica no ponderada. Dicho de forma práctica: ponderar clases puede mejorar discriminación o sensibilidad a la minoritaria, pero también puede descalibrar probabilidades.
 
-\begin{itemize}[leftmargin=1.5em]
-    \item \texttt{class\_weight = None};
-    \item \texttt{class\_weight = balanced};
-    \item pesos explícitos definidos por configuración.
-\end{itemize}
+8.3. Regla institucional
 
-La opción \texttt{balanced} pondera cada clase en sentido inversamente proporcional a su frecuencia en el train del fold. Esto puede mejorar discriminación sobre la minoritaria, pero también puede alterar la interpretación probabilística cruda del modelo.
+Si class_weight ≠ None y especialmente si class_weight = balanced, la calibración posterior no debe ser opcional desde el punto de vista institucional. Debe ajustarse o, como mínimo, evaluarse explícitamente dentro del entrenamiento del fold. Esta es una mejora esencial que conviene fijar como política dura.
 
-\subsection{Principio importante}
+9. Calibración de probabilidades
 
-Un punto metodológico que debe quedar cerrado es el siguiente:
+9.1. Principio general
 
-\begin{quote}
-\textbf{mejorar la clasificación ponderando clases no equivale a mejorar la calibración de probabilidades.}
-\end{quote}
-
-Por ello, si se usa \texttt{class\_weight='balanced'} o pesos asimétricos, la calibración posterior no es opcional desde un punto de vista institucional: debe evaluarse explícitamente y, si está habilitada, ajustarse dentro del entrenamiento del fold.
-
-\section{Calibración de probabilidades}
-
-Éste es uno de los aspectos donde la versión previa quedaba demasiado abierta. Aquí debe cerrarse con precisión.
-
-\subsection{Principio general}
-
-La salida \(\hat{p}(y=1\mid x)\) del clasificador logístico regularizado puede estar descalibrada por:
-\begin{itemize}[leftmargin=1.5em]
-    \item regularización fuerte;
-    \item \texttt{class\_weight};
-    \item cambio de prevalencia entre train y test;
-    \item heterogeneidad temporal y cambio de régimen.
-\end{itemize}
+La salida del modelo logístico regularizado puede estar descalibrada por:
+- regularización,
+- uso de class weights,
+- cambio de prevalencia entre train y test,
+- heterogeneidad temporal,
+- tamaño muestral pequeño por fold.
 
 Por ello, el módulo debe separar conceptualmente:
-\begin{itemize}[leftmargin=1.5em]
-    \item \textbf{modelo discriminativo base};
-    \item \textbf{capa de calibración probabilística}.
-\end{itemize}
+- el clasificador base,
+- la capa de calibración.
 
-\subsection{Esquemas permitidos}
+9.2. Esquemas permitidos
 
-La configuración debe permitir explícitamente una política de calibración, por ejemplo:
+La configuración debe soportar al menos:
+- calibration = none,
+- calibration = sigmoid,
+- calibration = isotonic,
+- calibration = auto.
 
-\begin{itemize}[leftmargin=1.5em]
-    \item \texttt{calibration = none};
-    \item \texttt{calibration = sigmoid} (Platt);
-    \item \texttt{calibration = isotonic};
-    \item \texttt{calibration = auto}, según tamaño muestral y estabilidad.
-\end{itemize}
+9.3. Regla no negociable
 
-\subsection{Regla no negociable}
+La calibración debe ajustarse exclusivamente en datos internos al entrenamiento del fold externo, usando un subesquema temporal adicional si hace falta. Nunca debe calibrarse sobre el bloque OOF externo.
 
-La calibración debe ajustarse exclusivamente dentro del conjunto de entrenamiento del fold externo, mediante un subesquema temporal interno. Nunca debe calibrarse usando el bloque externo de validación/test.
+9.4. Recomendación operativa
 
-\subsection{Recomendación operativa}
+Como baseline institucional:
+- usar sigmoid cuando la muestra sea moderada o la estabilidad temporal sea limitada;
+- reservar isotonic para muestras más amplias y relativamente estables;
+- registrar siempre métricas antes y después de calibración si ambas existen.
 
-Como baseline de producción-research:
+9.5. Cambio de base-rate
 
-\begin{itemize}[leftmargin=1.5em]
-    \item usar \textbf{sigmoid} cuando el tamaño de muestra efectivo sea moderado o la estabilidad temporal sea limitada;
-    \item reservar \textbf{isotonic} para muestras suficientemente amplias y estables, ya que puede sobreajustar en escenarios pequeños o ruidosos;
-    \item registrar siempre métricas antes y después de calibración si ambas están disponibles.
-\end{itemize}
+El módulo no necesita incorporar en el MVP una teoría extensa de recalibración por cambio de prevalencia, pero sí debe dejar abierta una extensión razonable: ajuste de intercepto o de log-odds cuando exista una estimación fiable del base-rate actual distinta de la de entrenamiento. Esto es útil en escenarios de drift de prevalencia, aunque debe considerarse fase 2 por el riesgo de introducir ruido si esa estimación es mala.
 
-\section{Solvers y compatibilidad}
+10. Solvers y compatibilidad
 
-La especificación debe fijar compatibilidad entre \texttt{solver}, \texttt{penalty} y tamaño del problema. Como mínimo:
+La especificación debe rechazar configuraciones incompatibles en lugar de corregirlas silenciosamente. Como mínimo:
 
-\begin{itemize}[leftmargin=1.5em]
-    \item \texttt{lbfgs}: adecuado para L2, generalmente robusto en problemas densos;
-    \item \texttt{liblinear}: útil en ciertos problemas pequeños o medianos, soporta L1/L2 binarias;
-    \item \texttt{saga}: necesario para elastic-net y útil para datasets más grandes o sparse.
-\end{itemize}
+- lbfgs:
+  adecuado para L2 y problemas densos.
 
-El módulo debe rechazar configuraciones incompatibles en lugar de corregirlas silenciosamente. Por ejemplo, \texttt{penalty='elasticnet'} exige un \texttt{solver} compatible como \texttt{saga}.
+- liblinear:
+  útil para ciertos binarios pequeños/medianos, soporta L1/L2 en casos concretos.
 
-\section{Búsqueda de hiperparámetros}
+- saga:
+  necesario para elastic-net y útil en problemas grandes o sparse.
 
-\subsection{Espacio de búsqueda}
+Cualquier combinación penalty/solver incompatible debe producir error explícito. Esto evita fallbacks silenciosos de librería y protege la auditabilidad experimental.
 
-La configuración debe fijar un espacio explícito de tuning, por ejemplo:
+11. Espacio de hiperparámetros y disciplina de tuning
 
-\begin{itemize}[leftmargin=1.5em]
-    \item \(\texttt{C\_grid} = \{10^{-4},10^{-3},10^{-2},10^{-1},1,10,100\}\);
-    \item \(\texttt{penalty} \in \{\texttt{l1},\texttt{l2},\texttt{elasticnet}\}\) según configuración;
-    \item \(\texttt{l1\_ratio\_grid}\) si se usa elastic-net;
-    \item \(\texttt{class\_weight}\) como dimensión experimental opcional;
-    \item tipo de calibración si se desea tuning ampliado.
-\end{itemize}
+11.1. Grid declarado
 
-\subsection{Selección correcta}
+El módulo debe definir ex ante un grid finito
 
-La selección de hiperparámetros no debe mirar el tramo externo del fold. La política recomendada es:
+    G = { (C_g, penalty_g, ρ_g, class_weight_g, calib_type_g) }_{g=1}^G
 
-\begin{quote}
-\textbf{realizar validación temporal interna sobre el train de cada fold externo para elegir los hiperparámetros del clasificador y, en su caso, de la calibración.}
-\end{quote}
+con las restricciones de compatibilidad correspondientes.
 
-Si por simplicidad se adopta una política global única de hiperparámetros, ello debe quedar explícitamente documentado en \texttt{manifest.json}.
+El grid no debe inflarse sin control. Cada nueva dimensión experimental multiplica el riesgo de meta-overfitting y el coste computacional:
+- C,
+- penalty,
+- l1_ratio,
+- class_weight,
+- calibration type.
 
-\subsection{Métrica principal y desempates}
+Por tanto, el módulo debe:
+- fijar tamaño máximo del grid,
+- registrar el número de combinaciones realmente probadas,
+- persistir el grid usado,
+- documentar si el tuning es por fold o global.
 
-La \emph{spec} debe fijar una métrica primaria de selección. Recomendación:
+11.2. Función de selección
 
-\begin{itemize}[leftmargin=1.5em]
-    \item usar \textbf{logloss} como métrica principal si la prioridad es calidad probabilística;
-    \item usar \textbf{AUC ROC} o \textbf{AUC-PR} si la prioridad es ranking/discriminación;
-    \item registrar siempre ambas, junto a Brier y error de calibración.
-\end{itemize}
+La selección de hiperparámetros no debe quedar abierta o puramente subjetiva. Debe fijarse una función objetivo interna. Una forma razonable y suficientemente rigurosa es:
 
-En caso de empate material, debe aplicarse una regla explícita:
-\begin{enumerate}[label=\arabic*)]
-    \item preferir mejor calibración si el uso downstream depende de probabilidades;
-    \item preferir menor complejidad efectiva;
-    \item preferir el modelo más estable entre folds;
-    \item evitar sobre-premiar pequeñas diferencias no robustas.
-\end{enumerate}
+    J_g^(k) = LogLoss̄_g^(k) + λ_ECE · ECĒ_g^(k),
 
-\section{Threshold operativo}
+donde:
+- LogLoss̄_g^(k) es la media interna de logloss sobre sub-folds temporales del train del fold externo k,
+- ECĒ_g^(k) es la media de ECE interna,
+- λ_ECE es configurable.
 
-Otro punto que suele quedar mal definido es el uso del umbral de clasificación.
+Esto fuerza a que la selección tenga en cuenta calidad probabilística y calibración de forma conjunta.
 
-\subsection{Principio}
+11.3. Regla de parsimonia tipo one-standard-error
 
-El clasificador produce probabilidades. El umbral \(\tau\) para convertirlas en decisión binaria:
-\[
-\hat{y}_i = \mathbf{1}\{\hat{p}_i \ge \tau\}
-\]
-no forma parte del modelo probabilístico en sí, sino de una capa operativa posterior.
+No debe elegirse automáticamente el candidato con mejor J mínimo crudo. Sea J_min^(k) el mínimo observado y σ_J^(k) una medida de dispersión. Definir:
 
-\subsection{Regla}
+    G_acc^(k) = { g : J_g^(k) <= J_min^(k) + c · σ_J^(k) },
 
-El módulo puede reportar métricas para un \(\tau\) fijo, por ejemplo \(0.5\), pero:
+con c ≈ 1.
 
-\begin{itemize}[leftmargin=1.5em]
-    \item no debe optimizar el threshold usando el bloque externo de test;
-    \item si se tunea \(\tau\), debe hacerse solo dentro de validación temporal interna;
-    \item conviene tratar \(\tau\) como parámetro de reporte o de downstream, no como sustituto de la calibración.
-\end{itemize}
+Dentro de G_acc^(k), se debe preferir:
+1. menor complejidad efectiva,
+2. mejor estabilidad de coeficientes,
+3. mejor calibración si el uso downstream depende de probabilidades.
 
-\section{Métricas de evaluación}
+Esta regla añade disciplina cuantitativa real y evita sobre-ajustar al máximo espurio de una métrica ruidosa.
 
-Las métricas deben registrarse por fold y agregadas a nivel \texttt{run\_id}.
+11.4. Multiple testing interno
 
-\subsection{Discriminación}
+El módulo no necesita formalizar un FDR completo sobre el grid, pero sí debe reconocer el problema. En consecuencia:
+- el grid debe ser moderado,
+- la regla de selección debe incorporar parsimonia,
+- debe quedar prohibido re-tuning oportunista tras observar OOF externo,
+- cualquier override manual debe quedar auditado.
 
-\paragraph{AUC ROC}
-\[
-\mathrm{AUC}_{\mathrm{ROC}}
-=
-P(\hat{p}_i > \hat{p}_j \mid y_i=1, y_j=0).
-\]
-
-Mide capacidad de ordenación entre positivos y negativos y es invariante a transformaciones monótonas del score.
-
-\paragraph{AUC-PR}
-
-Especialmente informativa cuando existe desequilibrio importante y se quiere enfatizar comportamiento en la clase positiva.
-
-\subsection{Calidad probabilística}
-
-\paragraph{Logloss}
-\[
-\mathrm{LogLoss}
-=
--\frac{1}{n}\sum_{i=1}^{n}
-\left[
-y_i \log(\hat{p}_i) + (1-y_i)\log(1-\hat{p}_i)
-\right].
-\]
+12. Threshold operativo
 
-Penaliza con fuerza predicciones erróneas muy confiadas.
+El clasificador produce probabilidades. El threshold τ para generar clases duras
 
-\paragraph{Brier score}
-\[
-\mathrm{Brier}
-=
-\frac{1}{n}\sum_{i=1}^{n}(\hat{p}_i-y_i)^2.
-\]
-
-Más interpretable como error cuadrático medio de probabilidad.
-
-\subsection{Calibración}
-
-\paragraph{ECE}
-
-Una definición operativa del \emph{Expected Calibration Error} es:
-
-\[
-\mathrm{ECE}
-=
-\sum_{b=1}^{B}
-\frac{n_b}{n}
-\left|
-\bar{p}_b - \bar{y}_b
-\right|,
-\]
-
-donde \(B\) es el número de bins, \(n_b\) el tamaño del bin \(b\), \(\bar{p}_b\) la probabilidad media predicha y \(\bar{y}_b\) la frecuencia empírica.
-
-También puede registrarse:
-\begin{itemize}[leftmargin=1.5em]
-    \item \textbf{MCE} (Maximum Calibration Error);
-    \item pendiente e intercepto de calibración;
-    \item tablas de \emph{reliability}.
-\end{itemize}
-
-\subsection{Métricas de clase y cobertura}
-
-Además, el módulo debe informar:
-\begin{itemize}[leftmargin=1.5em]
-    \item prevalencia de la clase positiva por fold;
-    \item número de ejemplos por clase;
-    \item cobertura OOF;
-    \item métricas umbralizadas opcionales: accuracy, precision, recall, F1.
-\end{itemize}
-
-Estas últimas no deben ser la base principal de tuning salvo justificación clara.
-
-\section{Estabilidad del modelo}
-
-La estabilidad no debe reducirse a “la métrica media fue razonable”. Para una baseline seria, también importa la estabilidad estructural de la solución.
-
-\subsection{Estabilidad de coeficientes}
-
-Para cada feature \(j\), puede definirse:
-
-\[
-\text{ActiveRate}_j
-=
-\frac{
-|\{k: |\hat{\beta}^{(k)}_j| > \tau\}|
-}{K},
-\]
-
-y, entre las veces que aparece activa:
-
-\[
-\text{SignConsistency}_j
-=
-\frac{
-\left|
-\sum_{k=1}^{K}
-\operatorname{sign}(\hat{\beta}^{(k)}_j)\mathbf{1}\{|\hat{\beta}^{(k)}_j|>\tau\}
-\right|
-}{
-|\{k: |\hat{\beta}^{(k)}_j| > \tau\}| + \varepsilon
-}.
-\]
-
-Esto permite distinguir:
-\begin{itemize}[leftmargin=1.5em]
-    \item variables persistentemente activas;
-    \item variables con signo estable;
-    \item variables inestables o espurias.
-\end{itemize}
-
-\subsection{Estabilidad de prevalencia y calibración}
-
-En clasificación temporal también es útil medir:
-\begin{itemize}[leftmargin=1.5em]
-    \item dispersión de prevalencias por fold;
-    \item dispersión de AUC/logloss/Brier;
-    \item degradación de calibración al pasar de train a validación externa.
-\end{itemize}
-
-\section{Artefactos de salida}
-
-Por cada \texttt{run\_id}, el módulo debe persistir una estructura completa y auditable.
-
-\subsection{Modelos por fold}
-
-\[
-\texttt{models/artifacts/baselines/logistic/\{run\_id\}/fold\_\{k\}/model.pkl}
-\]
-
-Cada artefacto debe incluir:
-\begin{itemize}[leftmargin=1.5em]
-    \item clasificador ajustado;
-    \item pipeline de preprocesado del fold;
-    \item calibrador si existe;
-    \item lista exacta de features usadas;
-    \item hiperparámetros finales;
-    \item metadatos de versión, si procede.
-\end{itemize}
-
-\subsection{Predicciones OOF}
-
-\[
-\texttt{models/predictions/baselines/logistic/\{run\_id\}/oof.parquet}
-\]
-
-Debe contener, como mínimo:
-\begin{itemize}[leftmargin=1.5em]
-    \item índice temporal y activo;
-    \item label real;
-    \item score lineal opcional;
-    \item probabilidad no calibrada;
-    \item probabilidad calibrada, si existe;
-    \item fold de procedencia;
-    \item flags de cobertura y validez.
-\end{itemize}
-
-\subsection{Resumen de métricas}
-
-\[
-\texttt{models/reports/baselines/logistic/\{run\_id\}/metrics\_summary.json}
-\]
-
-Debe incluir:
-\begin{itemize}[leftmargin=1.5em]
-    \item métricas por fold;
-    \item medias, medianas y dispersión;
-    \item prevalencias por fold;
-    \item métricas antes y después de calibración;
-    \item estadísticas estructurales de coeficientes;
-    \item configuración final elegida.
-\end{itemize}
-
-\subsection{Manifiesto}
-
-\[
-\texttt{models/reports/baselines/logistic/\{run\_id\}/manifest.json}
-\]
-
-Debe actuar como contrato de auditoría e incluir:
-\begin{itemize}[leftmargin=1.5em]
-    \item \texttt{run\_id};
-    \item rutas de entrada;
-    \item hashes/versiones de datasets si existen;
-    \item configuración completa;
-    \item política de imputación;
-    \item política de escalado;
-    \item política de \texttt{class\_weight};
-    \item política de calibración;
-    \item esquema de tuning;
-    \item número de folds;
-    \item purging/embargo;
-    \item timestamp;
-    \item versión de dependencias;
-    \item estado final de la corrida.
-\end{itemize}
-
-\section{Flujo de ejecución de alto nivel}
-
-El flujo correcto del módulo debe ser:
-
-\begin{enumerate}[label=\arabic*)]
-    \item cargar features, labels, \emph{splits} y configuración;
-    \item validar alineación e integridad;
-    \item para cada fold externo:
-    \begin{enumerate}[label=\roman*)]
-        \item separar train y test externo;
-        \item ajustar imputación y escalado solo en train;
-        \item ejecutar tuning temporal interno del clasificador;
-        \item ajustar, si está habilitado, el calibrador usando solo train interno;
-        \item reentrenar el pipeline final del fold;
-        \item producir probabilidades sobre el bloque externo;
-        \item guardar artefactos del fold.
-    \end{enumerate}
-    \item consolidar predicciones OOF;
-    \item calcular métricas agregadas;
-    \item escribir \texttt{metrics\_summary.json} y \texttt{manifest.json};
-    \item finalizar con éxito solo si todos los artefactos críticos han sido persistidos.
-\end{enumerate}
-
-\section{Buenas prácticas obligatorias}
-
-\subsection{No fuga de información}
-
-Está prohibido:
-\begin{itemize}[leftmargin=1.5em]
-    \item escalar con información del test externo;
-    \item calibrar con el test externo;
-    \item optimizar threshold usando el bloque externo;
-    \item seleccionar hiperparámetros mirando métricas OOF finales;
-    \item mezclar horizontes de labels sin declaración explícita.
-\end{itemize}
-
-\subsection{Pliegues con prevalencia inestable}
-
-Si la prevalencia de clase fluctúa mucho entre folds, el módulo debe:
-\begin{itemize}[leftmargin=1.5em]
-    \item registrarlo explícitamente;
-    \item evitar conclusiones globales basadas solo en la media agregada;
-    \item considerar métricas robustas a desbalance y cambios de base-rate.
-\end{itemize}
-
-\subsection{Reproducibilidad}
-
-Toda ejecución debe poder reconstruirse a nivel de:
-\begin{itemize}[leftmargin=1.5em]
-    \item datos;
-    \item configuración;
-    \item \emph{splits};
-    \item tuning;
-    \item calibración;
-    \item artefactos y métricas.
-\end{itemize}
-
-\section{Por qué esta baseline es valiosa}
-
-La regresión logística ocupa una posición central en un \emph{stack} cuantitativo serio:
-
-\begin{itemize}[leftmargin=1.5em]
-    \item frente a modelos de regresión continua, produce probabilidades directamente interpretables para eventos binarios;
-    \item frente a árboles o redes, ofrece una referencia lineal transparente y rápida;
-    \item frente a modelos demasiado sofisticados, ayuda a detectar cuándo la complejidad añade señal real y cuándo solo añade fragilidad;
-    \item como baseline institucional, fuerza al pipeline a ser riguroso en validación temporal, calibración y gobernanza de probabilidades.
-\end{itemize}
-
-\section{Criterios de aceptación}
-
-El módulo debe considerarse correctamente implementado solo si:
-
-\begin{enumerate}[label=\arabic*)]
-    \item todos los folds externos son temporalmente válidos y \emph{purged};
-    \item el preprocesado y la calibración son estrictamente \emph{train-only};
-    \item la política de \texttt{class\_weight} está documentada;
-    \item no hay folds degenerados sin ambas clases;
-    \item las probabilidades OOF están persistidas y auditables;
-    \item las métricas de discriminación y calibración están registradas por fold;
-    \item el manifiesto permite reconstruir el experimento completo;
-    \item la comparación con otros modelos puede realizarse en igualdad metodológica.
-\end{enumerate}
-
-\section{Conclusión}
-
-\texttt{train\_logistic.py} no debe entenderse como un simple clasificador binario, sino como una \textbf{baseline probabilística institucional} para señales direccionales en el sistema de \emph{small-cap swing trading}. Su valor real no reside solo en producir una referencia interpretable, sino en fijar un estándar metodológico exigente para todo el \emph{stack}: validación temporal sin fuga, tratamiento explícito del desbalance, calibración probabilística, gobernanza cerrada del tuning y trazabilidad integral por \texttt{run\_id}.
-
-Cuando esta baseline está bien diseñada, aporta algo más valioso que una línea base cómoda: aporta una medida disciplinada de cuánto del rendimiento de un modelo complejo procede de señal real y cuánto podría ser mera sofisticación estadística. En un entorno cuantitativo serio, esa diferencia es decisiva.
-\end{document}
+    ŷ_i = 1{ p_i >= τ }
+
+no forma parte del modelo probabilístico base. Por tanto:
+- puede reportarse un τ fijo como 0.5,
+- si se tunea τ, debe hacerse sólo en validación temporal interna,
+- τ debe entenderse como parámetro downstream u operativo, no como sustituto de la calibración.
+
+13. Métricas de evaluación
+
+13.1. Discriminación
+
+AUC ROC:
+mide capacidad de ordenación entre positivos y negativos y es invariante a transformaciones monótonas del score.
+
+AUC-PR:
+especialmente informativa cuando existe desbalance relevante y el foco está en la clase positiva.
+
+13.2. Calidad probabilística
+
+LogLoss:
+penaliza severamente errores muy confiados y es la métrica natural si queremos evaluar probabilidades.
+
+Brier:
+mide error cuadrático medio de probabilidad y suele ser más interpretable como métrica global.
+
+13.3. Calibración
+
+ECE:
+debe calcularse con definición operativa estable y número de bins documentado.
+
+MCE:
+puede añadirse como métrica auxiliar de peor desviación local.
+
+Pendiente e intercepto de calibración:
+opcionales, pero muy útiles para diagnóstico fino.
+
+13.4. Cobertura y prevalencia
+
+El módulo debe reportar también:
+- prevalencia positiva por fold,
+- número de ejemplos por clase,
+- cobertura OOF,
+- dispersión inter-fold de AUC, logloss, Brier y ECE.
+
+Estas magnitudes son esenciales para interpretar robustez temporal y evitar que una media agregada oculte regímenes claramente peores.
+
+14. Estabilidad estructural del modelo
+
+La baseline no debe juzgarse sólo por métricas predictivas. También importa la estabilidad de la solución regularizada.
+
+14.1. ActiveRate
+
+Para cada feature j:
+
+    ActiveRate_j = | {k : |β_j^(k)| > τ} | / K.
+
+14.2. SignConsistency
+
+Para cada feature j:
+
+    SignConsistency_j =
+      | Σ_k sign(β_j^(k)) 1{|β_j^(k)| > τ} |
+      / ( | {k : |β_j^(k)| > τ} | + ε ).
+
+14.3. Uso operativo
+
+Estas métricas no deben quedarse como reporting pasivo. Deben utilizarse como filtro blando o criterio de desempate. En particular, el módulo debe permitir:
+- penalizar configuraciones con baja estabilidad estructural,
+- descartar configuraciones donde las N features más activas tengan SignConsistency media por debajo de un umbral,
+- favorecer soluciones más estables dentro del conjunto aceptable G_acc^(k).
+
+Esta es otra mejora esencial para llevar el módulo a un nivel más serio sin sobreingeniería.
+
+15. Failure modes principales
+
+El módulo debe documentar y detectar como mínimo:
+
+F1. Folds degenerados sin ambas clases.
+Entrenamiento imposible o métricas discriminativas sin sentido.
+
+F2. Calibración hecha usando el bloque externo.
+Leakage suave pero real, especialmente dañino para probabilidades.
+
+F3. Tuning que maximiza solo AUC.
+Se obtienen buenos rankings pero probabilidades pobres para sizing o filtrado.
+
+F4. Incompatibilidad penalty/solver.
+Puede provocar fallbacks silenciosos o errores mal interpretados.
+
+F5. Grid excesivamente grande.
+La baseline parece “ganar” por selección múltiple interna, no por edge real.
+
+F6. Variación fuerte de coeficientes entre folds.
+Existe aparente señal local pero estructura frágil.
+
+F7. Cambio fuerte de prevalencia entre folds.
+Las probabilidades pueden deteriorarse aunque la discriminación se mantenga moderadamente.
+
+Estos modos de fallo deben reflejarse en logs, resumen de métricas y, cuando corresponda, en warning/fail explícito.
+
+16. Complejidad computacional
+
+El coste grueso del módulo puede resumirse como
+
+    O(K · G · C_solver),
+
+donde:
+- K = número de folds externos,
+- G = número de combinaciones del grid,
+- C_solver = coste de entrenamiento por combinación, aproximadamente proporcional a iteraciones × n × p.
+
+Si además se usa tuning interno temporal y calibración por sub-folds, el coste crece multiplicativamente. Por tanto, el módulo debe:
+- limitar G,
+- fijar budgets de tiempo y memoria,
+- no permitir exploración indiscriminada impropia de una baseline,
+- registrar el coste experimental real en manifest si es posible.
+
+17. Artefactos de salida
+
+La estructura general que ya traía tu base es correcta y debe mantenerse. :contentReference[oaicite:2]{index=2}
+
+17.1. Modelos por fold
+
+Cada fold debe persistir:
+- clasificador ajustado,
+- pipeline de preprocesado,
+- calibrador si existe,
+- features exactas,
+- hiperparámetros finales,
+- metadata de versión si procede.
+
+17.2. Predicciones OOF
+
+El artefacto OOF debe incluir:
+- índice temporal/activo,
+- label real,
+- score lineal opcional,
+- probabilidad no calibrada,
+- probabilidad calibrada si existe,
+- fold,
+- flags de cobertura y validez.
+
+17.3. Resumen de métricas
+
+metrics_summary debe contener:
+- métricas por fold,
+- medias/medianas/dispersión,
+- prevalencias por fold,
+- métricas pre y post calibración,
+- estabilidad estructural de coeficientes,
+- configuración final elegida.
+
+17.4. Manifest
+
+manifest debe contener como mínimo:
+- run_id,
+- rutas de entrada,
+- hashes/versiones de datasets,
+- config completa,
+- política de imputación,
+- política de escalado,
+- política de class_weight,
+- política de calibración,
+- esquema de tuning,
+- número de folds,
+- purging/embargo,
+- timestamp,
+- versión de dependencias,
+- estado final del run.
+
+18. Flujo de ejecución de alto nivel
+
+El flujo recomendado del módulo es:
+
+1. cargar features, labels, splits y configuración;
+2. validar alineación e integridad;
+3. para cada fold externo:
+   a. separar train y test externo;
+   b. ajustar imputación y escalado solo en train;
+   c. ejecutar tuning temporal interno del clasificador;
+   d. ajustar calibrador interno si está habilitado;
+   e. seleccionar configuración con función J_g y regla one-SE;
+   f. aplicar filtros blandos de estabilidad/calibración;
+   g. reentrenar pipeline final del fold;
+   h. producir probabilidades sobre el bloque externo;
+   i. persistir artefactos del fold;
+4. consolidar OOF total;
+5. calcular métricas agregadas;
+6. escribir metrics_summary y manifest;
+7. devolver éxito sólo si todos los artefactos críticos existen y son coherentes.
+
+19. MVP y versión avanzada
+
+19.1. MVP obligatorio
+
+El MVP debe incluir:
+- regresión logística regularizada,
+- soporte L1/L2/elastic-net compatible con solver,
+- validación temporal purged,
+- pipeline train-only de imputación/winsorization/escalado,
+- tratamiento explícito de class imbalance,
+- calibración interna obligatoria cuando se usen class weights,
+- función de selección de hiperparámetros basada en logloss + ECE,
+- regla de parsimonia tipo one-standard-error,
+- métricas de discriminación y calibración,
+- estabilidad estructural mínima,
+- persistencia exhaustiva por run_id.
+
+19.2. Extensiones de segunda fase
+
+Como extensiones razonables:
+- ajuste de intercepto por cambio de base-rate cuando haya estimación fiable,
+- clipping opcional de logits en entornos extremos,
+- integración con métricas globales del pipeline, como una credibilidad estadística tipo PSR sobre logloss/AUC si se centraliza correctamente.
+
+20. No-objetivos
+
+No pertenece al alcance de este módulo:
+- teoría bayesiana avanzada de calibración,
+- focal losses complejas,
+- BNNs o probability engines especializados,
+- teoría asintótica profunda bajo dependencia fuerte,
+- causal inference.
+
+La misión aquí es construir una baseline logística regularizada metodológicamente impecable, no convertir el spec en un tratado de probabilidad avanzada.
+
+21. Criterios de aceptación
+
+El módulo sólo debe considerarse correcto si cumple simultáneamente:
+- todos los folds externos son temporalmente válidos y purged,
+- no existe leakage en preprocesado, tuning o calibración,
+- la política de class_weight está documentada,
+- las probabilidades OOF están persistidas y auditables,
+- las métricas de discriminación y calibración quedan registradas por fold,
+- la regla de selección de hiperparámetros es reproducible,
+- la estabilidad estructural queda medida y explotada al menos como filtro blando,
+- el manifest permite reconstruir el experimento completo,
+- la comparación con otros modelos puede hacerse en igualdad metodológica.
+
+22. Conclusión
+
+train_logistic.py debe entenderse como la baseline probabilística institucional para señales binarias del stack de small-cap swing trading. Su valor no reside sólo en entrenar una logística regularizada, sino en fijar un estándar disciplinado de validación temporal, tratamiento del desbalance, calibración de probabilidades, parsimonia en el tuning y trazabilidad integral.
+
+Cuando esta baseline está correctamente diseñada, no sólo produce una referencia interpretable. Produce una prueba de honestidad metodológica del sistema: obliga a separar ranking de probabilidad, discriminación de calibración y edge real de simple sofisticación estadística. En un laboratorio cuantitativo serio, esa separación es exactamente lo que convierte una baseline buena en una baseline verdaderamente útil.

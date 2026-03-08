@@ -1,331 +1,384 @@
-\documentclass{article}
-\usepackage[utf8]{inputenc}
-\usepackage[spanish]{babel}
-\usepackage{amsmath,amsfonts,amssymb}
-\usepackage{booktabs}
-\usepackage{graphicx}
-\usepackage{listings}
-\usepackage{xcolor}
-\usepackage{hyperref}
-\usepackage[margin=2.5cm]{geometry}
+Especificación Cuantitativa: tests/test_features_schema.py
 
-\lstset{
-  language=Python,
-  basicstyle=\ttfamily\small,
-  keywordstyle=\color{blue},
-  commentstyle=\color{teal},
-  stringstyle=\color{red},
-  breaklines=true,
-  frame=single,
-  showstringspaces=false
+0. Propósito y papel dentro de la suite
+
+tests/test_features_schema.py define la barrera estructural del feature store dentro de la suite de tests. Su función no es evaluar si las features tienen poder predictivo, mejoran un modelo o elevan el Sharpe de una estrategia, sino verificar algo anterior y más básico: que la salida de la pipeline de features respeta un contrato de datos estable, consumible y libre de roturas silenciosas. La base que has pasado ya fija bien el núcleo correcto del módulo: columnas requeridas, unicidad de PK=(date,symbol), dtypes exactos, ausencia de Inf y umbrales de cobertura por feature. :contentReference[oaicite:0]{index=0}
+
+En un stack cuantitativo serio, este módulo no es “cosmético”. Es el cortafuegos entre generación de features y todo lo demás:
+- training,
+- inference,
+- validation,
+- attribution,
+- backtest.
+
+Si falla esta capa, el resto del sistema puede seguir corriendo y aun así producir resultados sin significado operativo.
+
+La regla institucional debe ser esta:
+
+    ninguna tabla de features
+    debe entrar en entrenamiento o inferencia
+    si no satisface primero
+    un contrato estructural explícito, versionado y auditable.
+
+1. Objetivo formal del módulo
+
+Sea un DataFrame de features D y un contrato estructural S. El módulo debe verificar si:
+
+    D ⊨ S
+
+donde el schema S incluye, como mínimo:
+
+- columnas obligatorias;
+- tipos esperados;
+- política de nullabilidad;
+- clave primaria lógica;
+- restricciones de validez numérica;
+- umbrales mínimos de cobertura;
+- opcionalmente, dominios plausibles por familia de feature;
+- versión contractual.
+
+Una formalización útil es:
+
+    S = (C_req, T, N, K, R, V, Θ)
+
+donde:
+- C_req es el conjunto de columnas requeridas;
+- T asigna tipos esperados a columnas;
+- N define nullabilidad;
+- K define la PK lógica;
+- R define dominios válidos;
+- V define la versión del contrato;
+- Θ define umbrales de cobertura.
+
+Entonces:
+
+    D ⊨ S
+
+si y solo si se cumplen simultáneamente:
+
+1. C_req ⊆ C_obs
+2. PK_unique(D, K)
+3. dtype_D(c) = T(c) o dtype compatible declarado
+4. no Inf en columnas numéricas
+5. domain(c) respetado para columnas con restricciones
+6. Coverage(c) ≥ Θ(c) cuando el contrato lo exige
+7. la versión observada coincide con la versión aceptada o su política de compatibilidad
+
+2. Principios no negociables
+
+P1. Schema-first.
+El feature store se valida como contrato de datos, no como artefacto “informal” de pandas.
+
+P2. Fail-fast.
+Una violación estructural debe detener el flujo antes de training o inference.
+
+P3. Precisión diagnóstica.
+El test debe decir exactamente qué falló: columna, tipo, cobertura, PK o dominio.
+
+P4. Determinismo.
+El mismo input y la misma configuración deben producir el mismo schema efectivo.
+
+P5. No ambigüedad.
+No se permiten coerciones silenciosas, columnas implícitas ni tipos laxos no documentados.
+
+P6. Evolución disciplinada.
+Los cambios de schema deben ser deliberados y versionados.
+
+P7. Separación de capas.
+Este módulo valida consumibilidad estructural, no utilidad predictiva.
+
+3. Ámbito y no-objetivos
+
+El módulo cubre:
+
+- presencia de columnas obligatorias;
+- unicidad de PK=(date,symbol) o la PK definida;
+- dtypes exactos o compatibles explícitos;
+- ausencia de ±Inf;
+- cobertura mínima por feature;
+- dominios plausibles si el contrato lo fija;
+- compatibilidad con el schema central del sistema.
+
+Queda fuera de alcance:
+
+- feature importance;
+- stationarity completa;
+- selección de variables;
+- calidad predictiva;
+- causalidad;
+- SHAP;
+- model readiness profunda;
+- multicolinealidad compleja como criterio fuerte del schema base.
+
+Puede haber extensiones razonables, pero no deben desplazar el foco principal del módulo.
+
+4. Qué debe proteger este módulo
+
+4.1. Rotura de columnas requeridas
+
+Si una columna obligatoria desaparece, se renombra o no se produce, el módulo debe fallar inmediatamente. Es uno de los errores más caros aguas abajo porque:
+- rompe joins,
+- rompe consumers de inferencia,
+- invalida training sets,
+- y a menudo produce fallos tardíos difíciles de diagnosticar.
+
+La condición mínima es:
+
+    C_req ⊆ C_obs
+
+4.2. Duplicados de clave lógica
+
+Si la PK lógica es:
+
+    K = (date, symbol)
+
+entonces debe cumplirse:
+
+    | { rows in D : (date, symbol) = k } | <= 1   para todo k
+
+Un duplicado en PK convierte el dataset en ambiguo:
+- una señal deja de representar una observación única;
+- los joins pueden multiplicarse;
+- labels y features pueden desalinearse;
+- la inferencia puede depender del orden físico del DataFrame.
+
+4.3. Deriva de tipos
+
+Una feature numérica convertida a object, una fecha como string o una columna categórica casteada erróneamente pueden no romper la ejecución de inmediato, pero sí contaminar comparaciones, serialización, joins y modelos.
+
+Este módulo debe tratar cualquier dtype drift no declarado como una violación contractual real.
+
+4.4. Valores infinitos
+
+Los infinitos suelen emerger de:
+- divisiones por cero,
+- logs inválidos,
+- escalados degenerados,
+- normalizaciones defectuosas.
+
+No deben tratarse como “detalle menor”. Una feature con Inf no pertenece a un dataset consumible.
+
+4.5. Cobertura insuficiente
+
+Una feature puede existir nominalmente y aun así ser inútil o peligrosa si la mayor parte de sus valores son NaN. Por eso la cobertura debe validarse con thresholds explícitos, distintos por familia de features.
+
+5. Contrato estructural recomendado
+
+Una representación sobria y operativa del schema de features puede ser:
+
+~~~python
+schema_v1 = {
+    "version": "1.0.0",
+    "required_columns": {
+        "date",
+        "symbol",
+        "run_id",
+        "config_hash",
+        "ret_1d",
+        "vol_20d",
+    },
+    "expected_dtypes": {
+        "date": "datetime64[ns]",
+        "symbol": "object",
+        "run_id": "object",
+        "config_hash": "object",
+        "ret_1d": "float64",
+        "vol_20d": "float64",
+    },
+    "primary_key": ["date", "symbol"],
+    "coverage_thresholds": {
+        "ret_1d": 0.95,
+        "vol_20d": 0.80,
+    },
+}
+~~~
+
+Esto ya fija:
+- identidad;
+- estructura mínima;
+- tipos;
+- cobertura;
+- versión.
+
+Si además se añaden dominios plausibles, el contrato se vuelve mucho más útil sin sobrediseñarse.
+
+6. Contrato de columnas obligatorias
+
+El test base debe verificar:
+
+    C_req ⊆ C_obs
+
+Implementación recomendada:
+
+~~~python
+def test_features_required_columns_present(feature_df, feature_schema_ref):
+    required = feature_schema_ref["required_columns"]
+    missing = required.difference(feature_df.columns)
+    assert not missing, f"Faltan columnas requeridas: {sorted(missing)}"
+~~~
+
+Qué protege:
+- renombrados accidentales;
+- salidas parciales de pipeline;
+- columnas eliminadas en refactors;
+- drift entre módulos productores y consumidores.
+
+7. Contrato de clave primaria
+
+La clave lógica mínima recomendada es:
+
+    PK = (date, symbol)
+
+La condición formal es:
+
+    PK_unique(D)
+
+Implementación recomendada:
+
+~~~python
+def test_features_primary_key_unique_date_symbol(feature_df, feature_schema_ref):
+    pk = feature_schema_ref["primary_key"]
+    dup_mask = feature_df.duplicated(subset=pk, keep=False)
+    assert not dup_mask.any(), f"Duplicados detectados en PK {pk}"
+~~~
+
+Esto debe fallar con mensajes precisos, idealmente mostrando ejemplos de duplicados.
+
+8. Contrato de tipos
+
+Los dtypes deben validarse de forma estricta o mediante una clase declarada de compatibilidad. Si el sistema exige exactitud total, la comparación puede ser directa:
+
+~~~python
+def test_features_dtypes_match_schema(feature_df, feature_schema_ref):
+    expected = feature_schema_ref["expected_dtypes"]
+
+    for col, exp_dtype in expected.items():
+        assert col in feature_df.columns, f"Columna ausente: {col}"
+        obs_dtype = str(feature_df[col].dtype)
+        assert obs_dtype == exp_dtype, (
+            f"{col}: dtype observado={obs_dtype}, esperado={exp_dtype}"
+        )
+~~~
+
+Esto protege contra:
+- coerciones silenciosas;
+- cambios en parsers;
+- serializaciones que transforman numéricos en texto;
+- cambios de backend de lectura/escritura.
+
+Si el sistema decide permitir “familias compatibles” de tipos, esa compatibilidad debe estar centralizada y no repartida test a test.
+
+9. Contrato de validez numérica
+
+Para toda feature numérica f_j:
+
+    f_j ∈ ℝ ∪ {NaN}
+
+pero:
+
+    f_j ∉ {+∞, -∞}
+
+Implementación recomendada:
+
+~~~python
+import numpy as np
+
+def test_no_inf_values_in_numeric_features(feature_df):
+    num_cols = feature_df.select_dtypes(include=["number"]).columns
+    has_inf = np.isinf(feature_df[num_cols].to_numpy()).any()
+    assert not has_inf, "Se detectaron valores +/-Inf en features numéricas"
+~~~
+
+En un módulo más completo, conviene además informar qué columnas contienen Inf.
+
+10. Cobertura por feature
+
+Definimos cobertura de una feature f_j como:
+
+    Coverage(f_j) = (1/N) * Σ 1{f_ij no es NaN}
+
+El contrato exige:
+
+    Coverage(f_j) >= θ_j
+
+para cada feature cuyo threshold se haya fijado.
+
+Implementación recomendada:
+
+~~~python
+def test_feature_coverage_above_threshold(feature_df, feature_schema_ref):
+    thresholds = feature_schema_ref["coverage_thresholds"]
+
+    for col, thr in thresholds.items():
+        coverage = feature_df[col].notna().mean()
+        assert coverage >= thr, (
+            f"{col}: coverage={coverage:.3f} < {thr:.3f}"
+        )
+~~~
+
+Nota importante:
+los thresholds no deben ser universales ni arbitrarios. Deben reflejar la naturaleza de cada feature:
+- una contemporánea tipo ret_1d puede exigir cobertura casi total;
+- una rolling de 20 días necesita tolerar warm-up NaNs;
+- una feature fundamental puede tener cobertura estructuralmente menor si el contrato así lo admite.
+
+11. Domain constraints recomendadas
+
+Para subir este módulo a un nivel realmente fuerte, conviene introducir restricciones de dominio plausibles por feature. Ejemplos razonables:
+
+- ret_1d ∈ [-0.20, 0.20]
+- ret_5d ∈ [-0.50, 0.50]
+- vol_20d ∈ [0.0, 1.5]
+- ma_ratio ∈ [0.5, 2.0]
+- rsi_14 ∈ [0, 100]
+
+Esto no pretende modelar toda la estadística del mercado; pretende detectar valores físicamente absurdos o errores de transformación.
+
+Implementación recomendada:
+
+~~~python
+DOMAIN_BOUNDS = {
+    "ret_1d": (-0.20, 0.20),
+    "ret_5d": (-0.50, 0.50),
+    "vol_20d": (0.00, 1.50),
+    "ma_ratio": (0.5, 2.0),
+    "rsi_14": (0.0, 100.0),
 }
 
-\title{Especificación Técnica: \texttt{tests/test\_features\_schema.py}\\
-Validación de Contratos Estructurales del Feature Store}
-\author{Rewrite Quant PhD Level}
-\date{Marzo 2026}
+def test_feature_domain_constraints(feature_df):
+    for col, (lo, hi) in DOMAIN_BOUNDS.items():
+        if col not in feature_df.columns:
+            continue
+        valid = feature_df[col].between(lo, hi) | feature_df[col].isna()
+        assert valid.all(), f"{col}: valores fuera de [{lo}, {hi}]"
+~~~
 
-\begin{document}
-\maketitle
+Esto protege especialmente contra:
+- errores de normalización;
+- features mal escaladas;
+- retornos imposibles;
+- ratios degenerados.
 
-\section{Propósito del Módulo}
+12. Nullability policy
 
-El objetivo de \texttt{tests/test\_features\_schema.py} es verificar que la tabla de features entregada por la pipeline cumple un contrato estructural estable, compatible con las capas consumidoras del sistema y libre de roturas silenciosas de schema.
+No todas las columnas deben tratarse igual:
 
-Este módulo no evalúa si las features son predictivas ni si mejoran el rendimiento de un modelo. Su función es anterior y más básica: garantizar que el feature store puede ser consumido de forma determinista por entrenamiento, inferencia, validación y reporting sin ambigüedad estructural.
+- date, symbol, run_id, config_hash:
+  no deben ser nulas.
 
-En términos de arquitectura, este test responde a una pregunta concreta:
+- rolling features:
+  pueden admitir nulos en warm-up.
 
-\begin{quote}
-\emph{¿La salida del pipeline de features respeta exactamente el esquema, la clave lógica, los tipos y las restricciones mínimas necesarias para que el resto del sistema funcione correctamente?}
-\end{quote}
+- features fundamentales:
+  la nullabilidad depende del contrato explícito.
 
-Si la respuesta es no, entonces cualquier fase posterior ---training, model selection, inference, attribution o backtest--- queda expuesta a fallos espurios, leakage accidental, inferencias incoherentes o resultados no reproducibles.
+Por tanto, el test no debe preguntar solo “hay nulos o no”, sino “hay nulos donde están permitidos y en la magnitud permitida”.
 
-\section{Principios de Diseño}
+13. Fixture base recomendada
 
-El módulo debe construirse sobre principios de contrato de datos, no sobre lenguaje de modelado o rentabilidad:
+La fixture debe ser pequeña, determinista y fácil de manipular para inducir fallos controlados.
 
-\begin{enumerate}
-    \item \textbf{Schema como contrato}: nombres, tipos, clave primaria, nullabilidad y dominios válidos deben estar fijados.
-    \item \textbf{Fallos tempranos}: una violación estructural debe detectarse antes de entrar en training o inference.
-    \item \textbf{Determinismo}: el mismo input y la misma configuración deben producir la misma estructura de salida.
-    \item \textbf{Auditoría}: el test debe permitir señalar con precisión qué columna, fila o restricción ha fallado.
-    \item \textbf{Compatibilidad evolutiva}: los cambios de schema deben ser deliberados, versionados y testeados.
-\end{enumerate}
-
-\section{Contrato Estructural del Feature Store}
-
-Una tabla de features bien formada debe satisfacer simultáneamente cuatro capas de contrato:
-
-\subsection{Contrato de identidad}
-
-Cada observación debe corresponder a una unidad lógica inequívoca, normalmente identificada por una clave primaria como:
-
-\[
-\mathrm{PK} = (\mathrm{date}, \mathrm{symbol})
-\]
-
-o, si el sistema lo requiere, una extensión del tipo:
-
-\[
-\mathrm{PK} = (\mathrm{date}, \mathrm{symbol}, \mathrm{run\_id})
-\]
-
-Lo importante no es la forma concreta de la PK, sino que:
-\begin{itemize}
-    \item exista una definición única,
-    \item no admita duplicados,
-    \item y sea consistente con el resto del stack.
-\end{itemize}
-
-\subsection{Contrato de columnas obligatorias}
-
-Debe existir un conjunto mínimo de columnas cuya ausencia invalida el dataset. Por ejemplo:
-
-\begin{itemize}
-    \item \texttt{date}
-    \item \texttt{symbol}
-    \item \texttt{run\_id} o equivalente, si la pipeline versiona ejecuciones
-    \item \texttt{config\_hash} o equivalente, si la reproducibilidad depende de configuración
-    \item columnas de features definidas por el schema de referencia
-\end{itemize}
-
-\subsection{Contrato de tipos}
-
-Cada columna debe respetar un dtype esperado o una familia compatible de tipos. Por ejemplo:
-
-\begin{center}
-\begin{tabular}{lll}
-\toprule
-Columna & Tipo esperado & Observación \\
-\midrule
-\texttt{date} & datetime & sin ambigüedad temporal \\
-\texttt{symbol} & string/object & identificador categórico \\
-\texttt{run\_id} & string/object & metadato estable \\
-\texttt{config\_hash} & string/object & huella de configuración \\
-features numéricas & float/int & sin coerciones silenciosas \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\subsection{Contrato de validez numérica}
-
-Para toda feature numérica \(f_j\), las restricciones mínimas son:
-
-\[
-f_j \notin \{+\infty, -\infty\}
-\]
-
-y, salvo que el contrato lo permita, la fracción de nulos debe permanecer dentro de un umbral explícito. El punto clave es que la política de nullabilidad no puede quedar implícita.
-
-\section{Qué Debe Proteger Este Módulo}
-
-\subsection{Rotura de columnas obligatorias}
-
-Si una columna esencial desaparece o cambia de nombre, el test debe fallar inmediatamente. Este error suele producir fallos aguas abajo difíciles de interpretar; por eso debe interceptarse en origen.
-
-\subsection{Duplicados de clave}
-
-Si dos filas comparten la misma PK lógica, el sistema deja de tener una representación unívoca del estado de features. Esto puede contaminar joins, labels, training sets y evaluación.
-
-\subsection{Deriva de tipos}
-
-Una feature numérica convertida silenciosamente a \texttt{object}, una fecha leída como texto o un identificador categórico casteado a numérico pueden romper inferencia o producir comparaciones incorrectas. El test debe capturar estas derivas de dtype.
-
-\subsection{Valores infinitos}
-
-Los infinitos suelen emerger por divisiones por cero, logaritmos inválidos, escalados mal condicionados o transformaciones degeneradas. La suite debe tratarlos como violación estructural, no como incidente menor.
-
-\subsection{Cobertura insuficiente}
-
-Una feature puede existir formalmente y aun así ser inútil si está vacía o casi vacía. Por eso conviene testear cobertura mínima cuando el contrato lo exija.
-
-\section{Casos Mínimos del Módulo}
-
-\subsection{\texttt{test\_features\_required\_columns\_present}}
-
-Verifica que todas las columnas obligatorias del contrato están presentes.
-
-\paragraph{Contrato}
-Si \(C_{\mathrm{req}}\) es el conjunto de columnas requeridas y \(C_{\mathrm{obs}}\) el conjunto observado:
-
-\[
-C_{\mathrm{req}} \subseteq C_{\mathrm{obs}}
-\]
-
-\paragraph{Assertion base}
-\begin{lstlisting}
-required = {"date", "symbol", "run_id", "config_hash"}
-missing = required.difference(df.columns)
-assert not missing, f"Faltan columnas requeridas: {sorted(missing)}"
-\end{lstlisting}
-
-\paragraph{Qué protege}
-\begin{itemize}
-    \item renombrados accidentales,
-    \item columnas eliminadas en refactors,
-    \item salidas parciales de pipeline.
-\end{itemize}
-
-\subsection{\texttt{test\_features\_primary\_key\_unique\_date\_symbol}}
-
-Verifica unicidad de la clave lógica.
-
-\paragraph{Contrato}
-Para PK \(K\), debe cumplirse:
-
-\[
-\forall x \neq y,\quad K(x) \neq K(y)
-\]
-
-o equivalentemente, el número de filas debe coincidir con el número de claves distintas.
-
-\paragraph{Assertion base}
-\begin{lstlisting}
-dup_mask = df.duplicated(subset=["date", "symbol"], keep=False)
-assert not dup_mask.any(), "Existen claves duplicadas en (date, symbol)"
-\end{lstlisting}
-
-\paragraph{Qué protege}
-\begin{itemize}
-    \item joins multiplicativos,
-    \item concatenaciones duplicadas,
-    \item errores de particionado o append.
-\end{itemize}
-
-\subsection{\texttt{test\_features\_dtypes\_match\_schema}}
-
-Verifica compatibilidad entre dtypes observados y schema de referencia.
-
-\paragraph{Contrato}
-Sea \(T_j^{\mathrm{exp}}\) el tipo esperado de la columna \(j\) y \(T_j^{\mathrm{obs}}\) el observado. El test debe exigir:
-
-\[
-T_j^{\mathrm{obs}} \in \mathcal{C}(T_j^{\mathrm{exp}})
-\]
-
-donde \(\mathcal{C}(\cdot)\) es la clase de tipos compatibles permitida por el sistema.
-
-\paragraph{Assertion base}
-\begin{lstlisting}
-expected = {
-    "date": "datetime64[ns]",
-    "symbol": "object",
-    "run_id": "object",
-    "config_hash": "object",
-    "ret_1d": "float64",
-    "vol_20d": "float64",
-}
-
-for col, exp_dtype in expected.items():
-    assert col in df.columns, f"Columna ausente: {col}"
-    obs = str(df[col].dtype)
-    assert obs == exp_dtype, f"{col}: dtype observado={obs}, esperado={exp_dtype}"
-\end{lstlisting}
-
-\paragraph{Qué protege}
-\begin{itemize}
-    \item coerciones silenciosas,
-    \item carga inconsistente de datos,
-    \item cambios de parser o serialización.
-\end{itemize}
-
-\subsection{\texttt{test\_no\_inf\_values\_in\_numeric\_features}}
-
-Verifica ausencia de valores infinitos en columnas numéricas.
-
-\paragraph{Contrato}
-Para cada columna numérica \(f_j\):
-
-\[
-\forall i,\quad f_{ij} \in \mathbb{R} \cup \{\mathrm{NaN}\}
-\]
-
-siendo \(\pm \infty\) inválidos.
-
-\paragraph{Assertion base}
-\begin{lstlisting}
-num_cols = df.select_dtypes(include=["number"]).columns
-has_inf = np.isinf(df[num_cols].to_numpy()).any()
-assert not has_inf, "Se detectaron valores +/-Inf en features numéricas"
-\end{lstlisting}
-
-\subsection{\texttt{test\_feature\_coverage\_above\_threshold}}
-
-Verifica que ciertas features cumplen cobertura mínima.
-
-\paragraph{Definición}
-Para una feature \(f_j\), definimos cobertura como:
-
-\[
-\mathrm{Coverage}(f_j)
-=
-\frac{1}{N}
-\sum_{i=1}^{N}
-\mathbf{1}\{f_{ij}\ \text{no es nulo}\}
-\]
-
-\paragraph{Assertion base}
-\begin{lstlisting}
-thresholds = {
-    "ret_1d": 0.95,
-    "vol_20d": 0.80,
-}
-
-for col, thr in thresholds.items():
-    coverage = df[col].notna().mean()
-    assert coverage >= thr, f"{col}: coverage={coverage:.3f} < {thr:.3f}"
-\end{lstlisting}
-
-\paragraph{Nota}
-El umbral no debe ser universal ni decorativo; debe estar justificado por la naturaleza de cada feature. Una rolling de 20 días no puede exigirse igual que una feature contemporánea sin ventana de calentamiento.
-
-\section{Extensiones Recomendadas para Llevar el Módulo a Nivel Alto}
-
-\subsection{\texttt{test\_schema\_column\_order\_if\_contractual}}
-
-En muchos sistemas el orden de columnas no importa. Pero si la salida se consume por componentes sensibles al orden, el contrato debe fijarlo y testearlo.
-
-\subsection{\texttt{test\_nullable\_policy\_by\_feature\_family}}
-
-No todas las features deben tratar los nulos igual. El test puede exigir una política por familia:
-
-\begin{itemize}
-    \item features de identidad: no nulas,
-    \item features rolling: nulas permitidas en warm-up,
-    \item features de metadata: nulas prohibidas salvo contrato expreso.
-\end{itemize}
-
-\subsection{\texttt{test\_schema\_compatible\_with\_downstream\_consumer}}
-
-Valida que la tabla puede ser consumida por el schema formal del sistema, por ejemplo a través de una capa como \texttt{simons\_core.schemas}. Este test es especialmente útil cuando el contrato está centralizado.
-
-\subsection{\texttt{test\_feature\_names\_no\_duplicates\_or\_reserved\_tokens}}
-
-Comprueba que:
-\begin{itemize}
-    \item no hay nombres duplicados,
-    \item no se pisan columnas reservadas,
-    \item no aparecen alias inconsistentes del mismo concepto.
-\end{itemize}
-
-\subsection{\texttt{test\_schema\_version\_changes\_are\_explicit}}
-
-Si cambia el schema entre versiones, el cambio debe ser explícito. Una estrategia razonable es exigir:
-\begin{itemize}
-    \item \texttt{schema\_version},
-    \item changelog o migration path,
-    \item tests de compatibilidad hacia atrás o hacia delante.
-\end{itemize}
-
-\section{Fixtures Recomendadas}
-
-Las fixtures deben ser pequeñas, deterministas y fáciles de manipular para inducir fallos controlados.
-
-\subsection{Panel base válido}
-
-\begin{lstlisting}
+~~~python
 import numpy as np
 import pandas as pd
 import pytest
@@ -345,172 +398,192 @@ def synthetic_feature_panel():
     df["config_hash"] = "cfg_abc123"
     df["ret_1d"] = np.array([0.01, 0.02, -0.01, 0.00, 0.03, 0.01, -0.02, 0.01, 0.00, 0.02, 0.01, -0.01])
     df["vol_20d"] = np.array([np.nan, np.nan, 0.12, 0.10, 0.11, 0.13, np.nan, np.nan, 0.09, 0.08, 0.10, 0.11])
+
     return df
-\end{lstlisting}
+~~~
 
-\subsection{Schema de referencia}
+Esta fixture es suficientemente rica para:
+- probar coverage;
+- probar PK;
+- probar dtypes;
+- inducir fallos por transformación mínima;
+- seguir siendo auditable a mano.
 
-\begin{lstlisting}
+14. Fixtures derivadas para fallo controlado
+
+Una buena suite debe disponer de variaciones mínimas sobre la fixture válida:
+
+14.1. Missing column
+
+~~~python
 @pytest.fixture
-def feature_schema_ref():
-    return {
-        "required_columns": {
-            "date",
-            "symbol",
-            "run_id",
-            "config_hash",
-            "ret_1d",
-            "vol_20d",
-        },
-        "expected_dtypes": {
-            "date": "datetime64[ns]",
-            "symbol": "object",
-            "run_id": "object",
-            "config_hash": "object",
-            "ret_1d": "float64",
-            "vol_20d": "float64",
-        },
-        "primary_key": ["date", "symbol"],
-        "coverage_thresholds": {
-            "ret_1d": 0.95,
-            "vol_20d": 0.60,
-        }
-    }
-\end{lstlisting}
+def feature_panel_missing_run_id(synthetic_feature_panel):
+    return synthetic_feature_panel.drop(columns=["run_id"])
+~~~
 
-\subsection{Fixtures derivadas para fallo}
+14.2. PK duplicate
 
-Conviene definir variaciones mínimas sobre la fixture válida:
+~~~python
+@pytest.fixture
+def feature_panel_with_duplicate_pk(synthetic_feature_panel):
+    dup = synthetic_feature_panel.iloc[[0]].copy()
+    return pd.concat([synthetic_feature_panel, dup], ignore_index=True)
+~~~
 
-\begin{itemize}
-    \item una con columna faltante,
-    \item una con duplicado en PK,
-    \item una con dtype incorrecto,
-    \item una con \texttt{Inf},
-    \item una con cobertura por debajo del umbral.
-\end{itemize}
+14.3. Dtype drift
 
-Eso permite que cada test falle por una única razón clara.
+~~~python
+@pytest.fixture
+def feature_panel_dtype_drift(synthetic_feature_panel):
+    df = synthetic_feature_panel.copy()
+    df["ret_1d"] = df["ret_1d"].astype("object")
+    return df
+~~~
 
-\section{Ejemplo Sobrio de Implementación}
+14.4. Inf value
 
-\begin{lstlisting}
-def test_features_required_columns_present(synthetic_feature_panel, feature_schema_ref):
-    df = synthetic_feature_panel
-    required = feature_schema_ref["required_columns"]
-    missing = required.difference(df.columns)
-    assert not missing, f"Faltan columnas requeridas: {sorted(missing)}"
+~~~python
+@pytest.fixture
+def feature_panel_with_inf(synthetic_feature_panel):
+    df = synthetic_feature_panel.copy()
+    df.loc[0, "ret_1d"] = np.inf
+    return df
+~~~
 
+14.5. Low coverage
 
-def test_features_primary_key_unique_date_symbol(synthetic_feature_panel, feature_schema_ref):
-    df = synthetic_feature_panel
-    pk = feature_schema_ref["primary_key"]
-    dup_mask = df.duplicated(subset=pk, keep=False)
-    assert not dup_mask.any(), f"Duplicados detectados en PK {pk}"
+~~~python
+@pytest.fixture
+def feature_panel_low_coverage(synthetic_feature_panel):
+    df = synthetic_feature_panel.copy()
+    df["ret_1d"] = np.nan
+    return df
+~~~
 
+La ventaja es clara: cada test falla por una razón única y comprensible.
 
-def test_features_dtypes_match_schema(synthetic_feature_panel, feature_schema_ref):
-    df = synthetic_feature_panel
-    expected_dtypes = feature_schema_ref["expected_dtypes"]
+15. Integración con la capa formal de schemas
 
-    for col, exp in expected_dtypes.items():
-        assert col in df.columns, f"Columna ausente: {col}"
-        obs = str(df[col].dtype)
-        assert obs == exp, f"{col}: dtype observado={obs}, esperado={exp}"
+Si el repositorio dispone de una capa central como simons_core.schemas, este módulo no debería reinventar contratos incompatibles. Lo correcto es actuar como validación operacional de esa capa central.
 
+Una interfaz razonable sería:
 
-def test_no_inf_values_in_numeric_features(synthetic_feature_panel):
-    df = synthetic_feature_panel
-    num_cols = df.select_dtypes(include=["number"]).columns
-    assert not np.isinf(df[num_cols].to_numpy()).any()
+~~~python
+from simons_core.schemas import validate_schema
 
+def test_feature_schema_matches_central_contract(feature_df):
+    result = validate_schema(feature_df, "features")
+    assert result.passed, result.issues
+~~~
 
-def test_feature_coverage_above_threshold(synthetic_feature_panel, feature_schema_ref):
-    df = synthetic_feature_panel
-    thresholds = feature_schema_ref["coverage_thresholds"]
+Así se evita:
+- lógica duplicada;
+- drift entre schema formal y test local;
+- criterios distintos según el fichero.
 
-    for col, thr in thresholds.items():
-        coverage = df[col].notna().mean()
-        assert coverage >= thr, f"{col}: coverage={coverage:.3f} < {thr:.3f}"
-\end{lstlisting}
+16. Versionado del schema
 
-\section{Casos Borde que Deben Añadirse}
+Este módulo debe tratar el schema como artefacto versionado. Una estrategia mínima razonable:
 
-Para que este módulo suba realmente de nivel, debe cubrir además:
+~~~python
+schema_v1 = {..., "version": "1.0.0"}
+schema_v2 = {..., "version": "2.0.0"}
+~~~
 
-\subsection{Warm-up windows}
+Y tests del tipo:
 
-Las features rolling generan nulos al inicio. El test debe distinguir entre:
-\begin{itemize}
-    \item nulos permitidos por construcción,
-    \item nulos espurios fuera de la ventana de calentamiento.
-\end{itemize}
+- v1 sigue siendo aceptado por consumidores v1;
+- v2 introduce cambios deliberados;
+- si v2 rompe compatibilidad, el test debe hacerlo explícito.
 
-\subsection{Columnas numéricas serializadas como texto}
+Ejemplo:
 
-Un fallo típico es leer \texttt{"0.123"} como string. La suite debe detectarlo, porque muchos frameworks convierten silenciosamente o fallan tarde.
+~~~python
+def test_schema_version_changes_are_explicit(feature_df, schema_v1, schema_v2):
+    assert schema_v1["version"] != schema_v2["version"]
+~~~
 
-\subsection{Duplicados parciales por partición}
+La clave no es el formalismo por sí mismo, sino impedir cambios silenciosos de contrato.
 
-Puede ocurrir que una misma PK aparezca una vez en train y otra en inference por error de ensamblado. El test debe trabajar sobre la unidad lógica final consumida, no solo sobre fragmentos intermedios.
+17. Extensiones razonables sin sobrediseño
 
-\subsection{Schema drift entre runs}
+Para acercarse al techo realista 90-92, pueden añadirse:
 
-Si una ejecución produce columnas adicionales, elimina otras o cambia tipos, el sistema debe:
-\begin{itemize}
-    \item aceptar el cambio si está versionado y permitido,
-    \item o fallar si rompe compatibilidad contractual.
-\end{itemize}
+17.1. Temporal alignment check
+Verificar que las features están alineadas con la fecha de decisión o label_date esperada.
 
-\subsection{Cobertura desigual por símbolo o tramo temporal}
+17.2. Column order test
+Solo si el downstream consumer depende contractualmente del orden.
 
-Una media global de cobertura puede ocultar roturas localizadas. En módulos más fuertes conviene añadir checks por símbolo, por ventana temporal o por familia de features.
+17.3. No duplicated feature names
+Evitar alias o colisiones.
 
-\section{Relación con la Capa de Schema Formal}
+17.4. Optional feature groups
+Permitir familias opcionales bien definidas sin debilitar el contrato.
 
-Si el repositorio dispone de una capa tipo \texttt{simons\_core.schemas}, este módulo debe actuar como verificación operacional de ese contrato formal. La idea correcta no es duplicar lógica arbitrariamente, sino comprobar que la salida efectiva del pipeline coincide con la definición central del schema.
+17.5. Run-to-run schema stability
+Confirmar que distintas ejecuciones con misma config mantienen mismo schema estructural.
 
-En términos de diseño, el test debería preferir algo del estilo:
+18. Failure modes críticos que debe detectar
 
-\begin{lstlisting}
-validated = FeatureFrameSchema.validate(df)
-assert validated is not None
-\end{lstlisting}
+F1. Columna obligatoria ausente.
+F2. Duplicados en PK=(date, symbol).
+F3. Dtype drift silencioso.
+F4. Valores ±Inf.
+F5. Cobertura por debajo del umbral contractual.
+F6. Valores físicamente absurdos fuera de dominio.
+F7. Drift de schema entre runs no versionado.
+F8. Incompatibilidad con el schema central del sistema.
 
-o una comprobación equivalente, antes que dispersar reglas incompatibles en varios ficheros.
+19. MVP obligatorio
 
-\section{Qué No Debe Hacer Este Módulo}
+El MVP del módulo debe incluir, como mínimo:
 
-Para mantener nivel alto, \texttt{test\_features\_schema.py} no debe:
+- test_features_required_columns_present
+- test_features_primary_key_unique_date_symbol
+- test_features_dtypes_match_schema
+- test_no_inf_values_in_numeric_features
+- test_feature_coverage_above_threshold
 
-\begin{itemize}
-    \item justificar el schema por Sharpe, IC o métricas de estrategia,
-    \item mezclar validación estructural con drift estadístico general salvo que sea un test separado y contractual,
-    \item introducir modelos concretos como LSTM o Transformers si no son consumidores directos del contrato,
-    \item convertir un test de schema en una discusión sobre feature engineering.
-\end{itemize}
+Y, a ser posible ya en primera iteración:
+- test_feature_domain_constraints
+- test_feature_schema_matches_central_contract
 
-El lenguaje correcto aquí es el de \emph{contrato de datos}. Todo lo demás es secundario.
+20. Segunda fase razonable
 
-\section{Definition of Done}
+Como extensiones útiles:
+- schema versioning tests;
+- temporal alignment tests;
+- no duplicated feature names;
+- nullability policy by feature family;
+- domain constraints más ricas;
+- run-to-run schema stability;
+- checks ligeros de correlación extrema solo como warning contractual si el sistema lo necesita.
 
-El módulo puede considerarse sólido si cumple simultáneamente lo siguiente:
+21. No-objetivos
 
-\begin{enumerate}
-    \item Verifica presencia de columnas obligatorias.
-    \item Verifica unicidad de la PK lógica.
-    \item Verifica compatibilidad exacta o declarada de dtypes.
-    \item Verifica ausencia de \texttt{Inf} en features numéricas.
-    \item Verifica cobertura mínima con umbrales explícitos y justificados.
-    \item Verifica política de nullabilidad donde corresponda.
-    \item Verifica compatibilidad con la capa formal de schema del sistema.
-    \item Falla con mensajes precisos sobre la restricción violada.
-\end{enumerate}
+No pertenece al alcance de este módulo:
+- demostrar predictividad;
+- medir IC o Sharpe;
+- probar feature importance;
+- hacer selección de variables;
+- validar stationarity completa;
+- discutir arquitectura de modelos.
 
-\section{Conclusión}
+La misión aquí es estructural y contractual.
 
-\texttt{tests/test\_features\_schema.py} debe entenderse como una barrera estructural entre la generación de datos y el resto del stack cuantitativo. Su misión no es demostrar que las features son buenas, sino demostrar que son consumibles, coherentes y contractualmente válidas.
+22. Criterios de aceptación
 
-En una pipeline seria, los errores de schema no deben descubrirse al entrenar un modelo o al ejecutar un backtest. Deben detectarse inmediatamente en una suite de tests que trate el feature store como una interfaz formal: con clave lógica explícita, tipos controlados, restricciones auditables y evolución versionada. Ahí es donde este módulo alcanza de verdad un nivel alto.
+El módulo solo debe considerarse correcto si cumple simultáneamente:
 
-\end{document}
+- detecta ausencia de columnas obligatorias;
+- detecta duplicados de clave lógica;
+- detecta dtypes incorrectos;
+- detecta ±Inf en columnas numéricas;
+- detecta cobertura insuficiente según thresholds explícitos;
+- falla con mensajes claros y accionables;
+- permanece alineado con la capa central de schema del sistema.
+
+23. Conclusión
+
+tests/test_features_schema.py debe entenderse como la muralla estructural del feature store. Su valor no está en sonar sofisticado, sino en imponer una disciplina mínima sin la cual el resto del stack deja de ser fiable: columnas explícitas, PK única, tipos correctos, valores finitos, cobertura suficiente y evolución versionada. En un framework cuantitativo serio, eso no es burocracia; es la condición necesaria para que training, inference y backtesting operen sobre artefactos realmente consumibles. Ese es exactamente el estándar que este módulo debe imponer.

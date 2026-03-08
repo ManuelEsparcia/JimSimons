@@ -1,533 +1,491 @@
-\section{Módulo: \texttt{features/fundamentals\_deltas.py}}
+Especificación Cuantitativa: features/fundamentals_deltas.py
 
-\paragraph{Objetivo general}
-Este módulo construye la \textbf{capa de variación temporal fundamental point-in-time (PIT)} del sistema, derivando deltas QoQ, YoY y aceleraciones a partir de la base validada de \texttt{fundamentals\_core}. Su propósito no es simplemente calcular diferencias entre ratios contables, sino capturar de forma disciplinada \textbf{inflexiones económicas, cambios de régimen y aceleraciones de calidad o deterioro fundamental} que no aparecen en el nivel estático de la métrica core.
+1. Propósito del módulo
 
-En un sistema multifactor de \textit{small caps swing trading}, las señales de cambio fundamental pueden ser especialmente valiosas porque el mercado suele reaccionar con retraso, de forma no lineal o con sobre/infra-reacción a:
-\begin{itemize}
-    \item mejoras secuenciales de ingresos,
-    \item expansión o contracción de márgenes,
-    \item deterioro progresivo del balance,
-    \item mejora de conversión a caja,
-    \item o aceleraciones positivas/negativas en la trayectoria de la firma.
-\end{itemize}
+El objetivo de fundamentals_deltas.py no es simplemente calcular diferencias entre columnas fundamentales rezagadas, sino construir la capa canónica de dinámica fundamental point-in-time del sistema: una familia de señales que traduzca niveles contables estáticos en trayectorias económicas comparables, observables ex ante y utilizables downstream sin contaminación de calendario, restatements o bases degeneradas.
 
-Sin embargo, esta familia de señales también es una de las más frágiles metodológicamente. El problema no es solo calcular:
-\[
-\Delta F_t = F_t - F_{t-l},
-\]
-sino garantizar que:
-\begin{enumerate}
-    \item \( F_t \) y \( F_{t-l} \) son \textbf{comparables contablemente};
-    \item ambos son \textbf{PIT-observables} en las fechas correctas;
-    \item la periodicidad (QoQ, YoY) está correctamente alineada;
-    \item las bases cercanas a cero no generan explosiones numéricas sin semántica económica;
-    \item y las aceleraciones no son artefactos de reporting irregular o restatements.
-\end{enumerate}
+La pregunta correcta del módulo es:
 
-Por tanto, \texttt{fundamentals\_deltas.py} debe entenderse como una \textbf{capa de dinámica fundamental gobernada}, no como una simple operación aritmética sobre columnas rezagadas.
+“¿Podemos medir cambio fundamental real —QoQ, YoY y aceleración— usando únicamente pares de periodos fiscalmente comparables, PIT-válidos y económicamente interpretables, evitando que el delta sea un artefacto de calendario de mercado, base casi nula o reporting irregular?”
 
-\subsection{Rol dentro de la arquitectura}
+En un stack cuantitativo serio, la diferencia relevante no es entre F_t y “el valor de hace x días”, sino entre F_t y el último periodo contable comparable que habría sido observable en la fecha de decisión. Por eso este módulo no implementa una resta simple sobre columnas lagged, sino una disciplina formal de resolución de lags fiscales, validación PIT dual, control de comparabilidad, política de bases y construcción de aceleraciones de segundo orden.
 
-Este módulo se sitúa aguas abajo de:
-\begin{itemize}
-    \item \texttt{features/fundamentals\_core.py},
-    \item la resolución PIT de fundamentales y política de staleness,
-    \item y las series de ratios base ya validadas económicamente;
-\end{itemize}
-y aguas arriba de:
-\begin{itemize}
-    \item \texttt{features/build\_features.py},
-    \item \texttt{features/cross\_sectional.py},
-    \item \texttt{features/feature\_qc.py},
-    \item modelos multifactor, validación y backtests \textit{walk-forward}.
-\end{itemize}
+Si esta capa falla, todo el bloque de “fundamental momentum” se vuelve epistemológicamente débil: aparenta sofisticación, pero mezcla periodos no homogéneos, amplifica ruido numérico y deteriora la calidad económica del feature set.
 
-Su función arquitectónica es producir un bloque de \textbf{features de cambio fundamental} separado semánticamente de:
-\begin{itemize}
-    \item ratios fundamentales de nivel,
-    \item transformaciones cross-sectional,
-    \item interacciones con liquidez o momentum,
-    \item y features experimentales de segundo orden no estabilizadas.
-\end{itemize}
+2. Alcance y no-objetivos
 
-Esta separación es esencial. El sistema debe distinguir claramente entre:
-\begin{itemize}
-    \item \textbf{nivel}: “la empresa tiene margen alto”,
-    \item \textbf{delta}: “el margen ha mejorado frente al periodo comparable”,
-    \item \textbf{aceleración}: “la mejora del margen se está acelerando o frenando”.
-\end{itemize}
+2.1 Alcance
 
-\subsection{Marco teórico y contexto cuantitativo}
+El módulo:
+- resuelve lags fiscales comparables QoQ y YoY bajo disciplina PIT;
+- construye deltas absolutos y relativos solo cuando la pareja actual-lag es válida;
+- invalida comparaciones con base cercana a cero cuando la semántica del delta relativo lo exige;
+- construye aceleraciones solo si toda la cadena de deltas es válida;
+- emite flags explícitos de no comparabilidad, base degenerada, staleness y ambigüedad por restatement;
+- y entrega señales listas para consumo por cross_sectional.py, feature_qc.py y build_features.py.
 
-La lógica económica del módulo se apoya en varias intuiciones empíricas robustas:
+2.2 Fuera de alcance
 
-\begin{itemize}
-    \item El mercado no solo valora el nivel actual de una magnitud fundamental, sino también su \textbf{trayectoria}.
-    \item Cambios secuenciales en revenue, margen, leverage o cash flow suelen contener información adicional frente al nivel aislado.
-    \item Las señales de \textit{earnings momentum}, \textit{quality improvement} y deterioro progresivo del balance pueden emerger antes de que la valoración relativa se reconfigure por completo.
-    \item En small caps, las dinámicas de cambio son especialmente relevantes porque los ajustes informacionales pueden ser más lentos, menos arbitrados y más sensibles a sorpresas discretas de reporting.
-\end{itemize}
+El módulo no:
+- define la construcción primaria de fundamentales core;
+- no corrige errores contables originados aguas arriba;
+- no sustituye la lógica PIT base de fundamentals_core.py;
+- no decide por sí solo la utilidad económica final del factor;
+- no debe mezclar métricas quarterly, annual o TTM sin contrato explícito;
+- ni debe convertirse en un motor genérico de series temporales contables sin semántica de comparabilidad.
 
-No obstante, la evidencia útil depende de una construcción empírica rigurosa. En esta familia de features aparecen con facilidad varios fallos metodológicos:
-\begin{enumerate}
-    \item comparar periodos no equivalentes;
-    \item usar lags definidos por calendario de mercado en lugar de periodo contable comparable;
-    \item dividir por bases casi nulas;
-    \item mezclar frecuencia trimestral con TTM sin control;
-    \item contaminar la serie con restatements observados solo retrospectivamente;
-    \item o interpretar como aceleración económica un artefacto de missingness o de frecuencia irregular.
-\end{enumerate}
+3. Objeto formal del módulo
 
-\subsection{Marco formal y notación}
+Para cada métrica fundamental k, símbolo s y fecha de decisión t, el módulo parte de una observación PIT-válida:
 
-Sea \( \mathcal{T} \) el conjunto de fechas de trading y \( \mathcal{S}_t \) el universo PIT elegible en fecha \( t \). Para un símbolo \( s \in \mathcal{S}_t \), sea:
-\[
-F_t^{(s,k)}
-\]
-una métrica fundamental core del tipo \( k \) disponible para decisión en fecha \( t \), construida de forma PIT-compatible por \texttt{fundamentals\_core.py}.
+F_t^(s,k)
 
-Además, cada observación debe ir asociada a un identificador de periodo contable comparable:
-\[
-\pi_t^{(s,k)} \in \Pi,
-\]
-donde \( \Pi \) representa la colección de periodos fiscal-contables observables (por ejemplo, trimestre fiscal, año fiscal, TTM derivado, etc.).
+y define, para horizonte h, un operador de lag fiscal comparable:
 
-\paragraph{Comparabilidad temporal}
-La definición correcta de un lag fundamental no debe basarse meramente en:
-\[
-t-l,
-\]
-como fecha de mercado, sino en el \textbf{último periodo contable comparable observable} según el horizonte deseado:
-\begin{itemize}
-    \item \textbf{QoQ}: comparar con el trimestre fiscal inmediatamente anterior comparable;
-    \item \textbf{YoY}: comparar con el mismo trimestre del año anterior, o con un periodo anual/TTM comparable si la métrica así lo requiere.
-\end{itemize}
+L_h(t,s,k) = argmax_{τ∈Π_h(t,s,k)} { τ : a_τ ≤ t-δ }
 
-Por ello, definimos:
-\[
-\mathcal{L}_{\mathrm{QoQ}}(t,s,k), \qquad \mathcal{L}_{\mathrm{YoY}}(t,s,k)
-\]
-como operadores de búsqueda del último periodo comparable PIT-válido para la métrica \( k \), en el símbolo \( s \), observable a la fecha de decisión \( t \).
-
-\paragraph{Delta absoluto}
-Para horizonte \( h \in \{\mathrm{QoQ}, \mathrm{YoY}\} \):
-\[
-\Delta_h F_t^{(s,k)} = F_t^{(s,k)} - F_{\mathcal{L}_h(t,s,k)}^{(s,k)}.
-\]
-
-\paragraph{Delta relativo}
-Cuando la semántica económica lo permita:
-\[
-\Delta^{\mathrm{rel}}_h F_t^{(s,k)}
-=
-\frac{
-F_t^{(s,k)} - F_{\mathcal{L}_h(t,s,k)}^{(s,k)}
-}{
-B_h\!\left(F_{\mathcal{L}_h(t,s,k)}^{(s,k)}\right)
-},
-\]
-donde \( B_h(\cdot) \) representa una base válida elegida por política explícita. Esta base no tiene por qué ser siempre el valor lag bruto si éste es casi nulo, no interpretable o de signo problemático.
-
-\paragraph{Aceleración}
-La aceleración se define como segunda diferencia sobre una serie de cambios comparables:
-\[
-A_h F_t^{(s,k)}
-=
-\Delta_h F_t^{(s,k)}
--
-\Delta_h F_{\mathcal{L}_h(t,s,k)}^{(s,k)},
-\]
-siempre que ambas diferencias estén construidas sobre pares de periodos comparables y PIT-válidos.
-
-\subsection{Principios de diseño}
-
-\paragraph{1. Comparabilidad contable antes que proximidad temporal}
-El lag correcto no es necesariamente el valor observado “hace tres meses” en calendario de mercado, sino el último periodo fiscal comparable realmente disponible.
-
-\paragraph{2. PIT estricto por cada punto de comparación}
-Tanto el valor actual como el lag y, en su caso, el lag del lag para aceleraciones, deben satisfacer su propia restricción de observabilidad temporal.
-
-\paragraph{3. No toda métrica admite delta relativo}
-Las diferencias porcentuales son útiles cuando la base conserva sentido económico y estabilidad numérica. En otros casos, el delta absoluto o una transformación signed/log-safe es superior.
-
-\paragraph{4. Bases cercanas a cero requieren política explícita}
-No se permite dividir silenciosamente por valores minúsculos y producir ratios explosivos solo porque la operación es computable.
-
-\paragraph{5. Las aceleraciones son derivadas de segundo orden y deben gobernarse con más dureza}
-Toda aceleración hereda la fragilidad de dos diferencias consecutivas; por tanto, sus reglas de cobertura y validez deben ser más estrictas que las deltas simples.
-
-\paragraph{6. Restatements no pueden introducir retrospectividad}
-La versión del dato usada para cada comparación debe ser la observable en la fecha de decisión correspondiente, no la versión reconstruida a posteriori salvo que la fuente PIT garantice esa cronología.
-
-\subsection{Catálogo canónico de features}
-
-El módulo debe construir, como mínimo, un bloque canónico de deltas fundamentales sobre métricas ya aceptadas en \texttt{fundamentals\_core.py}. Cada feature debe especificar:
-\begin{itemize}
-    \item métrica base,
-    \item horizonte comparable (QoQ/YoY),
-    \item tipo de delta (absoluto/relativo),
-    \item política de base y near-zero,
-    \item política de signos,
-    \item y tratamiento de missing/invalidación.
-\end{itemize}
-
-\subsubsection{Crecimiento de ingresos}
-
-\paragraph{\texttt{fund\_revenue\_growth\_qoq}}
-Sea \( R_t^{(s)} \) el revenue comparable PIT del periodo actual. Entonces:
-\[
-\mathrm{RevGrow}_{t,\mathrm{QoQ}}^{(s)}
-=
-\frac{R_t^{(s)} - R_{t,\mathrm{QoQ\_lag}}^{(s)}}{B_{\mathrm{rev}}\!\left(R_{t,\mathrm{QoQ\_lag}}^{(s)}\right)}.
-\]
-
-\paragraph{Base recomendada}
-La base recomendada es:
-\[
-B_{\mathrm{rev}}(x)=
-\begin{cases}
-x, & |x| > \tau_{\mathrm{rev,base}} \\
-\text{invalid}, & |x| \le \tau_{\mathrm{rev,base}}
-\end{cases}
-\]
-para la versión canónica. Si se desea una variante más permisiva, debe publicarse con nombre distinto, no mezclarse con la serie canónica.
-
-\paragraph{\texttt{fund\_revenue\_growth\_yoy}}
-\[
-\mathrm{RevGrow}_{t,\mathrm{YoY}}^{(s)}
-=
-\frac{R_t^{(s)} - R_{t,\mathrm{YoY\_lag}}^{(s)}}{B_{\mathrm{rev}}\!\left(R_{t,\mathrm{YoY\_lag}}^{(s)}\right)}.
-\]
-
-\paragraph{Justificación}
-La comparación YoY suele ser más robusta que QoQ frente a estacionalidad, pero exige mayor cuidado en reporting irregular y disponibilidad PIT del periodo equivalente.
-
-\subsubsection{Delta de margen}
-
-\paragraph{\texttt{fund\_margin\_delta\_qoq}}
-Sea \( PM_t^{(s)} \) el margen PIT actual:
-\[
-\Delta PM_{t,\mathrm{QoQ}}^{(s)}
-=
-PM_t^{(s)} - PM_{t,\mathrm{QoQ\_lag}}^{(s)}.
-\]
-
-\paragraph{Observación}
-Para márgenes, la versión absoluta suele ser más estable que una variación relativa, ya que un margen base pequeño o negativo puede volver la ratio porcentual poco interpretable.
-
-\paragraph{Validez}
-Ambos márgenes comparados deben proceder de observaciones válidas ya aceptadas por \texttt{fundamentals\_core.py}; no debe recalcularse el ratio con reglas distintas en este módulo.
-
-\subsubsection{Delta de leverage}
-
-\paragraph{\texttt{fund\_leverage\_delta\_yoy}}
-Sea \( L_t^{(s)} \) el leverage ratio PIT actual:
-\[
-\Delta L_{t,\mathrm{YoY}}^{(s)}
-=
-L_t^{(s)} - L_{t,\mathrm{YoY\_lag}}^{(s)}.
-\]
-
-\paragraph{Interpretación}
-Esta variable mide deterioro o mejora en disciplina de balance y riesgo financiero. En general, la diferencia absoluta es más interpretable que un crecimiento relativo de leverage.
-
-\subsubsection{Delta de flujo de caja}
-
-\paragraph{\texttt{fund\_cashflow\_delta\_qoq}}
-Sea \( CFO_t^{(s)} \) el flujo operativo PIT comparable:
-\[
-\Delta CFO_{t,\mathrm{QoQ}}^{(s)}
-=
-CFO_t^{(s)} - CFO_{t,\mathrm{QoQ\_lag}}^{(s)}.
-\]
-
-\paragraph{Opcionalidad de normalización}
-Si la versión canónica del CFO está normalizada por activos o ingresos, esa semántica debe heredarse aquí sin redefinición implícita. No se permite que el módulo mezcle CFO bruto y CFO normalizado bajo el mismo nombre.
-
-\subsubsection{Aceleración de crecimiento}
-
-\paragraph{\texttt{fund\_growth\_acceleration}}
-Sea \( G_t^{(s)} \) una serie de crecimiento previamente válida, por ejemplo revenue growth YoY:
-\[
-A_t^{(s)} = G_t^{(s)} - G_{t,\mathrm{comparable\_lag}}^{(s)}.
-\]
-
-\paragraph{Condición adicional}
-Una aceleración solo es válida si:
-\begin{itemize}
-    \item el crecimiento actual es válido;
-    \item el crecimiento lag también es válido;
-    \item ambos están definidos sobre periodos comparables del mismo tipo;
-    \item y la cadena PIT no está rota por missing o restatement inconsistente.
-\end{itemize}
-
-\subsection{Alineación temporal y definición de lags}
-
-\subsubsection{Regla general}
-
-Para cada \( (t,s,k) \), el módulo debe localizar el periodo comparable usando metadatos contables, no únicamente desplazamientos de fechas de mercado. Formalmente, el lag QoQ y YoY debe resolverse como una función:
-\[
-\mathcal{L}_h(t,s,k) = \arg\max_{\tau \in \Pi_{h,\mathrm{comparable}}(t,s,k)} \{ \tau : a_\tau^{(s,k)} \le t-\delta \},
-\]
 donde:
-\begin{itemize}
-    \item \( \Pi_{h,\mathrm{comparable}}(t,s,k) \) es el conjunto de periodos fiscalmente comparables para el horizonte \( h \),
-    \item \( a_\tau^{(s,k)} \) es la fecha efectiva de observabilidad del periodo \( \tau \),
-    \item \( \delta = \texttt{decision\_lag\_days} \).
-\end{itemize}
+- Π_h(t,s,k) es el conjunto de periodos fiscalmente comparables para horizonte h;
+- a_τ es la fecha efectiva de observabilidad del periodo τ;
+- δ representa el decision_lag operativo del sistema.
 
-\subsubsection{QoQ}
+La construcción canónica del cambio es entonces:
 
-La comparación QoQ debe usar el trimestre fiscal anterior comparable, no simplemente el valor disponible tres meses antes en calendario de mercado. Si la firma reporta de forma irregular o cambia frecuencia, la observación debe invalidarse o degradarse según política, no emparejarse con un periodo no homogéneo.
+Δ_h F_t^(s,k) = F_t^(s,k) - F_{L_h(t,s,k)}^(s,k)
 
-\subsubsection{YoY}
+y, cuando procede semánticamente, el delta relativo:
 
-La comparación YoY debe usar el mismo trimestre fiscal del año anterior, o una construcción TTM consistente si la métrica así lo exige. No deben compararse:
-\begin{itemize}
-    \item TTM actual contra trimestre simple,
-    \item quarter actual contra annual total,
-    \item ni periodos con cobertura contable no equivalente.
-\end{itemize}
+Δ_h^rel F_t^(s,k) = (F_t^(s,k) - F_{L_h(t,s,k)}^(s,k)) / B_h(F_{L_h(t,s,k)}^(s,k))
 
-\subsubsection{Reporting irregular}
+solo si la base B_h(F_lag) satisface la política de validez.
 
-Si la frecuencia o la estructura de reporting impiden una comparación homogénea, la observación debe marcarse como:
-\[
-\texttt{noncomparable\_period\_flag} = 1
-\]
-y excluirse de la versión canónica.
+La aceleración se define como segunda diferencia sobre una cadena válida:
 
-\subsection{Restatements, revisiones y PIT}
+A_h F_t^(s,k) = Δ_h F_t^(s,k) - Δ_h F_{L_h(t,s,k)}^(s,k)
 
-\paragraph{Principio}
-Toda comparación debe usar la versión del dato que era efectivamente observable en cada fecha de decisión histórica correspondiente.
+y solo existe si tanto el delta actual como el delta del lag han sido construidos sobre pares comparables y PIT-válidos.
 
-\paragraph{Regla operativa}
-Si la fuente PIT permite distinguir versiones sucesivas del mismo periodo:
-\begin{itemize}
-    \item en fecha \( t \), usar la versión más reciente con \( a \le t-\delta \);
-    \item para el lag, usar la versión observable en la fecha histórica en que ese lag habría sido consumido, no una corrección incorporada posteriormente.
-\end{itemize}
+4. Principio central: comparabilidad fiscal antes que proximidad de calendario
 
-\paragraph{Limitación}
-Si la fuente no preserva historial de restatements, esta limitación debe registrarse en metadata. El módulo no debe fingir una pureza PIT que la fuente no permite.
+La regla estructural del módulo es:
 
-\subsection{Jerarquía de validez}
+el lag correcto no es market_calendar_lag; el lag correcto es fiscal_period_prior_PIT_valid.
 
-La resolución de una observación debe seguir el siguiente orden obligatorio:
+Esto implica que:
+- QoQ no significa “tres meses atrás”;
+- YoY no significa “doce meses atrás” en calendario bursátil;
+- y el emparejamiento actual-lag debe respetar el periodo fiscal y la frecuencia real de reporting del emisor.
 
-\begin{enumerate}
-    \item verificar observabilidad PIT del valor actual;
-    \item verificar observabilidad PIT del lag comparable;
-    \item en aceleraciones, verificar observabilidad PIT del lag del lag;
-    \item verificar comparabilidad contable entre periodos;
-    \item verificar staleness heredada de \texttt{fundamentals\_core.py};
-    \item verificar validez económica de la base si el delta es relativo;
-    \item solo entonces calcular delta o aceleración;
-    \item y únicamente después considerar clipping/winsorización sobre observaciones válidas.
-\end{enumerate}
+Esta es la diferencia entre una implementación amateur y una implementación institucional. El módulo debe trabajar en espacio de periodos contables comparables, no en espacio de simples offsets temporales de mercado.
 
-Esto evita que el clipping o ranking escondan una comparación contable incorrecta.
+5. Resolución de lags comparables
 
-\subsection{Política de bases cercanas a cero}
+5.1 Regla general
 
-\paragraph{Problema}
-Los deltas relativos del tipo:
-\[
-\frac{F_t - F_{t-l}}{F_{t-l}}
-\]
-pueden explotar cuando \( F_{t-l} \approx 0 \), incluso aunque ambos valores sean técnicamente válidos.
+Para cada (t,s,k), el módulo debe resolver el lag comparable mediante metadatos de periodo y observabilidad PIT:
 
-\paragraph{Política canónica}
-Para cada familia con delta relativo debe existir un umbral:
-\[
-|F_{t-l}| > \tau_{k,\mathrm{base}}
-\]
-como condición obligatoria de validez. Si no se cumple:
-\begin{itemize}
-    \item la observación canónica debe invalidarse;
-    \item o, en una variante separada, usar una transformación signed-safe explícita y nombrada aparte.
-\end{itemize}
+L_h(t,s,k) = argmax_{τ∈Π_h(t,s,k)} { τ : a_τ ≤ t-δ }
 
-\paragraph{Prohibición}
-No se permite sumar silenciosamente una constante arbitraria al denominador para “arreglar” la explosión numérica, salvo que esa transformación esté formalmente definida, justificada y tenga nombre distinto.
+El lag elegido debe ser:
+- comparable fiscalmente;
+- observable ex ante;
+- consistente con el tipo de métrica;
+- y suficientemente reciente bajo política de staleness.
 
-\subsection{Transformaciones permitidas}
+5.2 QoQ
 
-\paragraph{Deltas absolutos}
-Recomendados cuando:
-\begin{itemize}
-    \item la métrica base ya es una ratio,
-    \item los signos pueden cambiar,
-    \item o la escala relativa no es económicamente estable.
-\end{itemize}
+L_QoQ debe corresponder al trimestre fiscal inmediatamente anterior comparable, no al valor disponible más cercano en una fecha desplazada del calendario de mercado.
 
-\paragraph{Deltas relativos}
-Recomendados cuando:
-\begin{itemize}
-    \item el nivel base conserva sentido económico,
-    \item el denominador es estrictamente positivo y suficientemente alejado de cero,
-    \item y la comparación porcentual añade interpretabilidad real.
-\end{itemize}
+5.3 YoY
 
-\paragraph{Aceleraciones}
-Deben tratarse como features de segundo orden con mayor riesgo de ruido. La build canónica puede incluir solo un subconjunto reducido de aceleraciones con evidencia económica clara; el resto debería quedar como experimental.
+L_YoY debe corresponder al mismo trimestre fiscal del año anterior o, si la métrica lo requiere, a una construcción anual/TTM homogénea. No se permite comparar quarter actual con annual, quarter con TTM o TTM con quarter salvo que exista una política explícita y nombrada por separado.
 
-\paragraph{Clipping y winsorización}
-Solo deben aplicarse después de validar la construcción PIT y económica. Un valor extremo válido puede winsorizarse; un valor extremo por base degenerada debe invalidarse.
+5.4 Reporting irregular
 
-\subsection{Controles de sanidad y consistencia}
+Si el emisor reporta con frecuencia irregular, cambia estructura de periodo o no permite emparejamiento homogéneo, la comparación canónica debe invalidarse y activarse noncomparable_period_flag.
 
-\paragraph{Coherencia temporal}
-\begin{itemize}
-    \item verificar que el lag comparable realmente existe;
-    \item verificar que su \texttt{asof\_date} respeta el \textit{decision cut};
-    \item verificar que no se mezclan periodos no homogéneos;
-    \item verificar que aceleraciones usan deltas construidos con la misma convención.
-\end{itemize}
+6. Construcción de deltas
 
-\paragraph{Cobertura}
-Para cada feature \( \Delta f \), deben calcularse:
-\[
-\rho_{\mathrm{cov}}^{(\Delta f)},
-\qquad
-Q_{0.05}\big(\rho_{\mathrm{cov}}^{(\Delta f,t)}\big),
-\qquad
-\text{breach rate de cobertura}.
-\]
-Las aceleraciones deben tener umbrales de cobertura más exigentes o, alternativamente, tolerancias separadas y estado experimental.
+6.1 Delta absoluto
 
-\paragraph{Flags recomendados}
-\begin{itemize}
-    \item \texttt{noncomparable\_period\_flag}
-    \item \texttt{near\_zero\_base\_flag}
-    \item \texttt{restatement\_ambiguity\_flag}
-    \item \texttt{stale\_lag\_flag}
-    \item \texttt{acceleration\_invalid\_chain\_flag}
-\end{itemize}
+La forma básica es:
 
-\paragraph{Rangos plausibles}
-Los rangos plausibles pueden servir como \textit{soft checks}, pero no deben sustituir la validación causal. Un crecimiento del \(300\%\) puede ser extraordinario pero real; el QC debe distinguir si surge de una base minúscula, de un restatement o de un evento económico genuino.
+Δ_h F_t = F_t - F_lag
 
-\subsection{Flujo de procesamiento}
+y resulta especialmente apropiada cuando:
+- la métrica base ya es una ratio;
+- la escala relativa no es estable;
+- los signos pueden cambiar;
+- o el denominador carece de interpretación económica fuerte.
 
-\paragraph{Secuencia de alto nivel}
-\begin{enumerate}
-    \item Cargar snapshot de \texttt{fundamentals\_core} con metadata de periodo y \texttt{asof}.
-    \item Resolver para cada fecha y símbolo los lags QoQ/YoY comparables.
-    \item Verificar comparabilidad contable y PIT de cada pareja actual-lag.
-    \item Construir deltas absolutos o relativos según política por feature.
-    \item Construir aceleraciones solo cuando la cadena de comparaciones sea completamente válida.
-    \item Aplicar clipping/winsorización únicamente sobre observaciones válidas.
-    \item Persistir outputs, summary y manifest.
-\end{enumerate}
+6.2 Delta relativo
 
-\paragraph{Descomposición funcional sugerida}
-\begin{itemize}
-    \item \texttt{load\_fundamentals\_core\_with\_metadata()}
-    \item \texttt{resolve\_comparable\_lags()}
-    \item \texttt{validate\_period\_comparability()}
-    \item \texttt{validate\_lag\_availability()}
-    \item \texttt{compute\_absolute\_deltas()}
-    \item \texttt{compute\_relative\_deltas()}
-    \item \texttt{compute\_accelerations()}
-    \item \texttt{apply\_delta\_sanity\_flags()}
-    \item \texttt{apply\_clipping\_policy()}
-    \item \texttt{persist\_fundamental\_deltas()}
-    \item \texttt{main()}
-\end{itemize}
+La forma relativa es:
 
-\subsection{Salidas y contrato de persistencia}
+Δ_h^rel = (F_t - F_lag) / B_h(F_lag)
 
-\paragraph{Dataset principal}
-\begin{verbatim}
-features/fundamentals_deltas/
-  run_id=<RUN_ID>/
-    date=YYYY-MM-DD/part-*.parquet
-\end{verbatim}
+y solo debe usarse cuando:
+- la base conserva sentido económico;
+- el denominador es suficientemente grande en valor absoluto;
+- la interpretación porcentual añade contenido real;
+- y la política de near-zero está explícitamente definida.
 
-\paragraph{Columnas mínimas}
-\begin{itemize}
-    \item \texttt{date}, \texttt{symbol}, \texttt{run\_id}
-    \item \texttt{fund\_revenue\_growth\_qoq}
-    \item \texttt{fund\_revenue\_growth\_yoy}
-    \item \texttt{fund\_margin\_delta\_qoq}
-    \item \texttt{fund\_leverage\_delta\_yoy}
-    \item \texttt{fund\_cashflow\_delta\_qoq}
-    \item \texttt{fund\_growth\_acceleration}
-    \item flags auxiliares:
-    \begin{itemize}
-        \item \texttt{noncomparable\_period\_flag}
-        \item \texttt{near\_zero\_base\_flag}
-        \item \texttt{restatement\_ambiguity\_flag}
-        \item \texttt{stale\_lag\_flag}
-        \item \texttt{acceleration\_invalid\_chain\_flag}
-    \end{itemize}
-\end{itemize}
+6.3 Prohibición de arreglos silenciosos
 
-\paragraph{Manifest}
-El \texttt{manifest\_\{run\_id\}.json} debe incluir:
-\begin{itemize}
-    \item \texttt{run\_id}
-    \item \texttt{config\_hash}
-    \item \texttt{fundamentals\_core\_hash}
-    \item \texttt{lag\_policy\_hash}
-    \item \texttt{comparability\_policy\_hash}
-    \item \texttt{lineage\_hash}
-\end{itemize}
+No se permite “arreglar” el denominador añadiendo constantes arbitrarias, epsilons oportunistas o transformaciones implícitas que no formen parte del contrato formal del feature. Si una variante signed-safe existe, debe publicarse con otro nombre.
 
-\paragraph{Summary recomendado}
-\begin{itemize}
-    \item cobertura por feature;
-    \item número de invalidaciones por base casi nula;
-    \item número de invalidaciones por no comparabilidad;
-    \item distribución de deltas válidos;
-    \item número de aceleraciones válidas y descartadas;
-    \item percentiles de clipping/winsorización.
-\end{itemize}
+7. Política de base y near-zero governance
 
-\subsection{CLI recomendada}
+Uno de los puntos críticos del módulo es la validez de la base del delta relativo.
 
-\begin{verbatim}
-python -m features.fundamentals_deltas ^
-  --fundamentals-core-path features/fundamentals_core ^
-  --config-path configs/features/fundamentals_deltas.yaml ^
-  --run-id fundamentals_deltas_20260305_001
-\end{verbatim}
+Definimos la base canónica como:
 
-\subsection{Uso downstream}
+B_h(F_lag) = F_lag   si |F_lag| > τ_base
+B_h(F_lag) = invalid si |F_lag| ≤ τ_base
 
-\begin{itemize}
-    \item \texttt{features/build\_features.py} integra estas señales como bloque de dinámica fundamental.
-    \item \texttt{features/cross\_sectional.py} transforma los deltas válidos en representación comparable por fecha.
-    \item \texttt{features/feature\_qc.py} evalúa cobertura, drift, colinealidad y posibles fragilidades de esta familia.
-    \item Los modelos multifactor pueden usar estas variables como factores de mejora/deterioro fundamental, evitando confundir nivel y cambio.
-\end{itemize}
+Esta regla cumple dos funciones:
+- evitar explosiones numéricas sin semántica económica;
+- y separar observaciones realmente informativas de observaciones degeneradas por base casi nula.
 
-\subsection{Definition of Done}
+La invalidez por near-zero no es un fallo cosmético. Es una condición estructural de calidad. Un crecimiento “enorme” generado por pasar de 0.001 a 0.02 puede ser matemáticamente correcto pero económicamente inútil como señal canónica.
 
-\paragraph{El módulo se considera terminado únicamente si:}
-\begin{enumerate}
-    \item los lags QoQ y YoY se resuelven por comparabilidad contable real, no por desplazamiento ingenuo de fechas;
-    \item todas las comparaciones respetan observabilidad PIT del punto actual y del lag;
-    \item las bases cercanas a cero tienen política explícita y no generan explosiones numéricas silenciosas;
-    \item las aceleraciones solo se calculan cuando la cadena de deltas es íntegramente válida;
-    \item restatements y reporting irregular están tratados o, al menos, señalizados explícitamente;
-    \item el output es reproducible y trazable por \texttt{run\_id}, hashes y lineage.
-\end{enumerate}
+8. Construcción de aceleraciones
 
-\subsection{Casos de prueba mínimos}
+La aceleración captura segundo orden de la trayectoria:
 
-\begin{itemize}
-    \item Verificación de que QoQ usa el trimestre fiscal comparable y no simplemente una fecha de mercado desplazada.
-    \item Verificación de que YoY usa periodo homogéneo y no mezcla TTM con quarter simple.
-    \item Invalidación correcta de crecimiento relativo con base cercana a cero.
-    \item Detección correcta de \texttt{noncomparable\_period\_flag} bajo reporting irregular.
-    \item Confirmación de que un restatement posterior no reescribe retrospectivamente la comparación histórica si la fuente PIT lo distingue.
-    \item Verificación de que una aceleración no se calcula si falta validez en uno de los deltas intermedios.
-    \item Reproducibilidad exacta con misma configuración e inputs.
-\end{itemize}
+A_h = Δ_h F_t - Δ_h F_{L_h(t)}
 
-\paragraph{Síntesis final}
-\texttt{features/fundamentals\_deltas.py} no debe verse como una extensión decorativa de \texttt{fundamentals\_core.py}, sino como la capa que traduce niveles fundamentales estáticos en \textbf{trayectorias económicas observables}. En un universo de \textit{small caps}, esa traducción exige mucha más disciplina que una resta entre columnas: hay que decidir qué periodos son realmente comparables, cuándo un crecimiento es informativo y cuándo es un artefacto de base degenerada, y hasta qué punto una aceleración refleja un cambio real o un problema de reporting. Si el módulo está mal especificado, la dinámica fundamental se convierte en ruido disfrazado de sofisticación. Si está bien blindado, añade al sistema una dimensión muy valiosa: la capacidad de detectar no solo qué empresas son buenas o malas hoy, sino cuáles están \textbf{mejorando o deteriorándose de forma económicamente significativa}.
+pero debe imponerse con disciplina más dura que un delta simple, porque acumula fragilidad de dos comparaciones consecutivas.
+
+Una aceleración solo es válida si:
+- el valor actual es PIT-válido;
+- el lag comparable es PIT-válido;
+- el lag del lag también es PIT-válido;
+- ambos deltas intermedios son comparables y construidos con la misma convención;
+- no hay ruptura de cadena por missing, staleness o restatement ambiguo;
+- y la semántica de la métrica justifica una segunda diferencia.
+
+En otras palabras: no toda serie con delta válido merece aceleración canónica.
+
+9. Jerarquía obligatoria de validación
+
+La secuencia correcta de validación del módulo es:
+
+1. validar PIT del valor actual;
+2. validar PIT del lag comparable;
+3. en aceleraciones, validar PIT del lag del lag;
+4. validar comparabilidad fiscal entre periodos;
+5. validar staleness;
+6. validar la base si el delta es relativo;
+7. calcular delta;
+8. calcular aceleración solo si la cadena sigue íntegra;
+9. y solo después aplicar winsor/clipping.
+
+Este orden es muy importante. Nunca debe “rescatarse” una mala construcción económica mediante clipping posterior. Primero se valida la legitimidad de la comparación; después, si la observación válida sigue siendo extrema, puede tratarse estadísticamente.
+
+10. Catálogo canónico de señales
+
+El bloque canónico mínimo del módulo debe incluir, como mínimo, familias del tipo:
+
+- RevGrow_QoQ
+- RevGrow_YoY
+- MarginΔ_QoQ
+- LeverageΔ_YoY
+- CFΔ_QoQ
+- GrowthAccel
+
+Cada feature debe especificar:
+- métrica base;
+- horizonte de comparabilidad;
+- forma absoluta o relativa;
+- política de base;
+- convención de signos;
+- flags asociados;
+- y criterio de invalidación.
+
+La separación entre “nivel”, “delta” y “aceleración” debe mantenerse semánticamente limpia. No debe mezclarse una métrica de cambio con una de nivel bajo nombres ambiguos.
+
+11. Invariantes del módulo
+
+El módulo debe imponer, al menos, los siguientes invariantes:
+
+- L_h debe ser fiscal_period_prior_PIT_valid y nunca un market lag ingenuo;
+- el valor actual y el lag deben ser PIT-válidos de forma independiente;
+- no puede existir delta relativo válido con |F_lag| ≤ τ_base;
+- las aceleraciones requieren cadena completa válida;
+- los periodos no comparables deben invalidarse, no aproximarse silenciosamente;
+- los restatements no deben reescribir retrospectivamente una comparación histórica si la fuente PIT distingue versiones;
+- clipping y winsor solo se aplican sobre observaciones ya validadas;
+- cada output debe conservar trazabilidad hacia fundamentals_core y hacia la política de lag/comparabilidad;
+- y la semántica del feature debe ser estable entre runs.
+
+12. Failure modes frecuentes
+
+El módulo debe capturar explícitamente los siguientes modos de fallo:
+
+12.1 Calendar bias
+Usar fecha de mercado desplazada en vez de periodo fiscal comparable.
+
+12.2 PIT leakage
+Usar un lag que todavía no era observable en la fecha de decisión.
+
+12.3 Base explosion
+Dividir por una base casi nula y producir un crecimiento artificialmente enorme.
+
+12.4 Non-comparable period pairing
+Comparar quarter con TTM, annual con quarter o periodos fiscalmente no homogéneos.
+
+12.5 Chain break in acceleration
+Construir aceleración cuando uno de los deltas intermedios no era válido.
+
+12.6 Restatement ambiguity
+Usar retrospectivamente una versión revisada que no estaba disponible en el momento histórico correspondiente.
+
+12.7 Stale lag
+Resolver un lag comparable en teoría, pero demasiado antiguo para ser económicamente aceptable.
+
+12.8 Semantic drift
+Mantener el mismo nombre de feature aunque cambie la política de base, comparabilidad o frecuencia.
+
+13. Flags mínimos recomendados
+
+El output canónico debe incluir flags explícitos como:
+
+- noncomparable_period_flag
+- near_zero_base_flag
+- restatement_ambiguity_flag
+- stale_lag_flag
+- acceleration_invalid_chain_flag
+
+Estos flags no deben verse como decorativos. Son parte del contrato de interpretabilidad del módulo y permiten downstream distinguir missing estructural, invalidación económica y simple ausencia de dato.
+
+14. Gobernanza PASS / WARN / FAIL
+
+14.1 PASS
+
+El módulo o un run recibe PASS si:
+- los lags se resuelven por comparabilidad fiscal real;
+- current y lag son PIT-válidos;
+- la base relativa está correctamente gobernada;
+- las aceleraciones respetan validez de cadena;
+- los flags cubren los casos principales;
+- y el output es reproducible y trazable.
+
+14.2 WARN
+
+Recibe WARN si:
+- la lógica general es correcta pero ciertos edge cases de comparabilidad quedan solo parcialmente cubiertos;
+- la política de restatements no es plena;
+- existe cobertura limitada en ciertas familias;
+- o hay reglas canónicas correctas pero todavía sin monitorización avanzada.
+
+14.3 FAIL
+
+Recibe FAIL si:
+- QoQ/YoY se resuelve con market lags ingenuos;
+- hay PIT leakage en current o lag;
+- la base near-zero no está gobernada;
+- las aceleraciones se calculan sin cadena válida;
+- se mezclan periodos no comparables;
+- o el output downstream no permite auditar cómo se construyó el delta.
+
+15. Qué ya está muy bien en esta especificación
+
+La especificación base ya acierta en piezas de mucho nivel:
+
+- L_h definido como fiscal_period_prior_PIT_valid;
+- separación explícita entre QoQ/YoY y market calendar lags;
+- construcción de Δ_h con PIT_current y PIT_lag obligatorios;
+- política explícita de base válida;
+- aceleración como segunda diferencia con chain validation;
+- jerarquía formal de validación PIT → comparability → staleness → base_valid → delta;
+- flags de noncomparable_period y near_zero_base;
+- y una lectura económica correcta: el módulo captura inflexiones y trayectoria, no solo niveles.
+
+Esto lo sitúa claramente en territorio institucional.
+
+16. Qué falta para rozar el 99.5
+
+Si el objetivo es llevarlo al techo “Simons-scale”, faltan sobre todo extensiones de gobernanza avanzada:
+
+16.1 Bayesian comparability
+Formalizar algo como:
+
+P(comparable | period_metadata, fiscal_alignment, reporting_consistency)
+
+para no depender solo de reglas deterministas.
+
+16.2 Dynamic base thresholds
+Hacer τ_base dependiente de régimen, sector y distribución empírica:
+
+τ_base^t = f(regime_t, sector_cluster, N_t^f)
+
+16.3 Causal delta attribution
+Modelar la cadena:
+
+base_degeneracy → delta_noise → IC_degradation
+
+y usarla para priorizar controles.
+
+16.4 IC-optimized lag selection
+Explorar, de forma gobernada, si ciertos horizontes comparables alternativos maximizan la utilidad predictiva:
+
+L_h^* = argmax IC(Δ_L F_t)
+
+sin violar comparabilidad económica.
+
+16.5 Regime-adaptive periodicity
+Permitir que la propia definición de Π_h se adapte a frecuencia real de reporting o regímenes contables.
+
+17. Salida del módulo
+
+Formato recomendado:
+
+{
+  "run_id": "...",
+  "gate": "PASS|WARN|FAIL",
+  "coverage": {
+      "revgrow_qoq": ...,
+      "revgrow_yoy": ...,
+      "margin_delta_qoq": ...,
+      "leverage_delta_yoy": ...,
+      "cf_delta_qoq": ...,
+      "growth_accel": ...
+  },
+  "lag_resolution": {
+      "qoq_policy": "...",
+      "yoy_policy": "...",
+      "decision_lag_days": ...
+  },
+  "quality": {
+      "n_noncomparable_period": ...,
+      "n_near_zero_base": ...,
+      "n_restatement_ambiguity": ...,
+      "n_stale_lag": ...,
+      "n_invalid_acceleration_chain": ...
+  },
+  "hard_failures": [...],
+  "soft_flags": [...],
+  "binding_failure": "...",
+  "recommended_action": "...",
+  "notes": [...]
+}
+
+Cada fallo relevante debe indicar:
+- feature afectada;
+- tipo de fallo;
+- severidad;
+- símbolo/fecha si procede;
+- y acción recomendada.
+
+18. Esqueleto de implementación
+
+def build_fundamental_deltas(core_df, config):
+    current_valid = validate_current_pit(core_df, config)
+    lag_map = resolve_comparable_lags(core_df, config)
+
+    lag_valid = validate_lag_pit(core_df, lag_map, config)
+    comparability = validate_period_comparability(core_df, lag_map, config)
+    staleness = validate_lag_staleness(core_df, lag_map, config)
+
+    abs_deltas = compute_absolute_deltas(
+        core_df, lag_map,
+        current_valid=current_valid,
+        lag_valid=lag_valid,
+        comparability=comparability,
+        staleness=staleness
+    )
+
+    rel_base_valid = validate_relative_bases(core_df, lag_map, config)
+
+    rel_deltas = compute_relative_deltas(
+        core_df, lag_map,
+        current_valid=current_valid,
+        lag_valid=lag_valid,
+        comparability=comparability,
+        staleness=staleness,
+        base_valid=rel_base_valid
+    )
+
+    accelerations = compute_accelerations(
+        abs_deltas=abs_deltas,
+        rel_deltas=rel_deltas,
+        lag_map=lag_map,
+        config=config
+    )
+
+    flags = build_delta_flags(
+        comparability=comparability,
+        base_valid=rel_base_valid,
+        staleness=staleness,
+        accelerations=accelerations
+    )
+
+    outputs = apply_winsor_only_on_valid(
+        abs_deltas=abs_deltas,
+        rel_deltas=rel_deltas,
+        accelerations=accelerations,
+        flags=flags,
+        config=config
+    )
+
+    return persist_fundamentals_deltas(outputs, flags, config)
+
+19. MVP vs versión avanzada
+
+19.1 MVP
+
+- resolución fiscal correcta de QoQ y YoY;
+- validación PIT dual current + lag;
+- invalidación por periodos no comparables;
+- política explícita de τ_base;
+- construcción de aceleraciones solo con cadena íntegra;
+- flags mínimos;
+- output reproducible por run_id.
+
+19.2 Versión avanzada
+
+- Bayesian comparability scoring;
+- τ_base dinámico por régimen y sector;
+- causal attribution del deterioro del delta;
+- selección adaptativa de lag con criterio IC;
+- periodicidad adaptable por patrón de reporting;
+- monitorización online de degradación de cobertura y calidad.
+
+20. Interpretación correcta
+
+La lectura correcta de fundamentals_deltas.py es:
+
+“este módulo transforma fundamentales de nivel en trayectoria económica PIT-comparable, asegurando que el cambio medido es fiscalmente legítimo, observable ex ante y robusto frente a bases degeneradas.”
+
+La lectura incorrecta es:
+
+“este módulo calcula diferencias trimestrales y anuales sobre columnas de fundamentales.”
+
+No calcula “diferencias” sin más.
+Gobierna el concepto mismo de cambio fundamental utilizable en un sistema cuantitativo serio.
+
+21. Referencias orientativas
+
+- Ball & Brown, como base de la relevancia informativa de la trayectoria de earnings
+- literatura de PEAD y earnings momentum
+- trabajos sobre comparabilidad quarterly vs annual
+- research sobre reporting frequency e irregularidad contable
+- literatura PIT y as-of accounting data handling en sistemas cuantitativos institucionales
+
+22. Conclusión
+
+fundamentals_deltas.py está ya conceptualmente en un nivel altísimo.
+
+La combinación de:
+- lags fiscales comparables en lugar de market lags;
+- PIT dual current + lag;
+- base governance explícita;
+- aceleración con chain validation;
+- y flags de no comparabilidad, base degenerada y ambigüedad de restatement
+
+define una especificación claramente institucional para señales de dinámica fundamental.
+
+Lo que le falta para rozar el techo absoluto no es una mejor intuición económica —esa ya está muy bien—, sino una capa superior de gobernanza probabilística, adaptación dinámica de thresholds y atribución causal del ruido de construcción.
+
+Como capa de “fundamental trajectory signals”, está muy cerca de excelencia real.

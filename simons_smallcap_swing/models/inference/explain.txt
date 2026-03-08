@@ -1,568 +1,527 @@
-\section{Módulo \texttt{models/inference/explain.py}}
-
-\subsection{Objetivo}
-
-El módulo \texttt{models.inference.explain.py} tiene como objetivo proporcionar una capa de
-\textbf{explicabilidad operativa, reproducible y auditable} sobre las predicciones generadas por los
-modelos registrados en el sistema. Su función no es “interpretar” el modelo en abstracto, sino
-\textbf{producir artefactos de explicación consistentes con una ejecución concreta de inferencia},
-de forma que una predicción individual o un conjunto de scores puedan ser analizados ex post con
-suficiente precisión para:
-
-\begin{itemize}
-    \item auditar qué grupos de features dominaron el comportamiento del modelo;
-    \item depurar fallos de señal, drift o sensibilidad excesiva a determinadas variables;
-    \item validar que la estructura explicativa observada es coherente con la hipótesis de investigación;
-    \item documentar el comportamiento del modelo para validación interna, monitoring y revisión cuantitativa.
-\end{itemize}
-
-El módulo soporta explicabilidad:
-
-\begin{itemize}
-    \item \textbf{global}: importancia agregada de features, estabilidad por grupos y jerarquías de señal;
-    \item \textbf{local}: atribuciones por observación, fecha y símbolo;
-    \item \textbf{por tipo de modelo}: coeficientes para modelos lineales, \texttt{TreeSHAP} para modelos de árboles y
-    estrategias de agregación para ensamblados;
-    \item \textbf{versionada por run}: toda explicación queda ligada a un \texttt{run\_id}, a un
-    \texttt{model\_version}, a una versión de datos y a una configuración explícita.
-\end{itemize}
-
-En un sistema de \textit{small-cap swing trading}, esto es especialmente importante porque la explicación
-de una señal no es solo una comodidad analítica: es una herramienta de control de modelo, de análisis
-de robustez y de detección temprana de degradación estructural.
-
-\subsection{Principio de diseño}
-
-El módulo adopta un principio deliberadamente conservador:
-
-\begin{quote}
-\textit{Una explicación es un artefacto descriptivo del comportamiento del modelo sobre una distribución
-de entrada y una ejecución concretas; no constituye, por sí sola, una inferencia causal ni una garantía
-de validez económica.}
-\end{quote}
-
-Por tanto:
-
-\begin{itemize}
-    \item las explicaciones se interpretan como \textbf{descomposiciones del score del modelo};
-    \item no se usa lenguaje causal fuerte salvo que exista un procedimiento externo que lo justifique;
-    \item las explicaciones locales se consideran potencialmente ruidosas y se contextualizan siempre con
-    explicaciones globales, estabilidad temporal y agrupaciones por familia de features.
-\end{itemize}
-
-\subsection{Contexto de XAI en Trading Cuantitativo}
-
-En investigación cuantitativa industrial, la explicabilidad cumple una función distinta a la de entornos
-puramente regulatorios o de producto. Aquí no se trata solo de justificar una predicción, sino de responder
-preguntas operativas del tipo:
-
-\begin{itemize}
-    \item ¿está el modelo concentrando demasiada sensibilidad en una familia concreta de señales?
-    \item ¿ha cambiado la jerarquía de importancias tras un retrain o una promoción a \texttt{staging}/\texttt{production}?
-    \item ¿están las explicaciones locales extremas asociadas a outliers, errores de datos o comportamiento legítimo?
-    \item ¿son las señales explicativamente estables entre regímenes de mercado o dependen de un subperiodo estrecho?
-\end{itemize}
-
-Por ello, el módulo se diseña para producir no solo importancias puntuales, sino también artefactos que
-permitan estudiar \textbf{consistencia, estabilidad, cobertura y coste computacional}.
-
-\subsection{Alcance Funcional}
-
-\subsubsection{Incluye}
-
-\begin{itemize}
-    \item \textbf{Explicabilidad global}:
-    \begin{itemize}
-        \item importancia global por feature;
-        \item ranking de features;
-        \item agregación por grupos de features usando el \texttt{feature dictionary};
-        \item comparación temporal opcional entre ventanas o runs.
-    \end{itemize}
-
-    \item \textbf{Explicabilidad local}:
-    \begin{itemize}
-        \item atribuciones por observación para un subconjunto o para la totalidad del universo explicado;
-        \item ranking por contribución absoluta;
-        \item top contributors positivos y negativos por predicción.
-    \end{itemize}
-
-    \item \textbf{Soporte por clase de modelo}:
-    \begin{itemize}
-        \item modelos lineales: descomposición determinista basada en coeficientes;
-        \item GBDT: \texttt{TreeSHAP} como método preferente para explicaciones locales y globales;
-        \item importancia por permutación como método complementario o \textit{fallback} global;
-        \item ensembles: explicación por componente y agregación conforme a la regla de combinación del ensemble.
-    \end{itemize}
-
-    \item \textbf{Persistencia estructurada}:
-    \begin{itemize}
-        \item artefactos tabulares en Parquet;
-        \item metadatos de ejecución en JSON;
-        \item manifiesto con hashes, configuración, seeds, librerías y validaciones.
-    \end{itemize}
-\end{itemize}
-
-\subsubsection{No incluye}
-
-\begin{itemize}
-    \item entrenamiento o recalibración del modelo;
-    \item selección de cartera o sizing;
-    \item inferencia causal, \textit{counterfactual reasoning} o análisis estructural fuera de la clase descriptiva;
-    \item explicación de modelos no registrados o ejecuciones no trazables.
-\end{itemize}
-
-\subsection{Dependencias}
-
-\subsubsection{Upstream}
-
-\begin{itemize}
-    \item \textbf{Model registry}: resolución determinista de \texttt{model\_ref} a una versión concreta;
-    \item \textbf{Artefactos de inferencia}: features efectivamente usadas en scoring y predicciones persistidas;
-    \item \textbf{Training contract}: lista de features de entrenamiento, transformaciones y metadatos de compatibilidad;
-    \item \textbf{Feature dictionary}: taxonomía de features, grupos, horizontes, unidades y familia económica/estadística.
-\end{itemize}
-
-\subsubsection{Downstream}
-
-\begin{itemize}
-    \item validación cuantitativa de señales;
-    \item monitoring de drift explicativo;
-    \item debugging de predicciones extremas;
-    \item evidencia de research y documentación de comportamiento de modelo.
-\end{itemize}
-
-\subsection{Invariantes Operativos}
-
-El módulo debe satisfacer las siguientes propiedades:
-
-\begin{itemize}
-    \item \textbf{Determinismo condicionado}: dado el mismo \texttt{run\_id}, la misma versión de modelo,
-    la misma muestra y la misma configuración, los artefactos explicativos deben ser reproducibles salvo
-    diferencias numéricas acotadas por tolerancia.
-    \item \textbf{Trazabilidad completa}: toda explicación debe poder enlazarse con
-    \texttt{model\_version}, \texttt{inference\_run\_id}, \texttt{data\_hash}, \texttt{code\_commit} y
-    \texttt{explain\_config\_hash}.
-    \item \textbf{Separación entre explicación y scoring}: el módulo no altera scores ya persistidos;
-    solo los explica.
-    \item \textbf{Fail-closed en inconsistencia}: si el contrato entre features, predicciones y modelo no
-    se cumple, la ejecución falla; no se generan explicaciones parciales silenciosas.
-\end{itemize}
-
-\subsection{Contrato de Entrada}
-
-\subsubsection{Entradas mínimas}
-
-\begin{itemize}
-    \item \texttt{model\_ref}: referencia lógica o versión exacta del modelo;
-    \item \texttt{features\_path}: conjunto de features efectivamente usado por la inferencia;
-    \item \texttt{predictions\_path}: salida persistida del scoring;
-    \item \texttt{explain\_config\_path}: configuración de explicabilidad;
-    \item \texttt{run\_id}: identificador único de esta ejecución de explicación;
-    \item \texttt{inference\_run\_id}: identificador del batch de inferencia que se desea explicar.
-\end{itemize}
-
-\subsubsection{Parámetros clave}
-
-\begin{itemize}
-    \item \texttt{explain\_mode}: \texttt{global}, \texttt{local}, \texttt{both};
-    \item \texttt{method\_policy}: \texttt{auto}, \texttt{force\_shap}, \texttt{force\_permutation}, \texttt{force\_coef};
-    \item \texttt{sample\_size\_local}: tamaño máximo para explicaciones locales;
-    \item \texttt{top\_k\_features}: número de features destacadas en resúmenes;
-    \item \texttt{background\_sample\_size}: tamaño del conjunto de referencia para métodos que lo requieran;
-    \item \texttt{max\_compute\_budget\_sec}: presupuesto temporal máximo permitido;
-    \item \texttt{group\_by\_feature\_family}: si se agregan importancias por grupos taxonómicos;
-    \item \texttt{stability\_window\_spec}: ventanas opcionales para medir estabilidad temporal.
-\end{itemize}
-
-\subsection{Resolución Formal del Método}
-
-Uno de los puntos críticos del módulo es que la selección del método de explicación no quede a criterio
-implícito del implementador. La política es:
-
-\begin{enumerate}
-    \item Si el modelo es \textbf{lineal} y la transformación entre entrada persistida y score final es lineal
-    y conocida, el método por defecto es \texttt{coef}.
-    \item Si el modelo es \textbf{GBDT} compatible con \texttt{TreeSHAP} y el coste estimado cabe dentro del
-    presupuesto computacional, el método por defecto es \texttt{shap}.
-    \item Si el modelo es GBDT pero el coste de \texttt{TreeSHAP} excede el presupuesto o existe incompatibilidad
-    de librerías/serialización, se usa \texttt{permutation} para importancia global y se desactiva la explicación
-    local salvo override explícito.
-    \item Si el modelo es \textbf{ensemble}, se intenta explicar cada componente con su método nativo y luego
-    agregar; si eso no es posible, se produce únicamente explicación global sobre el ensemble final con el método
-    compatible más conservador.
-    \item Si el usuario fuerza un método incompatible con la clase de modelo, la ejecución falla.
-\end{enumerate}
-
-Esta política elimina ambigüedad y evita dos errores comunes: explicar con una técnica conceptualmente inadecuada
-o activar un método demasiado costoso sin control.
-
-\subsection{Baseline y Conjunto de Referencia}
-
-Para métodos basados en contribuciones aditivas, la noción de baseline debe quedar fijada. El módulo define:
-
-\begin{itemize}
-    \item \textbf{Baseline local}:
-    \[
-    \hat{y}(x) \approx \phi_0 + \sum_{j=1}^{p} \phi_j(x),
-    \]
-    donde \(\phi_0\) representa el valor esperado del modelo bajo un conjunto de referencia reproducible.
-    \item \textbf{Conjunto de referencia por defecto}: muestra estratificada y persistida del universo de
-    entrenamiento válido o, en su defecto, del universo de inferencia del run, siempre que esa elección quede
-    registrada en \texttt{manifest.json}.
-\end{itemize}
-
-El baseline nunca se deja implícito. Debe almacenarse:
-
-\begin{itemize}
-    \item tipo de baseline;
-    \item tamaño de muestra;
-    \item criterio de muestreo;
-    \item hash o identificadores de filas del conjunto de referencia.
-\end{itemize}
-
-\subsection{Contrato de Salida}
-
-Los artefactos se persisten en:
-
-\begin{center}
-    \texttt{models/explain/\{run\_id\}/}
-\end{center}
-
-\subsubsection{Ficheros generados}
-
-\begin{itemize}
-    \item \texttt{global\_importance.parquet}
-    \begin{itemize}
-        \item importancia global por feature;
-        \item ranking;
-        \item familia/grupo de feature;
-        \item signo neto opcional y métricas de estabilidad.
-    \end{itemize}
-
-    \item \texttt{local\_explanations.parquet}
-    \begin{itemize}
-        \item atribuciones por observación y feature;
-        \item baseline asociado;
-        \item ranking por contribución absoluta;
-        \item flags de calidad numérica.
-    \end{itemize}
-
-    \item \texttt{explain\_summary.json}
-    \begin{itemize}
-        \item cobertura de observaciones explicadas;
-        \item método resuelto;
-        \item coste computacional;
-        \item tests de consistencia;
-        \item top features globales;
-        \item observaciones con mayor score absoluto y mayor inestabilidad explicativa.
-    \end{itemize}
-
-    \item \texttt{stability\_report.parquet} (opcional)
-    \begin{itemize}
-        \item estabilidad temporal de importancias por ventana;
-        \item correlaciones rank-rank entre periodos;
-        \item dispersión de contribuciones.
-    \end{itemize}
-
-    \item \texttt{manifest.json}
-    \begin{itemize}
-        \item metadatos completos de run, hashes, versiones y validaciones.
-    \end{itemize}
-\end{itemize}
-
-\subsubsection{Campos mínimos de \texttt{local\_explanations}}
-
-\begin{itemize}
-    \item \texttt{run\_id}
-    \item \texttt{inference\_run\_id}
-    \item \texttt{date}
-    \item \texttt{symbol}
-    \item \texttt{model\_version}
-    \item \texttt{method}
-    \item \texttt{baseline\_value}
-    \item \texttt{y\_pred}
-    \item \texttt{feature\_name}
-    \item \texttt{feature\_group}
-    \item \texttt{feature\_value}
-    \item \texttt{contribution}
-    \item \texttt{abs\_contribution}
-    \item \texttt{rank\_abs\_contribution}
-    \item \texttt{is\_finite}
-\end{itemize}
-
-\subsection{Metodologías Implementadas}
-
-\subsubsection{Modelos lineales}
-
-Para modelos lineales de la forma
-
-\[
-\hat{y}(x) = \beta_0 + \sum_{j=1}^{p}\beta_j x_j,
-\]
-
-la explicación local se obtiene mediante:
-
-\[
-\phi_j(x)=\beta_j x_j,
-\]
-
-siempre que los \(x_j\) persistidos correspondan exactamente a la representación usada por el modelo.
-Si el pipeline incluye escalado, normalización o transformaciones no triviales, el módulo debe explicar
-en el espacio realmente consumido por el predictor, no en una reconstrucción aproximada posterior.
-
-Para importancia global, se reportan al menos dos medidas:
-
-\[
-I^{(\text{coef})}_j = |\beta_j|,
-\qquad
-I^{(\text{contrib})}_j = \frac{1}{n}\sum_{i=1}^{n}|\beta_j x_{ij}|.
-\]
-
-La primera mide sensibilidad estructural del modelo; la segunda refleja importancia efectiva sobre la muestra explicada.
-
-\subsubsection{GBDT: \texttt{TreeSHAP} como método principal}
-
-Para modelos de árboles, el método principal es \texttt{TreeSHAP}. El módulo utiliza:
-
-\begin{itemize}
-    \item explicaciones locales aditivas por observación;
-    \item importancia global como media de contribuciones absolutas:
-    \[
-    \bar{\phi}_j = \frac{1}{n}\sum_{i=1}^{n}|\phi_j(x_i)|.
-    \]
-\end{itemize}
-
-El uso de \texttt{TreeSHAP} requiere:
-
-\begin{itemize}
-    \item compatibilidad confirmada entre la clase del modelo y la librería de explicación;
-    \item baseline explícito;
-    \item tolerancia máxima permitida en el cierre:
-    \[
-    \left| \hat{y}(x_i) - \left(\phi_0 + \sum_{j=1}^{p}\phi_j(x_i)\right) \right| \le \epsilon.
-    \]
-\end{itemize}
-
-Si el cierre falla sistemáticamente fuera de tolerancia, la ejecución se marca como inválida.
-
-\subsubsection{Permutation Importance como método global complementario}
-
-La importancia por permutación se usa para contrastar o sustituir importancias globales cuando:
-
-\begin{itemize}
-    \item \texttt{TreeSHAP} no es viable;
-    \item se desea una medida directamente ligada a degradación de pérdida out-of-sample;
-    \item el interés principal es ranking global, no explicación local.
-\end{itemize}
-
-Se define:
-
-\[
-\mathrm{PFI}_j = \mathbb{E}[L(\mathbf{y},\hat{\mathbf{y}}_{j^{\mathrm{perm}}})]
--
-\mathbb{E}[L(\mathbf{y},\hat{\mathbf{y}})].
-\]
-
-Aquí el signo queda fijado de modo que valores altos impliquen mayor pérdida al permutar y, por tanto,
-mayor importancia. El módulo debe registrar:
-
-\begin{itemize}
-    \item métrica \(L\) usada;
-    \item número de repeticiones;
-    \item universo de evaluación;
-    \item semillas por repetición.
-\end{itemize}
-
-Dado que la permutación rompe estructuras de dependencia entre variables, sus resultados deben leerse como
-\textbf{medida global de sensibilidad predictiva}, no como atribución local exacta.
-
-\subsubsection{Ensembles}
-
-Para ensembles, el módulo distingue dos casos:
-
-\paragraph{(a) Agregación lineal explícita entre modelos base}
-Si el ensemble produce
-
-\[
-\hat{y}(x)=\sum_{b=1}^{B} w_b \hat{y}^{(b)}(x),
-\]
-
-con pesos \(w_b\) conocidos y constantes, entonces se agregan explicaciones base como
-
-\[
-\phi_j(x)=\sum_{b=1}^{B} w_b \phi_j^{(b)}(x).
-\]
-
-\paragraph{(b) Meta-modelos o combinaciones no lineales}
-Si la capa final no es lineal o no existe correspondencia aditiva fiable, el módulo:
-
-\begin{itemize}
-    \item explica cada componente por separado, cuando sea posible;
-    \item produce una explicación global del ensemble final con el método compatible;
-    \item marca explícitamente que la agregación entre componentes y salida final no admite una lectura
-    aditiva exacta.
-\end{itemize}
-
-\subsection{Control de Coste Computacional}
-
-La explicabilidad puede ser prohibitivamente costosa en universos amplios. Por eso el módulo implementa
-reglas explícitas de presupuesto:
-
-\begin{itemize}
-    \item \texttt{sample\_size\_local} limita el número de observaciones locales explicadas;
-    \item se permite muestreo estratificado por score, fecha, símbolo o cuantiles;
-    \item si el coste estimado excede \texttt{max\_compute\_budget\_sec}, el módulo degrada de
-    \texttt{shap} a \texttt{permutation} para global o falla según configuración;
-    \item el tiempo total, tiempo por bloque y memoria aproximada se registran en el \texttt{manifest}.
-\end{itemize}
-
-La política por defecto es priorizar:
-
-\begin{enumerate}
-    \item cobertura suficiente para debugging;
-    \item consistencia metodológica;
-    \item respeto al presupuesto;
-    \item ausencia de degradaciones silenciosas.
-\end{enumerate}
-
-\subsection{Reglas de Reproducibilidad}
-
-La reproducibilidad no se limita a fijar una semilla. El módulo debe almacenar:
-
-\begin{itemize}
-    \item \texttt{seed\_global} y, en su caso, seeds por bloque;
-    \item versión exacta de librerías (\texttt{shap}, \texttt{numpy}, \texttt{sklearn}, etc.);
-    \item \texttt{model\_version}, \texttt{data\_hash}, \texttt{code\_commit};
-    \item índices o claves primarias de la muestra explicada;
-    \item baseline y conjunto de referencia;
-    \item configuración resuelta tras defaults.
-\end{itemize}
-
-No se recomienda usar una semilla derivada de \texttt{timestamp} si eso dificulta la repetibilidad exacta.
-Por defecto, la seed debe venir de configuración o derivarse determinísticamente de
-\texttt{run\_id} mediante una función estable.
-
-\subsection{Flujo de Ejecución}
-
-\begin{enumerate}
-    \item \textbf{Resolver modelo y verificar contrato}
-    \begin{itemize}
-        \item cargar la versión exacta del modelo desde el registry;
-        \item verificar compatibilidad entre features persistidas, schema y predicciones.
-    \end{itemize}
-
-    \item \textbf{Resolver método}
-    \begin{itemize}
-        \item clasificar el tipo de modelo;
-        \item estimar coste;
-        \item aplicar \texttt{method\_policy}.
-    \end{itemize}
-
-    \item \textbf{Construir muestra y baseline}
-    \begin{itemize}
-        \item fijar subconjunto local si aplica;
-        \item construir o recuperar el conjunto de referencia;
-        \item persistir selección.
-    \end{itemize}
-
-    \item \textbf{Calcular explicaciones globales}
-    \begin{itemize}
-        \item SHAP, coeficientes o permutación;
-        \item agregar por feature y, opcionalmente, por grupo.
-    \end{itemize}
-
-    \item \textbf{Calcular explicaciones locales}
-    \begin{itemize}
-        \item ejecutar solo si el método y el presupuesto lo permiten;
-        \item persistir atribuciones por observación.
-    \end{itemize}
-
-    \item \textbf{Ejecutar validaciones}
-    \begin{itemize}
-        \item finitud numérica;
-        \item cierre aditivo cuando corresponda;
-        \item cobertura mínima;
-        \item integridad de schemas y cardinalidades.
-    \end{itemize}
-
-    \item \textbf{Persistir artefactos}
-    \begin{itemize}
-        \item escritura atómica de tablas y manifiesto;
-        \item marcar run como válido solo si todas las validaciones críticas pasan.
-    \end{itemize}
-\end{enumerate}
-
-\subsection{Validaciones Implementadas}
-
-\begin{itemize}
-    \item \textbf{Finitud numérica}:
-    \[
-    \phi_j(x_i)\in\mathbb{R}, \quad \forall i,j.
-    \]
-
-    \item \textbf{Cierre aditivo}:
-    para métodos aditivos válidos,
-    \[
-    \left| y_{\mathrm{pred},i} - \left(\phi_0+\sum_{j=1}^{p}\phi_j(x_i)\right)\right|\le\epsilon.
-    \]
-
-    \item \textbf{Cobertura mínima}:
-    \[
-    \frac{n_{\mathrm{explained}}}{n_{\mathrm{eligible}}}\ge \gamma.
-    \]
-
-    \item \textbf{Consistencia de ranking}:
-    ausencia de empates patológicos o artefactos de ordenación por overflow/redondeo.
-
-    \item \textbf{Integridad entre artefactos}:
-    las claves \texttt{date-symbol-model\_version-run\_id} deben reconciliar entre
-    \texttt{predictions}, \texttt{local\_explanations} y \texttt{manifest}.
-
-    \item \textbf{Estabilidad temporal} (opcional pero recomendada):
-    correlación de Spearman/Kendall entre rankings globales en ventanas consecutivas,
-    con alertas si la estructura explicativa rota bruscamente.
-\end{itemize}
-
-\subsection{Tratamiento de Edge Cases}
-
-Para llevar el módulo a estándar de producción, deben contemplarse explícitamente los siguientes casos:
-
-\begin{itemize}
-    \item \textbf{Features faltantes o reordenadas}: fallo inmediato si el conjunto explicado no coincide con
-    el contrato del modelo.
-    \item \textbf{Predicciones presentes pero features ausentes}: no se permite explicación retroactiva incompleta.
-    \item \textbf{Universo demasiado grande}: explicación local parcial con muestreo persistido; nunca truncado silencioso.
-    \item \textbf{Contribuciones todas casi nulas}: marcar posible degeneración del método o saturación del score.
-    \item \textbf{Features altamente colineales}: advertencia en el resumen, especialmente para lineales y PFI.
-    \item \textbf{Ensemble no aditivo}: impedir una lectura de suma exacta si no está matemáticamente justificada.
-\end{itemize}
-
-\subsection{Interpretación Recomendada}
-
-Las salidas del módulo deben leerse con la siguiente jerarquía:
-
-\begin{enumerate}
-    \item primero, importancias globales y su estabilidad;
-    \item después, agrupación por familias de features;
-    \item por último, explicaciones locales individuales, especialmente en casos extremos o anómalos.
-\end{enumerate}
-
-La política recomendada es no tomar decisiones de investigación o de producción basadas en una única explicación local
-aislada. Una explicación local solo adquiere significado fuerte cuando es consistente con patrones agregados, estabilidad
-temporal y evidencia de validación externa.
-
-\subsection{Resumen}
-
-En conjunto, \texttt{models/inference/explain.py} no debe entenderse como un módulo cosmético de visualización,
-sino como una capa de \textbf{instrumentación científica del modelo en producción}. Su valor real reside en que:
-
-\begin{itemize}
-    \item convierte predicciones opacas en artefactos auditables;
-    \item obliga a fijar baseline, método, muestra y presupuesto computacional;
-    \item reduce ambigüedad de implementación mediante políticas explícitas;
-    \item facilita debugging, monitoring y validación cuantitativa;
-    \item mantiene una postura metodológicamente prudente: explicación descriptiva fuerte, causalidad no inferida.
-\end{itemize}
-
-Este enfoque es el adecuado para una plataforma cuantitativa seria: no promete más interpretabilidad de la que el método
-puede ofrecer, pero sí exige que toda explicación generada sea reproducible, trazable y operativamente útil.
+Especificación Cuantitativa: models/inference/explain.py
+
+0. Propósito y papel dentro del stack
+
+models/inference/explain.py define la capa institucional de explicabilidad descriptiva del sistema de inferencia. Su función no es reinterpretar el modelo en abstracto ni ofrecer narrativas causales, sino generar artefactos de explicación reproducibles, auditables y útiles para debugging, monitoring, control de drift explicativo y validación cuantitativa de hipótesis de señal. La base que me has pasado ya cerraba muy bien este propósito, el alcance funcional, la separación entre explicación y scoring, la trazabilidad por run_id/model_version/data_hash y la política explícita de resolución de método según tipo de modelo y presupuesto computacional. :contentReference[oaicite:0]{index=0}
+
+En un sistema de small-cap swing trading, explain.py debe entenderse como instrumentación científica del modelo en producción. Su papel no es “demostrar por qué el modelo tiene razón”, sino responder de forma controlada a preguntas operativas como:
+- qué familias de features dominan el score;
+- si una promoción o retrain ha alterado la jerarquía explicativa;
+- si las explicaciones locales extremas son coherentes o sospechosas;
+- si la estructura explicativa se mantiene estable entre ventanas y regímenes.
+
+La regla de diseño debe ser prudente:
+
+    toda explicación producida por el módulo
+    es una descomposición descriptiva del comportamiento del modelo
+    sobre una ejecución concreta,
+    no una inferencia causal ni una validación económica por sí sola.
+
+1. Objetivo formal del módulo
+
+El módulo implementa una transformación del tipo:
+
+    E : (model_ref, X_inference, ŷ_persisted, config, run_id)
+        -> (global_explanations, local_explanations, explain_summary, manifest)
+
+donde:
+- model_ref resuelve a una versión exacta del modelo;
+- X_inference es el conjunto de features efectivamente usado en scoring;
+- ŷ_persisted son las predicciones ya generadas y persistidas;
+- config fija método, baseline, presupuesto y política de muestreo;
+- run_id identifica unívocamente la ejecución de explicación.
+
+El output debe incluir, como mínimo:
+- explicabilidad global por feature y por familia;
+- explicabilidad local por observación cuando el método lo permita;
+- métricas de consistencia y cierre numérico;
+- metadatos de trazabilidad completa.
+
+El módulo no entrena, no recalibra y no altera scores ya persistidos. Sólo explica lo que ya fue puntuado.
+
+2. Principios no negociables
+
+P1. Separación estricta entre scoring y explicación.
+explain.py no modifica predicciones ya persistidas.
+
+P2. Fail-closed ante inconsistencia.
+Si el contrato entre modelo, features y predicciones no se cumple, la ejecución falla.
+
+P3. Trazabilidad completa.
+Toda explicación debe enlazarse con model_version, inference_run_id, data_hash, explain_config_hash y código/librerías.
+
+P4. Método explícito.
+El método de explicación no puede quedar implícito en el implementador; debe resolverse por política documentada.
+
+P5. Baseline explícito.
+Toda explicación aditiva debe fijar y persistir su baseline y conjunto de referencia.
+
+P6. Prudencia semántica.
+Las explicaciones son descriptivas, no causales.
+
+P7. Presupuesto gobernado.
+Si el método exacto no cabe dentro del presupuesto computacional, el módulo debe degradar de forma explícita o fallar, nunca recortar silenciosamente.
+
+3. Contrato de entrada
+
+La especificación base ya define correctamente las entradas mínimas y dependencias upstream del módulo. Deben mantenerse como contrato fuerte. :contentReference[oaicite:1]{index=1}
+
+3.1. Entradas mínimas obligatorias
+
+- model_ref
+- features_path
+- predictions_path
+- explain_config_path
+- run_id
+- inference_run_id
+
+3.2. Parámetros clave de configuración
+
+- explain_mode ∈ {global, local, both}
+- method_policy ∈ {auto, force_shap, force_permutation, force_coef}
+- sample_size_local
+- background_sample_size
+- top_k_features
+- max_compute_budget_sec
+- group_by_feature_family
+- stability_window_spec
+- baseline_policy
+- faithfulness_checks_enabled
+- stability_checks_enabled
+
+3.3. Validaciones previas obligatorias
+
+Antes de calcular cualquier explicación, el módulo debe verificar:
+- compatibilidad exacta entre schema del modelo y features persistidas;
+- reconciliación entre predictions_path y features_path sobre claves lógicas;
+- consistencia de model_version;
+- ausencia de NaN/inf en inputs críticos;
+- disponibilidad de todas las columnas requeridas por el método resuelto.
+
+Si falla cualquiera de estas validaciones, la ejecución debe abortar y no generar artefactos parciales silenciosos.
+
+4. Resolución formal del método
+
+La base ya fija una política correcta de resolución por tipo de modelo. Conviene convertirla en una matriz institucional explícita. :contentReference[oaicite:2]{index=2}
+
+4.1. Method Resolution Matrix recomendada
+
+    ┌────────────┬────────────┬──────────────────┬─────────────┐
+    │ Model Type │ Budget Low │ Budget Medium    │ Budget High │
+    ├────────────┼────────────┼──────────────────┼─────────────┤
+    │ Linear     │ coef       │ coef             │ coef        │
+    │ GBDT       │ PFI_global │ TreeSHAP_global  │ TreeSHAP_*  │
+    │ Ensemble   │ PFI_global │ component+PFI    │ component_* │
+    └────────────┴────────────┴──────────────────┴─────────────┘
+
+    * = global + local si cobertura y coste lo permiten
+
+4.2. Reglas duras
+
+- Si el modelo es lineal y la transformación entre entrada persistida y score es lineal y conocida, el método por defecto debe ser coef.
+- Si el modelo es GBDT compatible y el presupuesto lo permite, el método por defecto debe ser TreeSHAP.
+- Si TreeSHAP no cabe en presupuesto o no es compatible, debe usarse permutation importance para global y desactivar local salvo override explícito.
+- Si el modelo es ensemble, debe intentarse explicación por componente + agregación cuando matemáticamente sea válida; en otro caso, explicación global conservadora del ensemble final.
+- Forzar un método incompatible debe producir error explícito.
+
+Esto elimina ambigüedad y hace el módulo realmente implementable.
+
+5. Baseline y conjunto de referencia
+
+Toda explicación aditiva debe explicitar el baseline. La base ya lo deja bien planteado; aquí conviene cerrar las validaciones cuantitativas. :contentReference[oaicite:3]{index=3}
+
+5.1. Definición base
+
+Para métodos aditivos:
+
+    ŷ(x) ≈ ϕ_0 + Σ_j ϕ_j(x)
+
+donde:
+- ϕ_0 es el valor esperado del modelo sobre un conjunto de referencia reproducible;
+- ϕ_j(x) es la contribución atribuida a la feature j.
+
+5.2. Baseline obligatorio
+
+El módulo debe persistir:
+- tipo de baseline;
+- tamaño del background set;
+- política de muestreo;
+- hash o IDs de filas del baseline set.
+
+5.3. Baseline convergence check
+
+Debe añadirse una validación explícita:
+
+    | E[ ŷ(X_ref) ] - ϕ_0 | <= δ_baseline
+
+con δ_baseline configurable y suficientemente estricto para el método usado. Esto mejora mucho la confiabilidad de ϕ_0 y evita que el baseline quede como una noción difusa.
+
+6. Metodologías soportadas
+
+6.1. Modelos lineales
+
+Para un modelo lineal:
+
+    ŷ(x) = β_0 + Σ_j β_j x_j
+
+la explicación local debe definirse como:
+
+    ϕ_j(x) = β_j x_j
+
+siempre que x corresponda exactamente al espacio consumido por el modelo.
+
+Deben reportarse al menos dos medidas globales:
+
+    I_j^(coef) = |β_j|
+
+    I_j^(contrib) = (1/n) Σ_i |β_j x_{ij}|
+
+La primera refleja sensibilidad estructural. La segunda, importancia efectiva sobre la muestra explicada.
+
+6.2. GBDT: TreeSHAP como método principal
+
+Para árboles, el método principal debe ser TreeSHAP, con:
+- explicaciones locales por observación;
+- importancia global como media de contribuciones absolutas:
+
+    ϕ̄_j = (1/n) Σ_i |ϕ_j(x_i)|
+
+Debe verificarse siempre el cierre aditivo:
+
+    | ŷ(x_i) - (ϕ_0 + Σ_j ϕ_j(x_i)) | <= ε_closure
+
+y persistir el error de cierre por observación.
+
+6.3. Permutation Feature Importance como método global complementario
+
+La definición operativa debe ser:
+
+    PFI_j = E[ L(y, ŷ_perm^j) ] - E[ L(y, ŷ) ]
+
+donde L es la loss fijada en configuración.
+
+PFI debe interpretarse como sensibilidad predictiva global, no como atribución local exacta. Deben persistirse:
+- métrica L;
+- número de repeticiones;
+- seeds;
+- universo de evaluación;
+- dispersión entre repeticiones.
+
+6.4. Ensembles
+
+Caso aditivo lineal entre componentes:
+
+    ŷ(x) = Σ_b w_b ŷ^(b)(x)
+
+si los pesos w_b son conocidos y constantes, puede agregarse:
+
+    ϕ_j(x) = Σ_b w_b ϕ_j^(b)(x)
+
+Caso no lineal o no aditivo:
+- explicar componentes cuando sea posible;
+- producir explicación global conservadora del ensemble final;
+- marcar explícitamente que no existe lectura aditiva exacta del ensemble completo.
+
+7. Axiomas y consistencia de explicaciones aditivas
+
+Este es uno de los puntos que faltaba reforzar para subir el nivel del módulo. Para métodos tipo SHAP, explain.py debe verificar y documentar explícitamente, cuando aplique, los axiomas relevantes del marco de additive feature attribution:
+
+7.1. Efficiency
+La suma de atribuciones más baseline debe reconstruir la predicción:
+
+    Σ_j ϕ_j(x) + ϕ_0 = ŷ(x)
+
+hasta tolerancia ε.
+
+7.2. Dummy
+Si una feature no afecta al modelo en el contexto del método y del background set, su atribución debe ser 0 o numéricamente despreciable.
+
+7.3. Symmetry
+Features intercambiables bajo el modelo y la distribución de referencia no deberían recibir atribuciones sistemáticamente distintas.
+
+7.4. Linearity
+Cuando el modelo explicado pertenece a una familia aditiva compatible, la combinación lineal de modelos debe reflejarse en la combinación lineal de atribuciones.
+
+No todas estas propiedades podrán testearse exhaustivamente en producción para todos los métodos, pero el manifest debe indicar al menos:
+- qué axiomas aplican;
+- cuáles se verificaron numéricamente;
+- cuáles quedan como “not applicable”;
+- y cuáles no se comprobaron.
+
+8. Faithfulness cuantitativa
+
+La base ya incluía cierre aditivo y consistencia, pero eso no basta para medir fidelidad real del ranking de features. Aquí conviene introducir una validación cuantitativa mínima.
+
+8.1. Deletion AUC
+
+Debe permitirse, al menos opcionalmente y recomendado por defecto para explain_mode global de modelos no lineales, una curva de deletion:
+- ordenar features por |ϕ_j(x)| o importancia local/media;
+- eliminar progresivamente las más importantes;
+- medir la degradación del score o de la salida del modelo.
+
+La métrica resumen puede definirse como AUC de deletion curve. La interpretación institucional debe ser:
+- AUC alta o degradación rápida cuando se eliminan las top features -> explicaciones más fieles;
+- degradación plana -> explicaciones posiblemente poco informativas.
+
+8.2. Insertion curve
+Opcionalmente, puede añadirse la curva inversa:
+- partir de baseline o input neutral;
+- insertar features por orden de importancia;
+- medir cuánto se reconstruye el score.
+
+Estas métricas no deben bloquear el MVP, pero sí deben formar parte de la primera fase seria del módulo.
+
+9. Estabilidad temporal de importancias
+
+La base ya contempla stability_report y comparación entre ventanas. Conviene convertir eso en una validación cuantitativa explícita. :contentReference[oaicite:4]{index=4}
+
+9.1. Rank-stability entre ventanas
+
+Para ventanas consecutivas u, u+1, el módulo debe calcular:
+- Spearman rank correlation entre rankings globales;
+- opcionalmente Kendall-τ;
+- cambios de top-k families/features.
+
+Ejemplo de criterio útil:
+
+    Spearman( rank_t , rank_{t+1} ) >= ρ_min
+
+con ρ_min configurable.
+
+9.2. Interpretación
+
+- estabilidad alta -> estructura explicativa robusta;
+- estabilidad muy baja -> posible drift, colinealidad, retrain no estable o cambio de régimen.
+
+9.3. Política
+
+La estabilidad temporal no debe usarse para rechazar automáticamente toda ejecución, pero sí para:
+- generar alertas;
+- alimentar monitoring;
+- y contextualizar cualquier lectura de global importance.
+
+10. Cobertura y presupuesto computacional
+
+10.1. Cobertura mínima
+
+Debe cumplirse:
+
+    n_explained / n_eligible >= γ_min
+
+con γ_min configurable.
+
+10.2. Política de muestreo
+
+Si el universo es demasiado grande para explicaciones locales completas, debe usarse muestreo persistido y reproducible:
+- estratificado por score,
+- por fecha,
+- por símbolo,
+- por cuantiles,
+- o mixto.
+
+Nunca se permite truncado silencioso.
+
+10.3. Degradación por presupuesto
+
+Si el método preferido excede max_compute_budget_sec:
+- degradar explícitamente a un método más barato permitido por la matrix de resolución;
+- o fallar si la configuración prohíbe degradación.
+
+Toda degradación debe registrarse en manifest.
+
+11. Validaciones obligatorias
+
+11.1. Finitud numérica
+
+    ϕ_j(x_i) ∈ R
+
+para todas las atribuciones persistidas.
+
+11.2. Cierre aditivo
+Para métodos aditivos:
+
+    | ŷ_i - (ϕ_0 + Σ_j ϕ_{ij}) | <= ε_closure
+
+11.3. Cobertura mínima
+
+    n_explained / n_eligible >= γ_min
+
+11.4. Baseline convergence
+
+    | E[ ŷ(X_ref) ] - ϕ_0 | <= δ_baseline
+
+11.5. Faithfulness
+Si está activado:
+
+    deletion_auc >= τ_del
+
+o, al menos, generar warning si cae por debajo del umbral.
+
+11.6. Estabilidad temporal
+Si está activada:
+
+    Spearman(rank_t, rank_{t+1}) >= ρ_min
+
+o warning/alerta si se incumple.
+
+12. Edge cases críticos
+
+El módulo debe contemplar explícitamente:
+
+- features faltantes o reordenadas -> fail inmediato;
+- predictions presentes pero features ausentes -> no explicación retroactiva incompleta;
+- universo demasiado grande -> sampleo persistido, nunca truncado silencioso;
+- todas las contribuciones casi nulas -> posible baseline trivial, score saturado o fallo metodológico;
+- features altamente colineales -> warning fuerte, especialmente para lineales y PFI;
+- ensemble no aditivo -> impedir lectura de suma exacta;
+- degradación de método por budget -> no silenciosa.
+
+13. Métricas adicionales recomendadas
+
+Como extensiones razonables de primera o segunda fase:
+- attribution variance vía bootstrap por bloques;
+- outlier score de atribuciones, por ejemplo max|ϕ_j| / std(ϕ_j);
+- VIF o diagnóstico de colinealidad entre features explicadas;
+- top-k family churn entre ventanas;
+- frecuencia con que una feature entra/sale del top-k global.
+
+Estas métricas mejoran mucho el valor del módulo para monitoring real sin convertirlo en un framework de investigación XAI ornamental.
+
+14. Artefactos de salida
+
+La estructura base de artefactos es correcta y debe mantenerse. :contentReference[oaicite:5]{index=5}
+
+14.1. Ficheros mínimos
+
+- global_importance.parquet
+- local_explanations.parquet
+- explain_summary.json
+- stability_report.parquet (opcional)
+- manifest.json
+
+14.2. Campos mínimos adicionales recomendados
+
+En global_importance.parquet:
+- feature
+- feature_family
+- importance_mean_abs
+- importance_std_abs
+- global_rank
+- rank_stability
+- deletion_auc (si aplica)
+
+En local_explanations.parquet:
+- date
+- symbol
+- feature
+- feature_value
+- contribution
+- abs_contribution
+- contribution_rank
+- baseline_value
+- y_pred
+- closure_error
+- is_finite
+
+En manifest.json:
+- resolved_method
+- baseline_policy
+- baseline_hash
+- budget_sec
+- budget_used_sec
+- axioms_checked
+- deletion_auc_summary
+- stability_summary
+- n_explained
+- n_eligible
+- coverage_ratio
+- model_version
+- data_hash
+- explain_config_hash
+
+15. Interfaz interna recomendada
+
+La implementación debe separar estrictamente:
+- resolución del modelo,
+- validación del contrato,
+- resolución del método,
+- construcción del sample y baseline,
+- cálculo de explicaciones,
+- validaciones,
+- agregación por grupos,
+- persistencia atómica.
+
+Interfaz sugerida:
+- load_model_from_registry
+- validate_explain_contract
+- resolve_explain_method
+- sample_explain_rows
+- build_background_reference
+- compute_global_explanations
+- compute_local_explanations
+- validate_explain_invariants
+- compute_deletion_auc
+- compute_stability_report
+- aggregate_feature_groups
+- persist_explain_artifacts
+- main
+
+16. MVP y versión avanzada
+
+16.1. MVP obligatorio
+
+El MVP debe incluir:
+- coef para lineales;
+- TreeSHAP para GBDT cuando sea viable;
+- PFI como fallback global;
+- matrix explícita de resolución de método;
+- baseline persistido;
+- cierre aditivo;
+- cobertura mínima;
+- manifest completo;
+- artefactos globales/locales estructurados.
+
+16.2. Primera fase recomendada
+
+Añadir ya:
+- baseline convergence test;
+- verificación explícita de axiomas aplicables;
+- deletion AUC;
+- rank-stability Spearman entre ventanas.
+
+16.3. Segunda fase
+
+Como extensiones razonables:
+- insertion curves;
+- attribution variance;
+- VIF/colinealidad;
+- análisis más rico por régimen;
+- métricas de outlier attribution.
+
+17. No-objetivos
+
+No pertenece al alcance de este módulo:
+- inferencia causal;
+- contrafactuales avanzados;
+- mechanistic interpretability;
+- attribution patching;
+- frameworks de explicación no trazables al run real;
+- investigación metodológica profunda sobre XAI.
+
+La misión aquí es explicabilidad operativa, reproducible y útil para control cuantitativo, no investigación ornamental.
+
+18. Criterios de aceptación
+
+El módulo sólo debe considerarse correcto si cumple simultáneamente:
+- contrato exacto entre modelo, features y predicciones;
+- método resuelto de forma explícita y compatible;
+- baseline persistido y coherente;
+- cierre aditivo dentro de tolerancia cuando aplique;
+- cobertura mínima suficiente;
+- degradación por presupuesto no silenciosa;
+- artefactos persistidos con trazabilidad completa;
+- semántica prudente y no causal en outputs y documentación.
+
+19. Conclusión
+
+models/inference/explain.py debe entenderse como la capa de instrumentación explicativa seria del sistema de inferencia. Su valor no está en “decorar” predicciones con gráficos o narrativas, sino en convertir scores opacos en artefactos auditables, comparables y útiles para debugging, monitoring y control de drift explicativo. En un laboratorio cuantitativo profesional, esa diferencia es decisiva: una explicación buena no es la que suena convincente, sino la que es reproducible, metodológicamente honesta y suficientemente fiel como para ayudar a detectar cuándo el modelo está haciendo algo razonable, algo frágil o algo directamente sospechoso.

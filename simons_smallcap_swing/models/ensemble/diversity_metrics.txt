@@ -1,557 +1,586 @@
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%% DOCUMENTACIÓN TÉCNICA: models/ensemble/diversity_metrics.py
-%%% Standard: production-grade quant research / ensemble selection specification
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+Especificación Cuantitativa: models/ensemble/diversity_metrics.py
 
-\section*{Módulo: \texttt{models/ensemble/diversity\_metrics.py}}
-\label{sec:diversity_metrics}
+0. Propósito y papel dentro del stack
 
-\subsection*{1. Propósito estratégico del módulo}
+diversity_metrics.py define la capa institucional de gobernanza de diversidad entre modelos base del stack de ensembles. Su función no es medir “descorrelación” como un adorno estadístico, sino decidir, bajo reglas cuantitativas reproducibles, qué pares y subconjuntos de modelos son candidatos razonables para blending y stacking, y cuáles sólo añaden redundancia, complejidad y fragilidad operacional. La especificación base que me has pasado ya cerraba muy bien este propósito estratégico, el panel alineado, las métricas pairwise obligatorias, los flags automáticos, la lógica PIT, la selección greedy de subconjuntos y la integración explícita con blender.py y stacking.py. :contentReference[oaicite:0]{index=0}
 
-El módulo \texttt{diversity\_metrics.py} implementa la capa de \textbf{medición, validación y selección de diversidad entre modelos base} dentro de la arquitectura de ensembles del sistema. Su objetivo no es producir una métrica decorativa de “descorrelación”, sino resolver un problema cuantitativo central: \textbf{determinar qué subconjuntos de modelos aportan información incremental real y cuáles solo añaden redundancia, complejidad y fragilidad operacional}.
+En un sistema de small-cap swing trading, la diversidad útil no puede definirse por discrepancia superficial entre scores. Debe entenderse como complementariedad económicamente relevante entre modelos, especialmente en el espacio de errores y en el comportamiento en extremos, y siempre subordinada a la calidad individual de cada modelo. Este módulo existe precisamente para imponer esa disciplina.
 
-En un sistema de \textit{small-cap swing trading}, la diversidad relevante no se define por discrepancia superficial entre predicciones, sino por su capacidad para:
+1. Objetivo formal del módulo
 
-\begin{enumerate}
-    \item reducir el riesgo de error conjunto,
-    \item mejorar la robustez del ensemble fuera de muestra,
-    \item evitar concentración implícita en familias de modelos casi equivalentes,
-    \item y generar subconjuntos candidatos defendibles para \texttt{blender.py} y \texttt{stacking.py}.
-\end{enumerate}
+Sea
 
-Por tanto, este módulo debe interpretarse como una capa de \textbf{gobernanza del universo de modelos base}, no como una simple utilidad estadística.
+    𝓜 = {m_1, ..., m_S}
 
-\subsection*{2. Problema formal que resuelve}
+el conjunto de modelos candidatos. Cada modelo m_i produce una predicción ŷ_{i,t,s} para símbolo s en fecha t, y el sistema dispone de labels y_{t,s} alineados al mismo horizonte. El módulo toma como entrada predicciones OOF/PIT alineadas y produce una transformación
 
-Sea \( \mathcal{M} = \{m_1,\dots,m_S\} \) el conjunto de modelos candidatos. Cada modelo \(m_i\) genera una predicción \( \hat{y}_{i,t,s} \) para símbolo \(s\) en fecha \(t\), y el sistema dispone de labels \( y_{t,s}^{\text{true}} \) alineados al mismo horizonte.
+    𝓜
+    -> (pairwise_metrics, redundancy_flags, candidate_sets, selection_diagnostics),
 
-El módulo construye un panel alineado:
+donde:
+- pairwise_metrics resume diversidad y redundancia entre pares,
+- redundancy_flags activa reglas automáticas de poda o cautela,
+- candidate_sets propone subconjuntos razonables para ensemble,
+- selection_diagnostics documenta cobertura, estabilidad, potencia y fiabilidad.
 
-\[
-\mathcal{P}
-=
-\left\{
-(t,s,\hat{y}_{1,t,s},\dots,\hat{y}_{S,t,s},y_{t,s}^{\text{true}})
-\right\}
-\]
+El objetivo del módulo no es demostrar que “más diversidad” siempre es mejor. Su objetivo es identificar combinaciones donde calidad individual y diversidad útil conviven de forma defendible, y excluir configuraciones donde la aparente diversidad no es más que ruido, baja potencia estadística o inestabilidad de régimen.
 
-sobre el cual estima la estructura de dependencia entre modelos. El resultado buscado no es solo una matriz de correlaciones, sino una transformación:
+2. Principio cuantitativo rector
 
-\[
-\mathcal{M}
-\longrightarrow
-\left(
-\text{pairwise metrics},
-\text{redundancy flags},
-\text{candidate sets},
-\text{selection diagnostics}
-\right)
-\]
+La hipótesis operativa central del módulo es:
 
-capaz de alimentar decisiones de selección posteriores de forma limpia, PIT y reproducible.
+    dos modelos sólo deben coexistir en un ensemble
+    si su convivencia mejora el compromiso entre calidad predictiva,
+    robustez y control de riesgo de modelo
+    respecto a utilizar uno solo o una combinación más parsimoniosa.
 
-\subsection*{3. Principio cuantitativo rector}
+De este principio se derivan tres consecuencias no negociables:
 
-La hipótesis central del módulo es la siguiente:
+P1. La diversidad de outputs no es suficiente.
+Dos modelos pueden estar poco correlacionados en scores y aun así fallar juntos en lo importante.
 
-\begin{quote}
-Dos modelos solo deben coexistir en un ensemble si su convivencia mejora el compromiso entre calidad predictiva, robustez y control de riesgo de modelo respecto a utilizar uno solo o una combinación más parsimoniosa.
-\end{quote}
+P2. La diversidad de errores tiene prioridad sobre la mera decorrelación superficial.
+Si los errores residuales co-mueven, la protección mutua del ensemble es escasa.
 
-De ello se derivan tres consecuencias operativas:
+P3. La diversidad sólo tiene valor si se combina con competencia.
+Un modelo mediocre no debe entrar en un ensemble sólo porque “parece distinto”.
 
-\begin{itemize}
-    \item La \textbf{diversidad de outputs} no es suficiente.
-    \item La \textbf{diversidad de errores} es más importante que la mera discrepancia de scores.
-    \item La decisión final debe basarse en \textbf{valor incremental defendible}, no en heurísticas vagas de “descorrelación”.
-\end{itemize}
+3. Panel alineado y unidad de análisis
 
-\subsection*{4. Tipos de diversidad que deben medirse}
+La unidad elemental del módulo debe ser la observación alineada:
 
-El módulo debe medir, al menos, cuatro familias de diversidad:
+    (date, symbol, model_id, y_pred, y_true, split_role, regime_id?)
 
-\begin{enumerate}
-    \item \textbf{Diversidad de predicción}: cuánto difieren las señales brutas.
-    \item \textbf{Diversidad de error}: cuánto difieren los errores residuales.
-    \item \textbf{Diversidad de selección/ranking}: cuánto difieren las posiciones extremas sugeridas.
-    \item \textbf{Diversidad marginal útil}: cuánto mejora el sistema al añadir un modelo a un subconjunto dado.
-\end{enumerate}
+El panel base debe construirse como
 
-Estas cuatro dimensiones deben tratarse como complementarias. Ninguna por sí sola define diversidad útil de manera suficiente.
+    P = { (t, s, model_id, ŷ_{i,t,s}, y_{t,s}, split_role, regime_id) }.
 
-\subsection*{5. Panel alineado y unidad de análisis}
+Toda métrica pairwise debe calcularse sobre una intersección explícita. Para cada par (a,b), definimos
 
-La unidad elemental de comparación debe ser la observación alineada \((date, symbol)\). El módulo debe construir un panel limpio con las siguientes claves:
+    I_{a,b} =
+      { (t,s) : ŷ_{a,t,s}, ŷ_{b,t,s}, y_{t,s} están disponibles y son OOF válidos }.
 
-\begin{itemize}
-    \item \texttt{date}
-    \item \texttt{symbol}
-    \item \texttt{model\_id}
-    \item \texttt{y\_pred}
-    \item \texttt{y\_true}
-    \item \texttt{split\_role} (\texttt{OOF}, \texttt{OOS}, etc.)
-    \item opcionalmente \texttt{regime\_id}
-\end{itemize}
+Y su cardinalidad
 
-Toda métrica pairwise debe calcularse sobre una intersección válida y explícita entre los modelos comparados. No se permite comparar dos modelos sobre bases temporales implícitamente distintas sin registrar ese hecho.
+    N_{a,b} = | I_{a,b} |.
 
-\subsection*{6. Métricas obligatorias de diversidad}
+No se permite comparar dos modelos sobre bases temporales implícitamente distintas sin persistir ese hecho. La comparabilidad debe ser una propiedad explícita del artefacto, no una suposición silenciosa.
 
-\subsubsection*{6.1 Correlación de predicciones}
+4. Familias de diversidad que deben medirse
 
-Para cada par \( (m_a, m_b) \), se calcula:
+El módulo debe medir, como mínimo, cuatro familias complementarias:
 
-\[
-\rho^{\text{pred}}_{a,b}
-=
-\mathrm{Corr}\left(
-(\hat{y}_{a,t,s})_{(t,s)\in\mathcal{I}_{a,b}},
-(\hat{y}_{b,t,s})_{(t,s)\in\mathcal{I}_{a,b}}
-\right)
-\]
+4.1. Diversidad de predicción
+Cuánto difieren las señales brutas de dos modelos.
 
-donde \( \mathcal{I}_{a,b} \) es la intersección válida de observaciones compartidas.
+4.2. Diversidad de error
+Cuánto difieren sus residuos respecto al label observado.
 
-Esta métrica captura redundancia superficial en la señal. Debe interpretarse con cautela: una correlación alta sugiere dependencia, pero no implica necesariamente inutilidad si los errores y el comportamiento en extremos son distintos.
+4.3. Diversidad de selección o ranking
+Cuánto difieren en extremos explotables, como top-k o bottom-k.
 
-\subsubsection*{6.2 Correlación de errores}
+4.4. Diversidad marginal útil
+Cuánto mejora un subconjunto cuando se añade un modelo concreto.
 
-Definimos residuos:
+Estas dimensiones no son intercambiables. La diversidad de error debe considerarse la dimensión base. Las demás son proxies o refinamientos cuya importancia relativa dependerá de la función objetivo downstream del ensemble.
 
-\[
-e_{i,t,s} = y^{\text{true}}_{t,s} - \hat{y}_{i,t,s}
-\]
+5. Métricas pairwise obligatorias
 
-y calculamos:
+5.1. Correlación de predicciones
 
-\[
-\rho^{\text{err}}_{a,b}
-=
-\mathrm{Corr}\left(
-(e_{a,t,s})_{(t,s)\in\mathcal{I}_{a,b}},
-(e_{b,t,s})_{(t,s)\in\mathcal{I}_{a,b}}
-\right)
-\]
+Para cada par (a,b):
 
-Esta es una de las métricas más importantes del módulo. Dos modelos con errores altamente correlacionados fallan conjuntamente y, por tanto, aportan poca protección recíproca al ensemble.
+    ρ_pred(a,b) = Corr( ŷ_a, ŷ_b ) sobre I_{a,b}.
 
-\subsubsection*{6.3 Top-k overlap}
+Esta métrica captura redundancia superficial de señal. Debe calcularse, por defecto, en forma robusta si el dominio lo requiere:
+- Pearson si el score es aproximadamente lineal y estable,
+- Spearman o rank-based si hay colas pesadas o escalas poco comparables.
 
-Para un \(k\) definido en configuración, sea \( \mathcal{T}^{+}_{k}(m_i,t) \) el conjunto de activos top-k long sugeridos por \(m_i\) en fecha \(t\). Entonces:
+Interpretación:
+- valor alto en magnitud sugiere posible redundancia,
+- pero no basta para excluir un par si la estructura de errores o de extremos difiere.
 
-\[
-\text{overlap}^{+}_{a,b}(t)
-=
-\frac{
-\left|
-\mathcal{T}^{+}_{k}(m_a,t)\cap \mathcal{T}^{+}_{k}(m_b,t)
-\right|
-}{k}
-\]
+5.2. Correlación de errores
 
-Análogamente se puede definir para bottom-k o short book. La métrica global será la media temporal robusta:
+Definimos residuos
 
-\[
-\text{topk\_overlap}_{a,b}
-=
-\mathrm{RobustMean}_t\left(
-\text{overlap}^{+}_{a,b}(t)
-\right)
-\]
+    e_{i,t,s} = y_{t,s} - ŷ_{i,t,s},
 
-Esta métrica es crucial cuando la explotación del alpha depende de extremos de ranking y no del score continuo completo.
+y calculamos
 
-\subsubsection*{6.4 Disagreement rate}
+    ρ_err(a,b) = Corr( e_a, e_b ) sobre I_{a,b}.
 
-Para sistemas direccionales o señales con umbralización:
+Esta es la métrica central del módulo. Debe tener prioridad analítica porque se alinea más directamente con la utilidad real de combinar modelos. Dos modelos con errores altamente correlacionados fallan juntos; por tanto, ofrecen poca protección recíproca en un ensemble optimizado sobre error, Sharpe o utilidad neta.
 
-\[
-\text{disagreement}_{a,b}
-=
-\frac{1}{N_{a,b}}
-\sum_{(t,s)\in\mathcal{I}_{a,b}}
-\mathbf{1}
-\left[
-\mathrm{sign}_{\tau}(\hat{y}_{a,t,s})\neq
-\mathrm{sign}_{\tau}(\hat{y}_{b,t,s})
-\right]
-\]
+5.3. Top-k overlap
 
-donde \( \mathrm{sign}_{\tau} \) es una función de signo con zona muerta alrededor de cero. Esto evita que ruido cercano a cero infle artificialmente la supuesta diversidad.
+Para un k fijado en configuración, sea T_k^+(m_i,t) el conjunto de activos top-k long de m_i en fecha t. Entonces:
 
-\subsubsection*{6.5 Contribución incremental marginal}
-
-Sea \( \mathcal{A}\subset \mathcal{M} \) un subconjunto base y \(b\notin\mathcal{A}\) un modelo candidato. Definimos:
-
-\[
-\Delta \mathcal{J}_{b|\mathcal{A}}
-=
-\mathcal{J}(\mathcal{A}\cup\{b\}) - \mathcal{J}(\mathcal{A})
-\]
-
-donde \( \mathcal{J} \) es la función objetivo definida ex ante para evaluación de ensemble sobre OOF. Esta puede ser, por ejemplo, Sharpe penalizado por turnover, IC, o una métrica compuesta.
-
-Esta es la métrica que más se acerca a la pregunta verdaderamente importante: \textbf{¿aporta este modelo algo útil cuando ya existe el resto?}
-
-\subsection*{7. Métricas opcionales pero recomendadas}
-
-El módulo debe poder extenderse con métricas adicionales, entre ellas:
-
-\begin{itemize}
-    \item distancia de Spearman entre rankings completos,
-    \item información mutua aproximada entre outputs,
-    \item partial correlation condicionada a un tercer modelo o a un factor común,
-    \item dependencia por familia de señales,
-    \item co-fallo en colas o episodios extremos,
-    \item similitud de feature ancestry o pipeline lineage.
-\end{itemize}
-
-No obstante, estas métricas no deben sustituir a las obligatorias; su papel es refinar el diagnóstico, no reemplazar el núcleo operativo del módulo.
-
-\subsection*{8. Score sintético de diversidad}
-
-El módulo debe producir un \textbf{score sintético de diversidad pairwise} con significado operacional claro. Una formulación recomendada es:
-
-\[
-D_{a,b}
-=
-w_1(1-|\rho^{\text{pred}}_{a,b}|)
-+
-w_2(1-|\rho^{\text{err}}_{a,b}|)
-+
-w_3(1-\text{topk\_overlap}_{a,b})
-+
-w_4\text{disagreement}_{a,b}
-\]
-
-con \(w_i \ge 0\) y \( \sum_i w_i = 1 \).
-
-\paragraph{Política por defecto recomendada.}
-En trading, debe priorizarse la diversidad de error sobre la decorrelación superficial de outputs. Por tanto, por defecto:
-
-\[
-w_2 \ge w_1,\qquad
-w_3 \text{ alto si el sistema opera por ranking extremo}
-\]
+    overlap_k(a,b,t) =
+      | T_k^+(m_a,t) ∩ T_k^+(m_b,t) | / k.
 
-\paragraph{Regla de interpretación.}
-\begin{itemize}
-    \item \(D_{a,b}\) alto no implica aceptación automática del par.
-    \item \(D_{a,b}\) bajo sí puede justificar exclusión o fusión de candidatos.
-    \item El score debe interpretarse junto con la calidad marginal de cada modelo.
-\end{itemize}
+La métrica global debe ser una media robusta temporal:
 
-\subsection*{9. Score de redundancia y flags automáticos}
+    topk_overlap(a,b) = RobustMean_t( overlap_k(a,b,t) ).
 
-Además del score de diversidad, el módulo debe generar un \textbf{redundancy score} más conservador:
+RobustMean debe estar definido explícitamente en configuración. Recomendación institucional:
+- mediana,
+- o trimmed mean con trimming moderado.
 
-\[
-R_{a,b}
-=
-u_1|\rho^{\text{pred}}_{a,b}|
-+
-u_2|\rho^{\text{err}}_{a,b}|
-+
-u_3\text{topk\_overlap}_{a,b}
--
-u_4\text{disagreement}_{a,b}
-\]
+Esta métrica es especialmente importante cuando la explotación del alpha depende de extremos de ranking y no del score continuo completo.
 
-con \(u_i\ge 0\). Este score facilita políticas de exclusión.
+5.4. Disagreement con zona muerta
 
-El sistema debe emitir al menos los siguientes flags:
-
-\begin{itemize}
-    \item \texttt{high\_pred\_corr\_flag}
-    \item \texttt{high\_error\_corr\_flag}
-    \item \texttt{high\_topk\_overlap\_flag}
-    \item \texttt{near\_duplicate\_models\_flag}
-    \item \texttt{low\_intersection\_coverage\_flag}
-    \item \texttt{unstable\_pair\_flag}
-\end{itemize}
+Definir una función de signo con umbral τ:
 
-\subsection*{10. Umbrales operativos y política por defecto}
+    sign_τ(x) =
+      +1  si x >= τ
+       0  si |x| < τ
+      -1  si x <= -τ
 
-Uno de los fallos típicos de un documento conceptual es no fijar umbrales. Aquí deben existir \textbf{umbrales configurables y versionados}. La política por defecto recomendada es:
+y entonces
 
-\begin{itemize}
-    \item \textbf{Alta redundancia fuerte}: si
-    \[
-    |\rho^{\text{pred}}_{a,b}| \ge \tau_{\text{pred}}
-    \quad\text{y}\quad
-    |\rho^{\text{err}}_{a,b}| \ge \tau_{\text{err}}
-    \]
-    entonces el par se considera estructuralmente redundante.
-    \item \textbf{Redundancia por extremos}: si
-    \[
-    \text{topk\_overlap}_{a,b}\ge \tau_{\text{topk}}
-    \]
-    y además la contribución incremental es pequeña, uno de ambos puede excluirse.
-    \item \textbf{Baja potencia estadística}: si la intersección de datos es inferior a \(\tau_{N}\), la métrica se marca como no concluyente.
-\end{itemize}
+    disagreement(a,b) =
+      (1 / N_{a,b}) Σ 1[ sign_τ(ŷ_a) != sign_τ(ŷ_b) ].
 
-\paragraph{Principio de decisión.}
-Los umbrales no deben calibrarse observando ex post qué produce el mejor backtest. Deben fijarse antes del análisis o justificarse mediante estudios previos.
+La zona muerta evita inflar artificialmente la diversidad por ruido alrededor de cero.
 
-\subsection*{11. Tratamiento de la inestabilidad temporal}
+5.5. Contribución incremental marginal
 
-La diversidad útil no es solo nivel medio; también importa su estabilidad. Para cada par \( (a,b) \), el módulo debe calcular métricas rolling o por bloques:
+Sea A ⊂ 𝓜 un subconjunto base y b ∉ A. Definimos
 
-\[
-\rho^{\text{pred}}_{a,b}(u), \quad
-\rho^{\text{err}}_{a,b}(u), \quad
-D_{a,b}(u)
-\]
+    ΔJ_{b|A} = J(A ∪ {b}) - J(A),
 
-donde \(u\) indexa ventanas temporales o subperiodos.
+donde J es la función objetivo del ensemble downstream evaluada sobre OOF:
+- Sharpe penalizado,
+- IC medio,
+- utility net,
+- o la métrica compuesta fijada en config.
 
-Se deben derivar, al menos:
+Esta es la métrica más cercana a la pregunta realmente importante:
 
-\begin{itemize}
-    \item media temporal,
-    \item desviación estándar,
-    \item rango intercuartílico,
-    \item porcentaje de ventanas en las que el par cae en zona de alta redundancia.
-\end{itemize}
+    ¿aporta este modelo algo útil cuando ya existe el resto?
 
-\paragraph{Regla operativa.}
-Un par no debe considerarse diversificado de forma robusta si solo presenta buen comportamiento en promedio pero alterna frecuentemente con episodios de correlación extrema o co-fallo persistente.
+Por diseño, ΔJ_{b|A} debe reutilizar el mismo motor de evaluación del blender o del stacking cuando sea posible, para evitar incoherencias entre “diversidad medida” y “diversidad realmente útil”.
 
-\subsection*{12. Diversidad por régimen}
+6. Métricas opcionales recomendadas
 
-Si el sistema dispone de una taxonomía de regímenes \(r\in\mathcal{R}\), el módulo debe calcular:
+El módulo debe poder extenderse con métricas adicionales, pero sin sustituir al núcleo obligatorio. Entre las más razonables:
 
-\[
-D^{(r)}_{a,b},\quad
-\rho^{\text{pred},(r)}_{a,b},\quad
-\rho^{\text{err},(r)}_{a,b}
-\]
+- distancia de Spearman entre rankings completos;
+- double-fault o métricas clásicas de co-fallo;
+- Q-statistic en contextos clasificatorios;
+- dependencia en colas o co-fallo en episodios extremos;
+- partial correlations condicionadas a un modelo o familia dominante;
+- similitud de lineage o ancestry del pipeline.
 
-La diversidad por régimen es especialmente importante en finanzas porque muchos modelos parecen complementarios en agregado y dejan de serlo precisamente en los estados del mercado donde más importa la protección.
+Estas métricas deben tratarse como capas de diagnóstico adicional. El módulo central no debe depender de ellas para ser operativo.
 
-\paragraph{Regla recomendada.}
-Si un par presenta diversidad aceptable en agregado pero colapsa en regímenes de estrés o alta volatilidad, debe penalizarse en el ranking de candidatos.
+7. Scores sintéticos: diversidad y redundancia
 
-\subsection*{13. Selección de subconjuntos candidatos}
+7.1. Score sintético de diversidad
 
-El módulo no debe detenerse en métricas pairwise. Debe producir subconjuntos concretos recomendados para \texttt{blender} y \texttt{stacking}. Para ello, debe soportar dos enfoques:
+Una formulación recomendada es:
 
-\subsubsection*{13.1 Filtro greedy de redundancia}
+    D_{a,b} =
+      w_1 (1 - |ρ_pred(a,b)|)
+    + w_2 (1 - |ρ_err(a,b)|)
+    + w_3 (1 - topk_overlap(a,b))
+    + w_4 disagreement(a,b),
 
-\begin{enumerate}
-    \item Ordenar modelos por calidad individual OOF.
-    \item Inicializar con el mejor modelo.
-    \item Añadir secuencialmente el mejor candidato que:
-    \begin{itemize}
-        \item supere un mínimo de calidad,
-        \item no viole umbrales de redundancia con el conjunto actual,
-        \item y aporte contribución incremental mínima \(\Delta \mathcal{J}_{\min}\).
-    \end{itemize}
-\end{enumerate}
+con
+- w_i >= 0,
+- Σ_i w_i = 1.
 
-\subsubsection*{13.2 Selección combinatoria restringida}
+Política por defecto recomendada:
+- si el ensemble downstream se evalúa principalmente en espacio de error o utilidad neta, imponer
 
-Explorar subconjuntos de tamaño acotado \(K\) y maximizar una función del tipo:
+    w_2 >= w_1
 
-\[
-\mathcal{S}(A)
-=
-\alpha \cdot \text{quality}(A)
-+
-\beta \cdot \text{diversity}(A)
--
-\gamma \cdot \text{complexity}(A)
-\]
+- si el ensemble downstream opera por ranking extremo, elevar el peso de top-k overlap y, si conviene, sustituir parte del término de predicción por una distancia de ranking.
 
-donde \(A\subseteq\mathcal{M}\).
+Interpretación:
+- D_{a,b} alto no implica aceptación automática;
+- D_{a,b} bajo sí puede justificar exclusión o fusión;
+- D_{a,b} siempre debe leerse junto a la calidad individual y la potencia estadística del par.
 
-\paragraph{Política por defecto.}
-Usar enfoque greedy para producción por coste y trazabilidad; usar búsqueda combinatoria solo en research controlado o para universos pequeños.
+7.2. Score sintético de redundancia
 
-\subsection*{14. Criterio formal de aceptación o exclusión de modelos}
+Una formulación conservadora útil es:
 
-El módulo debe definir reglas explícitas. Un modelo \(m_b\) puede ser excluido del subconjunto candidato si se cumple alguna de las siguientes:
+    R_{a,b} =
+      u_1 |ρ_pred(a,b)|
+    + u_2 |ρ_err(a,b)|
+    + u_3 topk_overlap(a,b)
+    - u_4 disagreement(a,b),
 
-\begin{enumerate}
-    \item Está dominado en calidad por otro modelo \(m_a\) y además presenta redundancia alta con él.
-    \item Su contribución incremental marginal es inferior a \(\Delta \mathcal{J}_{\min}\) de forma persistente.
-    \item Su diversidad aparente proviene de ruido inestable y no se sostiene por subperiodos.
-    \item Su cobertura interseccional es demasiado baja para concluir valor real.
-\end{enumerate}
+con u_i >= 0.
 
-\paragraph{Regla inversa.}
-Un modelo mediocre en calidad individual puede mantenerse si reduce materialmente el error conjunto o mejora la robustez del ensemble en regímenes difíciles.
+Uso operativo:
+- R_{a,b} alto + uno de los dos modelos claramente peor en calidad
+  -> candidato fuerte a poda;
+- R_{a,b} alto pero ambos de calidad alta
+  -> candidato a coexistencia vigilada o a compresión por family governance;
+- R_{a,b} bajo
+  -> no implica valor real si la calidad individual es deficiente.
 
-\subsection*{15. Tratamiento de cobertura parcial y comparabilidad}
+8. Umbrales, flags y política de decisión
 
-Cuando dos modelos no comparten todas las observaciones, las métricas deben calcularse sobre la intersección:
+El módulo no puede quedarse en “scores bonitos”. Debe activar flags automáticos y reglas de uso.
 
-\[
-\mathcal{I}_{a,b}
-=
-\left\{
-(t,s): \hat{y}_{a,t,s}\ \text{y}\ \hat{y}_{b,t,s}\ \text{están disponibles}
-\right\}
-\]
+8.1. Umbrales configurables mínimos
 
-Pero además debe persistirse:
+- τ_pred para alta correlación de predicciones
+- τ_err para alta correlación de errores
+- τ_topk para overlap excesivo en extremos
+- N_min para declarar una métrica usable
+- τ_instability para marcar inestabilidad temporal
+- ΔJ_min para contribución marginal mínima útil
 
-\begin{itemize}
-    \item tamaño de intersección \(N_{a,b}\),
-    \item porcentaje de cobertura relativa,
-    \item periodo de fechas cubierto,
-    \item y bandera de comparabilidad débil.
-\end{itemize}
+8.2. Flags obligatorios
 
-Un par con métricas muy buenas sobre una intersección minúscula no debe competir en igualdad de condiciones frente a pares medidos sobre cobertura amplia.
+El sistema debe emitir al menos:
 
-\subsection*{16. Potencia estadística y fiabilidad de las métricas}
+- high_pred_corr_flag
+- high_error_corr_flag
+- high_topk_overlap_flag
+- near_duplicate_models_flag
+- low_intersection_coverage_flag
+- low_power_flag
+- unstable_pair_flag
+- stress_regime_collapse_flag
 
-El módulo debe distinguir entre:
-\begin{itemize}
-    \item valor estimado de la métrica,
-    \item estabilidad del valor,
-    \item y fiabilidad estadística de la estimación.
-\end{itemize}
+8.3. Regla de prudencia
 
-Por ello, debe incorporar como mínimo:
+Los umbrales no deben calibrarse ex post para justificar el mejor backtest. Deben fijarse antes del análisis o apoyarse en estudios previos del laboratorio.
 
-\begin{itemize}
-    \item conteo de observaciones por par,
-    \item intervalos o bandas de confianza aproximadas cuando proceda,
-    \item flags de baja potencia,
-    \item y tests simples de robustez por submuestreo o bloques.
-\end{itemize}
+9. Potencia estadística y fiabilidad
 
-\paragraph{Principio de prudencia.}
-En selección de modelos, una estimación incierta debe tratarse como incierta, no como evidencia favorable.
+Un valor estimado sin contexto de fiabilidad no es suficiente. Para cada par, el módulo debe persistir:
 
-\subsection*{17. Reglas PIT y anti-leakage}
+- N_{a,b}
+- porcentaje de cobertura relativa
+- periodo cubierto
+- calidad de la intersección
+- fiabilidad o banderas de baja potencia
+
+Principio:
+un par con métricas muy atractivas sobre una intersección minúscula no debe competir en igualdad de condiciones frente a pares con cobertura amplia.
+
+Como extensión razonable, el módulo debe admitir bandas de incertidumbre o dispersión estimadas mediante:
+- bootstrap por bloques temporales,
+- subperiodos rolling,
+- o split por regímenes.
+
+No es obligatorio convertir esto en inferencia formal pesada, pero sí etiquetar pares como:
+- alta diversidad robusta,
+- diversidad moderada pero estable,
+- diversidad alta e incierta.
+
+10. Estabilidad temporal y por régimen
+
+10.1. Estabilidad temporal
+
+Para cada par, el módulo debe calcular métricas por ventana u:
+
+    ρ_pred(a,b;u),
+    ρ_err(a,b;u),
+    D_{a,b}(u).
+
+Y resumir al menos:
+- media temporal,
+- desviación estándar,
+- rango intercuartílico,
+- porcentaje de ventanas en zona de alta redundancia.
+
+Regla operativa:
+un par no debe considerarse diversificado de forma robusta si sólo luce bien en promedio pero alterna frecuentemente con episodios de co-fallo severo.
+
+10.2. Diversidad por régimen
+
+Si existe una taxonomía PIT de regímenes r ∈ 𝓡, el módulo debe calcular:
+
+    D_{a,b}^{(r)},
+    ρ_pred^{(r)}(a,b),
+    ρ_err^{(r)}(a,b).
+
+Esto es crucial en finanzas: muchos modelos parecen complementarios en agregado y dejan de serlo precisamente en estados de estrés, alta volatilidad o iliquidez.
+
+Regla recomendada:
+si un par presenta diversidad aceptable en agregado pero colapsa en regímenes adversos, debe penalizarse en el ranking de candidatos.
+
+11. Selección de subconjuntos candidatos
+
+El módulo no debe detenerse en pairwise diagnostics. Debe generar subconjuntos concretos para blender y stacking.
+
+11.1. Función de selección explícita
+
+Para un subconjunto A ⊂ 𝓜, definir:
+
+    quality(A) = J(A)
+
+    diversity(A) =
+      [ 1 / (|A| (|A|-1)) ] Σ_{a != b, a,b ∈ A} D_{a,b}
+
+    complexity(A) = |A|.
+
+Y construir una función explícita:
+
+    S(A) = α · quality(A) + β · diversity(A) - γ · complexity(A),
+
+con
+- α >= 0,
+- β >= 0,
+- γ > 0.
+
+Esto aterriza la heurística en una función reproducible, auditable y suficientemente razonable para gobernanza, sin sobreprometer optimalidad matemática.
+
+11.2. Regla greedy recomendada
+
+Política institucional por defecto:
+
+1. ordenar modelos por calidad individual OOF;
+2. iniciar A con el mejor;
+3. añadir secuencialmente el candidato b que maximice ΔS y además:
+   - supere mínimos de calidad,
+   - no viole umbrales fuertes de redundancia,
+   - cumpla ΔJ_{b|A} >= ΔJ_min,
+   - mantenga |A| <= K_max;
+4. parar cuando no exista mejora marginal suficiente o se alcance tamaño máximo.
+
+Esto es simple, trazable y suficientemente robusto para producción.
+
+11.3. Política de parsimonia
+
+El módulo debe penalizar subconjuntos demasiado grandes. Diversidad sin parsimonia acaba favoreciendo conjuntos inflados que parecen buenos sólo por exploración amplia del espacio combinatorio.
+
+Por ello, deben existir límites explícitos:
+- tamaño máximo del subconjunto,
+- número máximo de subconjuntos evaluados,
+- número máximo de combinaciones exploradas en modo research.
+
+12. Competencia + diversidad
+
+El módulo debe fijar claramente que diversidad sin competencia no basta. Un modelo mediocre no debe entrar sólo por ser “distinto”. Por tanto, la lógica de selección debe combinar:
+
+- calidad individual mínima,
+- diversidad útil,
+- y contribución marginal real.
+
+Regla recomendada:
+un modelo de calidad media-baja sólo puede permanecer si mejora de forma consistente:
+- ΔJ_{b|A},
+- estabilidad del ensemble,
+- o comportamiento en regímenes difíciles.
+
+13. Tratamiento de cobertura parcial
+
+Cuando dos modelos no comparten todas las observaciones, las métricas deben calcularse sobre I_{a,b}. Además, debe persistirse:
+
+- n_intersection
+- pct_relative_coverage
+- date_range_intersection
+- weak_comparability_flag
+
+No se permite interpretar un par como “fuertemente diverso” sin tener en cuenta si esa diversidad fue medida sobre 5000 observaciones o sobre 80.
+
+14. PIT, anti-leakage y disciplina metodológica
 
 Toda la lógica principal del módulo debe ejecutarse sobre paneles OOF limpios. Esto implica:
 
-\begin{itemize}
-    \item prohibición de utilizar predicciones in-sample para selección,
-    \item separación estricta entre tuning y evaluación,
-    \item versionado de ventanas temporales,
-    \item preservación de cronología en análisis rolling y por régimen.
-\end{itemize}
+- prohibición de usar predicciones in-sample para selección principal;
+- separación estricta entre tuning y evaluación;
+- versionado de ventanas usadas;
+- congelación de candidate sets antes de pasar al siguiente tramo temporal del pipeline;
+- coherencia temporal entre métricas rolling y fechas de disponibilidad real.
 
-Si el módulo produce candidatos que luego serán evaluados en otro bloque del pipeline, la selección debe quedar congelada antes de consumir el siguiente tramo temporal.
+Si este módulo alimenta a blender.py o stacking.py sobre un tramo posterior, la selección debe quedar cerrada antes de consumir dicho tramo.
 
-\subsection*{18. Validaciones obligatorias}
+15. Failure modes principales
+
+El módulo debe documentar y detectar al menos:
+
+F1. Diversidad alta con baja potencia estadística.
+Pares aparentemente útiles medidos sobre muy pocas observaciones.
+
+F2. Diversidad sin competencia.
+Modelos malos que parecen distintos pero sólo añaden ruido.
+
+F3. Diversidad agregada que colapsa en regímenes críticos.
+Falsa sensación de protección en estados donde más importa.
+
+F4. Búsqueda combinatoria demasiado amplia.
+Subconjuntos “buenos” por azar y no por estructura real.
+
+F5. Cobertura parcial no comparable.
+Pares evaluados sobre dominios muy distintos sin etiquetado de fiabilidad.
+
+F6. Redundancia estética disimulada.
+Modelos con distinta arquitectura pero misma familia de error.
+
+16. Complejidad computacional
+
+Sea S el número de modelos y N el número de observaciones alineadas.
+
+- Cálculo pairwise básico:
+  O(S^2 N)
+
+- Métricas rolling/regime:
+  multiplica por número de ventanas o regímenes
+
+- Selección combinatoria:
+  puede explotar rápidamente si no se limita
+
+Por tanto, el módulo debe:
+- limitar búsqueda exhaustiva a universos pequeños;
+- usar greedy por defecto en producción;
+- registrar runtime y número de pares/subconjuntos evaluados;
+- fallar o degradar si el espacio explorado excede límites de configuración.
+
+17. Validaciones obligatorias
 
 El módulo debe fallar explícitamente si detecta:
 
-\begin{itemize}
-    \item panel vacío,
-    \item claves duplicadas por \((date,symbol,model\_id)\),
-    \item labels desalineados con horizonte predictivo,
-    \item mezcla de splits incompatibles,
-    \item insuficiente número de modelos,
-    \item intersecciones nulas o casi nulas,
-    \item \texttt{NaN}/\texttt{inf} en inputs críticos,
-    \item configuración inconsistente de top-k, umbrales o régimen.
-\end{itemize}
+- panel vacío,
+- duplicados por (date, symbol, model_id),
+- labels desalineados con horizonte predictivo,
+- mezcla de splits incompatibles,
+- menos de dos modelos válidos,
+- intersecciones nulas o casi nulas generalizadas,
+- NaN o inf en inputs críticos,
+- configuración inconsistente de top-k, umbrales, régimen o weights de scores.
 
-Además, debe emitir \texttt{WARNING} cuando las métricas sean computables pero metodológicamente débiles.
+Además debe emitir warning cuando:
+- las métricas sean computables pero metodológicamente débiles,
+- exista alta inestabilidad,
+- la diversidad venga dominada por cobertura parcial.
 
-\subsection*{19. Outputs obligatorios}
+18. Outputs obligatorios
 
 El módulo debe persistir, como mínimo:
 
-\begin{itemize}
-    \item \texttt{pairwise\_diversity\_metrics.parquet}
-    \item \texttt{pairwise\_diversity\_summary.json}
-    \item \texttt{candidate\_model\_sets.parquet}
-    \item \texttt{redundancy\_flags.parquet}
-    \item \texttt{diversity\_config\_snapshot.yaml}
-    \item \texttt{diversity\_metadata.json}
-\end{itemize}
+- pairwise_diversity_metrics.parquet
+- pairwise_diversity_summary.json
+- candidate_model_sets.parquet
+- redundancy_flags.parquet
+- diversity_config_snapshot.yaml
+- diversity_metadata.json
 
-\paragraph{Contenido mínimo del output pairwise.}
-\begin{itemize}
-    \item \texttt{model\_a}, \texttt{model\_b}
-    \item \texttt{n\_intersection}
-    \item \texttt{pred\_corr}
-    \item \texttt{error\_corr}
-    \item \texttt{topk\_overlap}
-    \item \texttt{disagreement}
-    \item \texttt{incremental\_gain}
-    \item \texttt{diversity\_score}
-    \item \texttt{redundancy\_score}
-    \item flags de calidad/fiabilidad
-\end{itemize}
+18.1. Contenido mínimo del output pairwise
 
-\subsection*{20. Métricas operativas y observabilidad}
+Cada fila debe incluir al menos:
+- model_a
+- model_b
+- n_intersection
+- pred_corr
+- error_corr
+- topk_overlap
+- disagreement
+- incremental_gain
+- diversity_score
+- redundancy_score
+- low_power_flag
+- unstable_pair_flag
+- regime_collapse_flag
+- weak_comparability_flag
 
-El sistema debe monitorizar, al menos:
+19. Observabilidad operativa
 
-\begin{itemize}
-    \item \(n_{\text{models}}\)
-    \item \(n_{\text{pairs}}=\binom{S}{2}\)
-    \item \texttt{pct\_pairs\_high\_pred\_corr}
-    \item \texttt{pct\_pairs\_high\_error\_corr}
-    \item \texttt{avg\_diversity\_score}
-    \item \texttt{avg\_redundancy\_score}
-    \item \texttt{pct\_pairs\_low\_coverage}
-    \item \texttt{pct\_pairs\_unstable}
-    \item \texttt{n\_candidate\_sets\_generated}
-    \item \texttt{runtime\_sec}
-\end{itemize}
+El módulo debe monitorizar como mínimo:
 
-La trazabilidad debe ser suficiente para reconstruir exactamente qué pares se midieron, con qué datos y bajo qué reglas de selección.
+- n_models
+- n_pairs = S (S-1) / 2
+- pct_pairs_high_pred_corr
+- pct_pairs_high_error_corr
+- avg_diversity_score
+- avg_redundancy_score
+- pct_pairs_low_coverage
+- pct_pairs_unstable
+- n_candidate_sets_generated
+- runtime_sec
 
-\subsection*{21. Interfaz interna recomendada}
+La trazabilidad debe ser suficiente para reconstruir exactamente:
+- qué pares se midieron,
+- con qué datos,
+- con qué umbrales,
+- y por qué ciertos modelos o subconjuntos entraron o quedaron fuera.
 
-Se recomienda separar el módulo en etapas explícitas:
+20. Interfaz interna recomendada
 
-\begin{itemize}
-    \item \texttt{load\_base\_predictions}
-    \item \texttt{load\_labels}
-    \item \texttt{build\_aligned\_panel}
-    \item \texttt{validate\_aligned\_panel}
-    \item \texttt{compute\_pairwise\_metrics}
-    \item \texttt{compute\_rolling\_stability}
-    \item \texttt{compute\_regime\_metrics}
-    \item \texttt{compute\_incremental\_contribution}
-    \item \texttt{score\_pairs}
-    \item \texttt{generate\_candidate\_sets}
-    \item \texttt{persist\_diversity\_outputs}
-    \item \texttt{main}
-\end{itemize}
+La implementación debe separar claramente:
+- carga,
+- validación,
+- cálculo pairwise,
+- análisis temporal/régimen,
+- scoring,
+- generación de subconjuntos,
+- persistencia.
 
-\subsection*{22. Contrato con \texttt{blender.py} y \texttt{stacking.py}}
+Interfaz recomendada:
 
-El output de \texttt{diversity\_metrics.py} no es meramente informativo. Debe actuar como:
+- load_base_predictions
+- load_labels
+- build_aligned_panel
+- validate_aligned_panel
+- compute_pairwise_metrics
+- compute_rolling_stability
+- compute_regime_metrics
+- compute_incremental_contribution
+- score_pairs
+- generate_candidate_sets
+- persist_diversity_outputs
+- main
 
-\begin{itemize}
-    \item \textbf{filtro de admisibilidad} para el universo de modelos que entra en \texttt{blender.py},
-    \item \textbf{mecanismo de poda} para evitar colinealidad excesiva en \texttt{stacking.py},
-    \item y \textbf{capa de documentación cuantitativa} de por qué ciertos modelos se combinan y otros no.
-\end{itemize}
+21. Contrato con blender.py y stacking.py
 
-\paragraph{Regla de integración.}
-Si un par o subconjunto viola umbrales fuertes de redundancia, el módulo downstream no debe ignorar esa información salvo anulación explícita y documentada en configuración.
+El output de diversity_metrics.py no es informativo sin consecuencias. Debe actuar como:
 
-\subsection*{23. Filosofía cuantitativa del módulo}
+- filtro de admisibilidad del universo que entra en blender.py;
+- mecanismo de poda para evitar colinealidad excesiva en stacking.py;
+- capa de documentación cuantitativa de por qué ciertos modelos se combinan y otros no.
 
-La diversidad útil en finanzas no consiste en acumular modelos diferentes “por arquitectura”, “por intuición” o por simple variedad estética. Consiste en combinar fuentes de señal cuya convivencia reduzca error conjunto, mejore estabilidad y limite la dependencia de una única hipótesis predictiva.
+Regla de integración:
+si un par o subconjunto viola umbrales fuertes de redundancia o baja fiabilidad, el módulo downstream no debe ignorar esa información salvo override explícito y documentado.
 
-Por ello, este módulo debe juzgarse bajo una norma exigente:
+22. MVP y versión avanzada
 
-\begin{quote}
-La diversidad solo tiene valor si sobrevive a la cronología, a los regímenes y al contraste contra la utilidad marginal real en el ensemble.
-\end{quote}
+22.1. MVP obligatorio
 
-\subsection*{24. Resumen ejecutivo de diseño}
+El MVP debe incluir:
+- panel OOF alineado;
+- métricas básicas obligatorias (pred_corr, error_corr, top-k overlap, disagreement, n_intersection);
+- scores D_{a,b} y R_{a,b};
+- flags de redundancia, baja potencia e inestabilidad;
+- selección greedy de candidate sets;
+- integración básica con blender y stacking;
+- persistencia exhaustiva de outputs.
 
-\begin{itemize}
-    \item El módulo mide diversidad útil, no simple discrepancia superficial.
-    \item La diversidad de error y la contribución incremental tienen prioridad sobre la decorrelación cosmética.
-    \item Deben existir umbrales explícitos, flags automáticos y tratamiento de fiabilidad estadística.
-    \item La selección de subconjuntos debe quedar cerrada con reglas reproducibles.
-    \item El output debe integrarse directamente con \texttt{blender} y \texttt{stacking} como capa de gobernanza del universo de modelos.
-\end{itemize}
+22.2. Extensiones de segunda fase
 
-En consecuencia, \texttt{models/ensemble/diversity\_metrics.py} debe implementarse como una pieza de infraestructura cuantitativa crítica para la arquitectura ensemble: estadísticamente disciplinada, metodológicamente limpia y operativamente accionable.
+Como extensiones razonables:
+- métricas clásicas como double-fault o Q-statistic;
+- bootstrap por bloques para fiabilidad;
+- diversidad por régimen más rica;
+- calibración histórica global de α, β, γ y pesos w_i/u_i;
+- análisis explícito competence-diversity trade-off.
+
+23. No-objetivos
+
+No pertenece al alcance de este módulo:
+- optimización combinatoria pesada tipo simulated annealing como estándar de producción;
+- teoría asintótica fuerte sobre garantías de mejora del ensemble;
+- frameworks unificados complejos de diversidad no accionables en práctica;
+- meta-modelos no lineales de selección de ensembles.
+
+La misión aquí es gobernanza cuantitativa seria y operativa, no investigación ornamental.
+
+24. Conclusión
+
+diversity_metrics.py debe entenderse como la capa institucional de gobernanza del universo de modelos base dentro de la arquitectura ensemble. Su valor no está en producir una matriz bonita de correlaciones, sino en responder con rigor a una pregunta difícil y central:
+
+    qué modelos conviene combinar,
+    cuáles son clones disfrazados,
+    cuáles sólo parecen distintos por ruido,
+    y qué subconjuntos ofrecen complementariedad defendible bajo cronología real.
+
+En finanzas, donde la señal es débil y la no estacionariedad manda, la diversidad útil no es la que impresiona en agregado, sino la que sobrevive a la cronología, a los regímenes y al contraste contra la utilidad marginal real en el ensemble. Ese es exactamente el estándar que este módulo debe imponer.

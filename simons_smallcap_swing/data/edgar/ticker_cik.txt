@@ -1,545 +1,458 @@
-\section{Módulo: \texttt{data/edgar/ticker\_cik.py}}
+Especificación Cuantitativa: data/edgar/ticker_cik.py
 
-\subsection{Objetivo estratégico del módulo}
+1. Propósito del módulo
 
-El módulo \texttt{ticker\_cik.py} implementa la capa formal de \emph{identity resolution}, \emph{historificación de identificadores} y \emph{crosswalk point-in-time safe} entre el universo negociable del sistema y la identidad regulatoria EDGAR de la SEC. Su función no es únicamente construir una tabla \texttt{ticker} \(\leftrightarrow\) \texttt{CIK}, sino producir una \textbf{fuente maestra de identidad} auditable, versionada, sin solapamientos activos ilegítimos y utilizable downstream en contextos donde un error de identificación puede contaminar tanto el research como la validez del backtest.
+El módulo `data/edgar/ticker_cik.py` implementa la capa formal de resolución maestra de identidad entre el universo negociable del sistema y la identidad regulatoria EDGAR de la SEC. Su función no es construir una tabla estática `ticker ↔ CIK`, sino producir una fuente de verdad versionada, historificada, PIT-safe y auditable que permita enlazar correctamente precios, eventos regulatorios y fundamentales sin contaminación cross-entity, sin solapamientos temporales ilegítimos y sin arbitraje opaco. :contentReference[oaicite:0]{index=0}
 
 El principio rector del módulo es el siguiente:
 
-\begin{quote}
-\emph{Un dato fundamental solo es utilizable si puede enlazarse de forma determinista y temporalmente correcta con el activo negociable correspondiente. Un fallo de identidad no es un error administrativo menor, sino una fuente primaria de leakage, de contaminación cross-entity y de falsos resultados en sistemas cuantitativos.}
-\end{quote}
+un dato fundamental sólo es utilizable si puede enlazarse de forma determinista y temporalmente correcta con el activo negociable correspondiente. Un fallo de identidad no es un error administrativo menor, sino una fuente primaria de leakage, survivorship contamination y resultados cuantitativos espurios. :contentReference[oaicite:1]{index=1}
 
 Formalmente, el módulo define un operador de resolución maestra:
 
-\[
-\mathcal{R}_{\mathrm{id}} :
-(\mathcal{U}_{\mathrm{sec}}, \mathcal{U}_{\mathrm{int}}, \Theta, r, a)
-\longrightarrow
-(\mathcal{H}, \mathcal{C}, \mathcal{E}, \mathcal{M}),
-\]
+`R_id : (U_sec, U_int, Θ, r, a) -> (H_history, C_current, E_conflicts, M_manifest)`
 
 donde:
 
-\begin{itemize}
-  \item \(\mathcal{U}_{\mathrm{sec}}\) es el universo bruto de mappings procedentes de la SEC;
-  \item \(\mathcal{U}_{\mathrm{int}}\) es el universo interno de símbolos, identificadores auxiliares y metadatos de trading;
-  \item \(\Theta\) es la configuración de normalización, prioridad de fuentes, arbitraje y políticas PIT;
-  \item \(r\) es el \texttt{run\_id};
-  \item \(a\) es la fecha lógica de snapshot o \texttt{asof}, cuando aplique;
-  \item \(\mathcal{H}\) es el historial versionado del mapping;
-  \item \(\mathcal{C}\) es el snapshot \texttt{current} vigente;
-  \item \(\mathcal{E}\) es el conjunto de conflictos, rechazos e incidencias;
-  \item \(\mathcal{M}\) es el \emph{manifest} auditable de ejecución.
-\end{itemize}
+- `U_sec` es el universo bruto de mappings procedentes de la SEC;
+- `U_int` es el universo interno de símbolos, metadatos y referencias auxiliares;
+- `Θ` es la configuración de normalización, jerarquía de fuentes, arbitraje y políticas temporales;
+- `r` es el `run_id`;
+- `a` es el `asof` lógico cuando aplique;
+- `H_history` es el historial versionado de mappings;
+- `C_current` es el snapshot actual consumible;
+- `E_conflicts` es el conjunto de conflictos, rechazos e incidencias;
+- `M_manifest` es el manifest auditable de ejecución.
 
-Este módulo es, por tanto, la \textbf{capa de referencia maestra} entre dos ontologías diferentes del sistema:
+El módulo es, por tanto, la capa maestra de identidad del subsistema EDGAR. Si esta capa es débil, el pipeline completo puede parecer correcto a nivel sintáctico y, sin embargo, estar cruzando precios de una entidad con fundamentales de otra. :contentReference[oaicite:2]{index=2}
 
-\[
-\text{universo cuantitativo de activos}
-\quad \longleftrightarrow \quad
-\text{universo regulatorio de filers}.
-\]
+2. Papel dentro de la arquitectura EDGAR
 
-Si esta capa es débil, el pipeline completo puede parecer correcto a nivel sintáctico y, sin embargo, estar cruzando precios de una entidad con fundamentales de otra.
+`ticker_cik.py` se sitúa al inicio del subsistema EDGAR y aguas arriba de:
 
-\subsection{Rol dentro de la arquitectura EDGAR}
+- `fetch_submissions.py`, que necesita `CIK` correctos por emisor;
+- `fetch_companyfacts.py`, que descarga facts por `CIK`;
+- `parse_xbrl.py`, que hereda identidad documental y regulatoria;
+- `point_in_time.py`, que debe resolver identidad histórica sin leakage;
+- `edgar_qc.py`, que valida cobertura y consistencia de la cadena completa.
 
-\texttt{ticker\_cik.py} se sitúa al inicio del subsistema EDGAR y aguas arriba de:
+Su responsabilidad no es sólo “normalizar un cruce”, sino imponer una disciplina formal de identidad sobre el universo fundamental. En particular, el módulo debe:
 
-\begin{itemize}
-  \item \texttt{fetch\_submissions.py}, que necesita \texttt{CIK} correctos por emisor;
-  \item \texttt{fetch\_companyfacts.py}, que descarga \emph{companyfacts} por \texttt{CIK};
-  \item \texttt{point\_in\_time.py}, que debe resolver identidad histórica sin leakage;
-  \item \texttt{edgar\_qc.py}, que valida cobertura y consistencia de la cadena completa.
-\end{itemize}
-
-Su responsabilidad no es solamente “normalizar un cruce”, sino imponer una disciplina formal de identidad sobre el universo fundamental. En particular, el módulo debe:
-
-\begin{itemize}
-  \item resolver conflictos entre fuentes oficiales e internas;
-  \item versionar cambios históricos de identificadores;
-  \item impedir solapamientos activos inconsistentes;
-  \item permitir reconstrucción PIT-safe del símbolo vigente para una fecha dada;
-  \item y exponer suficiente trazabilidad para auditoría y depuración downstream.
-\end{itemize}
+- resolver conflictos entre fuentes oficiales e internas;
+- versionar cambios históricos de identificadores;
+- impedir solapamientos activos inconsistentes;
+- permitir reconstrucción PIT-safe del mapping correcto para una fecha dada;
+- exponer suficiente trazabilidad para auditoría y depuración downstream.
 
 Pero el módulo no debe:
 
-\begin{itemize}
-  \item inventar mappings no sustentados por evidencia explícita sin marcarlos como heurísticos;
-  \item colapsar automáticamente entidades ambiguas;
-  \item ni resolver vía conveniencia operativa conflictos que requieren arbitraje formal o exclusión.
-\end{itemize}
+- inventar mappings no sustentados por evidencia explícita sin marcarlos como heurísticos;
+- colapsar automáticamente entidades ambiguas;
+- ni resolver vía conveniencia operativa conflictos que requieren arbitraje formal o exclusión. :contentReference[oaicite:3]{index=3}
 
-\subsection{Alcance funcional}
+3. Principios de diseño no negociables
+
+La especificación del módulo se rige por los siguientes principios:
+
+1. Normalización canónica obligatoria:
+   `symbol` y `CIK` deben pasar por una política determinista de canonización antes de cualquier arbitraje.
+
+2. Precedencia formal de fuentes:
+   la jerarquía entre SEC, maestro interno y heurísticas no puede depender del orden de carga.
+
+3. Integridad temporal dura:
+   no puede existir más de un mapping activo inconsistente para el mismo símbolo en el mismo intervalo.
+
+4. Historificación explícita:
+   el sistema debe conservar ventanas de vigencia `effective_from`–`effective_to`.
+
+5. PIT-safety real:
+   la identidad debe poder resolverse correctamente para cualquier fecha relevante de research o backtest.
+
+6. Arbitraje determinista:
+   toda resolución entre candidatos competidores debe seguir una tupla lexicográfica explícita.
+
+7. Trazabilidad completa:
+   todo mapping aceptado o rechazado debe poder reconstruirse hasta su fuente, evidencia y versión de configuración.
+
+8. Conflictos visibles:
+   los casos irresolubles no deben desaparecer del pipeline; deben materializarse en `conflicts`.
+
+Estos principios convierten al módulo en una capa maestra de identidad y no en un simple crosswalk utilitario. :contentReference[oaicite:4]{index=4}
+
+4. Alcance funcional
 
 El alcance del módulo incluye, como mínimo:
 
-\begin{enumerate}
-  \item \textbf{Ingestión multi-fuente de identidad}: fuentes oficiales SEC y fuentes internas del sistema.
-  \item \textbf{Normalización canónica}: \texttt{symbol}, \texttt{CIK}, campos auxiliares y metadatos de procedencia.
-  \item \textbf{Resolución de conflictos}: arbitraje formal entre mappings competidores.
-  \item \textbf{Historificación}: conservación del historial de cambios con ventanas de vigencia.
-  \item \textbf{Snapshot vigente}: construcción de una vista \texttt{current} consistente y sin ambigüedad.
-  \item \textbf{Soporte PIT}: posibilidad de resolver el mapping correcto para cualquier fecha relevante de backtest o research.
-  \item \textbf{Persistencia auditable}: artefactos reproducibles bajo \texttt{run\_id}.
-\end{enumerate}
+1. Ingestión multi-fuente de identidad:
+   fuentes oficiales SEC y fuentes internas del sistema.
 
-El alcance \textbf{no} incluye:
+2. Normalización canónica:
+   `symbol`, `CIK`, campos auxiliares y metadatos de procedencia.
 
-\begin{itemize}
-  \item reconciliación económica profunda de grupos empresariales;
-  \item inferencia jurídica de fusiones complejas a partir de datos incompletos;
-  \item sustitución de un security master institucional completo;
-  \item ni construcción directa de universos de inversión finales.
-\end{itemize}
+3. Resolución de conflictos:
+   arbitraje formal entre mappings competidores.
 
-Aun así, dentro del subsistema EDGAR, debe comportarse como un \textbf{security/reference master de grado institucional}.
+4. Historificación:
+   conservación del historial de cambios con ventanas de vigencia.
 
-\subsection{Entradas del módulo}
+5. Snapshot vigente:
+   construcción de una vista `current` consistente y sin ambigüedad.
 
-Las entradas son:
+6. Soporte PIT:
+   posibilidad de resolver el mapping correcto para cualquier fecha relevante.
 
-\begin{itemize}
-  \item \texttt{sec\_ticker\_source\_path/api}: fuente oficial SEC de mapeo \texttt{ticker} \(\leftrightarrow\) \texttt{CIK}.
-  \item \texttt{internal\_symbol\_master\_path} (opcional pero muy recomendable): maestro interno de símbolos con metadatos auxiliares.
-  \item \texttt{config\_path}: archivo YAML con reglas de normalización, prioridad de fuentes, políticas de conflicto y validaciones.
-  \item \texttt{run\_id}: identificador único y auditable de ejecución.
-  \item \texttt{asof} (opcional): fecha lógica de snapshot, cuando se quiera materializar una vista temporalmente consistente.
-\end{itemize}
+7. Persistencia auditable:
+   artefactos reproducibles bajo `run_id`.
+
+El alcance no incluye:
+
+- reconciliación económica profunda de grupos empresariales;
+- inferencia jurídica de fusiones complejas a partir de datos incompletos;
+- sustitución de un security master institucional completo;
+- ni construcción directa de universos finales de inversión.
+
+Aun así, dentro del subsistema EDGAR, debe comportarse como un security/reference master de grado institucional. :contentReference[oaicite:5]{index=5}
+
+5. Entradas del módulo
+
+Las entradas mínimas son:
+
+- `sec_ticker_source_path` o API equivalente de fuente oficial SEC;
+- `internal_symbol_master_path` opcional pero altamente recomendable;
+- `config_path`;
+- `run_id`;
+- `asof` opcional cuando se quiera materializar snapshot temporalmente consistente.
 
 En notación formal:
 
-\[
-\mathcal{I}
-=
-\{
-\mathcal{U}_{\mathrm{sec}},
-\mathcal{U}_{\mathrm{int}},
-\Theta_{\mathrm{id}},
-r,
-a
-\},
-\]
+`I = {U_sec, U_int, Θ_id, r, a}`
 
 donde:
 
-\begin{itemize}
-  \item \(\mathcal{U}_{\mathrm{sec}}\) es el universo SEC;
-  \item \(\mathcal{U}_{\mathrm{int}}\) es el universo interno;
-  \item \(\Theta_{\mathrm{id}}\) contiene reglas de identidad;
-  \item \(r\) es el \texttt{run\_id};
-  \item \(a\) es el \texttt{asof} lógico.
-\end{itemize}
-
-\subsection{Contrato mínimo de entrada}
+- `U_sec` es el universo SEC;
+- `U_int` es el universo interno;
+- `Θ_id` contiene reglas de identidad;
+- `r` es el `run_id`;
+- `a` es el `asof`.
 
 Antes de resolver ningún mapping, el módulo debe validar:
 
-\begin{itemize}
-  \item legibilidad y existencia de las fuentes declaradas;
-  \item presencia de campos mínimos en la fuente SEC y en la fuente interna;
-  \item parseabilidad de \texttt{CIK} y posibilidad de llevarlo a formato canónico;
-  \item consistencia básica de tipos de datos;
-  \item validez sintáctica y semántica del archivo de configuración;
-  \item ausencia de corrupción estructural que impida reconstruir el linaje del mapping.
-\end{itemize}
+- legibilidad y existencia de las fuentes declaradas;
+- presencia de campos mínimos de identidad;
+- parseabilidad de `CIK` y posibilidad de llevarlo a formato canónico;
+- consistencia básica de tipos de datos;
+- validez sintáctica y semántica del archivo de configuración;
+- ausencia de corrupción estructural que impida reconstruir el linaje del mapping.
 
-Si falla este contrato, la corrida no debe producir un snapshot parcial silencioso. Debe abortarse o marcarse como inválida según política explícita.
+Si falla este contrato, la corrida no debe producir un snapshot parcial silencioso. Debe abortarse o degradarse formalmente según política explícita. :contentReference[oaicite:6]{index=6}
 
-\subsection{Unidad de observación}
+6. Unidad de observación
 
-La unidad elemental del módulo no es simplemente el par \((\texttt{symbol}, \texttt{CIK})\), sino un \textbf{registro de asociación vigente en un intervalo temporal}:
+La unidad elemental del módulo no es simplemente el par `(symbol, CIK)`, sino un registro de asociación vigente en un intervalo temporal:
 
-\[
-m = (s, c, \sigma, \rho, f, t, a, \kappa, \ell, r, \tau),
-\]
+`m = (symbol, cik, source, effective_from, effective_to, is_active, confidence_score, run_id, ingest_ts_utc)`
 
-donde:
+Campos altamente recomendados:
 
-\begin{itemize}
-  \item \(s\) es el \texttt{symbol};
-  \item \(c\) es el \texttt{CIK};
-  \item \(\sigma\) es la fuente de origen;
-  \item \(\rho\) es el \texttt{resolution\_status};
-  \item \(f\) es \texttt{effective\_from};
-  \item \(t\) es \texttt{effective\_to};
-  \item \(a\) es \texttt{is\_active};
-  \item \(\kappa\) es un \texttt{confidence\_score} o prioridad de mapping;
-  \item \(\ell\) es información de linaje o evidencia;
-  \item \(r\) es el \texttt{run\_id};
-  \item \(\tau\) es \texttt{ingest\_ts\_utc}.
-\end{itemize}
+- `source_priority`
+- `resolution_status ∈ {exact, preferred, heuristic, rejected}`
+- `issuer_name`
+- `exchange`
+- `share_class`
+- `conflict_class`
+- `evidence_hash`
+- `mapping_version`
 
-Esta definición eleva el módulo desde una tabla estática de cruce a una verdadera capa de \emph{entity identity lifecycle}.
+Esta definición eleva el módulo desde una tabla estática a una verdadera capa de lifecycle identity management. Lo importante no es sólo “qué mapping quedó”, sino por qué quedó y con qué nivel de confianza. :contentReference[oaicite:7]{index=7}
 
-\subsection{Modelo de datos y campos mínimos}
-
-Cada registro válido del mapping debe contener, como mínimo:
-
-\[
-(
-\texttt{symbol},
-\texttt{cik},
-\texttt{source},
-\texttt{effective\_from},
-\texttt{effective\_to},
-\texttt{is\_active},
-\texttt{run\_id},
-\texttt{ingest\_ts\_utc}
-).
-\]
-
-Campos altamente recomendados para una spec más fuerte:
-
-\begin{itemize}
-  \item \texttt{source\_priority};
-  \item \texttt{resolution\_status} \(\in\{\texttt{exact},\texttt{preferred},\texttt{heuristic},\texttt{rejected}\}\);
-  \item \texttt{confidence\_score};
-  \item \texttt{exchange};
-  \item \texttt{sector};
-  \item \texttt{issuer\_name};
-  \item \texttt{share\_class};
-  \item \texttt{conflict\_class};
-  \item \texttt{evidence\_hash};
-  \item \texttt{mapping\_version}.
-\end{itemize}
-
-El punto importante es que la salida no solo diga ``qué mapping quedó'', sino \textbf{por qué quedó} y \textbf{con qué nivel de confianza}.
-
-\subsection{Normalización canónica}
+7. Normalización canónica
 
 El módulo debe aplicar una normalización determinista sobre los identificadores:
 
-\begin{itemize}
-  \item \texttt{symbol}:
-  \[
-  s^{\star} = \mathrm{UPPER}(\mathrm{TRIM}(s)),
-  \]
-  con reglas adicionales configurables para sufijos, separadores y símbolos especiales cuando proceda.
-  \item \texttt{CIK}:
-  \[
-  c^{\star} \in \{0,\dots,9\}^{10},
-  \]
-  es decir, representación canónica de 10 dígitos con \emph{zero-padding}.
-\end{itemize}
+`symbol* = UPPER(TRIM(symbol))`
 
-No obstante, en una especificación fuerte esta normalización no debe ser puramente sintáctica. Debe contemplar también:
+y:
 
-\begin{itemize}
-  \item símbolos retirados o reciclados históricamente;
-  \item share classes potencialmente distintas bajo patrones similares;
-  \item fuentes que usan el mismo símbolo con convenciones diferentes;
-  \item necesidad de distinguir \texttt{display symbol} de \texttt{canonical trading symbol}.
-\end{itemize}
+`CIK* ∈ {0,...,9}^10`
 
-\subsection{Jerarquía de fuentes y precedencia}
+es decir, representación canónica de 10 dígitos con zero-padding.
 
-Uno de los puntos más importantes que faltaba endurecer es la precedencia entre fuentes. El módulo no debe resolver conflictos con una lógica vaga tipo “last writer wins” salvo que dicha política esté explícitamente documentada y solo opere como último recurso.
+Pero una especificación seria no puede quedarse en la limpieza sintáctica. Debe contemplar también:
 
-Debe existir una jerarquía de confiabilidad como:
+- símbolos reciclados históricamente;
+- share classes bajo patrones casi idénticos;
+- convenciones distintas entre fuentes;
+- necesidad de distinguir `display_symbol` de `canonical_trading_symbol`.
 
-\[
-\texttt{official SEC mapping}
-\succ
-\texttt{trusted internal master}
-\succ
-\texttt{heuristic inferred mapping}.
-\]
+La normalización, por tanto, es condición necesaria pero no suficiente para resolver identidad. :contentReference[oaicite:8]{index=8}
 
-Esto implica que, si dos fuentes compiten para el mismo \texttt{symbol} en el mismo intervalo temporal:
+8. Jerarquía de fuentes y precedencia
 
-\begin{enumerate}
-  \item se prioriza la de mayor jerarquía;
-  \item si la jerarquía es igual, se evalúan reglas auxiliares de consistencia;
-  \item si persiste el conflicto, el caso no debe resolverse silenciosamente, sino pasar a arbitraje explícito o rechazo.
-\end{enumerate}
+Uno de los puntos más importantes del módulo es la precedencia entre fuentes. La política correcta debe ser explícita, por ejemplo:
 
-\subsection{Clave de integridad temporal}
+`official_SEC_mapping ≻ trusted_internal_master ≻ heuristic_inferred_mapping`
 
-Para una identidad robusta, el módulo debe imponer una restricción de no solapamiento activo ilegítimo. Sea \(m_1, m_2\) dos registros del mismo símbolo \(s\) con CIK distintos \(c_1 \neq c_2\). Entonces no puede existir un instante \(t\) tal que ambos sean vigentes simultáneamente, salvo excepciones configuradas y justificadas:
+Esto implica que, si dos fuentes compiten para el mismo símbolo en el mismo intervalo temporal:
 
-\[
-\forall s,\ \forall c_1 \neq c_2,\ 
-\neg \exists t \in [f_1,t_1] \cap [f_2,t_2]
-\quad \text{con ambos activos}.
-\]
+1. se prioriza la de mayor jerarquía;
+2. si la jerarquía es igual, se evalúan reglas auxiliares de consistencia;
+3. si persiste el conflicto, el caso no se resuelve silenciosamente: pasa a arbitraje explícito o rechazo.
 
-Dicho de otra forma: un símbolo no puede apuntar a dos entidades regulatorias distintas en el mismo intervalo temporal operativo, salvo que la configuración permita una clase especial de ambigüedad y dicha ambigüedad sea marcada como no consumible downstream.
+No se admite una política implícita tipo “last writer wins” salvo como último recurso documentado, trazable y muy restringido. :contentReference[oaicite:9]{index=9}
 
-\subsection{Casos especiales obligatorios}
+9. Restricción de integridad temporal
 
-Una spec >95 no puede limitarse a duplicados genéricos. Debe contemplar explícitamente varios casos límite.
+La restricción fundamental de integridad es que no puede haber solapamientos activos inconsistentes. Sea `m1` y `m2` dos registros del mismo símbolo `s` con `cik1 ≠ cik2`. Entonces no puede existir un instante `t` tal que ambos sean vigentes simultáneamente, salvo excepción configurada y explícitamente no consumible downstream:
 
-\subsubsection{1. Ticker changes}
+`∀s, ∀c1≠c2, ¬∃t ∈ [f1,t1] ∩ [f2,t2] con ambos activos`
 
-Si una misma entidad cambia de \texttt{symbol} manteniendo el mismo \texttt{CIK}, el histórico debe reflejar:
+Dicho de otra forma: un símbolo no puede apuntar a dos entidades regulatorias distintas en el mismo intervalo temporal operativo. Éste es un hard constraint, no una preferencia de scoring. :contentReference[oaicite:10]{index=10}
 
-\begin{itemize}
-  \item cierre del intervalo del símbolo anterior;
-  \item apertura del intervalo del símbolo nuevo;
-  \item preservación del mismo \texttt{CIK};
-  \item trazabilidad de que se trata de un cambio de identidad de mercado, no de emisor regulatorio.
-\end{itemize}
+10. Casos especiales obligatorios
 
-\subsubsection{2. Delistings y re-listings}
+10.1. Ticker changes
 
-El módulo debe poder cerrar intervalos de vigencia sin perder el historial. Si un símbolo deja de ser operativo y más tarde reaparece:
+Si una misma entidad cambia de `symbol` manteniendo el mismo `CIK`, el histórico debe reflejar:
 
-\begin{itemize}
-  \item el nuevo intervalo no debe fusionarse automáticamente con el anterior;
-  \item debe registrarse una discontinuidad temporal;
-  \item y la política de reactivación debe ser explícita.
-\end{itemize}
+- cierre del intervalo del símbolo anterior;
+- apertura del intervalo del símbolo nuevo;
+- preservación del mismo `CIK`;
+- trazabilidad de que se trata de un cambio de identidad de mercado, no de emisor regulatorio.
 
-\subsubsection{3. Mergers y corporate actions}
+10.2. Delistings y re-listings
 
-Si dos mappings compiten como consecuencia de una fusión, absorción o reestructuración, el módulo no debe inferir de forma agresiva equivalencia económica automática. Debe:
+Si un símbolo deja de ser operativo y más tarde reaparece:
 
-\begin{itemize}
-  \item conservar el historial de identidad anterior;
-  \item abrir el nuevo mapping cuando exista evidencia suficiente;
-  \item y registrar la transición como cambio estructural si la configuración lo permite.
-\end{itemize}
+- el nuevo intervalo no debe fusionarse automáticamente con el anterior;
+- debe registrarse una discontinuidad temporal;
+- la política de reactivación debe ser explícita.
 
-\subsubsection{4. Share classes}
+10.3. Mergers y corporate actions
 
-Cuando un emisor tenga múltiples clases de acciones o símbolos relacionados, el módulo no debe colapsarlos automáticamente al mismo \texttt{symbol} canónico salvo política explícita y segura. En caso de ambigüedad, debe preservarse la distinción o marcarse el conflicto.
+Si dos mappings compiten por fusión, absorción o reestructuración, el módulo no debe inferir equivalencia económica automática. Debe:
 
-\subsection{Resolución de conflictos}
+- conservar el historial anterior;
+- abrir el nuevo mapping cuando exista evidencia suficiente;
+- registrar la transición como cambio estructural si la configuración lo permite.
 
-La resolución de conflictos debe ser determinista y auditable. Para cada conjunto de candidatos competidores \(\mathcal{M}(s,\Delta)\) para un símbolo \(s\) en una ventana temporal \(\Delta\), el módulo debe ordenar candidatos por la tupla:
+10.4. Share classes
 
-\[
-\Big(
-\texttt{source\_priority},
-\texttt{confidence\_score},
-\texttt{temporal\_consistency},
-\texttt{metadata\_consistency},
-\texttt{ingest\_ts\_utc}
-\Big).
-\]
+Cuando existan múltiples clases de acciones o símbolos relacionados, el módulo no debe colapsarlos automáticamente salvo política explícita y segura. En caso de ambigüedad, debe preservarse la distinción o marcarse conflicto. :contentReference[oaicite:11]{index=11}
+
+11. Resolución de conflictos
+
+La resolución de conflictos debe ser determinista y auditable. Para cada conjunto de candidatos competidores `M(s,Δ)` para un símbolo `s` en una ventana temporal `Δ`, el módulo debe ordenar candidatos por la tupla:
+
+`Lex_5 = (source_priority, confidence_score, temporal_consistency, metadata_consistency, ingest_ts_utc)`
 
 Esto implica:
 
-\begin{enumerate}
-  \item preferir fuente de mayor jerarquía;
-  \item preferir mapping con mayor score de confianza;
-  \item preferir la solución que no rompa continuidad temporal ya establecida;
-  \item preferir la que sea consistente con metadatos auxiliares relevantes;
-  \item y, solo como último recurso, usar la más reciente con trazabilidad explícita.
-\end{enumerate}
+1. preferir fuente de mayor jerarquía;
+2. preferir mapping con mayor confianza;
+3. preferir la solución que no rompa continuidad temporal ya establecida;
+4. preferir la que sea consistente con metadatos auxiliares relevantes;
+5. sólo como último recurso, usar la más reciente con trazabilidad explícita.
 
 Si tras aplicar esta regla persiste la ambigüedad, el caso debe clasificarse como:
 
-\[
-\texttt{conflict\_class} \in
-\{
-\texttt{source\_conflict},
-\texttt{temporal\_overlap},
-\texttt{share\_class\_ambiguity},
-\texttt{unresolved\_identity}
-\},
-\]
+`conflict_class ∈ {source_conflict, temporal_overlap, share_class_ambiguity, unresolved_identity}`
 
-y no debe pasar a \texttt{current} como mapping limpio.
+y no debe pasar a `current` como mapping limpio. :contentReference[oaicite:12]{index=12}
 
-\subsection{Historificación formal}
+12. Historificación formal
 
 El histórico debe implementarse como una dimensión lentamente cambiante de tipo temporal. Cada transición debe respetar:
 
-\begin{itemize}
-  \item cierre de \texttt{effective\_to} del registro anterior;
-  \item apertura de \texttt{effective\_from} del nuevo registro;
-  \item continuidad temporal salvo discontinuidad explícita;
-  \item imposibilidad de que dos mappings vigentes para el mismo símbolo queden abiertos sin arbitraje.
-\end{itemize}
+- cierre de `effective_to` del registro anterior;
+- apertura de `effective_from` del nuevo registro;
+- continuidad temporal salvo discontinuidad explícita;
+- imposibilidad de que dos mappings vigentes para el mismo símbolo queden abiertos sin arbitraje.
 
-La historificación no es un extra documental: es el mecanismo que permite a \texttt{point\_in\_time.py} saber qué identidad era válida en cada fecha.
+La historificación no es un extra documental: es el mecanismo que permite a `point_in_time.py` saber qué identidad era válida en cada fecha. :contentReference[oaicite:13]{index=13}
 
-\subsection{Snapshot \texttt{current}}
+13. Snapshot current
 
-La tabla \texttt{ticker\_cik\_current.parquet} no debe definirse solo como “registros con \texttt{effective\_to = NULL}”. Debe construirse como el conjunto de mappings:
+La tabla `ticker_cik_current.parquet` no debe definirse sólo como “registros con `effective_to = NULL`”. Debe construirse como el conjunto de mappings:
 
-\[
-\mathcal{C}
-=
-\{m \in \mathcal{H}: m \text{ es vigente y no ambiguo bajo la política actual}\}.
-\]
+`C_current = { m ∈ H_history : m es vigente y no ambiguo bajo la política actual }`
 
-Esto significa que un registro abierto pero conflictivo no debe entrar automáticamente en el snapshot \texttt{current}. El snapshot debe ser \textbf{consumible}, no solo “último”.
+Esto significa que un registro abierto pero conflictivo no debe entrar automáticamente en el snapshot `current`. El snapshot debe ser consumible, no sólo “último”. :contentReference[oaicite:14]{index=14}
 
-\subsection{PIT-safe identity}
+14. PIT-safe identity resolution
 
-Uno de los mayores saltos de calidad es formular expresamente que este módulo no sirve solo para un snapshot actual, sino para resolver identidad \emph{point-in-time safe}. Para una fecha \(d\), la identidad válida de un símbolo \(s\) debe venir dada por:
+El módulo no sirve sólo para un snapshot actual, sino para resolver identidad point-in-time safe. Para una fecha `d`, la identidad válida de un símbolo `s` debe venir dada por:
 
-\[
-\mathcal{R}_{\mathrm{PIT}}(s,d)
-=
-\{m \in \mathcal{H}: \texttt{effective\_from}(m)\le d < \texttt{effective\_to}(m)\},
-\]
+`R_PIT(s,d) = { m ∈ H_history : effective_from(m) ≤ d < effective_to(m) }`
 
-ajustando la desigualdad final cuando \texttt{effective\_to} sea nulo.
+ajustando la desigualdad final cuando `effective_to` sea nulo.
 
 La política correcta es:
 
-\begin{itemize}
-  \item si \(|\mathcal{R}_{\mathrm{PIT}}(s,d)| = 1\), la identidad queda resuelta;
-  \item si \(|\mathcal{R}_{\mathrm{PIT}}(s,d)| = 0\), no existe mapping PIT utilizable;
-  \item si \(|\mathcal{R}_{\mathrm{PIT}}(s,d)| > 1\), hay ambigüedad y debe elevarse incidencia crítica.
-\end{itemize}
+- si `|R_PIT(s,d)| = 1`, la identidad queda resuelta;
+- si `|R_PIT(s,d)| = 0`, no existe mapping PIT utilizable;
+- si `|R_PIT(s,d)| > 1`, hay ambigüedad y debe elevarse incidencia crítica.
 
-\subsection{Quality score del mapping}
+Éste es el verdadero contrato cuantitativo del módulo: no sólo construir una foto actual, sino garantizar identidad histórica correcta sin leakage ni contaminación temporal. :contentReference[oaicite:15]{index=15}
 
-Para reforzar el uso downstream, conviene que cada mapping resuelto lleve un \texttt{confidence\_score}. No sustituye la lógica de arbitraje, pero ayuda a distinguir mappings exactos de mappings aceptados con reservas.
+15. Confidence score del mapping
 
-Una formulación simple puede ser:
+Para reforzar el uso downstream, conviene que cada mapping resuelto lleve un `confidence_score`. No sustituye la lógica de arbitraje, pero ayuda a distinguir mappings exactos de mappings aceptados con reservas.
 
-\[
-q(m)
-=
-w_{\sigma}\,q_{\sigma}(m)
-+
-w_{\tau}\,q_{\tau}(m)
-+
-w_{\mu}\,q_{\mu}(m)
-+
-w_{\ell}\,q_{\ell}(m),
-\qquad
-q(m)\in[0,1],
-\]
+Una formulación razonable es:
 
-donde los componentes reflejan calidad de la fuente, consistencia temporal, consistencia de metadatos y robustez del linaje.
+`q(m) = w_s q_s(m) + w_t q_t(m) + w_meta q_meta(m) + w_l q_l(m), q(m) ∈ [0,1]`
 
-\subsection{Artefactos de salida}
+donde los componentes reflejan:
+
+- calidad de la fuente;
+- consistencia temporal;
+- consistencia de metadatos;
+- robustez del linaje.
+
+Este score debe ser explicable y no puede usarse para compensar un conflicto duro de integridad temporal. :contentReference[oaicite:16]{index=16}
+
+16. Artefactos obligatorios de salida
 
 El módulo debe generar, como mínimo:
 
-\begin{itemize}
-  \item \texttt{data/edgar/mappings/ticker\_cik\_history.parquet}
-  \item \texttt{data/edgar/mappings/ticker\_cik\_current.parquet}
-  \item \texttt{data/edgar/mappings/ticker\_cik\_conflicts\_\{run\_id\}.parquet}
-  \item \texttt{data/edgar/mappings/ticker\_cik\_metrics\_\{run\_id\}.parquet}
-  \item \texttt{data/edgar/mappings/ticker\_cik\_manifest\_\{run\_id\}.json}
-\end{itemize}
+- `data/edgar/mappings/ticker_cik_history.parquet`
+- `data/edgar/mappings/ticker_cik_current.parquet`
+- `data/edgar/mappings/ticker_cik_conflicts_{run_id}.parquet`
+- `data/edgar/mappings/ticker_cik_metrics_{run_id}.parquet`
+- `data/edgar/mappings/ticker_cik_manifest_{run_id}.json`
 
-El artefacto de conflictos es importante: una spec seria no oculta los casos irresolubles dentro del snapshot final.
+El artefacto de conflictos es esencial: una especificación seria no oculta los casos irresolubles dentro del snapshot final. :contentReference[oaicite:17]{index=17}
 
-\subsection{Manifest y métricas}
+17. Manifest y métricas
 
-El \emph{manifest} debe incluir, como mínimo:
+El manifest debe incluir, como mínimo:
 
-\begin{itemize}
-  \item \texttt{run\_id};
-  \item fecha lógica de ejecución;
-  \item fuentes consumidas;
-  \item número total de registros de entrada;
-  \item número de mappings resueltos;
-  \item número de conflictos por clase;
-  \item número de cambios históricos detectados;
-  \item hash de configuración;
-  \item timestamps de inicio y fin.
-\end{itemize}
+- `run_id`
+- fecha lógica de ejecución
+- fuentes consumidas
+- número total de registros de entrada
+- número de mappings resueltos
+- número de conflictos por clase
+- número de cambios históricos detectados
+- `config_hash`
+- timestamps de inicio y fin
 
 Además, deben emitirse métricas como:
 
-\begin{itemize}
-  \item cobertura de \texttt{CIK} sobre el universo de símbolos;
-  \item número de símbolos con mapping único;
-  \item número de símbolos con ambigüedad;
-  \item número de ticker changes detectados;
-  \item distribución de \texttt{confidence\_score};
-  \item porcentaje de mappings resueltos por fuente principal;
-  \item tasa de conflictos temporales.
-\end{itemize}
+- cobertura de `CIK` sobre el universo de símbolos;
+- número de símbolos con mapping único;
+- número de símbolos con ambigüedad;
+- número de ticker changes detectados;
+- distribución de `confidence_score`;
+- porcentaje de mappings resueltos por fuente principal;
+- tasa de conflictos temporales. :contentReference[oaicite:18]{index=18}
 
-\subsection{Flujo de ejecución}
+18. Flujo de ejecución
 
 El flujo correcto del módulo se compone de siete etapas:
 
-\begin{enumerate}
-  \item \textbf{Carga y validación de inputs}: fuentes SEC, maestro interno y configuración.
-  \item \textbf{Normalización}: canonización de \texttt{symbol}, \texttt{CIK} y metadatos.
-  \item \textbf{Construcción de candidatos}: unificación de mappings procedentes de múltiples fuentes.
-  \item \textbf{Arbitraje}: resolución de conflictos mediante jerarquía de fuentes y consistencia temporal.
-  \item \textbf{Historificación}: apertura/cierre de ventanas \texttt{effective\_from}--\texttt{effective\_to}.
-  \item \textbf{Materialización}: construcción de \texttt{history} y \texttt{current}.
-  \item \textbf{Persistencia}: escritura de outputs, métricas, conflictos y manifest.
-\end{enumerate}
+1. carga y validación de inputs;
+2. normalización de `symbol`, `CIK` y metadatos;
+3. construcción de candidatos multi-fuente;
+4. arbitraje de conflictos mediante jerarquía de fuentes y consistencia temporal;
+5. historificación con apertura/cierre de ventanas de vigencia;
+6. materialización de `history` y `current`;
+7. persistencia de outputs, métricas, conflictos y manifest.
 
-\subsection{Precedencia de errores}
+Este flujo debe permanecer estable y versionado. Cambios en prioridades, thresholds o políticas de historificación deben reflejarse en configuración y manifest. :contentReference[oaicite:19]{index=19}
+
+19. Precedencia de errores
 
 No todos los fallos tienen la misma gravedad. La jerarquía correcta debe ser:
 
-\[
-\texttt{schema/config failure}
-\succ
-\texttt{unresolved identity conflict}
-\succ
-\texttt{temporal overlap conflict}
-\succ
-\texttt{coverage gap}
-\succ
-\texttt{row-level normalization issue}.
-\]
+`schema_or_config_failure ≻ unresolved_identity_conflict ≻ temporal_overlap_conflict ≻ coverage_gap ≻ row_level_normalization_issue`
 
 Esto implica:
 
-\begin{itemize}
-  \item un fallo estructural invalida toda la corrida;
-  \item un conflicto de identidad no resuelto pesa más que una pequeña pérdida de cobertura;
-  \item solapamientos temporales activos son especialmente graves porque contaminan cualquier uso PIT;
-  \item problemas menores de normalización no deben ocultar fallos estructurales.
-\end{itemize}
+- un fallo estructural invalida toda la corrida;
+- un conflicto de identidad no resuelto pesa más que una pequeña pérdida de cobertura;
+- solapamientos temporales activos son especialmente graves porque contaminan cualquier uso PIT;
+- problemas menores de normalización no deben ocultar fallos estructurales. :contentReference[oaicite:20]{index=20}
 
-\subsection{CLI y uso operativo}
+20. CLI y uso operativo
 
 La interfaz operativa recomendada es:
 
-\begin{verbatim}
-python -m data.edgar.ticker_cik ^
-  --source-path data/edgar/source/ticker_cik_raw.parquet ^
-  --internal-master-path data/reference/internal_symbol_master.parquet ^
-  --config-path configs/data/edgar_ticker_cik.yaml ^
-  --run-id ticker_cik_20260305_001 ^
-  --asof 2026-03-05
-\end{verbatim}
+`python -m data.edgar.ticker_cik --source-path data/edgar/source/ticker_cik_raw.parquet --internal-master-path data/reference/internal_symbol_master.parquet --config-path configs/data/edgar_ticker_cik.yaml --run-id ticker_cik_20260305_001 --asof 2026-03-05`
 
-El uso explícito de \texttt{asof} es recomendable cuando se quiera construir un snapshot temporalmente consistente y alineado con el resto del subsistema.
+El uso explícito de `asof` es recomendable cuando se quiera construir un snapshot temporalmente consistente y alineado con el resto del subsistema. :contentReference[oaicite:21]{index=21}
 
-\subsection{Tests mínimos obligatorios}
+21. Tests e invariantes obligatorios
 
-Para que el módulo quede realmente cerrado a nivel de producción, su DoD debe exigir al menos:
+La implementación debe incluir, al menos, tests sobre:
 
-\begin{itemize}
-  \item test de canonización correcta de \texttt{CIK} a 10 dígitos;
-  \item test de normalización de \texttt{symbol};
-  \item test de precedencia SEC frente a fuente interna en conflicto simple;
-  \item test de detección de solapamiento temporal ilegítimo;
-  \item test de ticker change con cierre y reapertura correctos;
-  \item test de construcción PIT-safe de identidad por fecha;
-  \item test de exclusión de conflicto irresuelto del snapshot \texttt{current};
-  \item test de persistencia de \texttt{history}, \texttt{current}, \texttt{conflicts} y \texttt{manifest};
-  \item test de estabilidad bajo misma entrada y misma configuración;
-  \item test de clasificación correcta de \texttt{conflict\_class}.
-\end{itemize}
+1. canonización correcta de `CIK` a 10 dígitos;
+2. normalización de `symbol`;
+3. precedencia SEC frente a fuente interna en conflicto simple;
+4. detección de solapamiento temporal ilegítimo;
+5. ticker change con cierre y reapertura correctos;
+6. construcción PIT-safe de identidad por fecha;
+7. exclusión de conflicto irresuelto del snapshot `current`;
+8. persistencia íntegra de `history`, `current`, `conflicts` y `manifest`;
+9. estabilidad bajo misma entrada y misma configuración;
+10. clasificación correcta de `conflict_class`.
 
-\subsection{Definición de terminado (DoD)}
+Estos tests no son cosméticos. Definen el contrato institucional del módulo. :contentReference[oaicite:22]{index=22}
 
-El módulo se considera terminado únicamente si:
+22. Definition of Done
 
-\begin{itemize}
-  \item resuelve mappings \texttt{symbol} \(\leftrightarrow\) \texttt{CIK} con reglas explícitas y versionadas;
-  \item preserva un historial temporal sin solapamientos activos ilegítimos;
-  \item genera un snapshot \texttt{current} limpio y consumible;
-  \item expone conflictos e incidencias de forma auditable;
-  \item soporta resolución PIT-safe de identidad;
-  \item y supera los tests mínimos de robustez temporal y de arbitraje.
-\end{itemize}
+El módulo `ticker_cik.py` se considera terminado únicamente si:
 
-\subsection{Conclusión}
+- resuelve mappings `symbol ↔ CIK` con reglas explícitas y versionadas;
+- preserva un historial temporal sin solapamientos activos ilegítimos;
+- genera un snapshot `current` limpio y consumible;
+- expone conflictos e incidencias de forma auditable;
+- soporta resolución PIT-safe de identidad;
+- y supera los tests mínimos de robustez temporal y de arbitraje.
 
-\texttt{ticker\_cik.py} no debe verse como una utilidad auxiliar de carga, sino como el \textbf{núcleo de identidad} del subsistema EDGAR. Su misión es garantizar que el universo de activos negociables y el universo regulatorio puedan enlazarse sin ambigüedad, sin contaminación temporal y sin errores silenciosos de entidad. En un sistema cuantitativo, ese problema no es menor: un solo error de mapping puede producir backtests aparentemente válidos con información de la empresa equivocada.
+En otras palabras, el módulo no está terminado cuando “construye un cruce”, sino cuando se comporta como una capa maestra de identidad que protege a todo el pipeline fundamental de contaminación cross-entity, survivorship bias y errores temporales silenciosos. :contentReference[oaicite:23]{index=23}
 
-Por ello, el estándar de diseño del módulo debe ser equivalente al de cualquier infraestructura crítica de referencia: \textbf{normalización determinista, precedencia explícita de fuentes, historificación formal, arbitraje auditable, soporte PIT-safe y exposición transparente de conflictos}. Bien implementado, este módulo convierte una tabla de crosswalk en una verdadera capa maestra de identidad. Mal implementado, introduce uno de los errores más costosos y menos visibles de todo el pipeline fundamental.
+23. MVP vs versión avanzada
+
+MVP correcto:
+
+- normalización canónica de `symbol` y `CIK`;
+- precedencia explícita de fuentes;
+- historificación con ventanas de vigencia;
+- no solapamiento activo ilegítimo;
+- resolución PIT-safe;
+- artefactos completos de `history`, `current`, `conflicts`, `metrics` y `manifest`;
+- tests de arbitraje temporal y conflictos.
+
+Versión avanzada justificable:
+
+- probabilistic entity resolution como capa diagnóstica;
+- modelado de corporate actions como DAG causal;
+- monitorización de evolución de conflictos;
+- reconciliación temporal más rica para mergers y spin-offs;
+- embeddings auxiliares para matching dudoso.
+
+No es obligatorio, en esta fase, introducir Bayesian fusion, embeddings o reconciliación dinámica multi-entidad como núcleo del módulo oficial. Son extensiones plausibles y potentes, pero la prioridad correcta aquí es cerrar perfectamente la capa rule-based, temporal, auditable y PIT-safe. :contentReference[oaicite:24]{index=24}
+
+24. Interpretación correcta
+
+`ticker_cik.py` no debe verse como una utilidad auxiliar de carga, sino como el núcleo de identidad del subsistema EDGAR. Su función es garantizar que el universo de activos negociables y el universo regulatorio puedan enlazarse sin ambigüedad, sin contaminación temporal y sin errores silenciosos de entidad.
+
+Un error de mapping aquí puede producir backtests aparentemente válidos con fundamentales de la empresa equivocada. Por eso, el estándar de diseño del módulo debe ser equivalente al de cualquier infraestructura crítica de referencia: normalización determinista, precedencia explícita de fuentes, historificación formal, arbitraje auditable, soporte PIT-safe y exposición transparente de conflictos. Bien implementado, este módulo convierte una tabla de crosswalk en una verdadera capa maestra de identidad. Mal implementado, introduce uno de los errores más costosos y menos visibles de todo el pipeline fundamental. :contentReference[oaicite:25]{index=25}
+
+25. Conclusión
+
+`data/edgar/ticker_cik.py` debe quedar definido como una pieza institucional de identity master resolution, no como un simple crosswalk.
+
+La especificación correcta no es “cruzar tickers con CIKs”, sino:
+
+- fijar qué entra;
+- fijar cómo se normaliza;
+- fijar cómo se arbitran fuentes competidoras;
+- fijar cómo se preserva el historial;
+- fijar cómo se resuelven fechas PIT;
+- fijar qué conflictos se materializan y qué snapshots son consumibles;
+- y fijar qué invariantes protegen al resto del pipeline.
+
+Si cumple esta especificación, el módulo deja de ser una tabla auxiliar y pasa a ser la base de identidad fiable del stack EDGAR. Si no la cumple, el riesgo no es sólo técnico: es contaminar silenciosamente precios, filings y fundamentales con la entidad equivocada.
