@@ -23,7 +23,7 @@ from simons_core.schemas import ColumnSpec, DataSchema, assert_schema
 
 
 MODULE_VERSION = "model_dataset_mvp_v1"
-DEFAULT_LABEL_NAMES: tuple[str, ...] = ("fwd_ret_5d",)
+DEFAULT_LABEL_NAMES: tuple[str, ...] = ()
 DEFAULT_TARGET_TYPE = "continuous_forward_return"
 VALID_SPLIT_ROLES: tuple[str, ...] = (
     "train",
@@ -125,7 +125,7 @@ def _normalize_label_names(label_names: Iterable[str] | None) -> tuple[str, ...]
         return DEFAULT_LABEL_NAMES
     cleaned = sorted({str(item).strip() for item in label_names if str(item).strip()})
     if not cleaned:
-        raise ValueError("label_names must include at least one non-empty label name.")
+        return DEFAULT_LABEL_NAMES
     return tuple(cleaned)
 
 
@@ -140,6 +140,17 @@ def _normalize_horizons(horizons: Iterable[int] | None) -> tuple[int, ...]:
 
 def _config_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _label_matches_target_type(label_name: str, target_type: str) -> bool:
+    name = str(label_name).strip()
+    ttype = str(target_type).strip()
+    if ttype == "continuous_forward_return":
+        return name.startswith("fwd_ret_")
+    if ttype == "binary_direction":
+        return name.startswith("fwd_dir_up_")
+    # For custom target_type values we require explicit label_names to avoid silent leakage.
+    return False
 
 
 def _load_inputs(
@@ -209,6 +220,7 @@ def _prepare_labels(
     *,
     selected_label_names: tuple[str, ...],
     selected_horizons: tuple[int, ...],
+    target_type: str,
 ) -> pd.DataFrame:
     assert_schema(labels, LABELS_INPUT_SCHEMA)
     frame = labels.copy()
@@ -232,7 +244,17 @@ def _prepare_labels(
             "labels_forward has duplicate (date, instrument_id, horizon_days, label_name) rows."
         )
 
-    frame = frame[frame["label_name"].isin(set(selected_label_names))].copy()
+    if selected_label_names:
+        frame = frame[frame["label_name"].isin(set(selected_label_names))].copy()
+    else:
+        frame = frame[
+            frame["label_name"].map(lambda x: _label_matches_target_type(x, target_type))
+        ].copy()
+        if frame.empty:
+            raise ValueError(
+                "No labels match target_type when label_names is omitted. "
+                f"target_type={target_type}"
+            )
     if selected_horizons:
         frame = frame[frame["horizon_days"].isin(set(selected_horizons))].copy()
     if frame.empty:
@@ -249,6 +271,7 @@ def _prepare_splits(
     *,
     selected_label_names: tuple[str, ...],
     selected_horizons: tuple[int, ...],
+    target_type: str,
 ) -> pd.DataFrame:
     assert_schema(splits, SPLITS_INPUT_SCHEMA)
     frame = splits.copy()
@@ -269,7 +292,17 @@ def _prepare_splits(
     if invalid_roles:
         raise ValueError(f"purged_splits contains invalid split_role values: {invalid_roles}")
 
-    frame = frame[frame["label_name"].isin(set(selected_label_names))].copy()
+    if selected_label_names:
+        frame = frame[frame["label_name"].isin(set(selected_label_names))].copy()
+    else:
+        frame = frame[
+            frame["label_name"].map(lambda x: _label_matches_target_type(x, target_type))
+        ].copy()
+        if frame.empty:
+            raise ValueError(
+                "No split rows match target_type when label_names is omitted. "
+                f"target_type={target_type}"
+            )
     if selected_horizons:
         frame = frame[frame["horizon_days"].isin(set(selected_horizons))].copy()
     if frame.empty:
@@ -309,11 +342,13 @@ def build_model_dataset(
         labels,
         selected_label_names=selected_label_names,
         selected_horizons=selected_horizons,
+        target_type=target_type_clean,
     )
     prepared_splits = _prepare_splits(
         splits,
         selected_label_names=selected_label_names,
         selected_horizons=selected_horizons,
+        target_type=target_type_clean,
     )
 
     join_key = ["date", "instrument_id", "horizon_days", "label_name"]
@@ -422,6 +457,7 @@ def build_model_dataset(
         {
             "version": MODULE_VERSION,
             "selected_label_names": list(selected_label_names),
+            "label_selection_mode": "explicit" if selected_label_names else "auto_by_target_type",
             "selected_horizon_days": list(selected_horizons),
             "target_type": target_type_clean,
             "feature_columns": list(feature_cols),
@@ -436,6 +472,8 @@ def build_model_dataset(
     output["run_id"] = run_id
     output["config_hash"] = config_hash
     output["built_ts_utc"] = built_ts_utc
+
+    resolved_label_names = tuple(sorted(output["label_name"].astype(str).unique().tolist()))
 
     target_dir = Path(output_dir).expanduser().resolve() if output_dir else (data_dir() / "datasets")
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -456,7 +494,8 @@ def build_model_dataset(
         "created_at_utc": built_ts_utc,
         "run_id": run_id,
         "config_hash": config_hash,
-        "label_name_selected": list(selected_label_names),
+        "label_name_selected": list(resolved_label_names),
+        "label_selection_mode": "explicit" if selected_label_names else "auto_by_target_type",
         "horizon_days_present": sorted({int(v) for v in output["horizon_days"].unique().tolist()}),
         "n_rows_total": int(len(output)),
         "n_train": int(role_counts.get("train", 0)),
@@ -504,7 +543,7 @@ def build_model_dataset(
         row_count=int(len(output)),
         n_features=int(len(feature_cols)),
         feature_names=feature_cols,
-        selected_label_names=selected_label_names,
+        selected_label_names=resolved_label_names,
         selected_horizons=selected_horizons,
         config_hash=config_hash,
     )
@@ -533,7 +572,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--labels-path", type=str, default=None)
     parser.add_argument("--purged-splits-path", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
-    parser.add_argument("--label-names", type=_parse_csv_strings, default=DEFAULT_LABEL_NAMES)
+    parser.add_argument("--label-names", type=_parse_csv_strings, default=None)
     parser.add_argument("--horizon-days", type=_parse_csv_ints, default=())
     parser.add_argument("--target-type", type=str, default=DEFAULT_TARGET_TYPE)
     parser.add_argument("--run-id", type=str, default=MODULE_VERSION)

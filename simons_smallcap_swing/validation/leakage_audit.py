@@ -1298,6 +1298,10 @@ def _check_cv_folds(
         expected_rule="Each (fold_id, label_name, horizon_days) block must contain valid rows.",
         pass_message="All CV fold blocks contain valid rows.",
         violation_message="CV fold blocks without valid rows detected.",
+        # Some long-horizon label blocks can legitimately lose the valid segment
+        # after horizon truncation/purge at the end of sample. This is a
+        # coverage warning, not temporal leakage by itself.
+        severity_if_violation=SEVERITY_WARN,
     )
 
     _emit_rule(

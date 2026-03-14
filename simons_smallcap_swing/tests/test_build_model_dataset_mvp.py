@@ -363,3 +363,106 @@ def test_build_model_dataset_small_case_join_and_split_role_propagation(
     assert summary["n_dropped_by_purge"] == 1
     assert summary["n_dropped_by_embargo"] == 0  # embargo row existed but was dropped by join
 
+
+def test_build_model_dataset_auto_label_selection_supports_multi_horizon_by_target_type(
+    tmp_workspace: dict[str, Path],
+) -> None:
+    base = tmp_workspace["data"] / "model_dataset_auto_labels_case"
+    features_path = base / "features_matrix.parquet"
+    labels_path = base / "labels_forward.parquet"
+    splits_path = base / "purged_splits.parquet"
+    output_cont = base / "output_continuous"
+    output_bin = base / "output_binary"
+    base.mkdir(parents=True, exist_ok=True)
+
+    dates = pd.to_datetime(["2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08"])
+    features = pd.DataFrame(
+        [
+            {"date": dt, "instrument_id": "SIMA", "ticker": "AAA", "ret_1d_lag1": 0.01 + i * 0.01, "vol_5d": 0.02 + i * 0.01}
+            for i, dt in enumerate(dates)
+        ]
+    )
+    features.to_parquet(features_path, index=False)
+
+    labels_rows: list[dict[str, object]] = []
+    splits_rows: list[dict[str, object]] = []
+    horizons = (1, 5, 20)
+    for idx, dt in enumerate(dates[:-1]):
+        for horizon in horizons:
+            entry = dates[min(idx + 1, len(dates) - 1)]
+            exit_ = dates[min(idx + 2, len(dates) - 1)]
+            role = "train" if idx == 0 else ("dropped_by_purge" if idx == 1 else "valid")
+            for label_name, label_value in (
+                (f"fwd_ret_{horizon}d", 0.01 * horizon * (idx + 1)),
+                (f"fwd_dir_up_{horizon}d", float((idx + horizon) % 2)),
+            ):
+                labels_rows.append(
+                    {
+                        "date": dt,
+                        "instrument_id": "SIMA",
+                        "ticker": "AAA",
+                        "horizon_days": horizon,
+                        "entry_date": entry,
+                        "exit_date": exit_,
+                        "label_name": label_name,
+                        "label_value": label_value,
+                        "price_entry": 100.0,
+                        "price_exit": 101.0,
+                        "source_price_field": "close_adj",
+                    }
+                )
+                splits_rows.append(
+                    {
+                        "date": dt,
+                        "instrument_id": "SIMA",
+                        "horizon_days": horizon,
+                        "label_name": label_name,
+                        "split_name": "holdout_temporal_purged",
+                        "split_role": role,
+                        "entry_date": entry,
+                        "exit_date": exit_,
+                    }
+                )
+
+    pd.DataFrame(labels_rows).to_parquet(labels_path, index=False)
+    pd.DataFrame(splits_rows).to_parquet(splits_path, index=False)
+
+    continuous = build_model_dataset(
+        features_path=features_path,
+        labels_path=labels_path,
+        purged_splits_path=splits_path,
+        output_dir=output_cont,
+        label_names=None,
+        horizon_days=(1, 5, 20),
+        target_type="continuous_forward_return",
+        run_id="test_build_model_dataset_auto_continuous",
+    )
+    continuous_df = read_parquet(continuous.dataset_path)
+    assert set(continuous_df["label_name"].astype(str).unique().tolist()) == {
+        "fwd_ret_1d",
+        "fwd_ret_5d",
+        "fwd_ret_20d",
+    }
+    assert set(pd.to_numeric(continuous_df["horizon_days"], errors="coerce").astype(int).tolist()) == {1, 5, 20}
+    assert set(continuous_df["split_role"].astype(str).unique().tolist()) == {"train", "valid", "dropped_by_purge"}
+    assert set(continuous.selected_label_names) == {"fwd_ret_1d", "fwd_ret_5d", "fwd_ret_20d"}
+
+    binary = build_model_dataset(
+        features_path=features_path,
+        labels_path=labels_path,
+        purged_splits_path=splits_path,
+        output_dir=output_bin,
+        label_names=None,
+        horizon_days=(1, 5, 20),
+        target_type="binary_direction",
+        run_id="test_build_model_dataset_auto_binary",
+    )
+    binary_df = read_parquet(binary.dataset_path)
+    assert set(binary_df["label_name"].astype(str).unique().tolist()) == {
+        "fwd_dir_up_1d",
+        "fwd_dir_up_5d",
+        "fwd_dir_up_20d",
+    }
+    assert set(pd.to_numeric(binary_df["horizon_days"], errors="coerce").astype(int).tolist()) == {1, 5, 20}
+    assert set(binary_df["split_role"].astype(str).unique().tolist()) == {"train", "valid", "dropped_by_purge"}
+    assert set(binary.selected_label_names) == {"fwd_dir_up_1d", "fwd_dir_up_5d", "fwd_dir_up_20d"}

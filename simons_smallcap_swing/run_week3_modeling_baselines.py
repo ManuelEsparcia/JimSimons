@@ -159,7 +159,6 @@ def run_week3_modeling_baselines(
         labels_path=labels.labels_path,
         purged_splits_path=purged.splits_path,
         output_dir=paths["datasets_regression"],
-        label_names=("fwd_ret_5d",),
         target_type="continuous_forward_return",
         run_id=_run_id(run_prefix, "model_dataset_regression"),
     )
@@ -174,7 +173,6 @@ def run_week3_modeling_baselines(
             labels_path=labels.labels_path,
             purged_splits_path=purged.splits_path,
             output_dir=paths["datasets_classification"],
-            label_names=("fwd_dir_up_5d",),
             target_type="binary_direction",
             run_id=_run_id(run_prefix, "model_dataset_classification"),
         )

@@ -212,3 +212,94 @@ def test_purged_cv_detects_overlap_purge_and_embargo_effect(
     assert sum(summary["n_dropped_by_purge_by_fold"].values()) >= 1
     assert sum(summary["n_dropped_by_embargo_by_fold"].values()) >= 1
 
+
+def test_purged_cv_builds_valid_blocks_per_label_horizon_group(
+    tmp_workspace: dict[str, Path],
+) -> None:
+    base = tmp_workspace["data"] / "purged_cv_case_grouped_horizons"
+    labels_path = base / "labels_forward.parquet"
+    calendar_path = base / "trading_calendar.parquet"
+    output_dir = base / "output"
+    base.mkdir(parents=True, exist_ok=True)
+
+    sessions = pd.bdate_range("2026-01-05", periods=40, freq="B")
+    calendar = pd.DataFrame({"date": sessions, "is_session": True})
+    calendar.to_parquet(calendar_path, index=False)
+
+    rows: list[dict[str, object]] = []
+    instruments = [("SIMA", "AAA"), ("SIMB", "BBB")]
+
+    # Long coverage short-horizon label.
+    for idx in range(30):
+        for instrument_id, ticker in instruments:
+            rows.append(
+                {
+                    "date": sessions[idx],
+                    "instrument_id": instrument_id,
+                    "ticker": ticker,
+                    "horizon_days": 1,
+                    "entry_date": sessions[idx + 1],
+                    "exit_date": sessions[idx + 1],
+                    "label_name": "fwd_ret_1d",
+                    "label_value": 0.001,
+                    "price_entry": 100.0,
+                    "price_exit": 100.1,
+                    "source_price_field": "close_adj",
+                }
+            )
+
+    # Shorter coverage long-horizon label.
+    for idx in range(15):
+        for instrument_id, ticker in instruments:
+            rows.append(
+                {
+                    "date": sessions[idx],
+                    "instrument_id": instrument_id,
+                    "ticker": ticker,
+                    "horizon_days": 20,
+                    "entry_date": sessions[idx + 1],
+                    "exit_date": sessions[idx + 20],
+                    "label_name": "fwd_ret_20d",
+                    "label_value": 0.01,
+                    "price_entry": 100.0,
+                    "price_exit": 101.0,
+                    "source_price_field": "close_adj",
+                }
+            )
+
+    pd.DataFrame(rows).to_parquet(labels_path, index=False)
+
+    result = build_purged_cv(
+        labels_path=labels_path,
+        trading_calendar_path=calendar_path,
+        output_dir=output_dir,
+        n_folds=4,
+        embargo_sessions=1,
+        run_id="test_purged_cv_case_grouped_horizons",
+    )
+    folds = read_parquet(result.folds_path)
+
+    grouped = (
+        folds.groupby(["fold_id", "label_name", "horizon_days", "split_role"], dropna=False)
+        .size()
+        .rename("n_rows")
+        .reset_index()
+    )
+
+    # Regression guard for the real bug:
+    # each (fold_id, label_name, horizon_days) block must carry valid rows,
+    # even when label/horizon groups have different date coverage.
+    by_block = grouped[grouped["split_role"] == "valid"]
+    expected_blocks = {
+        (int(fold_id), str(label_name), int(horizon))
+        for fold_id, label_name, horizon in folds[
+            ["fold_id", "label_name", "horizon_days"]
+        ].drop_duplicates().itertuples(index=False)
+    }
+    observed_blocks = {
+        (int(fold_id), str(label_name), int(horizon))
+        for fold_id, label_name, horizon in by_block[
+            ["fold_id", "label_name", "horizon_days"]
+        ].itertuples(index=False)
+    }
+    assert expected_blocks == observed_blocks

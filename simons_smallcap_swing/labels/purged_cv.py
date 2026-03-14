@@ -22,8 +22,8 @@ from simons_core.logging import get_logger
 from simons_core.schemas import ColumnSpec, DataSchema, assert_schema
 
 
-MODULE_VERSION = "purged_cv_mvp_v1"
-CV_METHOD = "purged_kfold_full_history"
+MODULE_VERSION = "purged_cv_mvp_v2"
+CV_METHOD = "purged_kfold_full_history_grouped_by_label_horizon"
 VALID_SPLIT_ROLES: tuple[str, ...] = (
     "train",
     "valid",
@@ -301,9 +301,6 @@ def build_purged_cv(
         selected_label_names=selected_label_names,
         selected_horizons=selected_horizons,
     )
-    decision_dates = pd.DatetimeIndex(sorted(labels["date"].unique()))
-    fold_blocks = _build_fold_blocks(decision_dates, n_folds_int)
-
     base = labels.copy()
     base["decision_pos"] = base["date"].map(session_pos_map).astype(int)
     base["entry_pos"] = base["entry_date"].map(session_pos_map).astype(int)
@@ -316,75 +313,95 @@ def build_purged_cv(
     n_purge_by_fold: dict[str, int] = {}
     n_embargo_by_fold: dict[str, int] = {}
 
-    for fold_idx, block in enumerate(fold_blocks, start=1):
-        valid_dates = set(pd.DatetimeIndex(block).tolist())
-        fold = base.copy()
-        fold["fold_id"] = int(fold_idx)
-        fold["split_role"] = "train_candidate"
-        fold.loc[fold["date"].isin(valid_dates), "split_role"] = "valid"
+    grouped = base.groupby(["label_name", "horizon_days"], sort=True, dropna=False)
+    for (label_name_value, horizon_value), group_frame in grouped:
+        decision_dates = pd.DatetimeIndex(sorted(group_frame["date"].unique()))
+        fold_blocks = _build_fold_blocks(decision_dates, n_folds_int)
 
-        valid_rows = fold[fold["split_role"] == "valid"].copy()
-        if valid_rows.empty:
-            raise ValueError(f"Fold {fold_idx} has no valid rows after assignment.")
+        for fold_idx, block in enumerate(fold_blocks, start=1):
+            valid_dates = set(pd.DatetimeIndex(block).tolist())
+            fold = group_frame.copy()
+            fold["fold_id"] = int(fold_idx)
+            fold["split_role"] = "train_candidate"
+            fold.loc[fold["date"].isin(valid_dates), "split_role"] = "valid"
 
-        valid_intervals = _merge_intervals(
-            list(
-                zip(
-                    valid_rows["entry_pos"].astype(int).tolist(),
-                    valid_rows["exit_pos"].astype(int).tolist(),
+            valid_rows = fold[fold["split_role"] == "valid"].copy()
+            if valid_rows.empty:
+                raise ValueError(
+                    f"Fold {fold_idx} has no valid rows after assignment "
+                    f"for label='{label_name_value}' horizon={int(horizon_value)}."
+                )
+
+            valid_intervals = _merge_intervals(
+                list(
+                    zip(
+                        valid_rows["entry_pos"].astype(int).tolist(),
+                        valid_rows["exit_pos"].astype(int).tolist(),
+                    )
                 )
             )
-        )
-        train_mask = fold["split_role"].eq("train_candidate")
-        purge_mask = fold.loc[train_mask].apply(
-            lambda row: _interval_overlaps_any(
-                int(row["entry_pos"]),
-                int(row["exit_pos"]),
-                valid_intervals,
-            ),
-            axis=1,
-        )
-        fold.loc[fold.loc[train_mask].index[purge_mask.to_numpy()], "split_role"] = "dropped_by_purge"
-
-        valid_end_pos = int(valid_rows["decision_pos"].max())
-        embargo_upper = valid_end_pos + embargo
-        if embargo > 0:
-            embargo_mask = (
-                fold["split_role"].eq("train_candidate")
-                & (fold["decision_pos"] > valid_end_pos)
-                & (fold["decision_pos"] <= embargo_upper)
+            train_mask = fold["split_role"].eq("train_candidate")
+            purge_mask = fold.loc[train_mask].apply(
+                lambda row: _interval_overlaps_any(
+                    int(row["entry_pos"]),
+                    int(row["exit_pos"]),
+                    valid_intervals,
+                ),
+                axis=1,
             )
-            fold.loc[embargo_mask, "split_role"] = "dropped_by_embargo"
+            fold.loc[fold.loc[train_mask].index[purge_mask.to_numpy()], "split_role"] = (
+                "dropped_by_purge"
+            )
 
-        fold.loc[fold["split_role"].eq("train_candidate"), "split_role"] = "train"
-        fold["split_role"] = fold["split_role"].astype(str)
+            valid_end_pos = int(valid_rows["decision_pos"].max())
+            embargo_upper = valid_end_pos + embargo
+            if embargo > 0:
+                embargo_mask = (
+                    fold["split_role"].eq("train_candidate")
+                    & (fold["decision_pos"] > valid_end_pos)
+                    & (fold["decision_pos"] <= embargo_upper)
+                )
+                fold.loc[embargo_mask, "split_role"] = "dropped_by_embargo"
 
-        invalid_roles = sorted(set(fold["split_role"].tolist()) - set(VALID_SPLIT_ROLES))
-        if invalid_roles:
-            raise ValueError(f"Fold {fold_idx} produced invalid split_role values: {invalid_roles}")
+            fold.loc[fold["split_role"].eq("train_candidate"), "split_role"] = "train"
+            fold["split_role"] = fold["split_role"].astype(str)
 
-        _validate_fold_integrity(
-            fold,
-            fold_id=fold_idx,
-            embargo_sessions=embargo,
-            session_pos_map=session_pos_map,
-        )
+            invalid_roles = sorted(set(fold["split_role"].tolist()) - set(VALID_SPLIT_ROLES))
+            if invalid_roles:
+                raise ValueError(f"Fold {fold_idx} produced invalid split_role values: {invalid_roles}")
 
-        fold_ranges.append(
-            {
-                "fold_id": int(fold_idx),
-                "valid_start": str(pd.Timestamp(min(valid_dates)).date()),
-                "valid_end": str(pd.Timestamp(max(valid_dates)).date()),
-                "n_valid_dates": int(len(valid_dates)),
-            }
-        )
-        fold_key = str(fold_idx)
-        n_train_by_fold[fold_key] = int((fold["split_role"] == "train").sum())
-        n_valid_by_fold[fold_key] = int((fold["split_role"] == "valid").sum())
-        n_purge_by_fold[fold_key] = int((fold["split_role"] == "dropped_by_purge").sum())
-        n_embargo_by_fold[fold_key] = int((fold["split_role"] == "dropped_by_embargo").sum())
+            _validate_fold_integrity(
+                fold,
+                fold_id=fold_idx,
+                embargo_sessions=embargo,
+                session_pos_map=session_pos_map,
+            )
 
-        fold_frames.append(fold)
+            fold_ranges.append(
+                {
+                    "fold_id": int(fold_idx),
+                    "label_name": str(label_name_value),
+                    "horizon_days": int(horizon_value),
+                    "valid_start": str(pd.Timestamp(min(valid_dates)).date()),
+                    "valid_end": str(pd.Timestamp(max(valid_dates)).date()),
+                    "n_valid_dates": int(len(valid_dates)),
+                }
+            )
+            fold_key = str(fold_idx)
+            n_train_by_fold[fold_key] = n_train_by_fold.get(fold_key, 0) + int(
+                (fold["split_role"] == "train").sum()
+            )
+            n_valid_by_fold[fold_key] = n_valid_by_fold.get(fold_key, 0) + int(
+                (fold["split_role"] == "valid").sum()
+            )
+            n_purge_by_fold[fold_key] = n_purge_by_fold.get(fold_key, 0) + int(
+                (fold["split_role"] == "dropped_by_purge").sum()
+            )
+            n_embargo_by_fold[fold_key] = n_embargo_by_fold.get(fold_key, 0) + int(
+                (fold["split_role"] == "dropped_by_embargo").sum()
+            )
+
+            fold_frames.append(fold)
 
     output = pd.concat(fold_frames, ignore_index=True)
     output = output[

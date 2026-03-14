@@ -277,3 +277,16 @@ def test_leakage_audit_flags_dataset_pk_duplicates(tmp_workspace: dict[str, Path
     assert len(dup_fail) >= 1
     assert "dataset_logical_pk_unique" in summary["failed_checks"]
 
+
+def test_leakage_audit_cv_missing_valid_block_is_warn_not_fail(
+    tmp_workspace: dict[str, Path],
+) -> None:
+    paths = _seed_leakage_inputs(tmp_workspace)
+    cv = pd.read_parquet(paths["cv_path"]).copy()
+    cv.loc[cv["split_role"].astype(str) == "valid", "split_role"] = "dropped_by_embargo"
+    cv.to_parquet(paths["cv_path"], index=False)
+
+    _result, summary = _run_seeded_audit(paths, run_id="test_leakage_audit_cv_missing_valid")
+    assert "cv_valid_block_present" in summary["warning_checks"]
+    assert "cv_valid_block_present" not in summary["failed_checks"]
+    assert summary["overall_status"] in {"PASS", "WARN"}
