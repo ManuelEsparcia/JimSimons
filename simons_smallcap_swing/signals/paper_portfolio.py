@@ -540,6 +540,13 @@ def run_paper_portfolio(
     daily = pd.DataFrame(daily_rows).sort_values(["date", "portfolio_mode"]).reset_index(drop=True)
     if daily.empty:
         raise ValueError("paper_portfolio_daily is empty.")
+    daily["n_long"] = pd.to_numeric(daily["n_long"], errors="coerce").fillna(0).astype("int64")
+    daily["n_short"] = pd.to_numeric(daily["n_short"], errors="coerce").fillna(0).astype("int64")
+    daily["n_names_ranked"] = pd.to_numeric(daily["n_names_ranked"], errors="coerce").fillna(0).astype("int64")
+    daily["gross_long_return"] = pd.to_numeric(daily["gross_long_return"], errors="coerce").astype("float64")
+    daily["gross_short_return"] = pd.to_numeric(daily["gross_short_return"], errors="coerce").astype("float64")
+    daily["gross_portfolio_return"] = pd.to_numeric(daily["gross_portfolio_return"], errors="coerce").astype("float64")
+    daily["is_executable"] = daily["is_executable"].astype(bool)
 
     positions = (
         pd.concat(positions_blocks, ignore_index=True)
