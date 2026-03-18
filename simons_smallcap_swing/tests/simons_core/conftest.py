@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 import importlib
 import io
 from pathlib import Path
+import sys
 from typing import Any, Callable
 
 import numpy as np
@@ -37,29 +38,60 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
+# Import-path bootstrap
+# ---------------------------------------------------------------------------
+
+_THIS_FILE = Path(__file__).resolve()
+PACKAGE_ROOT = _THIS_FILE.parents[2]  # .../simons_smallcap_swing
+REPO_ROOT = _THIS_FILE.parents[3]     # repository root
+
+for _path in (str(REPO_ROOT), str(PACKAGE_ROOT)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
+
+# ---------------------------------------------------------------------------
 # Import helpers
 # ---------------------------------------------------------------------------
 
 
 def _import_first(*candidates: str):
-    """Import the first module path that resolves."""
+    """Import the first module path that resolves.
+
+    Continue only when the candidate module path itself is absent. If a
+    candidate exists but fails internally, surface the real error instead of
+    silently falling through to another module.
+    """
     last_exc: BaseException | None = None
     for name in candidates:
         try:
             return importlib.import_module(name)
-        except BaseException as exc:  # pragma: no cover - only hit on missing layouts
-            last_exc = exc
+        except ModuleNotFoundError as exc:
+            if exc.name == name:
+                last_exc = exc
+                continue
+            raise
     joined = ", ".join(candidates)
     raise ImportError(f"Could not import any of: {joined}") from last_exc
 
 
 def _try_import_first(*candidates: str):
-    """Best-effort import. Returns ``None`` if nothing resolves."""
+    """Best-effort import.
+
+    Returns ``None`` only when the requested module path itself does not
+    exist. If a candidate module exists but fails internally (for example,
+    because an optional dependency is missing), surface the real error
+    instead of silently falling through to another unrelated module.
+    """
     for name in candidates:
         try:
             return importlib.import_module(name)
-        except BaseException:
-            continue
+        except ModuleNotFoundError as exc:
+            # Continue only when the candidate module itself is absent.
+            # If an internal dependency is missing, raise the real error.
+            if exc.name == name:
+                continue
+            raise
     return None
 
 
@@ -68,7 +100,6 @@ def schemas_mod():
     return _import_first(
         "simons_core.schemas",
         "simons_smallcap_swing.simons_core.schemas",
-        "schemas",
     )
 
 
@@ -77,7 +108,6 @@ def interfaces_mod():
     return _import_first(
         "simons_core.interfaces",
         "simons_smallcap_swing.simons_core.interfaces",
-        "interfaces",
     )
 
 
@@ -86,7 +116,6 @@ def logging_mod():
     return _import_first(
         "simons_core.logging",
         "simons_smallcap_swing.simons_core.logging",
-        "logging",
     )
 
 
@@ -95,13 +124,9 @@ def calendar_mod():
     module = _try_import_first(
         "simons_core.calendar",
         "simons_smallcap_swing.simons_core.calendar",
-        "calendar",
     )
     if module is None:
-        pytest.skip(
-            "calendar module unavailable or optional dependency "
-            "'exchange_calendars' is not installed in this runtime"
-        )
+        pytest.skip("simons_core.calendar unavailable in this runtime")
     return module
 
 
@@ -116,6 +141,7 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "interfaces: tests for simons_core.interfaces")
     config.addinivalue_line("markers", "calendar: tests for simons_core.calendar")
     config.addinivalue_line("markers", "logging: tests for simons_core.logging")
+    config.addinivalue_line("markers", "integration: integration tests for simons_core")
     config.addinivalue_line("markers", "optional_dependency: tests requiring optional extras")
     config.addinivalue_line("markers", "slow: slower integration / runtime tests")
 

@@ -1,453 +1,73 @@
-Especificación Cuantitativa: data/universe/corporate_actions.py
+Especificación: data/universe/corporate_actions.py
 
-1. Propósito del módulo
+1. Propósito
 
-El módulo `data/universe/corporate_actions.py` implementa la capa formal de canonización point-in-time de acciones corporativas del sistema. Su función no es simplemente recopilar eventos desde uno o varios proveedores, sino transformar un flujo heterogéneo, ambiguo y potencialmente conflictivo de corporate actions en una representación única, determinista, PIT-safe y auditable de la evolución económica de cada instrumento. :contentReference[oaicite:0]{index=0}
+Normaliza, resuelve conflictos y clasifica corporate actions de múltiples
+providers en un registro canónico PIT. Alimenta adjust_prices (factores
+de ajuste), build_universe (eligibilidad post-event), y labels (exclusion
+por corporate action unsafe).
 
-Su misión central es triple:
+2. Taxonomía de eventos (CanonicalEventType + EventFamily)
 
-1. proporcionar la base semántica correcta para ajuste de precios y volumen;
-2. preservar la continuidad histórica de identidad frente a ticker changes, splits, mergers, spin-offs, relistings y eventos terminales;
-3. garantizar trazabilidad institucional completa para que cualquier ajuste de serie, cambio de elegibilidad o transición del universo pueda reconstruirse hasta el evento corporativo exacto, la fuente exacta y la política exacta de resolución. :contentReference[oaicite:1]{index=1}
+EventFamily agrupación: structural (split, reverse_split, stock_dividend),
+  distribution (cash_dividend, special_cash_dividend),
+  reorganization (merger, acquisition, spinoff, bankruptcy_reorg),
+  administrative (ticker_change, name_change, exchange_change, share_class_change),
+  lifecycle (delisting, relisting, rights_issue, tender_offer).
 
-El principio rector del módulo es el siguiente:
+EVENT_TYPE_TO_FAMILY: mapping de 17+ event types a 5 families.
+DEFAULT_EVENT_TYPE_ALIASES: normalización de strings ("stock_split" → "split").
 
-las corporate actions no deben modelarse como simples anotaciones textuales asociadas a un ticker, sino como hechos económicos efectivos sobre instrumentos identificados de forma estable en el tiempo.
+3. Pipeline
 
-Por ello, la entidad primaria de modelado no es `symbol`, sino `instrument_id`. El ticker es sólo una etiqueta observacional versionada. Si esta capa es débil, el sistema no sólo ajusta mal precios: también rompe continuidad económica, introduce survivorship contamination y degrada seriamente la validez de backtests y señales. :contentReference[oaicite:2]{index=2}
+Ingest raw events (multi-provider) → normalize event types
+→ temporal alignment (visible_ts_utc) → conflict detection
+→ cluster matching → conflict resolution → persist canonical.
 
-2. Papel dentro de la arquitectura
+4. Normalización
 
-`corporate_actions.py` se sitúa en una posición central del stack porque da soporte semántico a varios subsistemas a la vez.
+NormalizationConfig: date parsing, symbol normalization, column mapping.
+Cada evento requiere: symbol, event_type, application_date, source_provider.
+Campos opcionales: ex_date, effective_date, ratio, amount, visible_ts_utc.
 
-Consume aguas arriba:
+5. Conflict detection y clustering (MatchingConfig)
 
-- feeds raw de corporate actions de uno o varios proveedores;
-- tablas PIT de identidad de instrumento;
-- mappings históricos de ticker, exchange, share class e identificadores externos;
-- configuración versionada de normalización, matching, deduplicación y resolución de conflictos.
+Cluster: agrupa eventos de múltiples providers que refieren al mismo
+  evento económico real. Matching por: (symbol, event_type, date_window).
+  date_window configurable (default: ±3 business days).
 
-Entrega aguas abajo una capa canónica que debe ser consumida por:
+Conflictos: mismo cluster pero ratios/amounts discrepantes.
+ConflictConfig: tolerance_pct, provider_priority_list.
+Resolución: provider con mayor prioridad gana. Conflicto logueado.
 
-- `adjust_prices.py`, para construir factores de ajuste correctos;
-- `build_universe.py`, para preservar continuidad de identidad, gestionar delistings, relistings y transformaciones estructurales;
-- capas de survivorship y lifecycle;
-- validación, attribution y auditoría.
+6. GateResult (usa shared de universe.__init__)
 
-Una regla institucional fundamental es que ningún módulo downstream debe reinterpretar por su cuenta los feeds raw de corporate actions. La unicidad semántica del sistema exige que toda resolución pase por esta capa canónica. :contentReference[oaicite:3]{index=3}
+Gates por etapa:
+  normalization_gate: % rows parseadas correctamente.
+  coverage_gate: % symbols con al menos 1 evento.
+  conflict_gate: % clusters sin conflictos materiales.
+  lineage_gate: trazabilidad de cada evento canónico a su fuente.
 
-3. Principios de diseño no negociables
+7. Output
 
-La especificación del módulo se rige por los siguientes principios:
+canonical_events.parquet: eventos normalizados con cluster_id, chosen flag.
+conflicts.parquet: conflictos detectados con detalle de discrepancia.
+clusters.parquet: agrupación de eventos equivalentes.
+manifest.json: config_hash, provider hashes, coverage stats.
 
-1. Primacía de `instrument_id`:
-   la continuidad histórica y económica se modela a nivel de instrumento, no de ticker.
+8. Invariantes
 
-2. PIT estricto:
-   un evento sólo puede afectar datasets etiquetados en fecha `t` si era conocido como muy tarde en el cutoff de decisión del sistema.
+I1. PIT: visible_ts_utc ≤ asof para todo evento usado.
+I2. Cada cluster tiene exactamente 1 evento "chosen" por prioridad.
+I3. event_type ∈ CanonicalEventType.values después de normalización.
+I4. Eventos sin visible_ts_utc usan filed_date como fallback.
+I5. Terminal events (delisting, merger, acquisition) marcan end-of-life.
 
-3. Separación entre capas temporales:
-   deben distinguirse sin ambigüedad `announcement_ts`, `ex_date` y `effective_date`.
+9. Tests mínimos
 
-4. Taxonomía semántica canónica:
-   los eventos de proveedor deben proyectarse a un vocabulario interno único y estable.
-
-5. Resolución determinista:
-   matching, deduplicación, arbitraje multi-provider y precedencia same-day no pueden depender del orden accidental de llegada.
-
-6. Conflictos visibles:
-   discrepancias materiales entre fuentes no se resuelven silenciosamente; se promocionan a conflicto formal.
-
-7. Lineage completo:
-   todo evento canónico debe enlazar con los registros raw exactos que lo originaron.
-
-8. Conservadurismo ante ambigüedad:
-   si un evento no puede enlazarse o resolverse con seguridad suficiente, debe ir a `failures`, no a la capa canónica confirmada.
-
-Estos principios convierten al módulo en un motor de verdad histórica, no en un parser de conveniencia. :contentReference[oaicite:4]{index=4}
-
-4. Convención temporal PIT obligatoria
-
-La semántica temporal del módulo debe quedar fijada de manera completamente cerrada. Para cada evento `a`, el sistema distingue como mínimo tres tiempos:
-
-- `announcement_ts(a)`: instante en que el evento fue hecho público o conocido por mercado/proveedor;
-- `ex_date(a)`: fecha a partir de la cual el instrumento negocia ex-evento;
-- `effective_date(a)`: fecha efectiva operativa del cambio en identidad, estructura o elegibilidad cuando difiere de `ex_date`.
-
-La regla PIT oficial es:
-
-`known_asof(a,t) = 1[ announcement_ts(a) <= decision_cutoff(t) ]`
-
-y, salvo configuración contraria, la política estándar será:
-
-`decision_cutoff(t) = close(t-1)`
-
-Por tanto, un evento con `ex_date = t` sólo puede afectar a artefactos construidos para `t` si era conocido como muy tarde al cierre de `t-1`. Esta regla evita incorporar retroactivamente información de eventos cuya fecha económica sea antigua pero cuya observabilidad real por el sistema fuese posterior. :contentReference[oaicite:5]{index=5}
-
-5. Modelo formal del conjunto canónico
-
-Sea `I` el conjunto de instrumentos económicamente identificables y `D = [t0, t1]` el horizonte temporal del run. El módulo construye un conjunto canónico:
-
-`A* = {a_1, ..., a_n}`
-
-donde cada `a in A*` representa un evento económico normalizado, PIT y consumible por el resto del sistema.
-
-Las entradas formales son:
-
-- `A_raw^(1), ..., A_raw^(m)`: feeds raw de uno o varios proveedores;
-- `M_id`: tablas PIT de identidad (`instrument_id`, `issuer_id`, FIGI, CUSIP, CIK, vendor IDs, ticker history);
-- `R_ca`: configuración versionada;
-- `D`: rango temporal solicitado;
-- `run_id`, `config_hash`, `code_version`: metadatos de reproducibilidad.
-
-Cada evento canónico debe contener, como mínimo:
-
-`a = (event_id, instrument_id, issuer_id, symbol, event_type, announcement_ts, ex_date, effective_date, status, source_provider, source_priority, confidence_score, raw_event_refs, ...)`
-
-donde:
-
-- `event_id` es estable y determinista;
-- `instrument_id` es la clave primaria del evento;
-- `status in {pending, confirmed, cancelled, superseded}`;
-- `raw_event_refs` enlaza a los registros raw de origen.
-
-Este modelo es obligatorio porque permite distinguir claramente entre evento económico, evidencia raw y estado operativo del evento. :contentReference[oaicite:6]{index=6}
-
-6. Taxonomía canónica de eventos
-
-El sistema no puede depender de taxonomías arbitrarias de proveedores. Todos los eventos deben proyectarse sobre un vocabulario interno canónico:
-
-`Omega_ca = {
-split,
-reverse_split,
-stock_dividend,
-cash_dividend,
-special_cash_dividend,
-ticker_change,
-name_change,
-share_class_change,
-exchange_change,
-merger,
-acquisition,
-spinoff,
-rights_issue,
-tender_offer,
-delisting,
-relisting,
-bankruptcy_reorg,
-identifier_maintenance
-}`
-
-Además, la especificación debe distinguir explícitamente entre cuatro grandes familias semánticas:
-
-1. eventos de ajuste mecánico:
-   `split`, `reverse_split`, `stock_dividend`, `cash_dividend`, `special_cash_dividend`;
-
-2. eventos de identidad:
-   `ticker_change`, `name_change`, `share_class_change`, `exchange_change`, `identifier_maintenance`;
-
-3. eventos de transformación económica:
-   `merger`, `acquisition`, `spinoff`, `rights_issue`, `tender_offer`, `bankruptcy_reorg`;
-
-4. eventos terminales o cuasi-terminales:
-   `delisting`, ciertos `bankruptcy_reorg`, liquidaciones o discontinuidades materiales.
-
-Esta separación es esencial porque distintos módulos downstream consumen subconjuntos semánticos diferentes. Un ticker change no debe tratarse como una merger, y una merger no debe colapsarse como si fuera sólo un cambio de ticker. :contentReference[oaicite:7]{index=7}
-
-7. Modelo de identidad y continuidad económica
-
-La continuidad histórica se modela a nivel de `instrument_id`. Para un instrumento `i`, el símbolo es una función del tiempo:
-
-`symbol(i,t) = etiqueta observable del instrumento i en t`
-
-Pero el historial económico y de pertenencia al universo debe seguir a `i`, no al texto del símbolo. Esta regla debe quedar blindada en el módulo.
-
-En particular, para un evento `ticker_change` con fecha efectiva `t_eff`:
-
-`symbol(i,t) =
-  old_symbol   si t < t_eff
-  new_symbol   si t >= t_eff`
-
-sin que ello genere discontinuidad económica, turnover falso o pseudoentrada/salida del universo.
-
-En caso de relisting, la política por defecto debe ser conservadora:
-
-`relisting_resolution = new_instrument_unless_proven_continuous`
-
-Es decir, el relisting se trata como nueva identidad salvo evidencia fuerte y explícita de continuidad del mismo `instrument_id`. Esto evita unir en silencio historias que pueden ser económicamente distintas. :contentReference[oaicite:8]{index=8}
-
-8. Factores económicos para ajuste de precios
-
-Aunque el módulo no necesariamente aplica los ajustes finales, sí debe producir los factores canónicos que permitan a `adjust_prices.py` hacerlo de forma consistente.
-
-8.1. Splits y reverse splits
-
-Sea un evento con razón `A:B`, donde una acción previa pasa a representar `B/A` acciones posteriores. Se define:
-
-`f_split = B / A`
-
-Entonces, para fechas históricas anteriores al evento:
-
-`p_adj_u = p_raw_u * f_split    para todo u < t_eff`
-`v_adj_u = v_raw_u / f_split    para todo u < t_eff`
-`shares_adj_u = shares_raw_u / f_split    para todo u < t_eff`
-
-El módulo debe persistir tanto la razón raw del evento como el factor canónico ya orientado para consumo downstream.
-
-8.2. Cash dividends ordinarios
-
-Sea un dividendo ordinario de cuantía `d_cash` con ex-date `t_ex`. El factor de ajuste backward se define como:
-
-`f_div = 1 - d_cash / p_raw_(t_ex-1)`
-
-siempre que:
-
-`0 < d_cash < p_raw_(t_ex-1)`
-
-Si no se cumple, el evento debe marcarse como anómalo o reclasificarse como `special_cash_dividend`.
-
-8.3. Special dividends
-
-Los dividendos extraordinarios no deben mezclarse automáticamente con dividendos ordinarios. Si su magnitud supera un umbral configurado `theta_special`, el evento debe reclasificarse como:
-
-`special_cash_dividend`
-
-y su tratamiento downstream debe quedar explícitamente gobernado. En small caps, este punto es crítico porque muchos eventos “especiales” alteran seriamente comparabilidad de retornos y market cap. :contentReference[oaicite:9]{index=9}
-
-9. Mergers, acquisitions y spin-offs
-
-Una merger no puede representarse como un simple `ticker_change`. Debe preservarse la estructura económica del evento. Para una merger con ratio de conversión `rho`, efectivo `c` y mezcla stock/cash, el módulo debe persistir:
-
-`consideration(a) = (rho, c, stock_cash_mix, survivor_instrument_id)`
-
-Esto permite que downstream decida continuidad económica, cierre de series, transición de identidad o tratamiento especial en attribution.
-
-En un `spinoff`, el evento debe modelarse como relación padre-hijo:
-
-`a_spinoff = (instrument_parent, instrument_child, alpha, t_ex)`
-
-donde `alpha` representa la asignación de títulos del hijo por título del padre. La política de ajuste del parent y la creación del nuevo instrumento deben apoyarse en esta estructura, no en heurísticas textuales. :contentReference[oaicite:10]{index=10}
-
-10. Pipeline de ingestión, normalización y canonización
-
-El pipeline del módulo debe ser estrictamente determinista y constar de cinco etapas.
-
-10.1. Ingestión raw
-
-Se construye:
-
-`A_raw = union_j A_raw^(j)`
-
-Cada registro raw debe conservar:
-
-- `provider_name`
-- `provider_event_id`
-- payload original normalizado
-- timestamp de ingesta
-
-10.2. Normalización semántica
-
-Se aplica una función:
-
-`phi : A_raw -> A_tilde`
-
-que:
-
-- mapea taxonomías de proveedor a `Omega_ca`;
-- estandariza fechas y zonas horarias;
-- homogeneiza unidades monetarias y ratios;
-- identifica campos críticos faltantes;
-- genera flags de calidad por evento.
-
-10.3. Resolución de identidad
-
-Se aplica una función PIT de linkage:
-
-`psi : A_tilde -> A_hat`
-
-La precedencia oficial debe ser:
-
-1. identificador estable explícito;
-2. mapping histórico PIT de ticker + exchange + share class;
-3. linkage rules-based con score de confianza;
-4. si no resuelve, el evento va a `failures`.
-
-10.4. Deduplicación intra- e inter-provider
-
-Dos registros raw `a` y `b` representan el mismo evento económico si cumplen una relación de equivalencia `a ~ b` basada en:
-
-- mismo `instrument_id`;
-- mismo `event_type` canónico;
-- proximidad temporal compatible;
-- parámetros económicos equivalentes dentro de tolerancia;
-- ausencia de contradicción material.
-
-Cada clase de equivalencia colapsa en un único evento canónico `a*`.
-
-10.5. Resolución de conflictos
-
-Cuando múltiples proveedores discrepan sobre el mismo evento, el módulo aplica una política cerrada de arbitraje. Nunca debe resolver por orden accidental de carga. :contentReference[oaicite:11]{index=11}
-
-11. Política formal de source-of-truth
-
-La configuración debe fijar una relación total de prioridad entre proveedores:
-
-`Pi(provider) in {1,2,...,m}`
-
-donde un valor menor implica mayor prioridad.
-
-Para una clase de eventos equivalentes `[a]`, el valor canónico de cada campo material `x` se decide como el proveniente del proveedor de mayor prioridad, salvo que exista inconsistencia económica grave. Si la hay:
-
-- el evento se marca `CONFLICT_MATERIAL`;
-- no se promociona automáticamente a `confirmed`;
-- puede bloquear downstream si afecta ajustes, continuidad o elegibilidad.
-
-Se consideran campos críticos, como mínimo:
-
-- `event_type`
-- `instrument_id`
-- `ex_date`
-- `effective_date`
-- `split_ratio`
-- `cash_amount`
-- `survivor_instrument_id`
-
-Una discrepancia material en cualquiera de ellos no puede resolverse silenciosamente. Ésta es una de las piezas más importantes de la especificación porque evita que corporate actions críticas queden “promediadas” o absorbidas opacamente. :contentReference[oaicite:12]{index=12}
-
-12. Precedencia same-day y eventos compuestos
-
-Cuando múltiples eventos afectan al mismo `instrument_id` en la misma fecha, el orden de aplicación debe estar formalmente cerrado. La precedencia operativa por defecto es:
-
-1. `identifier_maintenance` / `name_change`
-2. `ticker_change`
-3. `exchange_change`
-4. `split` / `reverse_split`
-5. `stock_dividend`
-6. `cash_dividend`
-7. `special_cash_dividend`
-8. `rights_issue`
-9. `spinoff`
-10. `merger` / `acquisition`
-11. `delisting`
-12. `relisting`
-
-La motivación es económica y operativa:
-
-- primero se resuelve identidad textual y venue;
-- después los ajustes mecánicos de capital structure;
-- después los eventos distributivos;
-- por último los transformacionales o terminales.
-
-Si un proveedor reporta un evento compuesto, por ejemplo split + ticker change + exchange move, el sistema debe descomponerlo en una secuencia ordenada de subeventos canónicos enlazados por un `compound_event_id`. Esto permite downstream reproducible y evita lógica opaca. :contentReference[oaicite:13]{index=13}
-
-13. Invariantes duros y checks blandos
-
-Todo run válido debe satisfacer, como mínimo, los siguientes invariantes duros:
-
-1. unicidad canónica:
-   no puede haber dos eventos canónicos con el mismo `event_id`;
-
-2. integridad temporal:
-   `ex_date` y `effective_date` deben ser parseables y coherentes;
-
-3. identidad resuelta:
-   todo evento `confirmed` debe tener `instrument_id` no nulo;
-
-4. split ratio válido:
-   `A > 0` y `B > 0` para todo split `A:B`;
-
-5. cash dividend no negativo:
-   `cash_amount >= 0`;
-
-6. no duplicidad económica no resuelta:
-   ninguna clase de equivalencia puede promocionarse a confirmada si mantiene conflicto material abierto.
-
-Además, existen checks blandos monitorizados como `WARN` o `FAIL` según umbral:
-
-- tasa de eventos no resueltos superior a umbral;
-- caída abrupta de cobertura por tipo de evento;
-- aumento anómalo de conflictos inter-provider;
-- concentración excesiva en una única fuente;
-- número inusual de `special_cash_dividend` o `relisting`.
-
-La severidad global del run debe ser:
-
-`run_status = max(severity of all checks)`
-
-y cualquier `FAIL` invalida la promoción a producción salvo override explícito y logueado. :contentReference[oaicite:14]{index=14}
-
-14. Artefactos obligatorios de salida
-
-El módulo debe producir, como mínimo:
-
-1. dataset histórico canónico:
-   `data/universe/corporate_actions/history.parquet`
-
-2. snapshot vigente:
-   `data/universe/corporate_actions/current.parquet`
-
-3. eventos fallidos:
-   `failures_{run_id}.parquet`
-
-4. manifest:
-   `manifest_{run_id}.json`
-
-El `manifest` debe incluir, como mínimo:
-
-- `run_id`
-- `config_hash`
-- `code_version`
-- hashes de inputs
-- conteos por `event_type`
-- cobertura por proveedor
-- número de conflictos y no resueltos
-- checks ejecutados y severidad final
-- timestamps de inicio y fin
-
-El dataset histórico debe contener el esquema canónico completo y lineage suficiente para reconstrucción. El snapshot vigente debe reflejar la vista operativa activa bajo la política actual. Los failures deben contener eventos no normalizados, no enlazados o conflictivos con código de fallo estable. Sin estos artefactos, la capa no es institucionalmente auditable. :contentReference[oaicite:15]{index=15}
-
-15. Contrato con módulos downstream
-
-El módulo expone un contrato estable y exclusivo a otras capas del sistema:
-
-- `adjust_prices.py` consume factores de ajuste mecánico y capas temporales correctas;
-- `build_universe.py` consume continuidad de identidad, delistings, relistings, exchange changes y transformaciones materiales;
-- `survivorship.py` consume eventos terminales y mappings de continuidad para no confundir muerte de ticker con muerte económica;
-- validación y attribution consumen lineage completo de evento.
-
-La regla institucional es clara: ningún módulo downstream debe reinterpretar feeds raw de corporate actions por su cuenta. La semántica histórica del sistema se decide aquí y sólo aquí. :contentReference[oaicite:16]{index=16}
-
-16. Definition of Done
-
-El módulo `corporate_actions.py` se considera terminado únicamente si:
-
-- produce un dataset PIT, canónico, deduplicado y resoluble por identidad económica;
-- fija una política determinista de source-of-truth y de precedencia same-day;
-- representa explícitamente eventos compuestos, eventos terminales y transformaciones económicas;
-- entrega lineage completo desde el evento canónico hasta los registros raw de origen;
-- expone artefactos suficientes para auditoría, bloqueo y reproducción exacta del run.
-
-En otras palabras, el módulo no está terminado cuando “parsea corporate actions”, sino cuando convierte feeds heterogéneos en una capa única de verdad histórica que preserve continuidad económica, ajuste correctamente precios y volumen, resuelva conflictos de proveedor con reglas cerradas y mantenga trazabilidad institucional completa. :contentReference[oaicite:17]{index=17}
-
-17. Interpretación correcta
-
-`data/universe/corporate_actions.py` no debe verse como un parser accesorio ni como un simple join de eventos de proveedor. Es el motor de canonización histórica del sistema. Su trabajo no consiste sólo en clasificar eventos, sino en fijar la ontología temporal y económica que sostiene ajuste de precios, continuidad del universo, lifecycle de instrumentos y reproducibilidad de cualquier análisis downstream.
-
-Un módulo que sólo recoja eventos textuales pero no distinga identidad económica, no cierre la política PIT, no resuelva conflictos materiales y no preserve lineage completo no sirve. Un módulo conservador, determinista, PIT-safe, centrado en `instrument_id` y con taxonomía canónica sí sirve, aunque resulte más exigente y menos cómodo que una integración ligera de proveedor. En un stack cuantitativo serio, esa exigencia no es un coste superfluo: es la condición necesaria para que toda la historia de precios y universo sea metodológicamente defendible. :contentReference[oaicite:18]{index=18}
-
-18. Conclusión
-
-`data/universe/corporate_actions.py` debe quedar definido como una pieza institucional de verdad histórica semántica, no como una utilidad de parsing.
-
-La especificación correcta no es “normalizar eventos corporativos”, sino:
-
-- fijar qué entra;
-- fijar qué identidad manda;
-- fijar qué tiempos gobiernan observabilidad y efecto;
-- fijar una taxonomía canónica de eventos;
-- fijar cómo se enlazan, deduplican y arbitran fuentes;
-- fijar cómo se ordenan eventos concurrentes;
-- fijar qué sale y con qué lineage;
-- y fijar qué invariantes protegen al resto del pipeline.
-
-Si cumple esta especificación, el módulo deja de ser un parser y pasa a ser la capa de verdad histórica que sostiene ajustes, continuidad del universo y reproducibilidad institucional. Si no la cumple, el riesgo no es sólo técnico: es contaminar silenciosamente precios, elegibilidad, retornos y backtests con una interpretación temporal o económica incorrecta de los eventos corporativos. :contentReference[oaicite:19]{index=19}
+- "stock_split" normaliza a "split".
+- 2 providers con mismo split ratio → cluster sin conflicto.
+- 2 providers con ratios diferentes → conflict logged, priority wins.
+- Evento con visible_ts > asof → excluido del canonical set.
+- Delisting event → TERMINAL_EVENT_TYPES match.
+- Cluster con 3+ providers → chosen = highest priority.

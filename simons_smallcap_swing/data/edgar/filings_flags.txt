@@ -1,548 +1,74 @@
-Especificación Cuantitativa: data/edgar/filings_flags.py
+Especificación: data/edgar/filings_flags.py
 
-1. Propósito del módulo
+1. Propósito
 
-El módulo `data/edgar/filings_flags.py` implementa la capa formal de inteligencia regulatoria, anotación de riesgo de reporting y quality masking sobre la historia de filings EDGAR y sobre los hechos financieros ya canonizados del emisor. Su función no es únicamente marcar incidencias administrativas, sino transformar la trayectoria regulatoria y contable de cada compañía en un conjunto de señales operativas, reproducibles y point-in-time safe que puedan utilizarse para:
+Deriva flags y eventos a nivel de filing que son informativos para la
+estrategia: late filings, restatements, NT filings, form type anomalías,
+filing frequency anomalías, y red flags regulatorios. Estos flags
+alimentan tanto point_in_time.py (quality scoring) como features/
+(señales de riesgo informacional).
 
-- penalizar o excluir observaciones fundamentales en research y feature engineering;
-- detectar deterioro persistente de calidad del reporting;
-- identificar episodios de amendment, restatement, gaps o anomalías contables;
-- y convertir ruido regulatorio en una representación estructurada de riesgo informacional.
+2. Flags canónicos (por filing)
 
-El principio rector del módulo es el siguiente: la historia regulatoria de una compañía no debe tratarse como metadato pasivo. Retrasos, amendments, discontinuidades contables, huecos de reporting y revisiones de cifras forman parte del estado informacional del emisor y deben entrar explícitamente en la capa de datos utilizables por el sistema. :contentReference[oaicite:0]{index=0}
+Timeliness:
+  is_late_filer: deadline_date < filed_date.
+  days_to_deadline: filed_date - deadline_date (negativo = early).
+  is_nt_filing: form_type in (NT 10-K, NT 10-Q).
 
-2. Papel dentro de la arquitectura
+Restatement / amendment:
+  is_amended: form_type contiene "/A" (10-K/A, 10-Q/A).
+  is_restatement: filing referencia un filing previo con misma
+    fiscal period y diferentes valores materiales.
 
-`filings_flags.py` se sitúa aguas abajo de:
+Form classification:
+  form_family: 10-K, 10-Q, 8-K, S-1, proxy, other.
+  _classify_form_family(form_type, reverse_map) → family string.
 
-- `fetch_submissions.py`, que preserva la cronología regulatoria observable;
-- `fetch_companyfacts.py`, que captura el repositorio raw de hechos;
-- `parse_xbrl.py`, que canoniza hechos financieros;
-- y, en su caso, del ensamblado previo filing–facts.
+Filing anomalies:
+  filing_gap_days: días desde el filing anterior del mismo CIK.
+  is_filing_gap_anomaly: gap > threshold (configurable).
 
-Se sitúa aguas arriba de:
+3. Deadline inference
 
-- `point_in_time.py`, que impone observabilidad final;
-- la construcción de features fundamentales;
-- el quality gating del universo fundamental;
-- y la capa de validación de datasets utilizables.
+_infer_deadline_date(row, cfg) → (deadline, method):
+  Large accelerated filer: 10-K 60d, 10-Q 40d after fiscal_period_end.
+  Accelerated filer: 10-K 75d, 10-Q 40d.
+  Non-accelerated: 10-K 90d, 10-Q 45d.
+  Smaller reporting: 10-K 90d, 10-Q 45d.
+  Default si filer_status desconocido: non-accelerated.
 
-Su misión es introducir una capa intermedia entre “tener filings y facts” y “confiar en ellos”. En otras palabras, el módulo convierte secuencias regulatorias y hechos contables en una representación operativa de:
+4. Inputs
 
-- confiabilidad;
-- degradación de reporting;
-- correcciones y revisiones;
-- discontinuidad informacional;
-- y riesgo potencial de contaminación del alpha. :contentReference[oaicite:1]{index=1}
+submissions.parquet: de fetch_submissions.
+companyfacts.parquet: de fetch_companyfacts (para detectar restatements).
+config: thresholds, form_family_map, deadline_rules.
 
-3. Principios de diseño no negociables
+5. Linking facts to filings
 
-La especificación del módulo se rige por los siguientes principios:
+_link_facts_to_filings(submissions, facts, failures):
+  Join por accession_number. Facts sin filing → orphan flag.
+  Filing sin facts → empty_filing flag.
 
-1. PIT-safety estricta:
-   ningún flag puede usar evidencia no observable ex ante respecto al `asof` operativo.
+6. Rolling statistics
 
-2. Separación entre anotación y verdad contable:
-   el módulo anota riesgo y calidad; no certifica la verdad económica última del emisor.
+_rolling_flag_mean(values, window): media móvil de flags binarios.
+  Usado para detectar tendencias: CIK con late filings recurrentes.
 
-3. Multi-granularidad:
-   el sistema debe soportar flags a nivel filing, periodo e historial del emisor.
+_mad(values): Median Absolute Deviation para detección de outliers
+  en filing_gap_days.
 
-4. Severidad explícita:
-   todo evento agregado debe traducirse a `info`, `warn` o `critical`.
+7. Output
 
-5. Arbitraje determinista:
-   cuando múltiples flags coexisten, la severidad y la acción PIT no pueden quedar a interpretación downstream.
+flags.parquet: (cik, accession_number, form_type, form_family,
+  filed_date, fiscal_period_end, deadline_date, days_to_deadline,
+  is_late_filer, is_nt_filing, is_amended, filing_gap_days,
+  is_filing_gap_anomaly, flag_summary_score).
 
-6. Robustez estadística:
-   la detección de anomalías debe preferir estadísticas robustas frente a supuestos gaussianos ingenuos.
+8. Tests mínimos
 
-7. Configuración externa y versionada:
-   ventanas, deadlines, pesos, thresholds y políticas PIT deben residir en config.
-
-8. Accionabilidad downstream:
-   el módulo no debe limitarse a “anotar”; debe producir una decisión usable del tipo `allow`, `penalize` o `exclude`.
-
-Estos principios convierten el módulo en una capa institucional de regulatory quality intelligence y no en un apéndice descriptivo del pipeline EDGAR. :contentReference[oaicite:2]{index=2}
-
-4. Alcance funcional
-
-El módulo cubre, como mínimo, las siguientes familias de eventos:
-
-1. Late filing behavior:
-   retrasos regulatorios puntuales y persistentes.
-
-2. Correction behavior:
-   amendments, reemisiones y patrones compatibles con restatement.
-
-3. Completeness failures:
-   ausencia de campos fundamentales core por filing o periodo.
-
-4. Accounting anomalies:
-   discontinuidades contables materiales o incoherencias estructurales.
-
-5. Reporting instability:
-   gaps, secuencias irregulares o trayectorias de reporting degradadas.
-
-6. Flag aggregation:
-   transformación de flags elementales en score, severidad y acción PIT.
-
-Quedan fuera del alcance:
-
-- decidir la verdad jurídica o económica definitiva de un restatement;
-- imputar hechos fundamentales ausentes;
-- sustituir una auditoría forense;
-- inferir causalidad económica a partir de una sola bandera;
-- seleccionar directamente la observación PIT final.
-
-Es un módulo de anotación de riesgo y confiabilidad, no un oráculo de verdad contable. :contentReference[oaicite:3]{index=3}
-
-5. Entradas y contrato mínimo
-
-Entradas requeridas:
-
-- `submissions_path`
-- `facts_path`
-- `config_path`
-- `run_id`
-- `asof` recomendable y, en producción, preferido
-
-Notación formal:
-
-`I = {S, X, theta_flags, r, a}`
-
-donde:
-
-- `S` es el conjunto de submissions regulatorias;
-- `X` es el conjunto de facts financieros canonizados;
-- `theta_flags` es la configuración de thresholds, ventanas, pesos y reglas;
-- `r` es el `run_id`;
-- `a` es el `asof`.
-
-Antes de generar ningún flag, el módulo debe validar:
-
-- existencia y legibilidad de submissions y facts;
-- presencia de claves mínimas de enlazado:
-  `cik`, `accession_number`, `form_type`, `filing_date`;
-- parseabilidad consistente de fechas regulatorias;
-- existencia de la lista de campos core en configuración;
-- posibilidad de enlazado filing–facts o, en su defecto, arbitraje determinista documentado;
-- validez del archivo de configuración.
-
-Si falla este contrato mínimo, el módulo no debe producir flags operativos. Un sistema serio no construye señales de calidad sobre una base ya estructuralmente dudosa. :contentReference[oaicite:4]{index=4}
-
-6. Unidad de observación y granularidad
-
-La unidad básica de observación es:
-
-`u = (cik, accession_number)`
-
-es decir, un filing regulatorio concreto de una entidad concreta.
-
-Sin embargo, algunas señales viven mejor a otras escalas. Por ello, el módulo debe soportar al menos tres granularidades:
-
-- `G_filing`
-- `G_period`
-- `G_issuer`
-
-Ejemplos:
-
-- `flag_amended` es principalmente filing-level;
-- `flag_missing_core_fields` suele ser period-level;
-- `flag_persistent_late_filer` es issuer-history-level.
-
-Esta separación es obligatoria porque evita mezclar eventos puntuales con degradaciones estructurales del emisor. :contentReference[oaicite:5]{index=5}
-
-7. Salidas y artefactos obligatorios
-
-El módulo debe generar, como mínimo:
-
-- `data/edgar/flags/filings_flags_{run_id}.parquet`
-- `data/edgar/flags/filings_flags_summary_{run_id}.json`
-- `data/edgar/flags/filings_flags_metrics_{run_id}.parquet`
-- `data/edgar/flags/filings_flags_failures_{run_id}.parquet` cuando existan incidencias estructurales o de arbitraje
-- `data/edgar/flags/manifest_{run_id}.json`
-
-La tabla principal no debe contener sólo flags, sino contexto suficiente para consumo downstream y auditoría. Un sistema que emite bits sin contexto no es production-grade. :contentReference[oaicite:6]{index=6}
-
-8. Modelo de datos mínimo de salida
-
-Cada fila de la tabla principal debe contener, como mínimo:
-
-- `cik`
-- `accession_number`
-- `form_type`
-- `filing_date`
-- `acceptance_datetime`
-- `period_end`
-- `flag_late_filer`
-- `flag_persistent_late_filer`
-- `flag_amended`
-- `flag_restatement_hard`
-- `flag_restatement_suspected`
-- `flag_missing_core_fields`
-- `flag_accounting_anomaly`
-- `flag_reporting_gap`
-- `quality_score`
-- `severity`
-- `pit_action`
-- `run_id`
-
-Campos altamente recomendados:
-
-- `form_family`
-- `deadline_date`
-- `days_late`
-- `num_missing_core_fields`
-- `core_coverage_ratio`
-- `anomaly_magnitude`
-- `restatement_evidence_type`
-- `score_version`
-- `config_version`
-
-La separación entre `flag_restatement_hard` y `flag_restatement_suspected` mejora la especificación respecto a una sola bandera indiferenciada y evita colapsar evidencia concluyente y sospecha operativa en la misma etiqueta. :contentReference[oaicite:7]{index=7}
-
-9. Familias de flags
-
-Para una especificación cerrada y extensible, los flags deben organizarse en familias jerarquizadas:
-
-1. Timeliness flags
-   - `flag_late_filer`
-   - `flag_persistent_late_filer`
-
-2. Correction flags
-   - `flag_amended`
-   - `flag_restatement_hard`
-   - `flag_restatement_suspected`
-
-3. Completeness flags
-   - `flag_missing_core_fields`
-   - `flag_sparse_fundamental_coverage`
-
-4. Accounting anomaly flags
-   - `flag_accounting_anomaly`
-   - `flag_balance_sheet_inconsistency`
-
-5. Reporting structure flags
-   - `flag_reporting_gap`
-   - `flag_irregular_filing_sequence`
-
-Esta jerarquía permite calibrar pesos, severidades y políticas PIT de manera consistente en vez de acumular reglas aisladas sin estructura. :contentReference[oaicite:8]{index=8}
-
-10. Regla de late filer
-
-Sea `u = (c, a)` una observación y `tau(u)` su `form_type`. Definimos:
-
-`d_obs(u) = filing_date(u)`
-`d_dead(u) = deadline_date(c, tau(u), kappa_c)`
-
-donde `kappa_c` representa, cuando exista, la clasificación regulatoria relevante del emisor.
-
-Entonces:
-
-`g_late(u) = 1(d_obs(u) > d_dead(u))`
-
-Además, el módulo debe computar:
-
-`Delta_late(u) = max(0, d_obs(u) - d_dead(u))`
-
-en días según la política definida en configuración.
-
-La especificación debe contemplar explícitamente que los deadlines no son universales. Por tanto:
-
-- el método de asignación del deadline debe venir parametrizado;
-- si la clasificación del emisor es desconocida, debe existir una política explícita de fallback;
-- el uso de fallback debe quedar reflejado en output. :contentReference[oaicite:9]{index=9}
-
-11. Regla de persistent late filer
-
-Una única presentación tardía puede ser ruido; un patrón repetido es señal estructural. Para cada emisor `c`, sobre una ventana `W` de longitud `L`, definimos:
-
-`pi_late(c;W) = mean(g_late(u) for u in W(c))`
-
-Entonces:
-
-`g_persistent_late(c) = 1(pi_late(c;W) >= tau_persistent_late)`
-
-Este flag distingue retraso puntual de debilidad persistente de reporting y debe propagarse al score agregado y a la acción PIT futura dentro de la ventana activa. :contentReference[oaicite:10]{index=10}
-
-12. Regla de amended form
-
-Para un filing `u`, se define:
-
-`g_amended(u) = 1(form_type(u) termina en "/A")`
-
-Pero esto no basta. El módulo debe distinguir, cuando la evidencia lo permita, entre:
-
-- `technical`
-- `substantive`
-- `unknown`
-
-y emitir un campo auxiliar:
-
-`amendment_class in {technical, substantive, unknown}`
-
-Esto eleva la especificación y evita tratar todas las enmiendas como eventos de la misma severidad económica. :contentReference[oaicite:11]{index=11}
-
-13. Regla de restatement
-
-La detección de restatement no debe depender de una sola heurística débil. Debe construirse como una regla de evidencia múltiple. Sea `E(u)` el conjunto de evidencias asociadas a un filing o periodo. Entonces:
-
-`g_restatement(u) = 1(psi(E(u)) >= tau_rest)`
-
-donde `psi` es una función de agregación de evidencias.
-
-Fuentes mínimas de evidencia admisibles:
-
-- indicadores explícitos de correction o error;
-- amendments sensibles como `10-K/A` o `10-Q/A`;
-- cambios materiales en hechos ya reportados para el mismo periodo;
-- reaparición de cifras históricas revisadas;
-- metadata adicional parametrizada en configuración.
-
-La salida oficial debe distinguir:
-
-- `flag_restatement_hard`
-- `flag_restatement_suspected`
-
-y no colapsarlas en una sola bandera. Esta separación es especialmente importante para downstream PIT y para scoring conservador sin sobrebloqueo indiscriminado. :contentReference[oaicite:12]{index=12}
-
-14. Regla de missing core fields
-
-Sea `C_core(tau)` el conjunto de campos fundamentales core esperados para la familia de formulario `tau`. Para un filing o periodo `u`, definimos:
-
-`m(u) = sum(1(x not in X(u)) for x in C_core(tau(u)))`
-
-Entonces:
-
-`g_missing_core(u) = 1(m(u) > 0)`
-
-Y, en forma más informativa:
-
-`rho_core(u) = 1 - m(u) / |C_core(tau(u))|`
-
-La configuración debe permitir pesos por campo core. No todos los campos faltantes pesan igual. La ausencia de `Revenue`, `NetIncome`, `TotalAssets` o `TotalLiabilities` no puede equipararse automáticamente a la de un campo periférico. :contentReference[oaicite:13]{index=13}
-
-15. Regla de accounting anomaly
-
-La idea de evento contable anormal debe formalizarse con estadística robusta. Sea `x_(c,t)^(j)` la serie temporal de la métrica `j` para el emisor `c`. Definimos:
-
-`z_robust(c,t,j) = (x - median(N)) / (1.4826 * MAD(N))`
-
-donde `N` es una ventana histórica relevante.
-
-Entonces:
-
-`g_anomaly^(j)(c,t) = 1(|z_robust(c,t,j)| > kappa_j)`
-
-Además, deben existir checks contables estructurales. Por ejemplo:
-
-`r_bs(c,t) = Assets(c,t) - Liabilities(c,t) - Equity(c,t)`
-
-y se marca inconsistencia cuando:
-
-`|r_bs(c,t)| / (1 + |Assets(c,t)|) > epsilon_bs`
-
-Esta doble capa —robust z-score univariante más residual contable estructural— eleva el módulo de rule engine simple a screening serio de consistencia contable. :contentReference[oaicite:14]{index=14}
-
-16. Regla de reporting gap
-
-La ausencia de un filing esperado debe quedar formalizada. Sea `T_c^tau` la secuencia esperada de filings del tipo `tau` para el emisor `c`, y `T_hat_c^tau` la secuencia observada. Entonces:
-
-`g_gap(c,tau,t) = 1(t in T_c^tau \ T_hat_c^tau)`
-
-Este flag es especialmente valioso cuando la cobertura agregada parece razonable, pero existe una discontinuidad puntual relevante en el historial del emisor. :contentReference[oaicite:15]{index=15}
-
-17. Jerarquía de severidad
-
-Todo evento agregado debe clasificarse en:
-
-`severity in {info, warn, critical}`
-
-Política mínima razonable:
-
-- `info`: amendment técnico menor, anomalía débil, gap no confirmado;
-- `warn`: late filing puntual, missing core moderado, restatement sospechado;
-- `critical`: restatement duro, combinación de amendment + missing_core severo + discontinuidad contable, o degradación persistente crítica.
-
-Debe existir una función de agregación de severidad:
-
-`Sigma(g_i) -> severity_i`
-
-con precedencia explícita:
-
-`critical > warn > info`
-
-La severidad no puede quedar a interpretación downstream. Debe salir ya resuelta por el módulo. :contentReference[oaicite:16]{index=16}
-
-18. Reglas de arbitraje entre flags
-
-Cuando múltiples flags afectan a la misma observación, el módulo debe resolverlos con reglas deterministas. Como mínimo:
-
-1. si `flag_restatement_hard = 1`, la observación es `critical` independientemente del resto;
-2. si `flag_amended = 1` y `flag_missing_core_fields = 1`, elevar severidad al menos a `warn`;
-3. si `flag_persistent_late_filer = 1`, penalizar cualquier `quality_score` futuro del emisor dentro de la ventana activa;
-4. si `flag_reporting_gap = 1` sin evidencia adicional, clasificar como `info` o `warn` según longitud y contexto;
-5. si coexisten múltiples anomalías contables materiales, promover `flag_restatement_suspected`.
-
-Estas reglas convierten al módulo en una capa de inferencia estructurada, no en una mera colección de bits. :contentReference[oaicite:17]{index=17}
-
-19. Quality score
-
-El `quality_score` no debe ser una media sin estructura. Debe definirse como un score penalizado y calibrable. Sea `g_i` el vector de flags y `w` su vector de pesos. Una forma oficial razonable es:
-
-`q_i = 1 - (sum_j w_j g_(i,j)) / (sum_j w_j)`
-
-con `q_i in [0,1]`.
-
-Además, debe incorporarse una penalización no lineal para eventos severos:
-
-`q_i* = q_i * exp(-lambda * h_i)`
-
-donde `h_i` es el número de flags de alta severidad o una función equivalente.
-
-Esto evita que varias incidencias graves queden “lavadas” por una media lineal demasiado benigna. El módulo debe persistir:
-
-- `quality_score_raw`
-- `quality_score_final`
-- `score_version`
-
-o equivalente funcional. :contentReference[oaicite:18]{index=18}
-
-20. Política PIT y accionabilidad downstream
-
-Cada fila debe incorporar una política PIT explícita:
-
-`pit_action in {allow, penalize, exclude}`
-
-Política mínima razonable:
-
-- `allow`: sin flags materiales;
-- `penalize`: late filing puntual, missing core moderado, amendment no severo;
-- `exclude`: restatement duro, inconsistencia contable severa, degradación estructural crítica.
-
-La decisión downstream no debe improvisarse fuera del módulo. `filings_flags.py` debe producir ya una anotación usable por `point_in_time.py` y por feature engineering. :contentReference[oaicite:19]{index=19}
-
-21. Flujo de ejecución
-
-El flujo oficial del módulo debe constar de seis etapas:
-
-1. carga y validación estructural de submissions y facts;
-2. enlazado filing–facts mediante criterio determinista;
-3. generación de flags elementales de timeliness, corrections, completeness y anomalies;
-4. arbitraje y promoción de severidad;
-5. cálculo de `quality_score`, métricas agregadas y `pit_action`;
-6. persistencia de tabla principal, summary, metrics, failures y manifest.
-
-Este flujo debe permanecer estable y versionado. Cambios en thresholds, deadlines, reglas de arbitraje o score deben quedar reflejados en config y en los artefactos de salida. :contentReference[oaicite:20]{index=20}
-
-22. Métricas agregadas obligatorias
-
-El módulo debe emitir, como mínimo:
-
-- proporción de `late_filers`;
-- proporción de `persistent_late_filers`;
-- proporción de `amended`;
-- proporción de `restatement_hard` y `restatement_suspected`;
-- distribución de `quality_score`;
-- tasa de `missing_core_fields`;
-- tasa de `accounting_anomaly`;
-- tasa de `allow / penalize / exclude`;
-- métricas desagregadas por `form_family`, sector, capitalización y bucket de liquidez, cuando la información esté disponible.
-
-Esto permite distinguir entre un problema puntual y una degradación sistémica del universo fundamental utilizable. :contentReference[oaicite:21]{index=21}
-
-23. CLI y uso operativo
-
-La interfaz operativa recomendada debe aceptar, al menos:
-
-- `--submissions-path`
-- `--facts-path`
-- `--config-path`
-- `--run-id`
-- `--asof`
-
-El uso explícito de `asof` es preferible para mantener versionado coherente y alineación con el resto del subsistema EDGAR. Un módulo que dependa implícitamente del reloj local para decisiones de producción no es suficientemente reproducible. :contentReference[oaicite:22]{index=22}
-
-24. Tests e invariantes obligatorios
-
-La implementación debe incluir, como mínimo, tests sobre:
-
-1. detección correcta de `late_filer` bajo deadlines parametrizados;
-2. cálculo de `persistent_late_filer` sobre ventana móvil;
-3. identificación de `amended` por `form_type`;
-4. clasificación separada entre `restatement_hard` y `restatement_suspected`;
-5. conteo y scoring de `missing_core_fields`;
-6. detección de anomalía contable robusta;
-7. arbitraje correcto de severidades;
-8. estabilidad del `quality_score` bajo misma configuración;
-9. emisión correcta de `pit_action`;
-10. persistencia íntegra de `summary`, `metrics`, `failures` y `manifest`.
-
-Estos tests no son cosméticos. Definen el contrato institucional del módulo. :contentReference[oaicite:23]{index=23}
-
-25. Definition of Done
-
-El módulo `filings_flags.py` se considera terminado únicamente si:
-
-- genera flags elementales y agregados con reglas documentadas y parametrizadas;
-- distingue entre eventos puntuales y degradaciones persistentes;
-- incorpora severidad y accionabilidad PIT en el output;
-- emite un `quality_score` estable, reproducible y calibrable;
-- persiste artefactos completos y auditables por `run_id`;
-- y dispone de tests que cubren los edge cases principales.
-
-En otras palabras, el módulo no está terminado cuando “marca incidencias”, sino cuando convierte historia regulatoria y hechos contables en una representación operativa de confiabilidad usable por un stack cuantitativo serio. :contentReference[oaicite:24]{index=24}
-
-26. MVP vs versión avanzada
-
-MVP correcto:
-
-- flags de late filing y persistent late filing;
-- detección de amended;
-- separación entre `restatement_hard` y `restatement_suspected`;
-- `missing_core_fields` con ratio de cobertura core;
-- anomalía contable robusta basada en MAD;
-- jerarquía de severidad y arbitraje determinista;
-- `quality_score` calibrable;
-- `pit_action` explícito;
-- artefactos auditables y reproducibles.
-
-Versión avanzada justificable:
-
-- combinación bayesiana de evidencias de restatement;
-- regímenes de reporting mediante HMM;
-- residual contable multivariante tipo Mahalanobis;
-- modelado más rico de degradación temporal de calidad;
-- análisis de impacto de flags sobre contaminación de señales downstream.
-
-No es obligatorio, en esta fase, introducir HMM, programación dinámica o causal impact como núcleo del módulo oficial. Son extensiones plausibles y valiosas, pero la prioridad correcta aquí es cerrar bien la capa rule-based, robusta, PIT-safe y accionable. :contentReference[oaicite:25]{index=25}
-
-27. Interpretación correcta
-
-Este módulo no debe interpretarse como un apéndice auxiliar del pipeline EDGAR, sino como una capa central de regulatory quality intelligence.
-
-Su función correcta es:
-
-- transformar la cronología regulatoria y los hechos contables en señales estructuradas de riesgo informacional;
-- evitar que research y features traten como homogéneos emisores con reporting degradado;
-- suministrar penalización o exclusión PIT-safe sin improvisación downstream;
-- y abrir una fuente adicional de señal ligada a calidad contable y comportamiento regulatorio.
-
-Un módulo que sólo marque amendments o retrasos pero no los convierta en severidad, score y acción PIT no sirve. Un módulo conservador, robusto, multi-granular y accionable sí sirve, aunque penalice más observaciones. En small caps, el principal error no es perder alguna observación útil; es tratar como limpia una trayectoria regulatoria estructuralmente dudosa. :contentReference[oaicite:26]{index=26}
-
-28. Conclusión
-
-`data/edgar/filings_flags.py` debe quedar definido como una pieza institucional de event intelligence regulatoria, no como una capa cosmética de postprocesado.
-
-La especificación correcta no es “marcar unas cuantas banderas sobre filings”, sino:
-
-- fijar qué entra;
-- fijar la unidad de observación;
-- fijar qué flags existen y a qué granularidad viven;
-- fijar cómo se agregan, arbitran y severizan;
-- fijar cómo se calcula el score;
-- fijar qué acción PIT se deriva;
-- y fijar qué artefactos auditables salen.
-
-Si cumple esta especificación, el módulo deja de ser un anotador informal y pasa a ser una frontera útil entre “tener filings” y “tener información regulatoria operativamente confiable”. Si no la cumple, el riesgo no es sólo técnico: es contaminar el research fundamental con emisores cuyo estado informacional real era peor de lo que el dataset dejaba ver. :contentReference[oaicite:27]{index=27}
+- 10-K filed 100d after FPE for large accelerated → is_late_filer=True.
+- 10-K/A → is_amended=True, form_family="10-K".
+- NT 10-Q → is_nt_filing=True.
+- Filing gap > threshold → is_filing_gap_anomaly=True.
+- Deadline inference: non-accelerated 10-K → 90 days.
+- Facts linked to filing por accession_number.

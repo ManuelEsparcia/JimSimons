@@ -1,534 +1,77 @@
-Especificación Cuantitativa: data/edgar/point_in_time.py
+Especificación: data/edgar/point_in_time.py
 
-1. Propósito del módulo
+1. Propósito
 
-El módulo `data/edgar/point_in_time.py` implementa la capa formal de observabilidad temporal, materialización as-of, control de staleness y quality gating del subsistema fundamental EDGAR. Su función no es hacer un `forward-fill` genérico sobre facts canónicos, sino construir una vista fundamental point-in-time por `asof`, `symbol` y `metric_name` tal que cada observación represente exclusivamente información que era legítimamente observable por el mercado en el instante de corte, sin contaminación temporal, sin backfill futuro y sin ambigüedad sobre su linaje regulatorio. :contentReference[oaicite:0]{index=0}
+Construye la tabla PIT (point-in-time) de fundamentales: para cada
+(CIK, metric, asof_date), selecciona el valor que habría sido
+conocido en esa fecha, usando solo filings aceptados antes de asof.
+Este es el módulo que convierte "datos financieros" en "datos
+financieros utilizables sin lookahead".
 
-El principio rector del módulo es el siguiente:
+2. Problema que resuelve
 
-un dato fundamental no es válido para investigación cuantitativa porque describa un periodo económico pasado, sino porque era observable en el instante `asof` y porque su persistencia temporal hasta dicho instante es metodológicamente aceptable dadas la naturaleza de la métrica, la edad del dato y la calidad del filing que la sustenta. :contentReference[oaicite:1]{index=1}
+Un filing de Q3 2024 puede ser aceptado por SEC el 2024-11-05 a las
+17:32 UTC. Si tu sistema procesa datos al cierre del 2024-11-04, ese
+filing NO existía. Si lo usas, introduces lookahead bias que infla
+artificialmente cualquier señal basada en fundamentales.
 
-Formalmente, el módulo define un operador PIT:
+point_in_time garantiza: solo usas lo que existía en t.
 
-`P_PIT : (F_can, A, Θ, r) -> (P, C, M)`
+3. Asof grid
 
-donde:
+resolve_asof_grid(start, end, frequency) → lista de timestamps.
+Default: diario a las 18:00 UTC (post-market, pre-overnight batch).
+Configurable: asof_time_utc = "18:00:00".
 
-- `F_can` es el conjunto de facts canónicos procedentes de `parse_xbrl.py`;
-- `A` es el conjunto de fechas o timestamps `asof`;
-- `Θ` es la configuración PIT con políticas de selección, staleness, penalización, exclusión y arbitraje;
-- `r` es el `run_id`;
-- `P` es la tabla PIT materializada;
-- `C` es el conjunto de métricas de cobertura, frescura y calidad PIT;
-- `M` es el manifest auditable de ejecución.
+Para cada asof, se buscan filings con acceptance_datetime < asof.
 
-Este módulo constituye la frontera entre “tener facts canónicos” y “tener una base fundamental utilizable en backtesting, ranking y modelización cuantitativa”. Por ello, es una de las capas más delicadas de todo el pipeline EDGAR: errores aquí no suelen manifestarse como errores sintácticos, sino como falsas mejoras de señal, leakage silencioso y sobreestimación de capacidad predictiva. :contentReference[oaicite:2]{index=2}
+4. Selection logic (por métrica, por asof)
 
-2. Papel dentro de la arquitectura EDGAR
+select_candidates_for_asof(facts, mapping, asof, cfg):
+  1. Filter facts donde filed_date < asof (PIT gate).
+  2. Si hay metric_mapping activo → filtrar por canonical_metric.
+  3. Resolver conflictos cuando hay múltiples valores para misma métrica:
+     - Priority: más reciente fiscal period primero.
+     - Entre mismo period: último filing (restated > original).
+     - selection_priority_columns: filed_date desc, form_priority, accession desc.
+  4. _resolve_selection_conflicts: groupby (cik, metric, period) → pick winner.
 
-`point_in_time.py` se sitúa aguas abajo de:
+5. Staleness y quality
 
-- `ticker_cik.py`, que resuelve identidad regulatoria;
-- `fetch_submissions.py`, que materializa la cronología observable de filings;
-- `fetch_companyfacts.py`, que ingiere la base raw de facts;
-- `parse_xbrl.py`, que canoniza tags, unidades y contextos;
-- `filings_flags.py`, que anota riesgo regulatorio y calidad de reporting.
+apply_staleness_and_quality(selected, asof, cfg):
+  - staleness_days = (asof - filed_date).days
+  - Age buckets: fresh (≤90d), recent (≤180d), aging (≤365d), stale (>365d).
+  - quality_score basado en: form_type priority, staleness, is_amended.
+  - stale_threshold configurable: datos > N días → flagged como stale.
 
-Se sitúa aguas arriba de:
+6. Full panel construction
 
-- construcción de features fundamentales;
-- ensamblado de datasets de research;
-- universe filtering y factor building;
-- cualquier subsistema de backtesting o producción que consuma fundamentales observables.
+build_full_panel(facts, submissions, mapping, flags, asof_grid, cfg):
+  Para cada asof en grid → select_candidates → apply_staleness → output row.
 
-El módulo sí debe:
+Output: panel con (cik, symbol, asof_date, metric, value, unit,
+fiscal_year, fiscal_period, filed_date, staleness_days, quality_score,
+age_bucket, is_stale, form_type, accession_number).
 
-- imponer la restricción temporal `acceptance_ts <= asof`;
-- resolver qué observación es el `best available fact` para cada métrica y fecha;
-- controlar la caducidad o staleness de cada dato;
-- aplicar la política configurada de `allow`, `penalize` o `exclude` según flags de calidad.
+7. Flags integration
 
-Pero el módulo no debe:
+join_flags(candidates, flags, cfg): incorpora filing flags
+(late_filer, restatement, nt_filing, etc.) como columnas adicionales.
 
-- rehacer la semántica XBRL ya resuelta aguas arriba;
-- imputar artificialmente hechos inexistentes;
-- mezclar materialización PIT con construcción de factores finales;
-- usar información ex post para mejorar cobertura.
+8. Invariantes
 
-En resumen, este módulo no “mejora” los fundamentales: los restringe causalmente para que el research deje de ver lo que en realidad aún no era visible. :contentReference[oaicite:3]{index=3}
+I1. Nunca se usa un filing con acceptance_datetime > asof.
+I2. Para cada (cik, metric, asof), hay exactamente 0 o 1 valor seleccionado.
+I3. El valor seleccionado es el más reciente fiscal period con el
+    último filing disponible.
+I4. staleness_days ≥ 0 siempre.
+I5. Idempotente: mismo (config, inputs, asof_grid) → mismo output.
 
-3. Principios de diseño no negociables
+9. Tests mínimos
 
-La especificación del módulo se rige por los siguientes principios:
-
-1. Causalidad estricta:
-   ningún fact puede entrar en la vista PIT si `acceptance_datetime > asof`.
-
-2. No backfill futuro:
-   una observación posterior no puede rellenar ni reinterpretar retrospectivamente fechas previas a su aceptación.
-
-3. Arbitraje determinista:
-   cuando existen múltiples hechos observables para la misma clave económica, la selección debe resolverse mediante precedencia formal y no por orden accidental de llegada.
-
-4. Staleness explícita:
-   el envejecimiento del dato debe modelarse por métrica y no por un único umbral global.
-
-5. Separación entre valor y elegibilidad:
-   `metric_value_pit`, `quality_weight` y `pit_action` deben poder coexistir sin colapsar semánticamente.
-
-6. NaN antes que cero:
-   la ausencia o invalidez de observación no debe transformarse silenciosamente en valor económico nulo.
-
-7. Integración con calidad regulatoria:
-   el estado PIT de un fact debe incorporar flags de calidad del filing subyacente.
-
-8. Trazabilidad completa:
-   todo valor PIT debe poder enlazarse hasta filing, accession number, acceptance timestamp y razón de selección.
-
-9. Versionado completo:
-   la política PIT, los thresholds de staleness y las reglas de arbitraje deben residir en configuración versionada.
-
-Estos principios convierten el módulo en una pieza de validez causal, no en una simple transformación tabular. :contentReference[oaicite:4]{index=4}
-
-4. Alcance funcional
-
-El alcance del módulo incluye, como mínimo:
-
-1. Selección PIT estricta por `asof`:
-   para cada `(d,s,m)`, seleccionar el último hecho canónico observable con `acceptance_ts <= d`.
-
-2. Forward-fill controlado:
-   permitir persistencia temporal del dato sólo mientras no exceda la edad máxima admitida por métrica.
-
-3. Control de staleness por métrica:
-   cada métrica tiene su propia política de envejecimiento.
-
-4. Integración con flags de calidad:
-   una observación puede ser `allow`, `penalize` o `exclude` según severidad del filing subyacente.
-
-5. Materialización para consumo downstream:
-   salida tabular lista para construir features y paneles de research.
-
-6. Cobertura auditable:
-   emisión de métricas de cobertura, frescura, exclusión y degradación PIT.
-
-Quedan fuera del alcance:
-
-- inferencia del valor “verdadero” económico cuando faltan hechos;
-- reparación manual de conflictos semánticos que debieron resolverse antes;
-- selección oportunista ex post del mejor filing;
-- agregación final de métricas en factores.
-
-Esta frontera funcional es crítica. Un PIT serio no inventa información: decide qué información ya existía de forma defendible en cada fecha. :contentReference[oaicite:5]{index=5}
-
-5. Entradas del módulo
-
-Entradas mínimas requeridas:
-
-- `parsed_facts_path`: facts canónicos procedentes de `parse_xbrl.py`;
-- `filings_flags_path`: flags regulatorios y de calidad, opcional pero altamente recomendado;
-- `ticker_cik_mapping_path`: mapping historificado `symbol` ↔ `cik`;
-- `pit_config_path`: configuración de reglas PIT;
-- `run_id`: identificador único de ejecución;
-- `start_date`, `end_date` o conjunto explícito de `asof`.
-
-En notación formal:
-
-`I = {F_can, G, U, Θ_pit, r, A}`
-
-donde:
-
-- `F_can` es la tabla de facts canónicos;
-- `G` es la tabla de flags de filings;
-- `U` es el mapping historificado `symbol` ↔ `cik`;
-- `Θ_pit` es la parametrización de selección, staleness y tratamiento de flags;
-- `r` es el `run_id`;
-- `A` es el conjunto de cortes PIT a materializar.
-
-6. Contrato mínimo de entrada
-
-Antes de materializar ningún dato PIT, el módulo debe validar:
-
-- existencia y legibilidad de todos los inputs obligatorios;
-- presencia de campos mínimos en `facts canonical`:
-  `cik`, `metric_name`, `value`, `period_end`, `filed_date`, `acceptance_datetime`;
-- existencia de unidad y linaje regulatorio suficiente;
-- posibilidad de resolver el `symbol` activo a partir del mapping PIT-safe;
-- coherencia temporal básica:
-  `period_end <= filed_date <= acceptance_datetime`
-  cuando todos los campos existan;
-- validez sintáctica y semántica de `Θ_pit`.
-
-Si este contrato falla, la corrida no debe materializar un PIT parcial silencioso. Debe abortarse o degradarse formalmente según severidad configurada. Este punto es importante: un panel PIT incompleto y silenciosamente truncado puede parecer sano y, sin embargo, introducir sesgos mucho más sutiles que un fallo explícito. :contentReference[oaicite:6]{index=6}
-
-7. Unidad de observación PIT
-
-Cada registro PIT representa una exposición fundamental observable para un símbolo y una métrica en una fecha de corte:
-
-`p = (d, s, c, m, v_pit, acc_ts, filed_date, period_end, delta, q, eta, r)`
-
-donde:
-
-- `d` es `asof`;
-- `s` es `symbol`;
-- `c` es `cik`;
-- `m` es `metric_name`;
-- `v_pit` es el valor materializado;
-- `acc_ts` es `source_acceptance_ts`;
-- `filed_date` es `source_filed_date`;
-- `period_end` es el periodo económico al que refiere el dato;
-- `delta` es `staleness_days`;
-- `q` es el `quality_weight`;
-- `eta` es la política aplicada en `{allow, penalize, exclude, stale}`;
-- `r` es el `run_id`.
-
-La semántica correcta es:
-
-- `v_pit` describe el mejor dato observable;
-- `q` describe cuánto debe confiar downstream en ese dato;
-- `eta` describe cómo debe tratarse operativamente;
-- `delta` describe su edad informacional.
-
-Colapsar estas cuatro dimensiones en un único campo sería metodológicamente débil. :contentReference[oaicite:7]{index=7}
-
-8. Modelo mínimo de salida
-
-La salida principal debe contener, al menos:
-
-- `asof`
-- `symbol`
-- `cik`
-- `metric_name`
-- `metric_value_pit`
-- `source_period_end`
-- `source_filed_date`
-- `source_acceptance_ts`
-- `staleness_days`
-- `pit_action`
-- `quality_weight`
-- `is_stale`
-- `run_id`
-
-Campos de alta prioridad recomendados:
-
-- `source_accession_number`
-- `source_form_type`
-- `flag_severity`
-- `selection_reason`
-- `ffill_applied`
-- `age_bucket`
-- `mapping_version`
-- `pit_config_version`
-
-La persistencia simultánea de valor, edad, calidad y acción PIT es obligatoria si se quiere un sistema downstream serio. Sin ella, backtesting y feature engineering se verían obligados a reconstruir lógica crítica fuera del módulo, rompiendo trazabilidad y consistencia. :contentReference[oaicite:8]{index=8}
-
-9. Principio central de observabilidad
-
-La regla central del módulo es:
-
-`forall p in P, source_acceptance_ts(p) <= asof(p)`
-
-Equivalentemente, para una combinación `(d,s,m)` se define el conjunto de candidatos observables:
-
-`K(d,s,m) = { f in F_can : symbol(f)=s and metric(f)=m and acceptance_datetime(f) <= d }`
-
-La selección PIT sólo puede operar sobre `K(d,s,m)`. Todo hecho con `acceptance_datetime > d` queda excluido de forma absoluta. No existe tolerancia positiva para esta restricción. Éste es el núcleo del módulo y, si se viola, todo el subsistema fundamental pierde credibilidad causal. :contentReference[oaicite:9]{index=9}
-
-10. Prohibición de backfill futuro
-
-La política PIT correcta exige dos prohibiciones simultáneas:
-
-1. no usar observaciones futuras para explicar o rellenar el pasado;
-2. no permitir que una observación posterior reconstruya retroactivamente el valor que el modelo habría visto antes de su publicación.
-
-Esto implica que un fact sólo entra en juego a partir de su `acceptance_datetime`, nunca desde su `period_end` ni desde el cierre económico del trimestre o ejercicio al que hace referencia. Esta precisión es crítica porque muchos errores de leakage en fundamentales no proceden de usar “datos futuros” obvios, sino de asumir prematuramente observabilidad sobre datos que económicamente pertenecen al pasado pero informacionalmente aún no existían para el mercado. :contentReference[oaicite:10]{index=10}
-
-11. Regla de selección PIT
-
-Para cada combinación `(d,s,m)`, el módulo debe seleccionar un único candidato dominante o declarar ausencia de valor PIT elegible.
-
-La regla base es:
-
-`f*(d,s,m) = argmax_{f in K(d,s,m)} acceptance_datetime(f)`
-
-Pero esta formulación no basta por sí sola. Debe complementarse con una política explícita de desempate y jerarquía documental.
-
-12. Regla de arbitraje y desempate
-
-Cuando existen múltiples candidatos con la misma `acceptance_datetime` o con timestamps prácticamente equivalentes para una misma clave económica, el módulo debe aplicar una precedencia formal. La tupla lexicográfica recomendada es:
-
-`Lex_6 = (acceptance_datetime, filing_authority_rank, amendment_priority, fact_quality_score, filed_date, accession_number)`
-
-Interpretación:
-
-1. seleccionar el hecho con mayor `acceptance_datetime` observable;
-2. en empate, priorizar el filing con mejor jerarquía documental;
-3. en empate, priorizar el amendment sustantivo sobre la versión previa si la política lo permite;
-4. en empate, priorizar el candidato canónico de mayor calidad;
-5. en empate, priorizar mayor `filed_date`;
-6. si persiste, aplicar una regla final determinista con `accession_number`.
-
-Si aún persiste un empate no resoluble, el caso debe ir a `pit_issues` o a exclusión explícita, nunca resolverse silenciosamente de forma no determinista. Este arbitraje es tan importante como la restricción temporal: evita que la materialización PIT dependa del orden interno de lectura o del backend de almacenamiento. :contentReference[oaicite:11]{index=11}
-
-13. Tratamiento de amendments y revisiones
-
-Una de las fuentes más peligrosas de pseudo-PIT bonito pero falso es el tratamiento incorrecto de filings corregidos. La política correcta es:
-
-- un amendment sólo puede desplazar a un filing previo a partir de su propio `acceptance_datetime`;
-- no se permite reescribir ex post fechas anteriores a la aceptación del amendment;
-- si la política distingue entre `technical amendment` y `substantive amendment`, esa jerarquía debe respetarse;
-- el `selection_reason` debe indicar si el valor PIT procede de filing original o corregido.
-
-Este punto debe quedar absolutamente cerrado en especificación. Una revisión contable puede ser económicamente relevante, pero si aún no había sido aceptada en EDGAR en una fecha determinada, no formaba parte del estado informacional observable del mercado. :contentReference[oaicite:12]{index=12}
-
-14. Forward-fill controlado
-
-El forward-fill no debe entenderse como relleno arbitrario, sino como persistencia temporal explícita de un hecho que sigue siendo la mejor información disponible. Para cada métrica `m`, se define un horizonte máximo de envejecimiento:
-
-`h_m = max_staleness_days(m)`
-
-Sea `f*(d,s,m)` el mejor candidato observable. Su edad es:
-
-`delta(d,s,m) = d - acceptance_datetime(f*(d,s,m))`
-
-El valor puede mantenerse mientras:
-
-`delta(d,s,m) <= h_m`
-
-Si no se cumple, el dato entra en estado `stale` y debe aplicarse la política definida en configuración. Esta política por métrica es indispensable: no tiene sentido exigir la misma frescura a `Revenue`, `NetIncome`, `SharesOutstanding` o `TotalAssets`. :contentReference[oaicite:13]{index=13}
-
-15. Política explícita NaN vs penalización vs exclusión
-
-La especificación debe cerrar una decisión muy sensible: qué hacer cuando un dato se vuelve stale o debe excluirse por calidad.
-
-Política recomendada:
-
-1. Dato no observable o excluido:
-   `metric_value_pit = NaN`
-   `pit_action = exclude`
-
-2. Dato observable pero penalizado:
-   conservar `metric_value_pit`
-   `pit_action = penalize`
-   `quality_weight in (0,1)`
-
-3. Ausencia estructural legítima:
-   el uso de cero sólo se permite cuando una métrica concreta lo admita por definición económica explícita; nunca como política global por defecto.
-
-La regla general debe ser:
-
-`NaN > 0` cuando el problema es ausencia o invalidez de información y no valor económico nulo.
-
-Esto corrige una de las trampas más habituales en pipelines fundamentales: transformar silenciosamente falta de información en neutralidad aparente. :contentReference[oaicite:14]{index=14}
-
-16. Tratamiento de flags de calidad
-
-Sea `g(f)` el vector de flags asociado al filing que soporta el hecho `f`. El módulo debe transformar dichos flags en una política PIT explícita:
-
-`pit_action(f) in {allow, penalize, exclude}`
-
-Política mínima razonable:
-
-- `allow`: sin flags materiales;
-- `penalize`: flags moderados como late filing puntual o amendment no severo;
-- `exclude`: restatement duro, conflicto contable grave, degradación crítica o política explícita de exclusión.
-
-Este paso no debe dejarse a interpretación downstream. Si el sistema ya conoce que un filing está degradado, ese conocimiento debe quedar materializado ya en la capa PIT. :contentReference[oaicite:15]{index=15}
-
-17. Función de penalización
-
-Si la observación no se excluye, el módulo puede definir un peso PIT:
-
-`w(f) = phi(g(f), m, Θ_pit), with w(f) in (0,1]`
-
-Una forma operativa razonable es:
-
-`w(f) = max(0, 1 - sum_j lambda_(m,j) * g_j(f))`
-
-donde `lambda_(m,j)` es la penalización del flag `j` para la métrica `m`.
-
-Es preferible persistir ambos campos:
-
-- `metric_value_pit`
-- `quality_weight`
-
-y no colapsarlos automáticamente en un único valor ya penalizado. Esto preserva flexibilidad downstream sin perder disciplina semántica. Un modelo puede querer usar el valor crudo, el ponderado, o ambos; lo que no debe ocurrir es que el módulo le oculte qué política aplicó realmente. :contentReference[oaicite:16]{index=16}
-
-18. Integridad de mapping symbol–CIK
-
-La materialización PIT no puede construirse con un mapping de identidad ingenuo. Para cada `(d,c)`, la resolución del `symbol` debe ser PIT-safe y respetar el mapping historificado. Esto implica:
-
-- no usar un ticker nuevo para fechas donde aún no era el identificador activo;
-- no colapsar automáticamente share classes o mappings conflictivos;
-- excluir o marcar incidencia cuando la identidad activa del símbolo no pueda resolverse sin ambigüedad.
-
-Este punto es menos vistoso que el leakage temporal, pero igual de crítico: una mala resolución de identidad puede crear continuidad artificial en series fundamentales que en realidad pertenecen a entidades económicas distintas o a estados corporativos no comparables. :contentReference[oaicite:17]{index=17}
-
-19. Cobertura PIT
-
-Una buena especificación PIT no mide solo cuántas filas se generaron, sino cuánta cobertura útil existe por métrica, fecha y universo. Para cada métrica `m` se define:
-
-`rho_m = |{(d,s): metric_value_pit(d,s,m) es utilizable}| / |A x S|`
-
-Además conviene desagregar:
-
-- cobertura bruta;
-- cobertura tras aplicar staleness;
-- cobertura tras aplicar exclusiones por flags;
-- cobertura por sector, tamaño y bucket de liquidez.
-
-Esta descomposición permite distinguir si la pérdida de cobertura proviene de ausencia estructural, envejecimiento excesivo del dato o degradación de calidad regulatoria. Sin esta separación, el panel PIT puede parecer “completo” en agregado mientras pierde precisamente la parte del universo donde el dataset era más frágil. :contentReference[oaicite:18]{index=18}
-
-20. Flujo de ejecución
-
-El flujo correcto del módulo se compone de siete etapas:
-
-1. carga y validación de inputs;
-2. resolución PIT-safe de identidad `symbol`–`cik`;
-3. construcción del panel `asof x symbol x metric`;
-4. filtrado de candidatos observables con `acceptance_datetime <= asof`;
-5. selección determinista del mejor candidato;
-6. aplicación de staleness y calidad: `allow / penalize / exclude / stale`;
-7. persistencia de tabla PIT, cobertura, incidencias y manifest.
-
-Este flujo debe permanecer estable y versionado. Cambios en thresholds de staleness, jerarquía de arbitraje o política de calidad deben quedar reflejados en configuración y manifest. La estabilidad del flujo es parte del contrato productivo del módulo, no una comodidad de implementación. :contentReference[oaicite:19]{index=19}
-
-21. Artefactos obligatorios de salida
-
-El módulo debe generar, como mínimo:
-
-- `data/edgar/pit/date={yyyy-mm-dd}/part-*.parquet`
-- `data/edgar/pit/pit_coverage_{run_id}.parquet`
-- `data/edgar/pit/pit_issues_{run_id}.parquet`
-- `data/edgar/pit/manifest_{run_id}.json`
-
-El `manifest` debe incluir, al menos:
-
-- `run_id`
-- rango de `asof` procesado
-- número de símbolos y métricas materializados
-- cobertura bruta y neta
-- porcentaje de observaciones penalizadas, excluidas y stale
-- `config_hash`
-- timestamps de inicio y fin
-
-Un PIT sin artefactos explícitos de cobertura e incidencias no es suficientemente auditable. En producción seria, la pregunta no es solo “qué valor materializaste”, sino “qué dejaste fuera, por qué, y con qué coste de cobertura”. :contentReference[oaicite:20]{index=20}
-
-22. Validaciones obligatorias
-
-El módulo debe ejecutar, como mínimo, las siguientes validaciones:
-
-1. No leakage:
-   `forall p in P, source_acceptance_ts(p) <= asof(p)`
-
-2. Unicidad PIT por clave:
-   para cada `(asof, symbol, metric_name)` existe como máximo un registro materializado.
-
-3. Consistencia de staleness:
-   `staleness_days = asof - source_acceptance_ts`
-
-4. Cobertura reportada:
-   toda caída de cobertura debe quedar cuantificada por causa.
-
-5. Resolución de conflictos:
-   cualquier empate no resuelto debe ir a `pit_issues`, nunca resolverse implícitamente.
-
-Estas validaciones no son cosméticas. Definen el contrato causal del módulo. :contentReference[oaicite:21]{index=21}
-
-23. Precedencia de errores
-
-No todos los fallos PIT tienen la misma gravedad. La jerarquía correcta es:
-
-`temporal_leakage > identity_ambiguity > selection_conflict > coverage_collapse > row_level_staleness`
-
-Interpretación:
-
-- cualquier leakage temporal invalida la corrida;
-- conflictos de identidad o selección pueden bloquear parte material del PIT;
-- la staleness fila a fila degrada cobertura, pero no necesariamente invalida toda la corrida;
-- una buena tasa agregada de filas no compensa un fallo estructural de causalidad temporal.
-
-Esta precedencia debe estar escrita en especificación y reflejada en el artefacto de issues. No puede quedar a criterio informal de quien revise la corrida. :contentReference[oaicite:22]{index=22}
-
-24. Tests e invariantes obligatorios
-
-La implementación debe incluir, al menos, tests sobre:
-
-1. bloqueo absoluto cuando `acceptance_ts > asof`;
-2. selección correcta del último hecho observable;
-3. desempate determinista con timestamps iguales;
-4. amendment que sólo entra en vigor desde su aceptación;
-5. política `NaN` vs `exclude` vs `penalize`;
-6. staleness por métrica;
-7. resolución PIT-safe de `symbol`–`CIK`;
-8. unicidad por `(asof, symbol, metric_name)`;
-9. persistencia íntegra de coverage, issues y manifest;
-10. estabilidad bajo misma entrada y misma configuración.
-
-Estos tests definen el comportamiento contractual del módulo. En un PIT serio, los edge cases temporales importan tanto como el caso medio. :contentReference[oaicite:23]{index=23}
-
-25. Definition of Done
-
-El módulo `point_in_time.py` se considera terminado únicamente si:
-
-- materializa una vista PIT estrictamente causal y sin leakage;
-- selecciona de forma determinista el mejor hecho observable por métrica y fecha;
-- aplica políticas explícitas y configurables de staleness y calidad;
-- preserva trazabilidad completa hasta filing, aceptación y razón de selección;
-- emite artefactos reproducibles bajo `run_id`;
-- supera los tests mínimos de robustez temporal y operativa.
-
-En otras palabras, el módulo no está terminado cuando “produce una tabla as-of”, sino cuando convierte hechos canónicos en una base fundamental realmente defendible para investigación cuantitativa seria. :contentReference[oaicite:24]{index=24}
-
-26. MVP vs versión avanzada
-
-MVP correcto:
-
-- restricción estricta `acceptance_ts <= asof`;
-- selección determinista con arbitraje lexicográfico;
-- staleness por métrica;
-- política explícita `allow / penalize / exclude`;
-- `NaN` como tratamiento por defecto de dato no utilizable;
-- integración con flags de calidad;
-- artefactos de cobertura, incidencias y manifest;
-- tests de leakage, amendments y unicidad.
-
-Versión avanzada justificable:
-
-- decay dinámico de calidad con la edad del dato;
-- validación DAG causal de dependencias temporales;
-- regímenes de calidad tipo HMM sobre ventanas `asof`;
-- reconciliación multi-universo en mergers, spin-offs y bankruptcies;
-- cuantificación explícita de pérdida de IC frente a panel oracle no PIT.
-
-No es obligatorio, en esta fase, introducir HMM, Kelly sizing o DAG causal complejo como núcleo del módulo oficial. Son extensiones plausibles y valiosas, pero la prioridad correcta aquí es cerrar perfectamente la capa causal, el arbitraje determinista y la política explícita de staleness y calidad. :contentReference[oaicite:25]{index=25}
-
-27. Interpretación correcta
-
-`point_in_time.py` no debe interpretarse como un forward-fill sofisticado, sino como la capa que transforma una base fundamental canónica en una base fundamental verdaderamente utilizable para trading cuantitativo.
-
-Su función correcta es:
-
-- impedir leakage temporal y backfill futuro;
-- seleccionar el mejor hecho observable para cada fecha y métrica;
-- controlar explícitamente la edad informacional del dato;
-- integrar calidad regulatoria en la materialización;
-- preservar identidad y trazabilidad PIT-safe.
-
-Un PIT que cubra mucho pero viole causalidad no sirve. Un PIT conservador, auditable, trazable y estrictamente temporal sí sirve, aunque cubra algo menos. En fundamentales, el principal error no es perder algunas observaciones; es permitir que entren observaciones que aún no existían para el mercado. :contentReference[oaicite:26]{index=26}
-
-28. Conclusión
-
-`data/edgar/point_in_time.py` debe quedar definido como la pieza central de validez causal del subsistema EDGAR, no como una transformación auxiliar de panel.
-
-La especificación correcta no es “hacer una vista as-of”, sino:
-
-- fijar qué hechos son observables;
-- fijar cómo se arbitran candidatos;
-- fijar cómo envejecen las métricas;
-- fijar cómo interactúa la calidad regulatoria con la materialización;
-- fijar qué se excluye, qué se penaliza y qué se deja pasar;
-- fijar qué artefactos de cobertura e incidencias salen;
-- y fijar qué invariantes protegen al research de leakage silencioso.
-
-Si cumple esta especificación, el módulo deja de ser una capa ETL y pasa a ser la frontera real entre facts canónicos y facts cuantitativamente defendibles. Si no la cumple, el riesgo no es sólo técnico: es introducir la forma más peligrosa de error cuantitativo, la que mejora artificialmente el backtest sin romper nunca el código. :contentReference[oaicite:27]{index=27}
+- Filing aceptado 1 día después de asof → excluido del panel.
+- Filing aceptado 1 día antes de asof → incluido.
+- Restatement posterior reemplaza valor original para misma métrica+periodo.
+- Staleness calculada correctamente: asof - filed_date.
+- Age bucket correcto: 45d → "fresh", 200d → "aging", 400d → "stale".
+- Dos filings para misma métrica+periodo → el más reciente gana.

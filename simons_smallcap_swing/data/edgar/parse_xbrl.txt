@@ -1,570 +1,69 @@
-Especificación Cuantitativa: data/edgar/parse_xbrl.py
+Especificación: data/edgar/parse_xbrl.py
 
-1. Propósito del módulo
+1. Propósito
 
-El módulo `data/edgar/parse_xbrl.py` implementa la capa formal de canonización semántica, normalización de unidades, resolución de contexto contable y deduplicación determinista de los facts XBRL procedentes del subsistema EDGAR. Su función no es simplemente convertir una estructura XBRL heterogénea en una tabla tabular, sino construir una base canónica de hechos fundamentales que preserve comparabilidad económica, trazabilidad documental y compatibilidad point-in-time para investigación cuantitativa, construcción de features y validación de señales.
+Transforma los company facts crudos (JSON de SEC) en una tabla normalizada
+de métricas financieras con resolución de unidades, períodos y mapping a
+nombres canónicos. Este es el paso que convierte datos XBRL heterogéneos
+en una tabla homogénea consumible por point_in_time.py.
 
-El principio rector del módulo es el siguiente:
+2. Problema que resuelve
 
-un fact XBRL no es utilizable porque exista en el payload de origen, sino porque puede mapearse de forma determinista a una métrica interna, con unidad, periodo, contexto y prioridad semántica compatibles con el esquema analítico del sistema.
+Los XBRL facts de SEC son caóticos:
+- Mismo concepto con diferentes taxonomías (us-gaap vs dei vs custom).
+- Unidades inconsistentes (USD, USD/shares, shares, pure).
+- Períodos que pueden ser instantáneos (balance) o duraciones (income).
+- Una empresa puede reportar la misma métrica con tags diferentes en
+  diferentes filings.
 
-Formalmente, el módulo implementa un operador de canonización:
+parse_xbrl aplica reglas de mapping configurables para normalizar esto.
 
-C_xbrl : (B, Θ, r, a) -> (F_can, R_rej, M)
+3. Mapping rules (DEFAULT_MAPPING_RULES)
 
-donde:
+Lista de reglas [{taxonomy, tag_pattern, canonical_name, unit_filter,
+period_type, priority}]. Ejemplo:
+  us-gaap / RevenueFromContract* → "revenue" / USD / duration / priority=10
+  us-gaap / Revenues → "revenue" / USD / duration / priority=5
 
-- B es el conjunto de hechos XBRL brutos procedentes de `submissions` y `companyfacts`;
-- Θ es la configuración versionada de mappings, reglas de prioridad, normalización y arbitraje;
-- r es el `run_id`;
-- a es el `asof` lógico de la corrida, cuando aplique;
-- F_can es la tabla de facts canónicos;
-- R_rej es el conjunto de facts rechazados con motivo explícito;
-- M es el manifest auditable de la ejecución.
+Cuando múltiples reglas matchean, gana la de mayor priority.
 
-El módulo constituye, por tanto, la frontera entre “tener tags XBRL” y “tener hechos fundamentales comparables”. Su valor no reside en parsear más registros, sino en resolver correctamente las ambigüedades que separan un fact bruto de una métrica cuantitativamente explotable.
+resolve_mapping(config, taxonomy, tag) → MappingDecision con:
+  canonical_name, priority, unit_decision, period_decision.
 
-2. Papel dentro de la arquitectura EDGAR
+4. Unit normalization
 
-`parse_xbrl.py` se sitúa aguas abajo de:
+UnitDecision: canonical_unit, conversion_factor, is_per_share.
+Aliases configurables: {"usd": "USD", "usdpershare": "USD/shares"}.
+canonicalize_unit(value, aliases) → normalized string.
 
-- `fetch_submissions.py`, que captura la cronología y metadata de filings;
-- `fetch_companyfacts.py`, que materializa el repositorio raw de facts;
+5. Period classification
 
-y aguas arriba de:
+PeriodDecision: period_type ∈ {instant, duration}, fiscal_alignment.
+Balance sheet items → instant (end date only).
+Income/cash flow → duration (start + end dates).
 
-- `filings_flags.py`, que deriva señales de calidad y riesgo regulatorio;
-- `point_in_time.py`, que impone observabilidad temporal estricta;
-- la construcción de features fundamentales;
-- y el subsistema de validación y control de calidad EDGAR.
+6. Pipeline
 
-Su responsabilidad es específica y crítica. El módulo:
+load_submissions_metadata() → load_companyfacts_candidates()
+→ build_accession_lookup() → resolve mappings → build output table.
 
-- sí resuelve mappings entre tags y métricas internas;
-- sí normaliza unidades, escalas y tipos de periodo;
-- sí arbitra conflictos entre taxonomías, tags equivalentes y contextos múltiples;
-- sí decide aceptación o rechazo de un fact para el esquema canónico;
-- pero no decide todavía la selección PIT final por `asof`;
-- y no imputa valores faltantes ni construye directamente factores finales.
+Output table columns:
+  cik, symbol, canonical_metric, value, unit, period_type,
+  start_date, end_date, fiscal_year, fiscal_period,
+  form_type, filed_date, accession_number,
+  taxonomy, original_tag, mapping_priority.
 
-En otras palabras, `parse_xbrl.py` no es una simple fase ETL, sino una capa de resolución semántica contable.
+7. Persistencia
 
-3. Principios de diseño no negociables
+parsed_xbrl/{asof}/{run_id}/metrics.parquet
+parsed_xbrl/{asof}/{run_id}/mapping_log.parquet (qué regla mapeó qué)
+parsed_xbrl/{asof}/{run_id}/unmapped.parquet (tags sin mapping)
 
-La especificación del módulo se rige por los siguientes principios:
+8. Tests mínimos
 
-1. Canonización semántica versionada:
-   todo mapping tag -> métrica debe venir de configuración externa, versionada y auditable.
-
-2. Separación estricta de responsabilidades:
-   parseo semántico no es selección PIT final, ni imputación, ni feature engineering.
-
-3. Precedencia taxonómica explícita:
-   la competencia entre taxonomías no puede resolverse por orden accidental de llegada.
-
-4. Normalización de unidades con compatibilidad económica:
-   convertir unidades sólo cuando exista regla explícita y semánticamente correcta.
-
-5. Resolución de contexto temporal:
-   todo fact debe quedar clasificado con un `period_type` canónico o ser rechazado.
-
-6. Deduplicación determinista:
-   para una misma clave económica debe existir una única selección canónica o un rechazo explícito por conflicto no resuelto.
-
-7. Rechazo auditable:
-   todo fact descartado debe salir con `rejection_class` y evidencia suficiente.
-
-8. Compatibilidad temporal mínima:
-   `filed_date` y, cuando exista, `acceptance_datetime`, deben ser consistentes con `period_end`.
-
-9. Trazabilidad completa:
-   todo fact aceptado debe poder reconstruirse hasta tag original, taxonomía, unidad, filing y configuración de mapping.
-
-Estos principios convierten al módulo en infraestructura semántica fundamental y no en un parser utilitario.
-
-4. Alcance funcional
-
-El alcance del módulo incluye, como mínimo:
-
-1. Mapping tag -> métrica interna:
-   asociación de conceptos XBRL a un vocabulario analítico interno versionado.
-
-2. Arbitraje entre taxonomías:
-   resolución explícita entre US-GAAP, DEI, IFRS u otras taxonomías admitidas.
-
-3. Normalización de unidades y escalas:
-   conversión a una unidad base por métrica.
-
-4. Resolución de contexto:
-   tratamiento de periodos instantáneos vs duracionales, frames, FY/FP y granularidad temporal.
-
-5. Deduplicación y selección canónica:
-   elección determinista del mejor fact cuando existen múltiples candidatos para la misma métrica económica.
-
-6. Validación y rechazo:
-   separación explícita entre hechos aceptados y rechazados con razón estructurada.
-
-7. Persistencia auditable:
-   emisión de artefactos reproducibles bajo `run_id`.
-
-El alcance no incluye:
-
-- imputación estadística de valores ausentes;
-- decisión final sobre observabilidad point-in-time;
-- reconciliación económica completa de estados financieros;
-- o modelización de factores finales.
-
-Esta separación es esencial: una ingestión fuerte captura, una canonización fuerte resuelve semántica, y una capa PIT fuerte impone temporalidad. Mezclar esas tres responsabilidades es una fuente clásica de leakage y de bugs difíciles de auditar.
-
-5. Entradas del módulo
-
-Las entradas del módulo son:
-
-- `submissions_raw_path`: ruta al repositorio raw de submissions EDGAR.
-- `companyfacts_raw_path`: ruta al repositorio raw de companyfacts XBRL.
-- `xbrl_mapping_config_path`: archivo de configuración con mappings, prioridades taxonómicas, reglas de unidad, ventanas de periodo y causas de rechazo.
-- `run_id`: identificador único y auditable de ejecución.
-- `asof` opcional pero recomendado: fecha lógica de snapshot.
-
-En notación formal:
-
-I = {B_S, B_F, Θ_map, r, a}
-
-donde:
-
-- B_S es el conjunto de submissions;
-- B_F es el conjunto de companyfacts;
-- Θ_map es la parametrización del motor de canonización;
-- r es el `run_id`;
-- a es el `asof` lógico.
-
-6. Contrato mínimo de entrada
-
-Antes de aceptar ningún fact para procesamiento, el módulo debe validar:
-
-- legibilidad y existencia de los paths de entrada;
-- presencia de los campos mínimos para reconstruir el fact:
-  (`cik`, `taxonomy`, `tag`, `unit`, `value`, `filed_date`)
-  con `period_end` o un contexto temporal equivalente;
-- parseabilidad de fechas y timestamps;
-- validez sintáctica y semántica del archivo de configuración;
-- existencia de una política explícita para taxonomías no reconocidas y unidades no convertibles.
-
-Si este contrato falla a nivel de lote o de payload, el módulo debe registrar la incidencia de forma auditable y rechazar los registros afectados sin contaminar la tabla canónica.
-
-7. Unidad de observación y representación intermedia
-
-La unidad de observación natural no es aún la métrica canónica, sino el fact candidato. Cada candidato puede representarse como:
-
-x = (c, τ, t, u0, v0, e, d_f, α, ϕ, π, ξ, r)
-
-donde:
-
-- c es el `CIK`;
-- τ es la taxonomía;
-- t es el tag XBRL original;
-- u0 es la unidad original;
-- v0 es el valor bruto;
-- e es el `period_end`;
-- d_f es la `filed_date`;
-- α es `acceptance_datetime`, cuando exista;
-- ϕ es el `period_type` o el contexto temporal bruto;
-- π representa metadatos fiscales como `fy`/`fp`;
-- ξ representa contexto auxiliar (`frame`, `accession_number`, `form_type`, fuente, etc.);
-- r es el `run_id`.
-
-La canonización transforma este candidato x en un fact canónico f_can o en un rechazo estructurado r_rej.
-
-8. Modelo de salida canónica
-
-Cada fila aceptada en `facts_canonical` debe contener, como mínimo:
-
-- `cik`
-- `symbol`
-- `metric_name`
-- `value`
-- `unit_base`
-- `period_end`
-- `period_type`
-- `filed_date`
-- `acceptance_datetime`
-- `source_taxonomy`
-- `source_tag`
-- `source_unit`
-- `accession_number`
-- `form_type`
-- `mapping_version`
-- `run_id`
-
-Campos de alta prioridad recomendados:
-
-- `metric_family`
-- `unit_scale_factor`
-- `canonical_priority_rank`
-- `selection_reason`
-- `quality_score`
-- `source_record_hash`
-
-La tabla de rechazados debe contener, al menos:
-
-- `cik`
-- `taxonomy`
-- `tag`
-- `unit`
-- `period_end`
-- `filed_date`
-- `acceptance_datetime`
-- `rejection_class`
-- `rejection_detail`
-- `run_id`
-
-9. Arquitectura de resolución semántica
-
-La parte crítica del módulo no es el parseo, sino el arbitraje. Para un candidato x, la canonización puede describirse como una composición:
-
-C_xbrl = S_select o V_validate o U_unit o P_period o M_map
-
-donde:
-
-- M_map resuelve el mapping tag -> métrica interna;
-- P_period canoniza el contexto temporal;
-- U_unit normaliza unidad y escala;
-- V_validate aplica reglas de aceptación/rechazo;
-- S_select decide el mejor candidato entre múltiples hechos equivalentes.
-
-Esta arquitectura es obligatoria porque impide mezclar validación, selección y mapping de forma opaca. Cada etapa debe ser auditable por separado.
-
-10. Mapping versionado tag -> métrica
-
-Sea t un tag XBRL y τ su taxonomía. El mapping canónico no debe depender sólo del tag, sino del par (τ,t) y, cuando proceda, del contexto. Se define:
-
-m = Φ_Θ(τ, t, ξ)
-
-donde Φ_Θ es una función versionada y externa al código, parametrizada por Θ.
-
-La salida del mapping debe incluir no solo la métrica interna m, sino también:
-
-- `mapping_status` en {`exact`, `alias`, `heuristic`, `unmapped`};
-- una prioridad de mapping;
-- una versión de configuración;
-- y, si aplica, una familia económica de la métrica.
-
-Esto permite distinguir un mapping sólido de uno provisional, y evita tratar como igualmente fiables todos los tags resueltos.
-
-11. Precedencia entre taxonomías
-
-Una de las debilidades clásicas en pipelines XBRL es mezclar taxonomías compatibles sólo parcialmente. Este módulo debe definir una precedencia explícita entre taxonomías. Por ejemplo:
-
-`us-gaap` ≻ `dei` ≻ `ifrs-full` ≻ `issuer-extension`
-
-salvo que una regla específica de configuración indique lo contrario para una métrica concreta.
-
-Esto implica que, si dos tags diferentes de taxonomías distintas compiten por representar la misma métrica interna, no se elige arbitrariamente. Se aplica una política explícita:
-
-1. priorizar la taxonomía de mayor jerarquía admitida para esa métrica;
-2. si la taxonomía es equivalente pero el tag tiene menor prioridad semántica, degradarlo;
-3. si la competencia no puede resolverse sin ambigüedad, rechazar o marcar el caso para revisión según configuración.
-
-Esta jerarquía es indispensable para evitar que la tabla canónica termine siendo una mezcla opaca de conceptos solo superficialmente equivalentes.
-
-12. Normalización de unidades y escala
-
-Para una métrica interna m, la configuración debe definir una unidad base u*(m). Dado un hecho con unidad original u0 y valor v0, la transformación es:
-
-v = v0 * λ(u0, m)
-u = u*(m)
-
-donde λ(u0,m) es el factor de conversión o escala aplicable.
-
-La normalización no puede depender sólo de la cadena textual de la unidad. Debe considerar:
-
-- unidades monetarias vs monetarias por acción;
-- magnitudes instantáneas vs acumuladas;
-- factores de escala explícitos o implícitos;
-- unidades incompatibles que no deben fusionarse;
-- y casos donde la conversión es técnicamente posible pero semánticamente incorrecta.
-
-Por tanto, la política correcta es:
-
-- convertir cuando la unidad es compatible y la regla es explícita;
-- rechazar cuando la unidad es incompatible para la métrica;
-- no inventar conversiones heurísticas de alto riesgo sin marcarlas como tales.
-
-13. Canonización del contexto temporal
-
-La dimensión temporal no se reduce a `period_end`. El módulo debe resolver:
-
-- si el hecho es instantáneo o duracional;
-- la duración económica relevante del hecho;
-- la conversión a `period_type` interno;
-- y la compatibilidad entre hechos con distinto frame o distinto FY/FP.
-
-Sea x un candidato. La función temporal puede expresarse como:
-
-ϕ* = Ψ_Θ(e, ϕ, π, ξ)
-
-donde ϕ* pertenece a un vocabulario interno como:
-
-{`Q`, `Y`, `TTM`, `H1`, `NineM`, `Instant`}
-
-o al subconjunto que decida el sistema.
-
-No todos los contextos deben aceptarse automáticamente. Deben rechazarse o marcarse los hechos cuya duración sea incompatible con la métrica canónica objetivo o no pueda resolverse de forma estable.
-
-14. Clave económica y deduplicación
-
-La clave correcta no puede ser solo `(cik, metric_name, period_end, filed_date)`, porque dos hechos pueden compartir esos campos y diferir materialmente en taxonomía, unidad, contexto o prioridad semántica.
-
-La clave de equivalencia económica mínima debe ser:
-
-k_econ = (`cik`, `metric_name`, `period_end`, `period_type`)
-
-Para cada clase de equivalencia F(k_econ), el módulo debe resolver un único fact canónico o marcar conflicto.
-
-15. Regla de selección determinista
-
-Cuando varios candidatos compiten por la misma clave económica, se debe aplicar una política explícita de precedencia. La ordenación oficial debe ser la tupla lexicográfica:
-
-(
-  `taxonomy_priority`,
-  `mapping_priority`,
-  `unit_compatibility`,
-  `context_quality`,
-  `filed_date`,
-  `acceptance_datetime`
-)
-
-Esto implica la siguiente jerarquía:
-
-1. mayor prioridad taxonómica;
-2. mejor prioridad de mapping semántico;
-3. unidad totalmente compatible frente a unidad dudosa;
-4. contexto temporal más alineado con la definición de la métrica;
-5. filing más reciente;
-6. mayor `acceptance_datetime` si persiste el empate.
-
-Si persiste un empate exacto incluso después de estos criterios, el caso debe:
-
-- o resolverse con una regla final documentada en configuración;
-- o marcarse como conflicto crítico y salir a `facts_rejected`.
-
-16. Reglas de rechazo
-
-Todo rechazo debe quedar clasificado. La taxonomía mínima de motivos de rechazo es:
-
-`rejection_class` in {
-  `unmapped_tag`,
-  `unsupported_taxonomy`,
-  `incompatible_unit`,
-  `invalid_value`,
-  `invalid_date`,
-  `ambiguous_context`,
-  `duplicate_dominated`,
-  `conflict_unresolved`
-}
-
-Esta clasificación permite:
-
-- monitorear deriva de taxonomías;
-- distinguir ausencia de cobertura de conflicto semántico;
-- y detectar dónde está realmente la fricción del pipeline.
-
-17. Validaciones obligatorias
-
-El módulo debe imponer, como mínimo, las siguientes validaciones:
-
-1. Mapping resuelto:
-   para todo fact aceptado, `metric_name` no puede ser nulo.
-
-2. Fechas coherentes:
-   `filed_date >= period_end`
-   y, cuando exista,
-   `acceptance_datetime >= period_end`.
-
-3. Unidad compatible:
-   la unidad del hecho debe ser convertible a la unidad base de la métrica o el hecho debe rechazarse.
-
-4. Valor numérico válido:
-   sin infinitos, NaNs operativamente inválidos o cadenas no parseables.
-
-5. Rango económico razonable:
-   para cada métrica m,
-   `value in [v_min_m, v_max_m]`
-   donde los límites pueden depender de la familia económica.
-
-6. Compatibilidad de contexto:
-   el `period_type` derivado debe ser admisible para la métrica interna.
-
-Estas validaciones no son solo QA cosmético: protegen frente a mezclas silenciosas de hechos incompatibles que destruyen comparabilidad sin generar errores sintácticos.
-
-18. Quality score del fact canónico
-
-Para uso downstream avanzado, conviene que cada fact canónico lleve un `quality_score`. No para decidir PIT final, sino para informar a capas posteriores sobre la fortaleza relativa del proceso de resolución.
-
-Sea f un candidato aceptado. Puede definirse:
-
-q(f) =
-  w_τ q_τ(f) +
-  w_m q_m(f) +
-  w_u q_u(f) +
-  w_ϕ q_ϕ(f) +
-  w_d q_d(f)
-
-con `q(f) in [0,1]`, donde cada componente mide calidad taxonómica, de mapping, de unidad, de contexto y de dominancia en la selección.
-
-Esto permite distinguir:
-
-- un fact US-GAAP exacto, perfectamente compatible y dominante;
-- de un fact aceptado vía alias o mapping heurístico con menor prioridad.
-
-19. Flujo de ejecución
-
-El flujo del módulo debe estructurarse en seis etapas:
-
-1. carga y validación de inputs;
-2. construcción de candidatos;
-3. resolución semántica;
-4. validación y rechazo;
-5. selección canónica;
-6. persistencia.
-
-Más explícitamente:
-
-1. lectura de raw facts, submissions y configuración;
-2. expansión del raw XBRL a una tabla intermedia de hechos candidatos;
-3. mapping, prioridad taxonómica, unidad y contexto;
-4. separación entre aceptables y no aceptables;
-5. deduplicación y arbitraje entre candidatos equivalentes;
-6. escritura de `facts_canonical`, `facts_rejected`, `facts_metrics` y `manifest`.
-
-20. Artefactos de salida
-
-El módulo debe generar como mínimo:
-
-- `data/edgar/parsed/facts_canonical_{run_id}.parquet`
-- `data/edgar/parsed/facts_rejected_{run_id}.parquet`
-- `data/edgar/parsed/facts_metrics_{run_id}.parquet`
-- `data/edgar/parsed/manifest_{run_id}.json`
-
-El manifest debe incluir:
-
-- `run_id`
-- `asof`
-- número de candidatos procesados
-- número de aceptados
-- número de rechazados por clase
-- distribución por taxonomía
-- distribución por `mapping_status`
-- hash de configuración
-- timestamps de inicio y fin
-
-21. Precedencia de errores
-
-No todos los fallos tienen la misma gravedad. La jerarquía correcta debe ser:
-
-`schema_or_config_failure`
-≻ `systemic_mapping_failure`
-≻ `taxonomy_conflict`
-≻ `unit_or_context_incompatibility`
-≻ `row_level_anomaly`
-
-Esto implica que:
-
-- un fallo de configuración o schema puede invalidar toda la corrida;
-- una caída masiva del mapping no puede tratarse como una simple suma de rejects fila a fila;
-- conflictos semánticos sistémicos pesan más que pequeñas anomalías individuales;
-- un pipeline no es sano solo porque el porcentaje de filas aceptadas sea alto.
-
-22. CLI y uso operativo
-
-La interfaz operativa recomendada es:
-
-python -m data.edgar.parse_xbrl ^
-  --submissions-path data/edgar/raw/submissions ^
-  --companyfacts-path data/edgar/raw/companyfacts ^
-  --config-path configs/data/edgar_parse_xbrl.yaml ^
-  --run-id parse_xbrl_20260305_001 ^
-  --asof 2026-03-05
-
-El uso de `asof` explícito es recomendable para mantener versionado coherente con el resto del subsistema EDGAR.
-
-23. Tests mínimos obligatorios
-
-Para que el módulo quede realmente cerrado a nivel de producción, su DoD debe exigir al menos:
-
-1. test de mapping exacto de tag a métrica interna;
-2. test de prioridad correcta entre taxonomías competidoras;
-3. test de rechazo de unidad incompatible;
-4. test de conversión correcta de escala y unidad;
-5. test de resolución consistente de `period_type`;
-6. test de deduplicación determinista entre múltiples candidatos;
-7. test de conflicto no resoluble enviado a `facts_rejected`;
-8. test de estabilidad bajo misma configuración y misma entrada;
-9. test de persistencia íntegra de manifest y métricas;
-10. test de clasificación correcta de `rejection_class`.
-
-Estos tests no son cosméticos. Definen el contrato institucional del módulo.
-
-24. Definition of Done
-
-El módulo se considera terminado únicamente si:
-
-- transforma hechos XBRL brutos en métricas internas canónicas con reglas versionadas;
-- resuelve explícitamente taxonomía, unidad, escala y contexto;
-- aplica una política determinista de selección entre candidatos equivalentes;
-- registra rechazos con causa auditable;
-- emite artefactos reproducibles bajo `run_id`;
-- y supera los tests mínimos de robustez semántica.
-
-25. MVP vs versión avanzada
-
-MVP correcto:
-
-- mapping versionado tag -> métrica;
-- precedencia taxonómica explícita;
-- normalización de unidades con reglas cerradas;
-- resolución de `period_type`;
-- deduplicación determinista por `k_econ`;
-- taxonomía estructurada de rechazos;
-- `quality_score` básico;
-- artefactos auditables y reproducibles.
-
-Versión avanzada justificable:
-
-- detección de drift taxonómico;
-- reglas más ricas de contexto multi-periodo;
-- validación adicional de identidades contables;
-- monitorización de impacto por cambio de ontology version;
-- capas auxiliares probabilísticas o embedding-driven como diagnóstico.
-
-No es obligatorio, en esta fase, introducir embeddings financieros, matching probabilístico u optimización dinámica multi-periodo como núcleo del módulo oficial. Son extensiones plausibles y potentes, pero la prioridad correcta aquí es cerrar bien la capa rule-based, determinista, auditable y semánticamente disciplinada.
-
-26. Interpretación correcta
-
-`parse_xbrl.py` es el núcleo semántico del subsistema fundamental EDGAR. Si esta capa es débil, el sistema no trabaja con hechos comparables, sino con una mezcla opaca de tags, unidades y contextos solo aparentemente homogéneos.
-
-Su función correcta es:
-
-- convertir heterogeneidad XBRL en homogeneidad de métricas internas;
-- resolver conflictos de taxonomía, unidad y contexto con arbitraje explícito;
-- preservar trazabilidad documental completa;
-- rechazar con causa clara lo que no pueda compararse con seguridad;
-- y entregar a downstream una base canónica disciplinada.
-
-Un parser que acepte muchos registros pero mezcle semánticas incompatibles no sirve. Un canonizador conservador, trazable, versionado y determinista sí sirve, aunque rechace más candidatos. En fundamentales, el principal error no es perder algunos facts dudosos; es aceptar como comparables hechos que no lo eran.
-
-27. Conclusión
-
-`data/edgar/parse_xbrl.py` debe quedar definido como una pieza institucional de canonización semántica, no como una fase ETL convencional.
-
-La especificación correcta no es “parsear XBRL y sacar una tabla”, sino:
-
-- fijar qué entra;
-- fijar cómo se mapea;
-- fijar cómo se priorizan taxonomías;
-- fijar cómo se normalizan unidades y periodos;
-- fijar cómo se deduplica y arbitra;
-- fijar qué se rechaza y por qué;
-- y fijar qué artefactos auditables salen.
-
-Si cumple esta especificación, el módulo deja de ser un parser y pasa a ser la base semántica fiable del stack fundamental EDGAR. Si no la cumple, el riesgo no es sólo técnico: es contaminar toda la cadena PIT y cualquier modelo downstream con hechos sólo aparentemente comparables.
+- Mapping rule con mayor priority gana sobre menor priority.
+- Revenue tag → canonical_name "revenue".
+- Unit "USD" y "usd" normalizan al mismo valor.
+- Period type: Assets → instant, Revenue → duration.
+- Tag sin mapping rule → aparece en unmapped.parquet.
+- Accession number → sanitize_accession_number format.

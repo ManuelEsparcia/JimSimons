@@ -1,589 +1,89 @@
-Especificación Cuantitativa: simons_core/calendar.py
+Especificación: simons_core/calendar.py
 
-0. Propósito y papel dentro del stack
+1. Propósito
 
-simons_core/calendar.py define la fuente de verdad temporal del stack para mercados de renta variable estadounidense, en particular NYSE/NASDAQ bajo la convención horaria de America/New_York. Su función no es contener lógica de señal, entrenamiento o ejecución, sino fijar de forma inequívoca qué fechas civiles corresponden a sesiones válidas de mercado, cómo se avanza o retrocede entre ellas, cómo se cuentan distancias en trading days y cómo se alinean timestamps a una sesión canónica.
+Fuente de verdad temporal del stack para US equities. Opera sobre sesiones
+reales de mercado (NYSE/NASDAQ), no sobre business days genéricos. Timezone
+canónica: America/New_York. Backend: exchange_calendars (encapsulado).
 
-En un sistema cuantitativo serio, este módulo es infraestructura crítica. Su valor no está en “gestionar fechas”, sino en impedir una familia muy concreta de errores:
-- confundir días naturales con días de mercado;
-- usar reglas distintas de avance temporal entre research, backtest y ejecución;
-- alinear timestamps a sesiones inconsistentes según el componente consumidor;
-- contaminar horizontes de predicción y validación por drift temporal.
+2. Modelo formal
 
-La regla institucional debe ser esta:
+    S = {s_1 < s_2 < ... < s_n}  sesiones válidas, ordenadas y únicas
 
-    toda transformación temporal del stack
-    que dependa de sesiones de mercado
-    debe resolverse a través de una única geometría temporal,
-    explícita, determinista y reusable.
+Operaciones sobre S:
+    next_trading_day(d, n)   -> s_{k+n-1}  (k = primera sesión > d)
+    prev_trading_day(d, n)   -> s_{k-(n-1)}  (k = última sesión < d)
+    trading_days_between(a,b,inclusive) -> |S ∩ [a,b]| según semántica
+    align_to_session(ts, mode) -> timestamp alineado a sesión
+    trading_days_array(a,b,inclusive) -> DatetimeIndex de sesiones
 
-1. Objetivo formal del módulo
+3. MarketCalendar (frozen dataclass)
 
-Sea un calendario de mercado dado y sea
+Campos:
+  market, timezone, sessions (DatetimeIndex tz-naive), opens (tz-aware),
+  closes (tz-aware), session_types (Series optional), backend_name
 
-    S = {s_1 < s_2 < ... < s_n}
+Propiedades:
+  first_session, last_session, coverage, schedule, n_sessions
 
-el conjunto ordenado de sesiones válidas del mercado dentro de un horizonte temporal. El módulo implementa operaciones sobre S, no sobre el calendario civil bruto.
+Métodos:
+  is_trading_day, session_open, session_close, session_type,
+  is_early_close, session_duration_minutes,
+  next_trading_day, prev_trading_day, trading_days_between,
+  trading_days_array, align_to_session
 
-La semántica central del módulo consiste en definir aplicaciones del tipo:
+4. SessionType enum
 
-    Φ : CivilDate × Market -> TradingSession
+  REGULAR, EARLY_CLOSE, HALF_DAY, SPECIAL
 
-y transformaciones derivadas como:
+5. Semánticas estrictas
 
-    next(d, n)
-    prev(d, n)
-    between(d1, d2, inclusive)
-    align(ts, mode)
+next_trading_day: estrictamente posterior a d. n >= 1.
+prev_trading_day: estrictamente anterior a d. n >= 1.
+trading_days_between: 4 modos (left, right, both, neither).
+  left  -> [start, end)
+  right -> (start, end]
+  both  -> [start, end]
+  neither -> (start, end)
+align_to_session:
+  next_open   -> primer open >= ts
+  prev_close  -> último close <= ts
+  session_label -> etiqueta de sesión tz-aware
 
-donde:
-- d, d1, d2 son fechas civiles o timestamps normalizados;
-- n es un desplazamiento entero positivo;
-- mode fija la regla exacta de alineación;
-- inclusive fija la semántica de intervalo.
+6. Normalización
 
-La propiedad operativa clave del módulo es:
+- Naive timestamps -> tz_localize(America/New_York, ambiguous="raise")
+- Tz-aware -> tz_convert(America/New_York)
+- Session labels -> tz-naive midnight (separate de opens/closes tz-aware)
+- DST transitions -> TimestampNormalizationError si ambiguo
 
-    mismas entradas lógicas, mismo calendario y misma convención
-    deben producir siempre la misma sesión resultado.
+7. Nuevos métodos (v1.1)
 
-2. Principios no negociables
+is_early_close(date_like) -> bool:
+  True si EARLY_CLOSE o HALF_DAY. Para fill simulation y impact models.
 
-P1. Temporal single source of truth.
-Toda lógica de trading day debe anclarse a este módulo, no a offsets civiles improvisados.
+session_duration_minutes(date_like) -> float:
+  Usa opens/closes reales. Regular=390, Thanksgiving Friday=210.
 
-P2. Timezone canónica.
-La geometría temporal base para US equities debe ser America/New_York.
+trading_days_array(start, end, inclusive) -> DatetimeIndex:
+  Batch de sesiones entre dos fechas. Para ejes de backtest, label horizons.
 
-P3. Sesión ≠ día natural.
-El módulo opera sobre sesiones válidas, no sobre business days genéricos.
+8. Fail modes
 
-P4. Semántica explícita de inclusividad.
-between() y funciones afines deben documentar exactamente qué extremos cuentan.
+- n <= 0 en next/prev -> ValueError
+- Rango invertido en between -> ValueError
+- Fecha fuera de cobertura -> CalendarRangeError
+- Mercado no soportado -> UnsupportedMarketError
+- DST ambiguo -> TimestampNormalizationError
 
-P5. Normalización explícita.
-str, date, datetime naive y tz-aware deben pasar por rutas de normalización cerradas.
+9. Tests mínimos
 
-P6. Determinismo.
-No puede depender de timezone local del proceso, locale del sistema o heurísticas implícitas.
-
-P7. Fail-closed.
-Entradas inválidas, rangos fuera de cobertura o convenciones no soportadas deben fallar explícitamente.
-
-3. Ámbito y no-objetivos
-
-El módulo cubre:
-
-- carga de calendario de mercado;
-- representación interna de sesiones válidas;
-- next_trading_day;
-- prev_trading_day;
-- trading_days_between;
-- align_to_session;
-- normalización de fechas y timestamps;
-- soporte para sesiones regulares y, idealmente, sesiones especiales.
-
-Queda fuera de alcance:
-
-- generación de señales;
-- construcción de features;
-- labelled data;
-- ejecución;
-- scheduling general de tareas;
-- time arithmetic arbitraria fuera del contexto de mercado.
-
-4. Modelo conceptual
-
-La estructura conceptual base es:
-
-    S = {s_1, s_2, ..., s_n}
-
-con:
-- orden total estricto;
-- unicidad de sesiones;
-- timezone consistente;
-- cobertura explícita en un rango temporal finito o extensible.
-
-Cada s_i representa una sesión de trading, no un instante cualquiera. Según el grado de detalle del calendario, una sesión puede además llevar metadatos de tipo, por ejemplo:
-- regular
-- early_close
-- half_day
-- special
-
-Este enriquecimiento no es ornamental: evita perder información crítica como el hecho de que Thanksgiving Friday en NYSE sí es trading day, pero no una sesión regular completa.
-
-5. API pública recomendada
-
-La API pública mínima y suficiente debe ser:
-
-~~~python
-load_market_calendar(market: str = "US_EQ") -> MarketCalendar
-
-next_trading_day(date_like, n: int = 1, market: str = "US_EQ") -> date
-prev_trading_day(date_like, n: int = 1, market: str = "US_EQ") -> date
-
-trading_days_between(
-    start,
-    end,
-    market: str = "US_EQ",
-    inclusive: str = "left",
-) -> int
-
-align_to_session(
-    ts_like,
-    mode: str = "next_open",
-    market: str = "US_EQ",
-) -> pd.Timestamp
-~~~
-
-o, preferiblemente, como métodos sobre una clase principal:
-
-~~~python
-class MarketCalendar:
-    def next_trading_day(self, date_like, n: int = 1) -> date: ...
-    def prev_trading_day(self, date_like, n: int = 1) -> date: ...
-    def trading_days_between(self, start, end, inclusive="left") -> int: ...
-    def align_to_session(self, ts_like, mode="next_open") -> pd.Timestamp: ...
-~~~
-
-6. Semántica precisa de operaciones
-
-6.1. load_market_calendar
-
-Debe cargar o construir una representación reutilizable del calendario, cacheable por mercado y rango. Dos llamadas equivalentes con misma especificación no deben producir reglas distintas.
-
-6.2. next_trading_day(date_like, n=1)
-
-Debe devolver la n-ésima sesión válida posterior a la fecha dada, bajo convención estrictamente posterior salvo que la API documente otra cosa.
-
-Formalmente, si s_k es la primera sesión estrictamente posterior a d:
-
-    next(d, n) = s_{k+n-1}
-
-Regla crítica:
-n debe satisfacer n >= 1.
-
-6.3. prev_trading_day(date_like, n=1)
-
-Análogo hacia atrás. Si s_k es la última sesión estrictamente anterior o igual según convención, prev debe documentar exactamente la semántica que aplica.
-
-6.4. trading_days_between(start, end, inclusive)
-
-Debe contar sesiones válidas entre extremos bajo una convención explícita. La implementación no debe basarse en restar fechas civiles ni en business days genéricos.
-
-Convenciones admisibles recomendadas:
-
-- "left"
-- "right"
-- "both"
-- "neither"
-
-Esto es preferible a una semántica implícita difícil de auditar.
-
-6.5. align_to_session(ts_like, mode)
-
-Debe mapear un timestamp o fecha a un instante representativo de una sesión válida. Modos recomendados:
-- next_open
-- prev_close
-- session_label
-
-Cada uno debe tener semántica cerrada. Por ejemplo:
-- next_open -> timestamp del open de la siguiente sesión válida;
-- prev_close -> timestamp del close de la última sesión válida anterior;
-- session_label -> etiqueta de sesión correspondiente.
-
-7. Zona horaria y normalización
-
-Toda operación debe ser coherente con:
-
-    America/New_York
-
-El módulo debe distinguir claramente entre:
-- fecha civil;
-- timestamp naive;
-- timestamp tz-aware;
-- etiqueta de sesión.
-
-7.1. Reglas mínimas de normalización
-
-Para date-like:
-1. parseo a Timestamp;
-2. si llega tz-aware, tz_convert a timezone canónica;
-3. si llega naive, política explícita de localización;
-4. reducción a fecha o normalize() local.
-
-Para ts-like:
-1. parseo a Timestamp;
-2. tz_localize o tz_convert según corresponda;
-3. alineación posterior al dominio de sesiones.
-
-7.2. Regla crítica
-
-No debe depender de la timezone local del servidor ni asumir silenciosamente UTC si el contrato no lo especifica.
-
-8. Representación interna
-
-Una representación razonable y eficiente para el caso base es:
-
-- sessions: pd.DatetimeIndex
-- session_types: estructura alineada opcional
-- timezone fija
-- market id
-
-La estructura sessions debe satisfacer:
-- monotonic increasing;
-- unique;
-- tz-aware o semánticamente normalizada de forma consistente;
-- búsqueda eficiente por searchsorted.
-
-9. SessionType y geometría de sesión
-
-Para llevar el módulo a estándar realmente de producción, debe introducirse un enum explícito:
-
-~~~python
-from enum import Enum
-
-class SessionType(Enum):
-    REGULAR = "regular"
-    EARLY_CLOSE = "early_close"
-    HALF_DAY = "half_day"
-    SPECIAL = "special"
-~~~
-
-Esto permite distinguir:
-- una sesión regular completa;
-- un cierre temprano;
-- una media sesión;
-- una sesión especial ad hoc.
-
-Regla institucional:
-un early close sigue siendo trading day. No debe quedar invisibilizado por un modelo binario demasiado pobre.
-
-10. Invariantes formales obligatorios
-
-El módulo debe respetar, como mínimo, los siguientes invariantes:
-
-I1. Monotonía
-Para toda fecha d dentro de rango,
-
-    next_trading_day(d, 1) > d
-
-bajo orden temporal de sesiones.
-
-I2. Consistencia de ida y vuelta
-Para una sesión válida s y convención estricta compatible,
-
-    prev_trading_day(next_trading_day(s, 1), 1) = s
-
-I3. No negatividad del conteo
-Si end >= start bajo orden temporal y la convención está bien definida, entonces:
-
-    trading_days_between(start, end, ...) >= 0
-
-I4. Determinismo
-Mismas entradas, mismo calendario y misma convención producen el mismo resultado.
-
-I5. Cierre bajo normalización
-Representaciones distintas de la misma fecha/timestamp lógico deben inducir la misma sesión final.
-
-11. Interval algebra para between
-
-La semántica de inclusividad no debe quedarse en un flag ambiguo. Conviene formalizarla como álgebra de intervalos semiabiertos o cerrados.
-
-Convenciones recomendadas:
-- left   -> [start, end)
-- right  -> (start, end]
-- both   -> [start, end]
-- neither-> (start, end)
-
-Esto evita bugs clásicos en:
-- labels forward;
-- conteo de horizontes;
-- evaluaciones OOS;
-- ventanas rolling.
-
-12. Cobertura y range extension
-
-El módulo debe definir explícitamente qué ocurre si la fecha consultada cae fuera del rango precargado del calendario.
-
-Políticas razonables:
-- fail explícito;
-- o range extension controlado mediante backend de calendario.
-
-Para un sistema productivo serio, es recomendable cargar o soportar extensión de varios años hacia delante y hacia atrás, por ejemplo:
-- start_date configurable;
-- end_date configurable;
-- horizonte por defecto amplio.
-
-13. DST y discontinuidades temporales
-
-Un módulo serio de calendario no puede ignorar DST. Debe garantizar que:
-- normalización de timestamps alrededor del cambio horario no rompa align_to_session;
-- una misma fecha civil en transición DST siga alineándose a la sesión correcta;
-- la timezone canónica se aplique siempre antes de mapear a sesión.
-
-Regla importante:
-la API pública debe trabajar en términos de sesiones, no confiar en offsets horarios fijos tipo “close = 16:00 UTC-5” en bruto.
-
-14. Diseño recomendado de clase
-
-~~~python
-from dataclasses import dataclass
-from datetime import date
-from enum import Enum
-from typing import Literal
-import pandas as pd
-
-class SessionType(Enum):
-    REGULAR = "regular"
-    EARLY_CLOSE = "early_close"
-    HALF_DAY = "half_day"
-    SPECIAL = "special"
-
-@dataclass(frozen=True)
-class MarketCalendar:
-    market: str
-    timezone: str
-    sessions: pd.DatetimeIndex
-    session_types: pd.Series | None = None
-
-    def next_trading_day(self, date_like, n: int = 1) -> date:
-        if n < 1:
-            raise ValueError("n must be >= 1")
-        d = self._normalize_date(date_like)
-        pos = self.sessions.searchsorted(pd.Timestamp(d), side="right")
-        if pos + n - 1 >= len(self.sessions):
-            raise ValueError("Requested date is beyond loaded calendar range.")
-        return self.sessions[pos + n - 1].date()
-
-    def prev_trading_day(self, date_like, n: int = 1) -> date:
-        if n < 1:
-            raise ValueError("n must be >= 1")
-        d = self._normalize_date(date_like)
-        pos = self.sessions.searchsorted(pd.Timestamp(d), side="left") - 1
-        if pos - (n - 1) < 0:
-            raise ValueError("Requested date is before loaded calendar range.")
-        return self.sessions[pos - (n - 1)].date()
-
-    def trading_days_between(
-        self,
-        start,
-        end,
-        inclusive: Literal["left", "right", "both", "neither"] = "left",
-    ) -> int:
-        s = self._normalize_date(start)
-        e = self._normalize_date(end)
-        if e < s:
-            raise ValueError("end must be >= start")
-
-        s_ts = pd.Timestamp(s)
-        e_ts = pd.Timestamp(e)
-
-        left = self.sessions.searchsorted(s_ts, side="left")
-        right = self.sessions.searchsorted(e_ts, side="left")
-
-        count = right - left
-
-        if inclusive == "left":
-            pass
-        elif inclusive == "right":
-            if e_ts in self.sessions:
-                count += 1
-        elif inclusive == "both":
-            if e_ts in self.sessions:
-                count += 1
-        elif inclusive == "neither":
-            if s_ts in self.sessions:
-                count -= 1
-        else:
-            raise ValueError("invalid inclusive mode")
-
-        return max(count, 0)
-
-    def align_to_session(
-        self,
-        ts_like,
-        mode: Literal["next_open", "prev_close", "session_label"] = "next_open",
-    ) -> pd.Timestamp:
-        ts = self._normalize_timestamp(ts_like)
-
-        if mode == "session_label":
-            return pd.Timestamp(self.next_trading_day(ts.date(), 1))
-
-        if mode == "next_open":
-            d = self.next_trading_day(ts.date(), 1)
-            return pd.Timestamp(d).tz_localize(self.timezone).replace(hour=9, minute=30)
-
-        if mode == "prev_close":
-            d = self.prev_trading_day(ts.date(), 1)
-            close_hour = 16
-            close_minute = 0
-            if self.session_types is not None:
-                ts_d = pd.Timestamp(d)
-                if ts_d in self.session_types.index:
-                    if self.session_types.loc[ts_d] == SessionType.EARLY_CLOSE:
-                        close_hour = 13
-            return pd.Timestamp(d).tz_localize(self.timezone).replace(hour=close_hour, minute=close_minute)
-
-        raise ValueError("invalid align mode")
-
-    def _normalize_date(self, x) -> date:
-        ts = pd.Timestamp(x)
-        if ts.tzinfo is not None:
-            ts = ts.tz_convert(self.timezone)
-        else:
-            ts = ts.tz_localize(self.timezone)
-        return ts.normalize().date()
-
-    def _normalize_timestamp(self, x) -> pd.Timestamp:
-        ts = pd.Timestamp(x)
-        if ts.tzinfo is None:
-            return ts.tz_localize(self.timezone)
-        return ts.tz_convert(self.timezone)
-~~~
-
-15. Backend y factoría
-
-La carga del calendario no debe hard-codearse dentro de la lógica de operaciones. Debe existir una factoría clara:
-
-~~~python
-_calendars: dict[str, MarketCalendar] = {}
-
-def load_market_calendar(
-    market: str = "US_EQ",
-    start_date: str = "2020-01-01",
-    end_date: str = "2035-12-31",
-) -> MarketCalendar:
-    key = f"{market}:{start_date}:{end_date}"
-    if key not in _calendars:
-        _calendars[key] = _build_calendar(market, start_date, end_date)
-    return _calendars[key]
-~~~
-
-La construcción interna puede apoyarse en:
-- exchange_calendars
-- pandas_market_calendars
-- backend equivalente
-
-pero esa decisión debe quedar encapsulada.
-
-16. Failure modes críticos
-
-El módulo debe detectar y tratar explícitamente:
-
-F1. Fecha en fin de semana.
-Debe saltar correctamente a sesión siguiente o previa.
-
-F2. Fecha en festivo de mercado.
-No debe tratarla como business day genérico.
-
-F3. n <= 0 en desplazamientos.
-Debe fallar explícitamente.
-
-F4. Rango invertido en between.
-Debe fallar explícitamente.
-
-F5. Timestamp naive ambiguo.
-Debe pasar por política cerrada de localización.
-
-F6. Fecha fuera de rango del calendario cargado.
-Debe fallar o extender rango de forma controlada.
-
-F7. DST discontinuity.
-No debe romper align_to_session ni inducir cambio de sesión erróneo.
-
-F8. Early close no modelado.
-Si el sistema expone session geometry, debe respetarla.
-
-17. Pruebas mínimas requeridas
-
-El módulo no debe considerarse listo sin pasar, como mínimo:
-
-~~~python
-def test_next_trading_day_skips_weekend():
-    cal = load_market_calendar("US_EQ")
-    d = cal.next_trading_day("2026-01-16")
-    assert d > pd.Timestamp("2026-01-16").date()
-
-def test_prev_trading_day_moves_to_valid_session():
-    cal = load_market_calendar("US_EQ")
-    d = cal.prev_trading_day("2026-01-20")
-    assert hasattr(d, "year")
-
-def test_trading_days_between_nonnegative():
-    cal = load_market_calendar("US_EQ")
-    n = cal.trading_days_between("2026-01-05", "2026-01-12")
-    assert n >= 0
-
-def test_align_to_session_returns_tz_aware():
-    cal = load_market_calendar("US_EQ")
-    ts = cal.align_to_session("2026-01-17 12:00:00", mode="next_open")
-    assert ts.tzinfo is not None
-
-def test_invalid_n_raises():
-    cal = load_market_calendar("US_EQ")
-    try:
-        cal.next_trading_day("2026-01-05", n=0)
-        assert False
-    except ValueError:
-        assert True
-~~~
-
-Y además conviene cubrir:
-- Thanksgiving Friday;
-- Christmas-adjacent sessions;
-- DST transition dates;
-- rango fuera de cobertura;
-- convención inclusive en los cuatro modos.
-
-18. MVP y segunda fase
-
-18.1. MVP obligatorio
-
-El MVP debe incluir:
-- MarketCalendar con sessions ordenadas;
-- timezone canónica America/New_York;
-- next_trading_day;
-- prev_trading_day;
-- trading_days_between;
-- align_to_session;
-- normalización explícita;
-- tests básicos de fines de semana, festivos y n inválido.
-
-18.2. Segunda fase razonable
-
-Como extensiones útiles:
-- SessionType enum completo;
-- soporte explícito de early_close y half_day;
-- range extension controlado;
-- vectorización batch;
-- cache invalidation o refresh policy;
-- semántica más rica de session_label intradía.
-
-19. No-objetivos
-
-No pertenece al alcance de este módulo:
-- lógica de features;
-- labels forward;
-- scheduling arbitrario de jobs;
-- execution logic;
-- modelling estadístico del tiempo;
-- inferencia sobre horarios óptimos.
-
-La misión aquí es geometría temporal de mercado, pequeña pero rigurosa.
-
-20. Criterios de aceptación
-
-El módulo sólo debe considerarse correcto si cumple simultáneamente:
-
-- existe una única fuente de verdad para sesiones válidas;
-- la API pública tiene semántica explícita y estable;
-- las fechas civiles se proyectan a sesiones válidas consistentemente;
-- fines de semana, festivos y DST quedan resueltos de forma coherente;
-- between no depende de restas civiles ingenuas;
-- align_to_session produce resultados timezone-aware y auditables;
-- el módulo es reusable por research, backtest y ejecución sin drift temporal.
-
-21. Conclusión
-
-simons_core/calendar.py es infraestructura temporal, no un helper cosmético. Su valor no está en “manejar fechas”, sino en fijar con precisión la geometría de sesiones del sistema y eliminar ambigüedades entre componentes. En un framework cuantitativo serio, eso es esencial: una capa de calendario buena no es la que parece cómoda, sino la que evita errores silenciosos de alineación, conteo y horizonte temporal. Ese es exactamente el estándar que este módulo debe imponer.
+- next_trading_day desde viernes -> lunes (o siguiente hábil)
+- prev_trading_day desde lunes -> viernes previo
+- trading_days_between con los 4 modos de inclusividad
+- align_to_session en cada modo
+- is_early_close en Thanksgiving Friday -> True
+- session_duration_minutes regular -> 390.0
+- trading_days_array devuelve DatetimeIndex ordenado y único
+- n=0 en next_trading_day -> ValueError
+- Fecha fuera de rango -> CalendarRangeError

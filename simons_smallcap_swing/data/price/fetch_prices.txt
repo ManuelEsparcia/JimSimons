@@ -1,619 +1,70 @@
-Especificación Cuantitativa: data/price/fetch_prices.py
+Especificación: data/price/fetch_prices.py
 
-1. Propósito del módulo
+1. Propósito
 
-El módulo `data/price/fetch_prices.py` implementa la capa formal de ingestión raw de market data diaria para el universo point-in-time del sistema. Su función no es “descargar precios”, sino construir una base raw, versionada, reproducible, idempotente y auditable de barras OHLCV sobre la que descansan ajuste corporativo, control de calidad, ingeniería de variables, etiquetado y backtesting. :contentReference[oaicite:0]{index=0}
+Ingesta de precios raw OHLCV desde múltiples providers con normalización,
+validación y persistencia. Produce la tabla cruda que alimenta qc_prices
+y adjust_prices. Arquitectura de providers extensible.
 
-El principio rector del módulo es el siguiente:
+2. Provider pattern
 
-antes de hablar de alfa, riesgo, ejecución o robustez estadística, el sistema debe saber exactamente qué barras existían, para qué símbolo, bajo qué proveedor, con qué semántica temporal, bajo qué snapshot de universo y con qué grado de completitud. Un pipeline cuantitativo se rompe mucho antes por defectos silenciosos de datos que por falta de sofisticación del modelo. :contentReference[oaicite:1]{index=1}
+ProviderClient(Protocol):
+  provider_name, provider_alias, dataset_id
+  fetch_daily_bars(symbol, start_date, end_date, frequency) → DataFrame
 
-Formalmente, el módulo define un operador de ingestión:
+Implementaciones incluidas:
+  CSVDirectoryProvider: un CSV/parquet por símbolo en directorio.
+  CSVFileProvider: un archivo con todos los símbolos (columna symbol_column).
 
-`I_price : (U_pit, Cal, Π_provider, Θ_fetch, r, a) -> (R_raw, R_canonical, C_cov, E_fail, E_rev, M_manifest)`
+Extensión futura: YFinanceProvider, PolygonProvider, DatabentoProvider.
 
-donde:
+3. FetchMode
 
-- `U_pit` es el universo PIT de símbolos elegibles;
-- `Cal` es el calendario oficial de sesiones;
-- `Π_provider` es la configuración de proveedor primario y de fallback;
-- `Θ_fetch` contiene modo de ingestión, política de persistencia, retries y normalización;
-- `r` es el `run_id`;
-- `a` es el `asof_ts_utc`;
-- `R_raw` es el dataset raw por corrida;
-- `R_canonical` es la vista operativa canónica si existe;
-- `C_cov` es el coverage report;
-- `E_fail` es el failures report;
-- `E_rev` es el revisions report;
-- `M_manifest` es el manifest auditable.
+full:         Descarga todo el rango.
+incremental:  Solo desde last_date + 1.
+repair:       Re-descarga y compara con existente.
 
-El módulo constituye, por tanto, la frontera entre el exterior y el sistema interno. Si esta capa es ambigua en temporalidad, idempotencia, versionado o procedencia, el resto del stack hereda una base inestable y el backtest deja de ser auditable. :contentReference[oaicite:2]{index=2}
+4. Pipeline por símbolo
 
-2. Papel dentro de la arquitectura
+Para cada (symbol, provider):
+  1. Resolver rango de fechas (start_date, end_date, FetchMode).
+  2. fetch_daily_bars con retry (RetryPolicy).
+  3. Rate limiting (RateLimitPolicy).
+  4. Validación (ValidationPolicy): OHLCV bounds, dates unique, volume ≥ 0.
+  5. Normalización (NormalizationPolicy): column rename, date parse, symbol upper.
+  6. Persist raw (PersistencePolicy): parquet partitioned by symbol.
 
-`fetch_prices.py` se sitúa al inicio del subsistema de market data y aguas arriba de:
+5. Config
 
-- `data/price/adjust_prices.py`
-- `data/price/qc_prices.py`
-- `features/build_features.py`
-- `labels/build_labels.py`
-- cualquier capa de investigación o backtest que necesite OHLCV raw con trazabilidad fuerte
+FetchPricesConfig:
+  providers: list[ProviderSpec]
+  universe_window: UniverseWindow (start, end, symbols or path)
+  fetch_policy: FetchPolicy (mode, max_gap_days)
+  retry_policy: RetryPolicy (max_retries, backoff)
+  rate_limit_policy: RateLimitPolicy
+  validation_policy: ValidationPolicy (ohlc_bounds, volume_floor)
+  normalization_policy: NormalizationPolicy
+  persistence_policy: PersistencePolicy
+  run_id, asof
 
-Consume aguas arriba:
+6. FetchArtifacts
 
-- universo PIT de símbolos elegibles por fecha;
-- calendario oficial de sesiones;
-- configuración del proveedor primario y, si aplica, de proveedores de respaldo;
-- política de ingestión: `full_refresh`, `incremental`, `reconcile`, `backfill`.
+raw_prices: DataFrame (all symbols concatenated).
+per_symbol_status: dict[symbol, {status, n_bars, provider, error}].
+manifest: config hash, run_id, timestamps, coverage stats.
 
-Su responsabilidad es:
+7. Invariantes
 
-- ingestar y normalizar market data raw;
-- imponer una semántica temporal única para `trade_date`;
-- persistir datos con disciplina idempotente;
-- cuantificar cobertura y fallos;
-- detectar revisiones históricas cuando proceda.
+I1. Para cada (symbol, date) hay exactamente 0 o 1 row.
+I2. open ≤ high, low ≤ high, low ≤ close (si validation enabled).
+I3. volume ≥ 0.
+I4. Dates ordenados cronológicamente por símbolo.
 
-No debe:
+8. Tests mínimos
 
-- imputar huecos de mercado;
-- deducir corporate actions a partir de saltos de precio;
-- ajustar OHLCV por eventos corporativos;
-- mezclar proveedores sin preservar procedencia;
-- delegar a módulos downstream ambigüedades sobre fecha de sesión o contrato de columnas. :contentReference[oaicite:3]{index=3}
-
-3. Principios de diseño no negociables
-
-La especificación del módulo se rige por los siguientes principios:
-
-1. Integridad estructural:
-   cada fila debe respetar un contrato canónico de esquema y tipos.
-
-2. Idempotencia:
-   reejecutar la misma corrida sobre el mismo estado lógico no debe duplicar ni corromper datos.
-
-3. Reproducibilidad:
-   mismos inputs lógicos, misma configuración, mismo snapshot de universo y mismo proveedor deben producir la misma salida raw.
-
-4. Trazabilidad:
-   toda observación debe poder rastrearse a proveedor, corrida, timestamp de ingesta y política de normalización.
-
-5. Separación de responsabilidades:
-   este módulo ingiere y normaliza, pero no ajusta corporate actions ni “arregla” anomalías heurísticamente.
-
-6. Robustez operacional:
-   fallos parciales, timeouts, rate limits y errores por símbolo no deben tumbar la corrida completa.
-
-7. Disciplina temporal:
-   la semántica de `trade_date` frente a timestamps de proveedor debe quedar completamente cerrada.
-
-8. Conservadurismo ante ambigüedad:
-   cuando un símbolo, barra o payload no puede interpretarse con seguridad contractual, debe aislarse y registrarse, no repararse silenciosamente.
-
-Estos principios convierten el módulo en infraestructura cuantitativa crítica y no en una utilidad de descarga. :contentReference[oaicite:4]{index=4}
-
-4. Alcance funcional
-
-El alcance del módulo incluye, como mínimo:
-
-1. descarga y normalización de barras OHLCV diarias;
-2. soporte de cuatro modos operativos:
-   `full_refresh`, `incremental`, `reconcile`, `backfill`;
-3. persistencia raw versionada por corrida;
-4. posibilidad de materializar una vista canónica por proveedor y fecha;
-5. cuantificación de cobertura por símbolo;
-6. clasificación de fallos técnicos y operativos;
-7. detección y reporte de revisiones históricas del proveedor;
-8. soporte multi-proveedor con fallback explícito.
-
-Quedan fuera del alcance:
-
-- corporate action adjustment;
-- imputación de huecos;
-- resolución económica de iliquidez real vs fallo de proveedor;
-- scoring cuantitativo de calidad final;
-- construcción de features o labels.
-
-Estas tareas pertenecen a capas posteriores del pipeline. `fetch_prices.py` captura y normaliza market data raw; no debe contaminarla con decisiones semánticas ajenas a ingestión. :contentReference[oaicite:5]{index=5}
-
-5. Entradas y contrato mínimo
-
-Entradas requeridas:
-
-- `universe_snapshot_path`
-- `calendar_path`
-- `provider_config_path`
-- `run_id`
-- `asof_ts_utc`
-- `start_date`
-- `end_date`
-- `frequency`
-- `fetch_mode`
-
-Notación formal:
-
-`I = {U_pit, Cal, Π_provider, Θ_fetch, r, a}`
-
-donde:
-
-- `U_pit` es el universo de símbolos;
-- `Cal` es el calendario oficial de sesiones;
-- `Π_provider` describe proveedor primario, fallback y límites operativos;
-- `Θ_fetch` contiene modos, chunking, persistencia y normalización;
-- `r` es el `run_id`;
-- `a` es el `asof_ts_utc`.
-
-Antes de iniciar llamadas al proveedor, el módulo debe validar:
-
-- existencia y legibilidad del universo PIT;
-- presencia de símbolos no nulos y normalizables;
-- existencia y legibilidad del calendario;
-- validez sintáctica y semántica de la configuración;
-- consistencia entre `start_date`, `end_date`, frecuencia y modo de ingestión;
-- posibilidad de construir un cliente de proveedor con credenciales válidas.
-
-Si falla este contrato mínimo, la corrida no debe empezar. No se permiten artefactos parciales nacidos de una entrada estructuralmente inválida. :contentReference[oaicite:6]{index=6}
-
-6. Contrato canónico de salida
-
-La salida principal raw debe contener, como mínimo:
-
-- `symbol`
-- `trade_date`
-- `open`
-- `high`
-- `low`
-- `close`
-- `volume`
-- `vwap` nullable
-- `trades_count` nullable
-- `currency` nullable
-- `source_provider`
-- `provider_dataset_id` nullable
-- `ingest_ts_utc`
-- `run_id`
-- `config_hash`
-- `universe_snapshot_id`
-- `fetch_mode`
-
-La clave primaria lógica del raw persistido debe quedar definida como:
-
-`PK_raw = (symbol, trade_date, source_provider, run_id)`
-
-Si se materializa una vista canónica adicional, su clave debe ser:
-
-`PK_canonical = (symbol, trade_date, source_provider)`
-
-La arquitectura debe distinguir claramente entre:
-
-- raw append-only reproducible por corrida;
-- snapshot canónico operativo para consumo downstream.
-
-Nunca deben confundirse ambas capas. La primera preserva auditabilidad total; la segunda expone la versión vigente según política de reconciliación. :contentReference[oaicite:7]{index=7}
-
-7. Identidad temporal: trade_date, ingest_ts y timezone
-
-Uno de los puntos críticos del módulo es la semántica temporal. La convención oficial debe ser:
-
-- `trade_date` representa la fecha de sesión de mercado;
-- `trade_date` no es equivalente a `ingest_ts_utc`;
-- si el proveedor devuelve timestamps intradiarios o UTC, el módulo debe mapearlos de forma determinista a la sesión oficial del calendario configurado;
-- toda comparación contra `start_date` y `end_date` se realiza en términos de `trade_date`.
-
-Regla obligatoria:
-el dataset raw debe contener ambas nociones cuando el proveedor las ofrezca:
-
-- fecha de sesión para análisis financiero;
-- timestamp UTC de ingestión para auditoría operativa.
-
-Esta separación es indispensable para evitar contaminación temporal aguas abajo. :contentReference[oaicite:8]{index=8}
-
-8. Modos de ingestión
-
-El módulo soporta exactamente cuatro modos operativos.
-
-8.1. `full_refresh`
-
-Reingiere el rango completo `[start_date, end_date]` para todos los símbolos del universo. Se usa para:
-
-- construir históricos iniciales;
-- rehacer snapshots bajo nueva lógica de normalización;
-- recomputar tras cambios de proveedor;
-- comparar consistencia frente a datos persistidos.
-
-8.2. `incremental`
-
-Para cada símbolo, detecta la última `trade_date` persistida en la vista canónica del proveedor y solicita únicamente el sufijo faltante:
-
-`t_min(s) = max(start_date, max trade_date_local(s) + 1)`
-
-Éste es el modo por defecto en producción diaria, pero no basta por sí solo porque los proveedores pueden revisar histórico.
-
-8.3. `reconcile`
-
-Permite reconsultar una ventana reciente o subconjunto de símbolos para detectar:
-
-- revisiones históricas del proveedor;
-- barras ausentes;
-- discrepancias OHLCV frente a snapshots previos;
-- correcciones de sesión o de mapping temporal.
-
-8.4. `backfill`
-
-Se usa para rellenar huecos detectados por coverage o failures sin relanzar un `full_refresh` completo.
-
-Regla de gobernanza:
-un pipeline serio no puede operar sólo en modo `incremental`. Debe existir una política periódica de `reconcile` o `full_refresh` parcial sobre ventana móvil. :contentReference[oaicite:9]{index=9}
-
-9. Idempotencia y política de persistencia
-
-La idempotencia debe quedar definida contractualmente:
-
-dada una combinación fija de proveedor, universo, rango temporal, modo de ingestión, `config_hash`, `universe_snapshot_id` y estado externo inalterado del proveedor, ejecutar el módulo dos veces no debe producir filas duplicadas ni modificar silenciosamente snapshots previos. :contentReference[oaicite:10]{index=10}
-
-El sistema puede adoptar una de estas estrategias, pero debe fijarla explícitamente:
-
-9.1. Estrategia A — append-only + snapshots
-
-- cada corrida escribe en ruta versionada por `run_id`;
-- una vista canónica posterior resuelve qué observación es la vigente;
-- máxima auditabilidad, mayor coste de almacenamiento.
-
-9.2. Estrategia B — raw versionado + overwrite controlado
-
-- el raw conserva metadatos de snapshot;
-- el overwrite sólo se permite bajo reconciliación explícita;
-- toda sustitución de barra previa debe quedar registrada en un artefacto de diffs.
-
-Regla obligatoria:
-una corrida `incremental` normal no puede sobrescribir silenciosamente histórico ya consolidado. :contentReference[oaicite:11]{index=11}
-
-10. Revisiones históricas y versionado de datos
-
-El módulo debe asumir que los proveedores pueden revisar histórico. Si una barra ya persistida para `(s,t)` cambia en una corrida posterior, el sistema debe:
-
-1. detectar la discrepancia a nivel de fila y campo;
-2. registrar la diferencia en `provider_revisions_report`;
-3. decidir, según `fetch_mode`, si sólo reporta o si actualiza la vista canónica;
-4. mantener trazabilidad de la versión anterior y la nueva.
-
-Debe distinguirse entre:
-
-- `raw as-observed`: lo descargado en una corrida concreta;
-- `canonical latest`: la mejor versión vigente según política de reconciliación.
-
-Esta dualidad es crítica para reproducir research antiguo y para auditar revisiones del proveedor. :contentReference[oaicite:12]{index=12}
-
-11. Normalización por proveedor
-
-El flujo lógico por símbolo debe ser:
-
-`fetch_symbol_prices -> normalize_provider_frame -> validate_ingestion_frame -> persist_raw_prices`
-
-La función `normalize_provider_frame(...)` debe:
-
-- mapear el esquema nativo del proveedor al contrato canónico interno;
-- normalizar símbolos, trim, casing y codificación textual;
-- fijar tipos fuertes;
-- convertir timestamps del proveedor a `trade_date` bajo la convención oficial;
-- preservar columnas de procedencia en namespace auxiliar cuando sea útil;
-- etiquetar campos ausentes o no soportados sin romper el contrato principal.
-
-Regla importante:
-la normalización debe ser determinista y pura. Dado el mismo payload y la misma configuración, debe producir exactamente el mismo frame canónico. :contentReference[oaicite:13]{index=13}
-
-12. Política multi-proveedor y fallback
-
-Si el sistema soporta más de un proveedor, la precedencia debe ser fija. Por ejemplo:
-
-`primary > secondary > tertiary`
-
-Reglas operativas:
-
-1. intentar primero el proveedor primario;
-2. si el error es transitorio y reintentable, agotar la política de retry antes de activar fallback;
-3. si el error es permanente a nivel de símbolo o el proveedor carece de cobertura, puede activarse el secundario;
-4. toda barra obtenida por fallback debe quedar marcada explícitamente;
-5. si dos proveedores entregan barras distintas para la misma fecha, no se promedian ni fusionan sin política formal de reconciliación.
-
-La procedencia de cada barra no puede perderse nunca. El consumidor downstream debe poder distinguir si una barra proviene de fuente primaria o de contingencia. :contentReference[oaicite:14]{index=14}
-
-13. Retries, backoff y rate limiting
-
-El módulo debe distinguir entre:
-
-Errores reintentables:
-- timeout
-- HTTP 429
-- HTTP 5xx
-- errores transitorios de conexión
-
-Errores no reintentables:
-- símbolo inválido o no soportado
-- credenciales incorrectas
-- request mal formada
-- recurso inexistente con semántica permanente
-
-El backoff recomendado es exponencial con jitter:
-
-`delay_k = min(cap, base * alpha^k) * U_k`
-
-con `alpha > 1` y `U_k` una variable uniforme en rango configurable.
-
-El rate limit debe centralizarse a nivel de proveedor, no dispersarse en llamadas individuales. En una implementación paralela, esto exige coordinador o token bucket global por cliente. :contentReference[oaicite:15]{index=15}
-
-14. Validaciones de integridad en ingestión
-
-14.1. Validaciones por fila
-
-Para toda fila con OHLC no nulos:
-
-`high >= max(open, close, low)`
-`low  <= min(open, close, high)`
-
-Además:
-
-- `open`, `high`, `low`, `close` deben ser positivos salvo política explícita de tolerancia;
-- `volume >= 0`;
-- `trade_date in [start_date, end_date]`;
-- no se permiten `NaN` en campos obligatorios del modo elegido.
-
-14.2. Validaciones por símbolo
-
-- fechas estrictamente crecientes tras normalización;
-- ausencia de duplicados por `(symbol, trade_date, provider)` dentro de la misma corrida;
-- cobertura frente al calendario de sesiones;
-- detección explícita de huecos, barras repetidas y orden temporal revertido.
-
-14.3. Validaciones por corrida
-
-- schema canónico homogéneo entre todos los símbolos;
-- contadores consistentes de filas leídas, aceptadas, descartadas, reintentadas y fallidas;
-- verificación de que la política de persistencia preserve idempotencia.
-
-Estas validaciones no pretenden certificar la verdad económica final del dato, pero sí garantizar que el raw entra con contrato mínimo razonable. :contentReference[oaicite:16]{index=16}
-
-15. Cobertura y missing sessions
-
-En universos small cap, la ausencia de observaciones no siempre implica error del proveedor; puede reflejar iliquidez real. El módulo no debe resolver ese problema económico, pero sí medirlo con precisión.
-
-Para cada símbolo `s`, sea `N_exp(s)` el número de sesiones esperadas y `N_obs(s)` el número de sesiones observadas. Entonces:
-
-`pct_missing_sessions(s) = (N_exp(s) - N_obs(s)) / N_exp(s)`
-
-Esta métrica debe registrarse junto con:
-
-- `expected_sessions`
-- `observed_sessions`
-- `first_date`
-- `last_date`
-- `provider_used`
-- `gap_count`
-- `severity_max`
-
-Regla importante:
-`fetch_prices.py` mide cobertura, pero no decide por sí mismo si excluir una acción por iliquidez. Esa decisión pertenece a QC, universo o research. :contentReference[oaicite:17]{index=17}
-
-16. Sistema de severidades
-
-La jerarquía recomendada es:
-
-`FAIL`
-- schema inválido
-- payload ilegible
-- clave duplicada no resoluble
-- imposibilidad total de obtener datos obligatorios para un símbolo
-- colisión de tipos
-- corrupción de persistencia
-
-`WARN`
-- huecos de cobertura
-- columnas opcionales ausentes
-- fallback a proveedor secundario
-- discrepancias menores de schema
-- barra descartada por validación de fila
-
-`INFO`
-- símbolo sin actividad observada pero sin error técnico
-- corrida incremental sin nuevas fechas
-- columnas opcionales no suministradas por el proveedor
-
-Regla de agregación:
-el fallo de algunos símbolos no debe tumbar la corrida global salvo que supere umbrales de tolerancia configurados a nivel de lote o proveedor. :contentReference[oaicite:18]{index=18}
-
-17. Artefactos obligatorios de salida
-
-Además del dataset raw, la corrida debe producir:
-
-17.1. Dataset principal
-Formato columnar, particionado de forma estable, por ejemplo:
-`/data/price/raw/provider={p}/freq=1d/run_id={r}/`
-
-17.2. Coverage report
-Con métricas por símbolo:
-- `expected_sessions`
-- `observed_sessions`
-- `pct_missing_sessions`
-- `first_date`
-- `last_date`
-- `provider_used`
-- `severity_max`
-
-17.3. Failures report
-Con:
-- `symbol`
-- `error_code`
-- `error_class`
-- `message`
-- `retry_count`
-- `provider`
-- `final_status`
-
-17.4. Revisions report
-Sólo si hubo reconciliación o cambios detectados:
-- `symbol`
-- `trade_date`
-- `field_name`
-- `old_value`
-- `new_value`
-- `old_run_id`
-- `new_run_id`
-
-17.5. Manifest
-`run_manifest.json` con, al menos:
-- `run_id`
-- `provider`
-- `fetch_mode`
-- `start_date`
-- `end_date`
-- `frequency`
-- `config_hash`
-- `universe_snapshot_id`
-- `code_version`
-- `tickers_requested`
-- `tickers_ok`
-- `tickers_failed`
-- `rows_ingested`
-- `provider_http_error_rate`
-- `fallback_usage_rate`
-- `run_duration_sec`
-
-Un sistema sin manifest completo no es auditable. Y un ingestor no auditable no puede sostener research cuantitativo serio. :contentReference[oaicite:19]{index=19}
-
-18. Estructura de funciones recomendada
-
-La arquitectura interna debe separar claramente orquestación, cliente de proveedor, normalización, validación y persistencia:
-
-- `load_config(...)`
-- `load_universe_snapshot(...)`
-- `load_market_calendar(...)`
-- `get_fetch_window(...)`
-- `build_provider_client(...)`
-- `fetch_symbol_prices(...)`
-- `normalize_provider_frame(...)`
-- `validate_ingestion_frame(...)`
-- `merge_with_existing_snapshot(...)`
-- `persist_raw_prices(...)`
-- `build_coverage_report(...)`
-- `build_failures_report(...)`
-- `build_revisions_report(...)`
-- `write_manifest(...)`
-- `main()`
-
-La separación modular es parte del contrato del módulo y no mera preferencia de estilo. Facilita auditabilidad, testing e invariantes de pureza donde corresponda. :contentReference[oaicite:20]{index=20}
-
-19. CLI y uso operativo
-
-La interfaz operativa recomendada es:
-
-`python -m data.price.fetch_prices --provider polygon --start-date 2014-01-01 --end-date 2026-03-01 --universe-path data/universe/snapshots/universe_2026-03-05.parquet --frequency 1d --fetch-mode incremental --fallback-provider tiingo --chunk-size-tickers 250 --as-of-ts-utc 2026-03-05T23:59:59Z --run-id fetch_prices_20260305_001`
-
-El uso explícito de `asof_ts_utc` es recomendable para mantener versionado coherente y alinear la corrida con el resto del sistema. :contentReference[oaicite:21]{index=21}
-
-20. Tests e invariantes obligatorios
-
-La implementación debe incluir, como mínimo, tests sobre:
-
-1. caso feliz:
-   varios símbolos, rango corto, schema correcto, sin duplicados y con métricas coherentes;
-
-2. retry transitorio:
-   `429` o `5xx` inicial seguido de éxito;
-
-3. error permanente:
-   símbolo inválido acaba en `failures_report` sin abortar la corrida;
-
-4. incremental puro:
-   segunda corrida no redescarga histórico ya materializado;
-
-5. idempotencia:
-   misma corrida repetida no duplica filas ni altera snapshot;
-
-6. schema drift:
-   columna faltante o inesperada se trata según política definida;
-
-7. mapeo temporal:
-   payload con timestamp UTC se asigna correctamente a `trade_date`;
-
-8. fallback:
-   proveedor primario falla y secundario entrega datos con trazabilidad preservada;
-
-9. revisión histórica:
-   una barra cambia entre corridas y aparece en `revisions_report`;
-
-10. duplicados de proveedor:
-    se resuelven según regla determinista sin violar `PK_raw`.
-
-Estos tests no son cosméticos. Definen el contrato institucional del módulo. :contentReference[oaicite:22]{index=22}
-
-21. Definition of Done
-
-El módulo `fetch_prices.py` se considera terminado únicamente si:
-
-- ejecuta end-to-end sin caer por el fallo aislado de un subconjunto pequeño de símbolos;
-- produce un dataset raw con contrato canónico estable;
-- respeta idempotencia bajo la política de persistencia declarada;
-- soporta `full_refresh`, `incremental` y al menos una forma de `reconcile`;
-- deja trazabilidad completa de proveedor, corrida, configuración y cobertura;
-- separa correctamente raw histórico, snapshot reproducible y vista canónica;
-- emite `coverage_report`, `failures_report` y `run_manifest`;
-- registra revisiones históricas cuando aparecen, en lugar de absorberlas silenciosamente;
-- fija de forma inequívoca la semántica de `trade_date` frente a timestamps del proveedor.
-
-En otras palabras, el módulo no está terminado cuando “descarga datos”, sino cuando construye una base raw suficientemente disciplinada como para sostener ajuste, QC, features y backtests sin autoengaño metodológico. :contentReference[oaicite:23]{index=23}
-
-22. MVP vs versión avanzada
-
-MVP correcto:
-
-- cliente de proveedor desacoplado por interfaz;
-- rate limiting centralizado;
-- retries con backoff exponencial y jitter;
-- normalización determinista por proveedor;
-- convención cerrada de `trade_date` y timezone;
-- política explícita de idempotencia y persistencia;
-- soporte de `incremental`, `full_refresh` y `reconcile`;
-- coverage report, failures report y revisions report;
-- manifest completo con hashes y metadatos;
-- suite mínima de tests con fallback y revisión histórica.
-
-Versión avanzada justificable:
-
-- modelado probabilístico de cobertura por símbolo y fecha;
-- fusión bayesiana multi-proveedor;
-- lineage causal explícito de `fetch -> normalize -> validate -> persist`;
-- scheduling de reconciliación optimizado;
-- métricas de divergencia de cobertura y detección de deriva.
-
-No es obligatorio, en esta fase, introducir cobertura probabilística, Bayesian fusion o RL de reconciliación como núcleo del módulo oficial. Son extensiones plausibles y valiosas, pero la prioridad correcta aquí es cerrar perfectamente la disciplina contractual de ingestión, temporalidad, idempotencia, persistencia y trazabilidad. :contentReference[oaicite:24]{index=24}
-
-23. Interpretación correcta
-
-`fetch_prices.py` no debe interpretarse como un downloader HTTP ni como una utilidad ETL ligera. Es la puerta de entrada del market data y, por tanto, una pieza de infraestructura cuantitativa crítica.
-
-Su función correcta es:
-
-- capturar barras OHLCV con contrato canónico estable;
-- fijar inequívocamente la semántica temporal de la serie;
-- preservar procedencia por proveedor y corrida;
-- soportar reejecución idempotente;
-- cuantificar cobertura y fallos;
-- registrar revisiones históricas explícitamente.
-
-Un ingestor que baja barras pero no fija bien `trade_date`, no distingue raw de canonical, no controla idempotencia o absorbe revisiones silenciosamente no sirve. Un ingestor conservador, reproducible, auditado y versionado sí sirve, aunque deje más trabajo a capas posteriores. En market data, ese no es un defecto: es exactamente el diseño correcto. :contentReference[oaicite:25]{index=25}
-
-24. Conclusión
-
-`data/price/fetch_prices.py` debe quedar definido como una pieza institucional de raw market data ingestion, no como una rutina de descarga.
-
-La especificación correcta no es “traer OHLCV del proveedor”, sino:
-
-- fijar qué entra;
-- fijar cómo se normaliza;
-- fijar qué significa temporalmente cada barra;
-- fijar cómo se persiste sin corromper histórico;
-- fijar cómo se gestionan retries, fallos, fallback y revisiones;
-- fijar qué artefactos auditables salen;
-- y fijar qué invariantes protegen al resto del pipeline.
-
-Si cumple esta especificación, el módulo deja de ser un downloader y pasa a ser la base raw fiable del stack de precios. Si no la cumple, el riesgo no es sólo técnico: es contaminar todo el research cuantitativo con una fuente de datos que parece estable pero no lo es.
+- CSVDirectoryProvider lee correctamente un directorio con 3 CSVs.
+- CSVFileProvider filtra por symbol_column.
+- Validation: high < low → error/exclusion.
+- Volume negativo → error/exclusion.
+- Incremental: solo descarga dates > last_date.
+- Provider no encontrado → PermanentProviderError.

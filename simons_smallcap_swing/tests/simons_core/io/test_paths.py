@@ -179,8 +179,10 @@ def test_confined_to_root_true_for_nested_local_uri(paths_mod, env_roots_file, s
 
 
 def test_confined_to_root_false_for_escape_local_uri(paths_mod, env_roots_file):
-    candidate = (Path(env_roots_file["local"].removeprefix("file://")).parent / "escape" / "x").resolve().as_uri()
-    assert paths_mod.confined_to_root(candidate, env_roots_file["local"]) is False
+    local_root_uri = env_roots_file["local"]
+    local_root_path = paths_mod._file_uri_to_path(local_root_uri)
+    candidate = (local_root_path.parent / "escape" / "x").resolve().as_uri()
+    assert paths_mod.confined_to_root(candidate, local_root_uri) is False
 
 
 def test_confined_to_root_for_s3(paths_mod):

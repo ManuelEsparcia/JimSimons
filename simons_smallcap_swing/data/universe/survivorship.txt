@@ -1,441 +1,76 @@
-Especificación Cuantitativa: data/universe/survivorship.py
+Especificación: data/universe/survivorship.py
 
-1. Propósito del módulo
+1. Propósito
 
-El módulo `data/universe/survivorship.py` implementa la capa formal de auditoría histórica del universo PIT para detectar, cuantificar y gobernar el survivorship bias del sistema. Su función no es construir el universo invertible —esa responsabilidad pertenece a `build_universe.py`— sino verificar que dicho universo preserve correctamente la historia de instrumentos que existieron, entraron, salieron, murieron económicamente o cambiaron de identidad, evitando que el research quede artificialmente sesgado hacia supervivientes actuales. :contentReference[oaicite:0]{index=0}
+Auditoría formal de survivorship bias en el universo construido. Detecta
+si el universo histórico está contaminado por sesgo de supervivencia:
+¿aparecen solo los winners? ¿desaparecen los muertos sin dejar rastro?
+¿las altas y bajas reflejan la realidad PIT?
 
-El principio rector del módulo es el siguiente:
+Un universo con survivorship bias infla el backtest entre 100-500bps/año
+en small caps, porque los nombres que quiebran, se delistan o colapsan
+en liquidez nunca entraron en la simulación.
 
-no toda ausencia histórica de un instrumento implica survivorship bias. El sesgo aparece sólo cuando un instrumento que debía estar representado históricamente bajo reglas PIT válidas no está presente y esa ausencia no puede explicarse por exclusión legítima, continuidad de identidad o terminación económica correctamente modelada. :contentReference[oaicite:1]{index=1}
+2. Dimensiones de auditoría
 
-Formalmente, el módulo define un operador de auditoría:
+Baseline check:
+  ¿El universo tiene delistings/exits en proporción realista?
+  BaselineConfig: min_exit_fraction (default: 0.05/año en small caps).
+  Si 0 exits en 10 años → FAIL (universo sospechoso de survivorship).
 
-`A_surv : (U_PIT, U_current, L_master, CA_can, P_adj, Θ_surv, r, a) -> (S_daily, S_summary, G_problem, C_compare, M_manifest)`
+Lifecycle coherence:
+  LifecycleConfig: cada símbolo tiene list_date ≤ first_appearance.
+  first_appearance ≤ last_appearance ≤ delist_date (si aplica).
+  Gaps entre first y last appearance → clasificar causa.
 
-donde:
+Absence classification (AbsenceClassification — 9 categorías):
+  EXPECTED_DELIST, EXPECTED_ACQUISITION, EXPECTED_SUSPENSION,
+  EXPLAINED_GAP, UNEXPLAINED_GAP, DATA_HOLE,
+  PREMATURE_ENTRY, PREMATURE_EXIT, ORPHAN_SYMBOL.
 
-- `U_PIT` es la historia diaria del universo point-in-time;
-- `U_current` es el snapshot final vigente;
-- `L_master` es el maestro PIT de lifecycle;
-- `CA_can` es la capa canónica de corporate actions;
-- `P_adj` es el dataset de precios ajustados, opcional;
-- `Θ_surv` contiene baseline naïve, thresholds, pesos y políticas de clasificación;
-- `r` es el `run_id`;
-- `a` es el `asof_ts_utc`;
-- `S_daily` es la serie diaria de métricas de survivorship;
-- `S_summary` es el resumen agregado y score final;
-- `G_problem` contiene casos problemáticos a nivel instrumento-fecha;
-- `C_compare` contiene la comparativa económica PIT vs naïve, si hay precios;
-- `M_manifest` es el manifest auditable.
+Risk scoring:
+  RiskWeightsConfig: peso por categoría de absence.
+  UNEXPLAINED_GAP y ORPHAN_SYMBOL tienen peso alto.
+  EXPECTED_DELIST tiene peso cero (es correcto que desaparezca).
 
-El módulo constituye, por tanto, la frontera entre “tener un universo PIT construido” y “poder afirmar que dicho universo no está embellecido artificialmente por la supervivencia de los nombres vivos hoy”. Si esta capa es débil, el sistema puede producir alfas, drawdowns y métricas de estabilidad ficticiamente buenas sin romper jamás el código. :contentReference[oaicite:2]{index=2}
+3. Pipeline
 
-2. Papel dentro de la arquitectura
+load_universe_history() → load_lifecycle_master()
+→ load_corporate_actions() → classify absences
+→ compute risk scores → aggregate gates → persist audit.
 
-`survivorship.py` se sitúa aguas abajo de:
+4. GateResult (usa shared de universe.__init__)
 
-- `build_universe.py`
-- `listing_master_pit`
-- `corporate_actions.py`
-- y, opcionalmente, de `prices_adjusted`
+lifecycle_coherence_gate: % symbols con lifecycle coherente.
+absence_classification_gate: % absences clasificadas (no UNEXPLAINED).
+risk_score_gate: weighted risk score < threshold.
+exit_rate_gate: exit_fraction ≥ min_exit_fraction.
+overall: combinación con fail_dominates.
 
-y aguas arriba de:
+5. PreparedUniverseContext
 
-- validación metodológica del stack
-- promotion gates de research datasets
-- informes de calidad histórica del universo
-- diagnóstico de robustez de backtests
+Estructura intermedia que une universe_history + lifecycle_master +
+corporate_actions en un panel alineado para la auditoría.
 
-Su responsabilidad es:
+6. Output
 
-- reconstruir el universo esperado históricamente bajo lifecycle e identidad PIT;
-- comparar dicho universo esperado con el universo PIT observado;
-- separar ausencias legítimas de ausencias estructuralmente indebidas;
-- cuantificar riesgo de survivorship;
-- bloquear o advertir cuando el nivel de sesgo exceda umbrales aceptables.
+survivorship_audit_{run_id}.parquet: detalle por symbol (absence_class,
+  risk_score, lifecycle dates, gaps).
+survivorship_gates_{run_id}.json: GateResult por dimensión + overall.
+survivorship_summary_{run_id}.json: stats agregadas.
 
-No debe:
+7. Invariantes
 
-- redefinir la lógica de elegibilidad del universo;
-- reinterpretar corporate actions raw;
-- imputar ad hoc presencias ausentes;
-- construir estrategias de trading;
-- o sustituir el backtest final de estrategia.
+I1. Un universo sin ningún exit en >5 años → FAIL (survivorship casi seguro).
+I2. UNEXPLAINED_GAP acumula risk; EXPECTED_DELIST no.
+I3. list_date ≤ first_appearance siempre (violación = PREMATURE_ENTRY).
+I4. delist_date ≥ last_appearance siempre (violación = info inconsistente).
+I5. Audit es read-only: no modifica el universo, solo diagnostica.
 
-La filosofía correcta es: este módulo no “arregla” survivorship bias; lo hace visible, medible y gobernable. :contentReference[oaicite:3]{index=3}
+8. Tests mínimos
 
-3. Principios de diseño no negociables
-
-La especificación del módulo se rige por los siguientes principios:
-
-1. Primacía de `instrument_id`:
-   la auditoría se realiza a nivel de identidad económica, no de símbolo textual.
-
-2. Separación entre ausencia legítima y ausencia indebida:
-   no toda ausencia histórica es survivorship bias.
-
-3. Baseline naïve explícito y versionado:
-   el universo naïve debe definirse formalmente, no por intuición.
-
-4. Lifecycle PIT:
-   todo juicio sobre presencia esperada debe apoyarse en ventanas de vida económica.
-
-5. Continuidad de identidad:
-   cambios de ticker, exchange o metadata no deben contarse como desapariciones si el instrumento persiste.
-
-6. Corporate actions canónicas:
-   mergers, acquisitions, spinoffs, delistings y eventos terminales deben consumirse desde la capa semántica canónica.
-
-7. Gates reales:
-   las métricas deben convertirse en criterios formales de `PASS/WARN/FAIL`.
-
-8. Reproducibilidad completa:
-   baseline, thresholds, pesos, overrides y clasificación deben quedar versionados en `manifest`.
-
-Estos principios convierten al módulo en una capa de validez estadística del research y no en un informe cosmético sobre nombres desaparecidos. :contentReference[oaicite:4]{index=4}
-
-4. Qué es y qué no es survivorship bias en este sistema
-
-Dentro del sistema, existe survivorship bias si el universo histórico observado omite instrumentos que debían estar representados históricamente y cuya ausencia no está justificada por reglas PIT válidas. Por tanto:
-
-- que un activo no esté hoy pero sí estuviera en 2012 no es problema;
-- que un activo muerto hoy no aparezca en 2012 cuando sí era históricamente elegible sí es una señal de survivorship;
-- que un ticker antiguo desaparezca por cambio de símbolo no debe contarse como sesgo si la identidad económica persiste;
-- que una acción salga del universo por violar reglas históricas de precio, liquidez o market cap no es survivorship, sino exclusión legítima.
-
-Esta distinción obliga a auditar frente a identidad económica + reglas PIT, no frente a una lista de tickers. Éste es uno de los puntos más fuertes de la especificación, porque elimina el error clásico de confundir rotación histórica normal con sesgo estructural real. :contentReference[oaicite:5]{index=5}
-
-5. Identidad primaria y dominio de auditoría
-
-La identidad primaria del módulo es `instrument_id`. Sea `I` el conjunto de instrumentos históricamente observables. Toda comparación, cobertura y gap debe calcularse a este nivel. El símbolo se persiste como atributo explicativo, pero no como clave primaria de la auditoría. :contentReference[oaicite:6]{index=6}
-
-El universo PIT auditado en fecha `t` se define como:
-
-`U_t^PIT = { i in I : is_eligible(i,t) = 1 }`
-
-donde `is_eligible` proviene exclusivamente de `build_universe.py`. El módulo no reevalúa elegibilidad desde cero; audita el resultado histórico de esa construcción. :contentReference[oaicite:7]{index=7}
-
-6. Baseline naïve obligatorio
-
-Uno de los puntos más delicados del módulo es fijar qué significa “universo naïve”. La definición por defecto y obligatoria es:
-
-`U_t^naive = { i in U_current : t in D }`
-
-donde `U_current` es el conjunto de instrumentos elegibles en la última fecha disponible del run, proyectado retrospectivamente sin lifecycle histórico, sin delistings históricos y sin reconstrucción PIT de identidad. Es, por tanto, una proyección artificial de supervivientes actuales sobre todo el pasado. :contentReference[oaicite:8]{index=8}
-
-El módulo debe admitir exactamente tres variantes de baseline:
-
-- `current_survivors`
-- `current_eligible`
-- `current_tradable`
-
-y la variante concreta usada debe persistirse siempre en el manifest. Los resultados no son comparables entre runs con baselines distintas. Esta cláusula es esencial para que la auditoría sea científicamente reproducible y no dependa de una interpretación informal del término “naïve”. :contentReference[oaicite:9]{index=9}
-
-7. Ventana de vida económica
-
-Para cada instrumento `i`, se define una ventana de vida económica PIT:
-
-`W_i = [tau_birth_i, tau_death_i]`
-
-donde:
-
-- `tau_birth_i` es la primera fecha en que el instrumento existe como entidad invertible;
-- `tau_death_i` es la fecha terminal PIT mínima entre delisting efectivo, adquisición terminal, liquidación, cancelación o cualquier evento que extinga la negociabilidad económica;
-- si no existe muerte económica observada, entonces `tau_death_i = +infinito`.
-
-A partir de esta ventana se define la presencia históricamente esperada, pero no aún la elegibilidad. Esta separación entre existencia económica y elegibilidad es muy importante: un instrumento puede existir y, aun así, no ser invertible por reglas legítimas del sistema. :contentReference[oaicite:10]{index=10}
-
-8. Conjunto de presencia esperada
-
-El conjunto esperado de presencia auditable en fecha `t` es:
-
-`E_t = { i in I : t in W_i and structurally_eligible(i,t) = 1 }`
-
-donde `structurally_eligible` significa que el instrumento no está excluido por restricciones estructurales permanentes o PIT de tipo de activo, mercado, share class o continuidad de identidad. Esta definición evita contar como survivorship instrumentos que nunca pudieron pertenecer al dominio de inversión del sistema. :contentReference[oaicite:11]{index=11}
-
-Además, para auditar específicamente cobertura de muertos económicos, se define:
-
-`E_t^dead = { i in I_dead : t in W_i and structurally_eligible(i,t) = 1 }`
-
-donde `I_dead` es el subconjunto de instrumentos con muerte económica observada dentro del rango auditado. Esta separación permite construir métricas de delisted coverage más precisas y más útiles que una simple comparación entre universo histórico y universo actual. :contentReference[oaicite:12]{index=12}
-
-9. Definición rigurosa del gap de survivorship
-
-El módulo distingue entre gap bruto y gap neto.
-
-El gap bruto es:
-
-`gross_survivorship_gap(i,t) = 1[ i in E_t and i notin U_t^PIT ]`
-
-pero esta definición mezcla exclusiones legítimas con fallos reales de cobertura. La métrica que de verdad importa es el gap neto:
-
-`net_survivorship_gap(i,t) =
-  1[ i in E_t and i notin U_t^PIT and absence_classification(i,t)=structural_missing ]`
-
-Sólo `structural_missing` cuenta como evidencia directa de survivorship bias. Esto corrige un error común: penalizar como sesgo casos que en realidad están bien explicados por lifecycle, ticker continuity o reglas PIT válidas. Éste es probablemente el núcleo conceptual más importante del módulo. :contentReference[oaicite:13]{index=13}
-
-10. Clasificación formal de ausencias
-
-Toda ausencia relevante debe clasificarse en exactamente una de las siguientes categorías:
-
-`absence_classification(i,t) in {
-  legitimate_rule_exclusion,
-  identity_continuity,
-  economic_termination,
-  structural_missing,
-  low_confidence
-}`
-
-La precedencia obligatoria es:
-
-1. si existe evento terminal válido con fecha efectiva `< t`:
-   `economic_termination`
-
-2. si existe continuidad de identidad vía ticker change, exchange change o mapping estable:
-   `identity_continuity`
-
-3. si el instrumento falla una regla PIT legítima de elegibilidad en `t`:
-   `legitimate_rule_exclusion`
-
-4. si falta evidencia suficiente pero existe información parcial:
-   `low_confidence`
-
-5. en cualquier otro caso:
-   `structural_missing`
-
-Esta precedencia elimina arbitraje informal y garantiza que sólo los casos verdaderamente inexplicados computen como survivorship gap neto. :contentReference[oaicite:14]{index=14}
-
-11. Delisted coverage ratio
-
-La métrica diaria principal para nombres muertos es:
-
-`delisted_coverage_ratio(t) =
-  | { i in E_t^dead : i in U_t^PIT or absence_classification(i,t) != structural_missing } |
-  / |E_t^dead|`
-
-cuando `|E_t^dead| > 0`.
-
-Interpretación: la métrica no pregunta simplemente “cuántos muertos siguen dentro del universo”, sino “cuánta historia de instrumentos muertos está correctamente representada o justificadamente ausente”. Por eso no penaliza cambios de ticker correctamente resueltos, mergers válidas ni exclusiones PIT legítimas. Esta definición es mucho más institucional y útil que una métrica ingenua de presencia de delisted names. :contentReference[oaicite:15]{index=15}
-
-12. Métricas diarias obligatorias
-
-Para cada fecha `t`, el módulo debe persistir al menos:
-
-- `N_t^PIT = |U_t^PIT|`
-- `N_t^naive = |U_t^naive|`
-- `overlap_ratio(t) =
-   |U_t^PIT ∩ U_t^naive| / |U_t^PIT ∪ U_t^naive|`
-- `delisted_coverage_ratio(t)`
-- `net_gap_rate(t) =
-   sum_i net_survivorship_gap(i,t) / |E_t|`
-- `n_missing_dead_instruments(t) =
-   |{ i in E_t^dead : absence_classification(i,t)=structural_missing }|`
-
-La `overlap_ratio` es informativa, pero no debe interpretarse como score de calidad por sí sola, porque un overlap bajo puede ser perfectamente coherente con un universo PIT correcto en horizontes largos y con alta mortalidad de small caps. Esta precisión debe quedar clara en la especificación para evitar lecturas incorrectas de la auditoría. :contentReference[oaicite:16]{index=16}
-
-13. Métricas agregadas del run
-
-Sobre el rango total auditado, el módulo debe calcular como mínimo:
-
-- `delisted_coverage_ratio_mean`
-- `pct_days_low_delisted_coverage`
-- `mean_net_gap_rate`
-- `n_missing_dead_instruments`
-
-y, si existen precios:
-
-- `CAGR_diff_pit_vs_naive`
-- `Sharpe_diff_pit_vs_naive`
-- `MaxDD_diff_pit_vs_naive`
-
-Estas métricas no son decorativas. Son la base para el risk score y para los gates de promoción o bloqueo del run. Sin ellas, el módulo no ofrece una decisión operativa; sólo ofrece observaciones sueltas. :contentReference[oaicite:17]{index=17}
-
-14. Score sintético de riesgo
-
-El módulo define un score de riesgo en `[0,100]`:
-
-`survivorship_risk_score =
-  100 * (0.30*R1 + 0.20*R2 + 0.25*R3 + 0.15*R4 + 0.10*R5)`
-
-donde:
-
-`R1 = 1 - delisted_coverage_ratio_mean`
-
-`R2 = pct_days_low_delisted_coverage`
-
-`R3 = min(1, mean_net_gap_rate / tau_gap)`
-
-`R4 = min(1, n_missing_dead_instruments / tau_missing)`
-
-`R5 =
-  min(1, |CAGR_diff_pit_vs_naive| / tau_cagr)` si hay precios,
-  y `0` en caso contrario.
-
-La interpretación oficial del score es:
-
-- `[0,20)` riesgo muy bajo
-- `[20,40)` riesgo bajo-moderado
-- `[40,60)` riesgo material
-- `[60,80)` riesgo alto
-- `[80,100]` riesgo crítico
-
-Los pesos y umbrales pueden configurarse, pero toda corrida debe persistir la parametrización exacta usada. Esto hace que el score sea gobernable y comparable entre runs de forma controlada. :contentReference[oaicite:18]{index=18}
-
-15. Impacto económico PIT vs naïve
-
-Si se dispone de precios ajustados PIT, el módulo debe cuantificar si el survivorship detectado es sólo conceptual o también afecta a métricas económicas. Para ello se define una cartera proxy sobre `U_t^PIT` y otra sobre `U_t^naive`, usando la misma política de pesos `w_(t,i)`.
-
-Entonces:
-
-`Delta r_t = r_t^naive - r_t^PIT`
-
-y se derivan métricas agregadas como:
-
-- `CAGR_diff_pit_vs_naive`
-- `Sharpe_diff_pit_vs_naive`
-- `MaxDD_diff_pit_vs_naive`
-
-Restricción metodológica crítica: esta comparación no debe interpretarse como backtest final de estrategia, sino como proxy diagnóstica del coste económico del survivorship bias. El objetivo es medir si la selección artificial de supervivientes está inflando retornos, reduciendo drawdowns o mejorando artificialmente la estabilidad del universo. :contentReference[oaicite:19]{index=19}
-
-16. Gates obligatorios
-
-A diferencia de una auditoría descriptiva, este módulo debe traducir sus métricas en criterios formales de aceptación. Los gates por defecto son:
-
-1. `delisted_coverage_ratio_mean >= 0.95`
-2. `pct_days_low_delisted_coverage <= 0.05`
-3. `mean_net_gap_rate <= 0.01`
-4. `n_missing_dead_instruments <= tau_missing`
-5. si hay precios:
-   `|CAGR_diff_pit_vs_naive| <= tau_cagr`
-
-Cada gate se clasifica como `PASS`, `WARN` o `FAIL`, y el estado global del run es:
-
-`gate_status = max(severity of all gates)`
-
-Cualquier `FAIL` impide la promoción del run a producción o su uso como input canónico de research downstream salvo override explícito, versionado y justificado. Esta regla es clave: transforma la auditoría en un verdadero validity gate, no en un dashboard pasivo. :contentReference[oaicite:20]{index=20}
-
-17. Edge cases obligatorios
-
-La especificación debe tratar explícitamente varios edge cases:
-
-17.1. Mergers y acquisitions
-
-Si un instrumento desaparece por merger o acquisition con corporate action canónica válida, la ausencia posterior se clasifica como `economic_termination`, no como `structural_missing`.
-
-17.2. Ticker changes
-
-Si existe continuidad de `instrument_id`, la desaparición del ticker antiguo se clasifica como `identity_continuity`. El turnover y los gaps deben medirse a nivel instrumento.
-
-17.3. OTC y degradación de venue
-
-Si una small cap migra a OTC o entra en proceso de quiebra, debe mantenerse su historia hasta su fecha terminal efectiva conforme a la política PIT del sistema. La falta de esa cola histórica sí puede constituir survivorship si no está explicada.
-
-17.4. Listings incompletos
-
-Cuando la evidencia de lifecycle es insuficiente, el caso se marca `low_confidence` y se separa de los gaps estructurales duros. Aun así, el conteo de estos casos debe monitorizarse como señal de deterioro de calidad.
-
-17.5. Relistings
-
-La política por defecto es:
-
-`relisting_policy = new_instrument_unless_proven_continuous`
-
-Por tanto, un relisting sólo preserva continuidad histórica si existe evidencia PIT suficiente para enlazar ambas fases como la misma identidad económica. Estas reglas deben quedar cerradas en configuración y reflejadas en el manifest. :contentReference[oaicite:21]{index=21}
-
-18. Flujo de ejecución oficial
-
-El flujo del módulo debe constar de ocho etapas:
-
-1. cargar `U_t^PIT`, `U_current`, lifecycle master, corporate actions canónicas y precios opcionales;
-2. construir `U_t^naive` según la variante de baseline configurada;
-3. construir `E_t` y `E_t^dead`;
-4. clasificar todas las ausencias relevantes con `absence_classification`;
-5. calcular métricas diarias de tamaños, overlap, coverage, gaps y missing dead instruments;
-6. calcular score agregado de riesgo;
-7. si hay precios, calcular el impacto económico PIT vs naïve;
-8. aplicar gates y persistir salidas, summary, casos problemáticos, comparativa y manifest.
-
-Este flujo debe permanecer estable y versionado. Cambios en baseline, política de clasificación, umbrales o pesos deben quedar reflejados en config y manifest. :contentReference[oaicite:22]{index=22}
-
-19. Artefactos obligatorios de salida
-
-El módulo debe generar, como mínimo:
-
-- `data/universe/audit/survivorship_summary.json`
-- `data/universe/audit/survivorship_daily.parquet`
-- `data/universe/audit/missing_dead_instruments.parquet`
-- `data/universe/audit/naive_vs_pit_comparison.parquet` si hay precios
-- `survivorship_manifest.json`
-
-El summary debe incluir al menos:
-
-- `delisted_coverage_ratio_mean`
-- `pct_days_low_delisted_coverage`
-- `mean_net_gap_rate`
-- `n_missing_dead_instruments`
-- `survivorship_risk_score`
-- `gate_status`
-- `baseline_definition`
-- `run_id`
-- `config_hash`
-- `code_version`
-
-El manifest debe registrar además:
-
-- baseline naïve exacto
-- políticas de clasificación y relinking
-- thresholds y pesos del score
-- conteos por `absence_classification`
-- severidad por gate
-- overrides manuales si existen
-
-Sin estos artefactos, el módulo no es auditable ni reproducible a nivel institucional. :contentReference[oaicite:23]{index=23}
-
-20. Tests e invariantes mínimos
-
-La implementación debe incluir, como mínimo, tests sobre:
-
-1. distinción correcta entre `structural_missing` y `legitimate_rule_exclusion`;
-2. clasificación de `ticker_change` como `identity_continuity` si `instrument_id` persiste;
-3. clasificación de merger terminal como `economic_termination`;
-4. baseline naïve reproducible y versionado;
-5. cálculo correcto de `delisted_coverage_ratio`;
-6. cálculo correcto de `net_gap_rate`;
-7. score de riesgo reproducible bajo misma configuración;
-8. gates que bloquean cuando `coverage_mean < 0.95` o `gap_rate > 0.01`;
-9. persistencia correcta de `missing_dead_instruments`;
-10. comparación económica PIT vs naïve sólo como diagnóstico, no como backtest final.
-
-Estos tests no son cosméticos. Definen el contrato institucional del módulo y blindan justamente la parte más delicada: la frontera entre ausencia legítima y survivorship real. :contentReference[oaicite:24]{index=24}
-
-21. Definition of Done
-
-El módulo `survivorship.py` se considera terminado únicamente si:
-
-- distingue formalmente entre ausencia legítima y gap estructural de survivorship;
-- define un baseline naïve estable, reproducible y versionado;
-- mide cobertura de delistings y muertes económicas sin confundir continuidad de identidad con desaparición;
-- convierte métricas en gates reales de aceptación o bloqueo;
-- entrega artefactos suficientes para auditar, reproducir y explicar cada caso problemático.
-
-En otras palabras, el módulo no está terminado cuando “detecta nombres muertos ausentes”, sino cuando convierte una noción metodológica abstracta —el survivorship bias— en una batería concreta de definiciones, métricas, clasificaciones y gates que permitan decidir si el universo PIT es históricamente creíble. :contentReference[oaicite:25]{index=25}
-
-22. Interpretación correcta
-
-`data/universe/survivorship.py` no debe interpretarse como una comparación superficial entre universo actual y universo histórico. Es el auditor de verdad histórica del universo. Su función es asegurar que la historia de activos muertos, adquiridos, quebrados, renombrados o transformados no haya sido borrada ni suavizada por construcción incorrecta del universo PIT. Un sistema serio de small-cap swing trading no puede considerar esta capa opcional: si los nombres muertos no están correctamente representados o justificadamente ausentes, entonces cualquier estadística posterior de alpha, drawdown, capacidad o estabilidad queda sesgada desde el punto de partida. :contentReference[oaicite:26]{index=26}
-
-23. Conclusión
-
-`data/universe/survivorship.py` debe quedar definido como una pieza institucional de auditoría de verdad histórica y validez estadística del universo, no como un informe accesorio.
-
-La especificación correcta no es “comparar PIT con un universo naïve”, sino:
-
-- fijar qué significa baseline naïve;
-- fijar qué significa presencia esperada;
-- fijar cómo se clasifica cada ausencia;
-- fijar qué cuenta como gap neto real;
-- fijar qué score resume el riesgo;
-- fijar qué gates bloquean el run;
-- y fijar qué artefactos permiten explicar cada caso conflictivo.
-
-Si cumple esta especificación, el módulo deja de ser una comprobación conceptual y pasa a ser una capa real de control de sesgo histórico del stack. Si no la cumple, el riesgo no es sólo técnico: es aceptar como “robusto” un research que, en realidad, sólo funciona porque los perdedores desaparecieron del pasado. :contentReference[oaicite:27]{index=27}
+- Universo con 0 exits en 10 años → exit_rate_gate FAIL.
+- Símbolo con delist_date y corporate_action "delisting" → EXPECTED_DELIST.
+- Símbolo que desaparece sin razón → UNEXPLAINED_GAP, risk alto.
+- first_appearance < list_date → PREMATURE_ENTRY flagged.
+- Universo limpio sintético → all gates PASS.

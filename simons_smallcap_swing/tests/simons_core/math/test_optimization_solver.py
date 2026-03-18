@@ -237,8 +237,10 @@ def test_solve_qp_result_raises_infeasible_problem(
         optimization_mod.solve_qp_result(
             Q=np.eye(1, dtype=float),
             c=np.array([0.0], dtype=float),
-            lb=np.array([1.0], dtype=float),
-            ub=np.array([0.0], dtype=float),
+            lb=np.array([0.0], dtype=float),
+            ub=np.array([1.0], dtype=float),
+            E=np.array([[1.0]], dtype=float),
+            f=np.array([2.0], dtype=float),
             solver_cfg=_preferred_solver_cfg(optimization_mod),
         )
 

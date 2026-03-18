@@ -1,494 +1,57 @@
-Especificación Cuantitativa: data/edgar/fetch_companyfacts.py
+Especificación: data/edgar/fetch_companyfacts.py
 
-1. Propósito del módulo
+1. Propósito
 
-El módulo `data/edgar/fetch_companyfacts.py` implementa la capa de ingestión raw de `companyfacts` desde la API oficial de la SEC. Su función no es “bajar JSONs” sin más, sino capturar de forma reproducible, auditable, idempotente y conservadora la fuente regulatoria de facts financieros por emisor, preservando suficiente contexto para que las capas posteriores de canonización, resolución PIT y feature engineering puedan operar sin contaminación semántica ni pérdida de linaje.
+Descarga company facts (XBRL datos financieros estructurados) de SEC EDGAR.
+Cada company fact contiene todos los valores reportados para cada concepto
+XBRL (revenue, assets, etc.) con sus períodos, unidades y filing metadata.
 
-Su misión central es transformar un universo de emisores identificado por `CIK` en un conjunto dual de artefactos:
+2. API de SEC
 
-- persistencia raw del payload SEC;
-- tabla mínima de facts extraídos con contexto suficiente para downstream.
+Endpoint: https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json
+- Payload masivo: todos los facts XBRL ever reported por la empresa.
+- Estructura: {facts: {taxonomy: {concept: {units: {unit: [values]}}}}}
 
-La filosofía del módulo es estricta: esta capa no decide la verdad económica final del dato, ni resuelve conflictos contables profundos, ni impone observabilidad point-in-time final. Lo que sí debe garantizar es que la fuente SEC quede capturada de manera íntegra, trazable y operativamente robusta. En un stack cuantitativo serio, este módulo no “embellece” los fundamentales; preserva su fuente de verdad regulatoria. :contentReference[oaicite:0]{index=0}
+Usa sec_fetch_json() compartido de edgar.__init__.
 
-2. Papel dentro de la arquitectura
+3. IngestConfig
 
-`fetch_companyfacts.py` ocupa la primera capa material del subsistema EDGAR y se sitúa entre:
+Hereda patrón de fetch_submissions: user_agent, rate_per_second,
+max_retries, backoff_*, cik_list, output_dir, asof, run_id.
+Adicional: taxonomy_filter (default: ["us-gaap", "dei"]).
 
-- la resolución previa de identidad regulatoria (`ticker_cik`);
-- y la capa posterior de normalización/canonización (`parse_xbrl.py`) y construcción point-in-time (`point_in_time.py`).
+4. Payload validation
 
-La secuencia lógica correcta es:
+validate_payload_structure(payload, cik):
+- "facts" key must exist
+- Each taxonomy must be a dict of concepts
+- Each concept must have "units" dict
+- Reporta PayloadSchemaError si estructura es inválida.
 
-1. resolver identidad regulatoria y universo de `CIK`;
-2. descargar payloads oficiales `companyfacts`;
-3. preservar raw + extraer tabla mínima;
-4. canonizar y resolver semántica downstream;
-5. construir vista PIT final.
+5. Fact row construction
 
-Esta separación de responsabilidades es crítica. El módulo no debe:
+build_fact_row(cik, taxonomy, concept, unit, value_record):
+- Extrae: val, start, end, fy, fp, form, filed, accn, frame
+- parse_date para start/end/filed
+- parse_numeric para val
+- sanitize_accession_number para accn
 
-- resolver equivalencias económicas profundas entre tags;
-- imputar valores ausentes;
-- colapsar prematuramente unidades o contextos;
-- decidir observabilidad temporal final;
-- sustituir la lógica de parse o PIT.
+6. Output
 
-Su responsabilidad institucional es más estrecha y más importante: capturar fielmente la estructura raw del endpoint SEC y preservarla con disciplina industrial. :contentReference[oaicite:1]{index=1}
+raw/{asof}/{run_id}/{cik}_facts.json: envelope crudo.
+parsed/{asof}/{run_id}/companyfacts.parquet: tabla normalizada.
+  Columnas: cik, taxonomy, concept, unit, value, start_date, end_date,
+  fiscal_year, fiscal_period, form_type, filed_date, accession_number.
 
-3. Principios de diseño no negociables
+7. FetchResult (por CIK)
 
-La especificación del módulo se rige por los siguientes principios:
+cik, status, n_facts_total, n_taxonomies, n_concepts,
+http_status, error_message, elapsed_seconds.
 
-1. Dual persistence obligatoria:
-   debe persistirse tanto el payload raw como la tabla mínima de facts.
+8. Tests mínimos
 
-2. Separación estricta de responsabilidades:
-   ingestión raw no es canonización semántica ni resolución PIT.
-
-3. Idempotencia operativa:
-   reejecuciones bajo mismo alcance lógico no deben introducir duplicación inconsistente.
-
-4. Trazabilidad completa:
-   todo fact tabular debe poder vincularse al payload, `CIK`, `run_id` y `asof`.
-
-5. Deduplicación conservadora:
-   sólo se eliminan duplicados exactos o operacionalmente redundantes bajo clave explícita.
-
-6. Robustez de red:
-   retries, backoff y clasificación de errores deben ser explícitos y auditables.
-
-7. Versionado completo:
-   la configuración de ingestión y los artefactos generados deben quedar firmados por `run_id`, `asof` y `config_hash`.
-
-8. Conservadurismo ante ambigüedad:
-   ante payload dudoso o schema inesperado, el sistema debe registrar y aislar, no “arreglar” silenciosamente.
-
-Estos principios convierten al módulo en una puerta de entrada de datos fundamentalmente seria y no en un scraper oportunista. :contentReference[oaicite:2]{index=2}
-
-4. Objetivo técnico exacto
-
-Para cada emisor con identificador regulatorio `CIK = c`, el módulo descarga el endpoint oficial:
-
-`https://data.sec.gov/api/xbrl/companyfacts/CIK{c:010}.json`
-
-y produce dos representaciones complementarias:
-
-1. payload raw completo;
-2. facts tabulares mínimos sin colapso semántico fuerte.
-
-Formalmente, la aplicación de ingestión se representa como:
-
-`I_cf : (C, T, theta, r, a) -> (R_raw, F_min, E_fail, M_manifest)`
-
-donde:
-
-- `C` es el conjunto de `CIK` objetivo;
-- `T` es el subconjunto permitido de taxonomías;
-- `theta` es la configuración de ingestión;
-- `r` es el `run_id`;
-- `a` es el `asof`;
-- `R_raw` es el repositorio raw persistido;
-- `F_min` es la tabla mínima de facts;
-- `E_fail` es el conjunto de incidencias y fallos;
-- `M_manifest` es el manifest auditable de la corrida.
-
-Este objetivo técnico es más fuerte que “hacer requests y parsear JSON”. Requiere que la salida sea reproducible, versionada, trazable y apta para las transformaciones posteriores. :contentReference[oaicite:3]{index=3}
-
-5. Entradas y contrato mínimo
-
-Entradas requeridas:
-
-- `cik_list_path`
-- `taxonomy_filter`
-- `config_path`
-- `run_id`
-- `asof`
-
-Notación formal:
-
-`I = {C, T, theta_ingest, r, a}`
-
-donde:
-
-- `C` es el universo de `CIK`;
-- `T` es el conjunto de taxonomías permitidas;
-- `theta_ingest` contiene rate limits, concurrencia, timeouts, persistencia, thresholds y política de retry;
-- `r` es el identificador único de corrida;
-- `a` es el timestamp lógico de ejecución.
-
-Antes de iniciar la descarga, el módulo debe verificar:
-
-- existencia y legibilidad del universo de `CIK`;
-- ausencia de `CIK` nulos;
-- canonización correcta a formato de 10 dígitos con zero-padding;
-- validez del `run_id`;
-- validez de la configuración de red y persistencia.
-
-Si falla cualquiera de estos prechecks, la corrida no debe comenzar. No se permiten artefactos parciales nacidos de una entrada estructuralmente inválida. :contentReference[oaicite:4]{index=4}
-
-6. Modelo de datos raw y tabular
-
-El módulo trabaja con dos representaciones complementarias.
-
-6.1. Payload raw
-
-Para cada `CIK` `c`, se preserva el payload fuente junto con metadatos de captura:
-
-`omega_c = (cik, payload, http_status, fetched_at, run_id, asof)`
-
-Esta capa raw permite:
-
-- reconstrucción exacta de la ingestión;
-- auditoría ex post;
-- detección de cambios de schema;
-- depuración de parse downstream;
-- reconciliación entre reruns.
-
-6.2. Facts tabulares mínimos
-
-Cada hecho extraído se representa como una tupla:
-
-`f = (c, tau, t, u, e, fd, fy, fp, v, form, accn, frame, r, a)`
-
-donde:
-
-- `c` = `CIK`
-- `tau` = taxonomía
-- `t` = tag XBRL
-- `u` = unidad
-- `e` = `end_date`
-- `fd` = `filed_date`
-- `fy` = fiscal year
-- `fp` = fiscal period
-- `v` = valor
-- `form` = tipo de filing
-- `accn` = accession number
-- `frame` = contexto SEC si existe
-- `r` = `run_id`
-- `a` = `asof`
-
-La preservación de `fy`, `fp`, `form`, `frame` y `accn` no es opcionalmente deseable, sino estratégicamente correcta: reduce pérdida de contexto y fortalece la trazabilidad antes de la canonización semántica. :contentReference[oaicite:5]{index=5}
-
-7. Campos obligatorios y recomendados
-
-Cada fila tabular válida debe contener, como mínimo:
-
-- `cik`
-- `taxonomy`
-- `tag`
-- `unit`
-- `end_date`
-- `filed_date`
-- `value`
-- `run_id`
-- `asof`
-
-Campos de alta prioridad que deben preservarse cuando existan:
-
-- `accession_number`
-- `form`
-- `fy`
-- `fp`
-- `frame`
-
-Si un hecho extraído carece de uno o más campos obligatorios, no puede entrar en la tabla válida. Debe registrarse explícitamente en el artefacto de fallos. La política correcta no es imputar silencio, sino aislar la fila inválida preservando evidencia diagnóstica. :contentReference[oaicite:6]{index=6}
-
-8. Idempotencia y versionado
-
-La especificación exige idempotencia operacional. Dos corridas con el mismo universo, misma configuración lógica, mismo `run_scope` y mismo estado observable de la API deben producir artefactos equivalentes o reconciliables.
-
-Formalmente, si `Phi` denota la ingestión y `H` el estado observable del endpoint:
-
-`Phi(C, theta, r; H) ≈ Phi(C, theta, r; H)`
-
-salvo diferencias explicables por metadatos de captura o por actualización real del origen.
-
-Esto implica:
-
-- escritura determinista;
-- reruns sin duplicación inválida;
-- separación clara entre `force_refresh` y reintento parcial;
-- particionado consistente por `asof` y `run_id`;
-- posibilidad de omitir CIKs ya descargados con éxito en reintentos, salvo política explícita contraria.
-
-La idempotencia aquí no es un lujo de ingeniería; es la condición para que lineage, QC y PIT no colapsen bajo reruns. :contentReference[oaicite:7]{index=7}
-
-9. Política de red, concurrencia y reintentos
-
-Cada request `q(c)` para un `CIK = c` debe terminar en uno de los estados:
-
-- `success`
-- `retryable_failure`
-- `permanent_failure`
-- `schema_failure`
-
-Clasificación mínima:
-
-- errores transitorios: `429`, `5xx`, timeouts;
-- errores permanentes: `404` consistente, `CIK` inválido, recurso inexistente;
-- errores de payload: respuesta técnicamente legible pero incompatible con el contrato esperado.
-
-La política correcta es:
-
-1. reintentar sólo errores transitorios;
-2. no reintentar indefinidamente errores permanentes;
-3. aislar payloads corruptos o inesperados como `schema_failure`;
-4. aplicar backoff exponencial con jitter;
-5. respetar estrictamente el límite operativo de la SEC.
-
-Esto evita dos patologías simétricas: saturar la fuente y degradar silenciosamente la cobertura. El módulo debe ser robusto, pero nunca agresivo o opaco con la API de origen. :contentReference[oaicite:8]{index=8}
-
-10. Checks estructurales mínimos sobre el payload
-
-El módulo no puede asumir que cualquier JSON devuelto por la API sea utilizable. Antes de tabularizar, deben aplicarse checks mínimos de integridad estructural:
-
-- existencia de nodo de entidad y metadatos básicos;
-- presencia de taxonomías relevantes o, al menos, estructura taxonómica parseable;
-- estructura esperada de conceptos y unidades;
-- posibilidad de iterar observaciones conservando contexto;
-- parseabilidad de fechas relevantes.
-
-Si el payload es JSON pero viola el contrato estructural esperado, debe clasificarse como `schema_failure`, no como éxito parcial. Esta distinción es esencial para downstream QC: una descarga técnicamente completada puede ser, económicamente, una ingestión fallida. :contentReference[oaicite:9]{index=9}
-
-11. Filtrado de taxonomías
-
-Sea `T_allowed` el subconjunto de taxonomías permitidas. La regla operativa es:
-
-`tau in T_allowed`
-
-pero el manifest debe registrar también taxonomías presentes y descartadas. Esto permite detectar:
-
-- cambios de estructura del emisor;
-- aparición de taxonomías no previstas;
-- filtros excesivamente restrictivos;
-- deriva de schema implícita del origen.
-
-La práctica correcta no es eliminar silenciosamente taxonomías no esperadas, sino descartarlas operativamente dejando evidencia de su presencia. :contentReference[oaicite:10]{index=10}
-
-12. Unidades, contexto y observaciones múltiples
-
-Para un mismo tag `t`, el endpoint puede devolver múltiples unidades y múltiples observaciones por unidad. Esta capa no debe colapsarlas prematuramente. Debe preservarse cada combinación relevante `(tag, unit, observation)` con el mayor contexto posible.
-
-Sea:
-
-`U(t) = {u_1, ..., u_m}`
-
-el conjunto de unidades observadas para el tag `t`. La salida tabular debe conservar cada par `(t,u)` y sus observaciones asociadas, dejando la resolución fina de equivalencias o unidades canónicas a `parse_xbrl.py`.
-
-Sí deben aplicarse checks mínimos de plausibilidad:
-
-- unidad presente;
-- valor parseable;
-- fechas temporales presentes cuando proceda;
-- contexto suficiente para resolución downstream.
-
-El error metodológico aquí sería fusionar temprano observaciones que sólo “parecen” equivalentes. En ingestión raw, la regla correcta es preservar. :contentReference[oaicite:11]{index=11}
-
-13. Deduplicación conservadora de primer nivel
-
-La deduplicación de ingestión debe ser explícita y conservadora. Se define la clave de deduplicación de primer nivel:
-
-`k_dedup = (cik, taxonomy, tag, unit, end_date, filed_date, value, accession_number)`
-
-Política:
-
-- eliminar duplicados exactos de `k_dedup`;
-- conservar registros distintos aunque compartan gran parte de la clave si difieren en contexto material;
-- no fusionar observaciones sólo porque “parecen el mismo hecho” económicamente.
-
-Esta política es correcta porque downstream aún debe decidir semántica, PIT y arbitraje entre hechos competidores. Ingestión no debe destruir información potencialmente resoluble después. :contentReference[oaicite:12]{index=12}
-
-14. Cobertura y métricas operativas
-
-Sea `C` el universo objetivo y `C_ok` el subconjunto descargado y validado correctamente. La cobertura de ingestión se define como:
-
-`rho_cf = |C_ok| / |C|`
-
-Además se computan:
-
-`epsilon_http   = |C_http_fail|   / |C|`
-`epsilon_schema = |C_schema_fail| / |C|`
-`epsilon_parse  = |C_parse_fail|  / |C|`
-
-A nivel más granular, el módulo debe emitir métricas como:
-
-- número de facts por `CIK`;
-- taxonomías observadas por emisor;
-- número de tags distintos por emisor;
-- distribución de unidades por tag;
-- tasa de registros descartados por campo faltante;
-- tasa de duplicados exactos eliminados;
-- latencia media y percentiles de descarga;
-- porcentaje de reintentos consumidos.
-
-Una corrida puede ser exitosa a nivel HTTP y aun así estar gravemente degradada en riqueza informativa. Por eso la cobertura operativa no puede reducirse a un único ratio grueso. :contentReference[oaicite:13]{index=13}
-
-15. Precedencia de errores
-
-No todos los errores tienen la misma gravedad. La precedencia correcta del módulo es:
-
-`input_failure > systemic_api_failure > coverage_collapse > payload_anomaly > row_level_parse_issue`
-
-Interpretación:
-
-- un fallo de entrada o contrato puede invalidar toda la corrida;
-- un fallo sistémico de API no se reduce a una colección de fallos locales;
-- un colapso severo de cobertura puede bloquear producción aunque existan datos parciales;
-- los errores fila a fila son menos graves si la cobertura y trazabilidad agregadas siguen siendo sólidas.
-
-Esta jerarquía evita decisiones erróneas basadas en medias agregadas que ocultan fallos estructurales. :contentReference[oaicite:14]{index=14}
-
-16. Artefactos obligatorios de salida
-
-El módulo debe persistir, como mínimo:
-
-- raw tabular de companyfacts
-- payloads raw de companyfacts
-- artefacto de failures
-- artefacto de metrics
-- `companyfacts_manifest_{run_id}.json`
-
-El manifest debe contener, como mínimo:
-
-- `run_id`
-- `asof`
-- número total de `CIK` objetivo
-- número de `CIK` con éxito
-- número de fallos por clase
-- número total de facts extraídos
-- taxonomías permitidas
-- `config_hash` o versión lógica
-- timestamps de inicio y fin
-- rutas de artefactos generados
-
-Un sistema sin manifest completo no es auditable. Y un sistema no auditable en ingestión raw no puede sostener un pipeline EDGAR institucionalmente serio. :contentReference[oaicite:15]{index=15}
-
-17. Flujo de ejecución
-
-El flujo oficial del módulo consta de ocho fases:
-
-1. validación de entradas y configuración;
-2. carga y canonización de `CIK`;
-3. planificación de solicitudes y batching;
-4. descarga robusta con control de carga y retries;
-5. validación estructural de payloads;
-6. extracción tabular mínima y deduplicación conservadora;
-7. persistencia de raw, tabla válida, fallos y métricas;
-8. cierre auditable mediante manifest y estado final de corrida.
-
-Este flujo debe permanecer estable y versionado. Cambios en la lógica de batching, thresholds o clasificación de fallos deben reflejarse en config y en el manifest. :contentReference[oaicite:16]{index=16}
-
-18. CLI y uso operativo
-
-La interfaz operativa del módulo debe aceptar, al menos:
-
-- `--cik-list-path`
-- `--config-path`
-- `--run-id`
-- `--asof`
-
-El parámetro `asof` debe ser explícito o derivarse de forma determinista. No debe depender implícitamente del reloj del sistema si el objetivo es reproducibilidad seria.
-
-La semántica correcta del CLI es institucional: una corrida debe poder reproducirse, auditarse y distinguirse claramente de un rerun parcial, un refresh forzado o una ejecución incremental. :contentReference[oaicite:17]{index=17}
-
-19. Reglas downstream
-
-La salida de este módulo sólo se considera raw utilizable si:
-
-- la cobertura supera el umbral mínimo configurado;
-- los payloads son estructuralmente válidos en proporción suficiente;
-- la trazabilidad por `run_id` y `asof` es completa;
-- los artefactos de failures y manifest han sido persistidos correctamente.
-
-Aun así, la salida no debe consumirse directamente para señales cuantitativas finales sin pasar por:
-
-- `parse_xbrl.py`
-- `point_in_time.py`
-
-Esta cláusula es fundamental: `fetch_companyfacts.py` no produce todavía verdad PIT final ni facts semánticamente canónicos; produce materia prima regulatoria usable. :contentReference[oaicite:18]{index=18}
-
-20. Tests e invariantes obligatorios
-
-La implementación debe incluir, como mínimo, tests sobre:
-
-1. canonización correcta de `CIK` a 10 dígitos;
-2. retry sólo para errores transitorios;
-3. no retry para errores permanentes;
-4. clasificación correcta de payload estructuralmente inválido;
-5. persistencia idempotente bajo mismo `run_id` o comportamiento reconciliable explícito;
-6. deduplicación exacta conservadora;
-7. escritura íntegra de manifest y failures;
-8. particionado correcto por `asof`;
-9. preservación de campos contextuales relevantes;
-10. cobertura agregada correctamente computada.
-
-Estos tests no son cosméticos. Definen el contrato institucional del módulo. :contentReference[oaicite:19]{index=19}
-
-21. Definition of Done
-
-El módulo `fetch_companyfacts.py` se considera terminado únicamente si:
-
-- descarga robustamente el universo objetivo de `CIK`;
-- persiste tanto payload raw como facts tabulares mínimos;
-- registra fallos e incidencias de forma explícita y auditable;
-- produce métricas operativas de cobertura y calidad;
-- soporta reejecución idempotente o reconciliable;
-- preserva contexto suficiente para canonización downstream;
-- expone una interfaz CLI reproducible y estable.
-
-En otras palabras, el módulo no está terminado cuando “baja datos”, sino cuando captura datos regulatorios con suficiente disciplina como para que el resto del stack pueda confiar en ellos sin autoengaño metodológico. :contentReference[oaicite:20]{index=20}
-
-22. MVP vs versión avanzada
-
-MVP correcto:
-
-- validación de entradas y canonización de `CIK`;
-- descarga robusta con retries y backoff;
-- dual persistence raw + tabla mínima;
-- validación estructural de payload;
-- deduplicación conservadora;
-- métricas de cobertura y fallos;
-- manifest auditable;
-- reruns idempotentes o reconciliables.
-
-Versión avanzada justificable:
-
-- detección explícita de schema drift;
-- fingerprinting de payloads;
-- incremental ingestion tipo CDC;
-- clasificación más fina de fallos sistémicos vs locales;
-- content-addressable storage;
-- monitorización de deriva de cobertura por familia de emisores.
-
-No es obligatorio, en esta fase, introducir Hawkes para disponibilidad de API, MDP batching o validación bayesiana de payload como núcleo del módulo oficial. Son extensiones plausibles de research infra, pero sin evidencia empírica suficiente corren el riesgo de añadir complejidad aparente más que robustez efectiva. La prioridad correcta aquí es disciplina de ingestión, no sofisticación estadística ornamental. :contentReference[oaicite:21]{index=21}
-
-23. Interpretación correcta
-
-Este módulo no debe interpretarse como un parser de fundamentales ni como una capa de features, sino como la puerta de entrada raw del capital informacional fundamental del sistema.
-
-Su función correcta es:
-
-- capturar fielmente el endpoint SEC;
-- preservar raw y contexto;
-- mantener cobertura y trazabilidad auditables;
-- aislar fallos sin contaminarlos semánticamente;
-- dejar a downstream la resolución económica y PIT.
-
-Un ingestor que “saca una tabla bonita” pero destruye contexto, pierde lineage o mezcla responsabilidades no sirve. Un ingestor conservador, dual, trazable e idempotente sí sirve, aunque deje más trabajo downstream. En un pipeline cuantitativo serio, eso no es una debilidad: es exactamente el diseño correcto. :contentReference[oaicite:22]{index=22}
-
-24. Conclusión
-
-`data/edgar/fetch_companyfacts.py` debe quedar definido como una pieza institucional de raw ingestion regulatoria, no como un simple descargador HTTP.
-
-La especificación correcta no es “descargar companyfacts y parsearlos un poco”, sino:
-
-- fijar qué entra;
-- fijar cómo se valida;
-- fijar qué se persiste;
-- fijar cómo se deduplica;
-- fijar cómo se clasifican los errores;
-- fijar qué artefactos salen;
-- y fijar qué límites de responsabilidad separan ingestión, canonización y PIT.
-
-Si cumple esta especificación, el módulo deja de ser una utilidad de scraping y pasa a ser una base fiable para todo el stack EDGAR. Si no la cumple, el riesgo no es sólo técnico: es contaminar desde origen la verdad regulatoria sobre la que luego se construyen features, modelos y backtests. :contentReference[oaicite:23]{index=23}
+- Parse de JSON sintético con estructura facts/taxonomy/concept/units.
+- validate_payload_structure detecta payload malformado.
+- parse_numeric(None) is None, parse_numeric("not_a_number") is None.
+- Fact row tiene todos los campos esperados y tipos correctos.
+- Idempotencia: raw envelope existente → skip.

@@ -1,452 +1,79 @@
-Especificación Cuantitativa: simons_core/logging.py
-
-0. Propósito y papel dentro del stack
-
-simons_core/logging.py define la capa institucional de observabilidad estructurada del sistema. Su función no es monitorizar rentabilidad ni emitir conclusiones cuantitativas sobre estrategia, sino proporcionar un registro consistente, parseable y trazable de lo que hace cada componente del pipeline. En un framework cuantitativo serio, el logging existe para resolver cinco problemas muy concretos: reconstruir causalmente qué ocurrió en una ejecución, depurar fallos sin depender de prints ad hoc, correlacionar eventos entre módulos y etapas, exponer evidencia operativa en tests/backtests/research/producción y separar observabilidad de lógica de negocio. Si interfaces.py fija contratos entre componentes, logging.py fija el contrato observacional del sistema. :contentReference[oaicite:0]{index=0}
-
-La regla de diseño es:
-
-    Log event = structured fact about execution
-
-Un log no debe ser una cadena literaria ni un volcado arbitrario de objetos Python. Debe ser un hecho estructurado, contextualizado y consumible por humanos y máquinas. La calidad del módulo no depende de cuántos logs produce, sino de si esos logs son:
-- consistentes;
-- suficientemente informativos;
-- baratos de emitir;
-- seguros desde el punto de vista de datos;
-- estables desde el punto de vista de esquema.
-
-1. Responsabilidad exacta
-
-logging.py debe encargarse de:
-
-- construir loggers con contexto base;
-- definir el esquema canónico de evento;
-- propagar identificadores de correlación;
-- ofrecer utilidades ergonómicas para instrumentar pasos del pipeline;
-- serializar excepciones y payloads de manera controlada;
-- imponer reglas mínimas de redacción, niveles y parseabilidad.
-
-No debe encargarse de:
-
-- configurar métricas de negocio;
-- decidir alertas de trading;
-- deducir conclusiones estadísticas sobre resultados;
-- mezclar logging con tracing distribuido complejo salvo interfaz mínima;
-- acoplarse a un backend único de observabilidad.
-
-2. API pública mínima
-
-Una API pública razonable para el módulo es:
-
-~~~python
-get_logger(name: str, run_context: RunContext | None = None) -> StructuredLogger
-
-with_step(logger: StructuredLogger, step: str, **fields)
-
-bind_context(logger: StructuredLogger, **fields) -> StructuredLogger
-
-serialize_exception(exc: Exception) -> dict[str, object]
-~~~
-
-Si se desea una clase explícita:
-
-~~~python
-class StructuredLogger:
-    def debug(self, event: str, **payload) -> None: ...
-    def info(self, event: str, **payload) -> None: ...
-    def warning(self, event: str, **payload) -> None: ...
-    def error(self, event: str, **payload) -> None: ...
-    def exception(self, event: str, exc: Exception | None = None, **payload) -> None: ...
-    def bind(self, **fields) -> "StructuredLogger": ...
-~~~
-
-El objetivo no es inventar una jerarquía compleja, sino fijar una interfaz pequeña y estable para observabilidad estructurada.
-
-3. Esquema canónico de evento
-
-Todo evento emitido por el sistema debe seguir un sobre canónico. Como mínimo:
-
-- ts_utc: string ISO-8601 UTC
-- level: string
-- logger: string
-- event: string
-- run_id: string (recomendado; obligatorio en pipeline)
-- step: string opcional
-- module: string opcional
-- payload: object
-- error_code: string opcional
-- trace_id: string opcional
-- span_id: string opcional
-- schema_version: string recomendable
-
-Una forma JSON de referencia sería:
-
-~~~json
-{
-  "ts_utc": "2026-03-06T10:15:24.183Z",
-  "level": "INFO",
-  "logger": "simons.features.momentum",
-  "event": "features_built",
-  "run_id": "run_20260306_001",
-  "step": "feature_build",
-  "module": "features",
-  "payload": {
-    "rows": 18420,
-    "cols": 57,
-    "symbols": 312
-  }
-}
-~~~
-
-4. Semántica de niveles
-
-Los niveles deben usarse con disciplina:
-
-- DEBUG: detalle técnico útil para depuración local o test.
-- INFO: hitos normales del pipeline y hechos operativos esperables.
-- WARNING: desviaciones recuperables o anomalías no fatales.
-- ERROR: fallo de una operación concreta con impacto local o de etapa.
-- CRITICAL: fallo sistémico o imposibilidad de continuar.
-
-Un error común es usar INFO para todo o inflar ERROR con incidencias que no rompen contrato. El valor del módulo depende de que la taxonomía de niveles sea consistente entre componentes.
-
-5. Context propagation
-
-La observabilidad del pipeline requiere propagar contexto mínimo entre etapas. Sea L un logger y C un conjunto de campos contextuales:
-
-    L' = bind(L, C)
-
-Entonces todo evento emitido por L' debe incorporar C salvo sobrescritura explícita. Los campos contextuales mínimos deseables son:
-
-- run_id
-- asof_date
-- pipeline_version
-- market
-- module
-- step, cuando proceda
-
-La regla es simple: el consumidor de logs no debe reconstruir contexto a partir del nombre del archivo ni de inferencias frágiles.
-
-6. Context manager de paso
-
-El patrón with_step(...) debe permitir instrumentar bloques de ejecución con inicio, fin, duración y fallo, sin repetir boilerplate.
-
-Semántica esperada:
-- al entrar, emitir step_started;
-- al salir con éxito, emitir step_completed;
-- al salir por excepción, emitir step_failed con serialización controlada del error;
-- incluir duration_ms.
-
-Ejemplo:
-
-~~~python
-with with_step(logger, "feature_build", universe="smallcap") as step_logger:
-    features = builder.build(raw_data, context)
-~~~
-
-Esto debería producir eventos como:
-
-~~~json
-{"event": "step_started", "step": "feature_build", "...": "..."}
-{"event": "step_completed", "step": "feature_build", "payload": {"duration_ms": 281.4}, "...": "..."}
-~~~
-
-o, en caso de error:
-
-~~~json
-{"event": "step_failed", "step": "feature_build", "error_code": "FEATURE_BUILD_ERROR", "...": "..."}
-~~~
-
-7. Serialización de excepciones
-
-La serialización de excepciones debe ser explícita y estable. No basta con str(exc). La forma recomendada es:
-
-~~~json
-{
-  "type": "ValueError",
-  "message": "n must be >= 1",
-  "repr": "ValueError('n must be >= 1')",
-  "traceback": "...",
-  "caused_by": null
-}
-~~~
-
-Reglas:
-- incluir tipo de excepción;
-- incluir mensaje;
-- permitir traceback controlado;
-- truncar o sanitizar contenidos excesivos;
-- evitar serializar objetos no JSON-compatibles sin transformación.
-
-8. Payload policy
-
-El campo payload debe seguir reglas estrictas:
-
-P1. Debe ser JSON-serializable o convertible de forma controlada.
-P2. Debe contener hechos operativos, no objetos arbitrarios gigantes.
-P3. Debe evitar duplicar campos que pertenecen al sobre principal.
-P4. Debe respetar política de redacción de datos.
-
-Ejemplos correctos:
-- número de filas procesadas;
-- nombres de split o etapa;
-- duración;
-- conteos de símbolos;
-- parámetros pequeños y estables.
-
-Ejemplos incorrectos:
-- DataFrames completos;
-- arrays masivos;
-- objetos de modelo no serializados;
-- secretos o credenciales;
-- información personal o sensible.
-
-9. Redacción y seguridad de datos
-
-El módulo debe imponer una política base de redacción:
-
-- no PII;
-- no secretos;
-- no tokens de acceso;
-- no rutas o URIs sensibles salvo necesidad operativa explícita;
-- no payloads crudos con datos de entrada completos si eso rompe privacidad o volumen.
-
-Idealmente, el logger debe poder aplicar una función sanitize(payload) previa a la emisión, conservando utilidad operativa pero eliminando campos prohibidos.
-
-10. Sinks y desacoplamiento
-
-logging.py debe desacoplar la emisión del backend. El módulo puede escribir a:
-
-- stdout/stderr en JSON;
-- fichero local rotado;
-- collector externo;
-- memory sink para test;
-- backend OTLP o equivalente en fase posterior.
-
-La interfaz no debe acoplarse a una tecnología concreta como ELK o Datadog. La política correcta es: formato estable, transporte intercambiable.
-
-11. Sampling y control de volumen
-
-En research y backtesting el volumen de eventos puede crecer rápido. El módulo debe prever, al menos a nivel conceptual:
-
-- no muestrear ERROR/CRITICAL;
-- muestrear selectivamente DEBUG de alta frecuencia;
-- agregar eventos repetitivos cuando sea razonable;
-- permitir niveles distintos por módulo o entorno.
-
-La observabilidad útil no es “loggear todo”, sino registrar lo suficiente sin degradar rendimiento ni generar ruido estructural.
-
-12. Compatibilidad de esquema
-
-El evento de log debe tratarse como un contrato de datos. Sea E_v el esquema de eventos en versión v. El módulo debe preservar:
-
-    E_(v+1) ⊇ E_v
-
-para cambios retrocompatibles, o versionar explícitamente el formato cuando se rompa compatibilidad.
-
-Cambios incompatibles típicos:
-- renombrar event;
-- mover error_code dentro de payload;
-- cambiar ts_utc de ISO-8601 a entero sin coordinación;
-- convertir payload en string arbitrario.
-
-Un buen módulo de logging no solo emite eventos; gobierna la estabilidad de su esquema.
-
-13. Diseño recomendado
-
-Una implementación sobria podría verse así:
-
-~~~python
-from __future__ import annotations
-
-from contextlib import contextmanager
-from dataclasses import asdict, is_dataclass
-from datetime import datetime, timezone
-import json
-import time
-import traceback
-from typing import Any
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
-def _to_jsonable(value: Any) -> Any:
-    if is_dataclass(value):
-        return asdict(value)
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    if isinstance(value, dict):
-        return {str(k): _to_jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_to_jsonable(v) for v in value]
-    return repr(value)
-
-def serialize_exception(exc: Exception) -> dict[str, Any]:
-    return {
-        "type": exc.__class__.__name__,
-        "message": str(exc),
-        "repr": repr(exc),
-        "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+Especificación: simons_core/logging.py
+
+1. Propósito
+
+Observabilidad estructurada del pipeline. JSON-line logging con envelope
+versionado, redacción de secrets, propagación de contexto, instrumentación
+de pasos y métricas. No implementa alertas ni métricas de negocio.
+
+2. Esquema canónico de evento
+
+    {
+      "ts_utc": "2026-03-06T10:15:24.183Z",
+      "level": "INFO",
+      "logger": "simons.features",
+      "event": "features_built",
+      "schema_version": "1.0.0",
+      "run_id": "run_20260306_001",
+      "step": "feature_build",
+      "payload": { "rows": 18420, "cols": 57 }
     }
 
-class StructuredLogger:
-    def __init__(self, name: str, base_fields: dict[str, Any] | None = None):
-        self.name = name
-        self.base_fields = base_fields or {}
+Campos reservados: ts_utc, level, logger, event, payload, exception,
+schema_version. Contextuales: run_id, step, module, asof_date, trace_id.
 
-    def bind(self, **fields) -> "StructuredLogger":
-        merged = {**self.base_fields, **fields}
-        return StructuredLogger(self.name, merged)
+3. API pública
 
-    def _emit(self, level: str, event: str, **payload) -> None:
-        record = {
-            "ts_utc": _utc_now_iso(),
-            "level": level,
-            "logger": self.name,
-            "event": event,
-            **self.base_fields,
-            "payload": _to_jsonable(payload),
-        }
-        print(json.dumps(record, ensure_ascii=False))
+StructuredLogger:
+  debug/info/warning/error/critical(event, **payload)
+  exception(event, exc=None, error_code=None, **payload)
+  bind(**fields) -> nuevo logger con contexto añadido
+  child(suffix, **fields) -> logger hijo con nombre dotted
 
-    def debug(self, event: str, **payload) -> None:
-        self._emit("DEBUG", event, **payload)
+get_logger(name, run_context=None, sink=None, ...) -> StructuredLogger
+bind_context(logger, **fields) -> StructuredLogger
+with_step(logger, step, **fields) -> context manager
+  Emite: step_started, step_completed (con duration_ms), step_failed
 
-    def info(self, event: str, **payload) -> None:
-        self._emit("INFO", event, **payload)
+with_metric(logger, metric_name, step=None, **fields) -> context manager
+  Emite: metric_started, metric_recorded (con payload del bag), metric_failed
+  Uso: with with_metric(logger, "sharpe_oos") as bag: bag["value"] = 1.5
 
-    def warning(self, event: str, **payload) -> None:
-        self._emit("WARNING", event, **payload)
+log_gate_result(logger, gate_name, result, **extra) -> None
+  Emite: gate_evaluated con passed/score/threshold/reasons/metrics
+  Nivel: info si passed, warning si not passed
 
-    def error(self, event: str, **payload) -> None:
-        self._emit("ERROR", event, **payload)
+4. Sinks
 
-    def exception(self, event: str, exc: Exception | None = None, **payload) -> None:
-        if exc is not None:
-            payload["exception"] = serialize_exception(exc)
-        self._emit("ERROR", event, **payload)
+LogSink (Protocol): write(record)
+StreamJsonSink: JSON a stream configurable
+StdoutJsonSink: JSON a stdout
+MemorySink: en memoria (para tests)
+MultiSink: fan-out a múltiples sinks
 
-def get_logger(name: str, run_context=None) -> StructuredLogger:
-    base = {}
-    if run_context is not None:
-        for field in ("run_id", "asof_date", "pipeline_version", "market"):
-            if hasattr(run_context, field):
-                base[field] = getattr(run_context, field)
-    return StructuredLogger(name, base)
+5. Seguridad
 
-@contextmanager
-def with_step(logger: StructuredLogger, step: str, **fields):
-    step_logger = logger.bind(step=step, **fields)
-    t0 = time.perf_counter()
-    step_logger.info("step_started")
-    try:
-        yield step_logger
-    except Exception as exc:
-        dt_ms = 1000.0 * (time.perf_counter() - t0)
-        step_logger.exception("step_failed", exc=exc, duration_ms=dt_ms)
-        raise
-    else:
-        dt_ms = 1000.0 * (time.perf_counter() - t0)
-        step_logger.info("step_completed", duration_ms=dt_ms)
-~~~
+Redacción automática de keys sensibles:
+  api_key, token, password, secret, authorization, bearer_token, etc.
+Serialización safe: numpy scalars, dataclasses, Path, UUID, Decimal, date.
+Truncamiento configurable: max_text_chars=10_000, max_collection_items=1_000.
 
-14. Buenas prácticas de uso
+6. Invariantes
 
-Uso correcto:
+I1. Un log event siempre tiene ts_utc, level, logger, event, schema_version.
+I2. Las keys en DEFAULT_REDACTED_KEYS se reemplazan por "[REDACTED]".
+I3. with_step siempre emite start + (completed | failed). Nunca solo start.
+I4. with_metric siempre emite started + (recorded | failed).
+I5. Niveles: DEBUG < INFO < WARNING < ERROR < CRITICAL.
+I6. require_run_id=True -> raise si no hay run_id en base_fields.
 
-~~~python
-logger = get_logger(__name__, run_context)
+7. Tests mínimos
 
-with with_step(logger, "feature_build", universe="smallcap") as log:
-    features = builder.build(raw_data, context)
-    log.info("features_built", rows=len(features), cols=len(features.columns))
-~~~
-
-Uso incorrecto:
-
-~~~python
-logger.info("Sharpe is amazing!!!")
-logger.info("dump_everything", payload=df.to_dict())
-logger.error("something bad happened maybe idk")
-~~~
-
-El primer bloque produce hechos observables y parseables. El segundo produce ruido, payload excesivo y semántica pobre.
-
-15. Métricas derivables del log
-
-Aunque logging.py no define métricas de negocio, sí debe permitir derivar métricas operativas de forma fiable, por ejemplo:
-
-- log_count_by_level
-- error_count_by_module
-- step_duration_p50/p95/p99
-- step_failure_rate
-- events_per_run
-
-La regla es importante: primero hechos estructurados; las métricas se construyen encima.
-
-16. Casos límite y errores frecuentes
-
-El módulo debe manejar o prevenir explícitamente:
-
-- payloads no serializables;
-- colisión entre campos base y payload;
-- excepciones anidadas;
-- timestamps naive;
-- logs emitidos sin run_id en etapas que lo exigen;
-- emisión recursiva por errores dentro del propio logger.
-
-Errores habituales de diseño:
-- mezclar mensaje libre y esquema estructurado;
-- registrar objetos demasiado grandes;
-- duplicar contexto en cada llamada manualmente;
-- no distinguir fallo recuperable de fallo fatal;
-- cambiar formato de evento sin gobernanza.
-
-17. Pruebas mínimas recomendadas
-
-~~~python
-def test_get_logger_binds_run_context():
-    class Ctx:
-        run_id = "r1"
-        asof_date = "2026-03-06"
-        pipeline_version = "1.0.0"
-        market = "US_EQ"
-
-    logger = get_logger("test.logger", Ctx())
-    assert logger.base_fields["run_id"] == "r1"
-
-def test_with_step_emits_completion():
-    logger = StructuredLogger("test")
-    with with_step(logger, "dummy_step"):
-        pass
-
-def test_serialize_exception_contains_type_and_message():
-    try:
-        raise ValueError("bad input")
-    except ValueError as exc:
-        data = serialize_exception(exc)
-    assert data["type"] == "ValueError"
-    assert "bad input" in data["message"]
-
-def test_payload_is_jsonable():
-    logger = StructuredLogger("test")
-    logger.info("sample_event", x=1, y={"a": [1, 2, 3]})
-~~~
-
-Además, conviene mantener tests de snapshot o schema para garantizar que el formato JSON no cambia accidentalmente.
-
-18. Definition of Done
-
-simons_core/logging.py queda correctamente resuelto cuando:
-
-- todo evento emitido sigue un esquema estable;
-- los loggers propagan contexto mínimo sin boilerplate excesivo;
-- los pasos del pipeline pueden instrumentarse con inicio, fin, duración y fallo;
-- excepciones y payloads se serializan de manera controlada;
-- no se filtran datos sensibles;
-- el backend de transporte es intercambiable;
-- existen tests que fijan parseabilidad y compatibilidad del formato.
-
-19. Conclusión
-
-La calidad de logging.py no reside en sonar industrial, sino en imponer disciplina observacional. En un sistema cuantitativo serio, el logging estructurado es la memoria verificable del pipeline: permite entender qué ocurrió, dónde falló y bajo qué contexto, sin contaminar la lógica de negocio ni depender de convenciones frágiles. Por eso, el estándar correcto para este módulo es: esquema estable, contexto propagado, serialización segura, semántica clara y cero ambigüedad operativa.
+- MemorySink captura records con estructura correcta
+- bind() preserva campos previos y añade nuevos
+- with_step emite step_started + step_completed con duration_ms
+- with_step con excepción emite step_failed con exception serializada
+- with_metric emite metric_started + metric_recorded con bag contents
+- log_gate_result emite gate_evaluated con passed/score/threshold
+- Redacción: payload con key "api_key" -> "[REDACTED]"
+- serialize_exception produce dict con type, message, traceback

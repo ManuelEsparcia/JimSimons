@@ -1,488 +1,66 @@
-Especificación Cuantitativa: data/edgar/fetch_submissions.py
+Especificación: data/edgar/fetch_submissions.py
 
-1. Propósito del módulo
+1. Propósito
 
-El módulo `data/edgar/fetch_submissions.py` implementa la capa de ingestión, historificación e integridad operativa de la metadata de filings desde EDGAR/SEC para un universo de emisores identificado por `CIK`. Su función no es simplemente descargar JSONs, sino construir una base raw, incremental, idempotente y auditable de eventos regulatorios que preserve el orden temporal observable de las presentaciones y pueda ser consumida con seguridad por las capas posteriores de reconstrucción point-in-time, señales sobre filings, enlazado documental y control de sesgo temporal.
+Descarga y persiste los filing submissions de SEC EDGAR para una lista
+de CIKs. Cada submission contiene metadata del filing: form type,
+filing date, acceptance datetime, accession number, primary document.
+Es el registro temporal de "cuándo SEC aceptó qué filing de quién".
 
-La tesis operativa del módulo es la siguiente: en un pipeline fundamental serio, la historia de presentaciones regulatorias no es un metadato accesorio, sino la estructura temporal que determina cuándo un filing, una modificación o una ausencia pasan a ser observables para el sistema. Por tanto, este módulo debe diseñarse como infraestructura de event lineage, no como un mero descargador HTTP.
+2. API de SEC
 
-Su misión central es transformar un universo de emisores `CIK` en un conjunto triple de artefactos:
+Endpoint: https://data.sec.gov/submissions/CIK{cik}.json
+- Contiene filings recientes + paginación para históricos.
+- Rate limit: 10 req/s con User-Agent obligatorio.
+- Responde 429 si se excede el rate.
 
-- persistencia raw del payload SEC;
-- tabla mínima y estandarizada de eventos regulatorios;
-- log formal de reconciliación incremental entre corridas.
+Usa sec_fetch_json() compartido de edgar.__init__.
 
-El módulo no produce todavía la verdad PIT final ni la semántica económica profunda del filing. Produce la cronología regulatoria observable y versionada sobre la que se apoyará el resto del stack.
+3. IngestConfig
 
-2. Papel dentro de la arquitectura
+user_agent, rate_per_second, max_retries, backoff_*,
+cik_list_path, output_dir, asof_date, run_id,
+min_filing_date, max_filing_date,
+include_form_types (default: all).
 
-`fetch_submissions.py` ocupa la capa de entrada de metadata de filings dentro del subsistema EDGAR. Se sitúa aguas abajo de la resolución de identidad regulatoria (`ticker_cik`) y aguas arriba de:
+4. Pipeline por CIK
 
-- `fetch_companyfacts.py`, que descarga hechos financieros;
-- `parse_xbrl.py`, que canoniza facts y resuelve semántica;
-- `point_in_time.py`, que impone observabilidad estricta;
-- `filings_flags.py`, que deriva señales sobre calidad, retrasos y eventos regulatorios;
-- `edgar_qc.py`, que valida el pipeline EDGAR completo.
+Para cada CIK:
+  1. fetch_json(url) con retry + rate limiting
+  2. Extraer filings recientes + paginar si hay más
+  3. Parse: form_type, filing_date, acceptance_datetime, accession_number,
+     primary_document, is_xbrl, file_number, size
+  4. Persist raw envelope (JSON) + parsed rows (parquet)
 
-En esta arquitectura, `fetch_submissions.py` no debe asumir responsabilidades que pertenecen a etapas posteriores. En particular, el módulo:
+5. FetchResult (por CIK)
 
-- no decide la verdad económica del filing;
-- no selecciona el hecho PIT definitivo;
-- no infiere señales cuantitativas finales;
-- no resuelve todavía la semántica profunda del contenido XBRL.
+cik, status (ok/error/skipped), n_filings, n_pages_fetched,
+http_status, error_message, elapsed_seconds.
 
-Su responsabilidad es más básica y más crítica: capturar fielmente el orden temporal, la identidad documental y la metadata observable de los filings.
+6. Normalización de campos
 
-3. Principios de diseño no negociables
+- acceptance_datetime → parse_datetime_utc (UTC-normalised)
+- filing_date → parse_date (ISO string)
+- is_xbrl → parse_boolish
+- accession_number → sanitize_accession_number
+- form_type → safe_str uppercase
 
-La especificación del módulo se rige por los siguientes principios:
+7. Output
 
-1. Persistencia triple obligatoria:
-   debe preservarse el payload raw, la tabla mínima de eventos y el log de reconciliación incremental.
+raw/{asof}/{run_id}/{cik}.json: envelope crudo para replay.
+parsed/{asof}/{run_id}/submissions.parquet: tabla normalizada.
+manifest.json: run metadata, config_hash, CIK results.
 
-2. Separación estricta de responsabilidades:
-   ingestión de submissions no es parse semántico, no es PIT final y no es feature engineering.
+8. Idempotencia
 
-3. Idempotencia operativa:
-   reejecuciones bajo el mismo alcance lógico no deben introducir duplicados ni contaminación de cronología.
+Si raw envelope ya existe para (asof, run_id, cik) y el config_hash
+coincide → skip (no re-fetch). Esto permite reintentar runs parciales
+sin re-descargar CIKs ya completados.
 
-4. Incrementalidad real:
-   el sistema debe distinguir formalmente entre filings ya vistos, filings nuevos, late arrivals y changed records.
+9. Tests mínimos
 
-5. Trazabilidad completa:
-   todo evento tabular debe poder enlazarse con `CIK`, `accession_number`, payload fuente, `run_id` y `asof`.
-
-6. Deduplicación conservadora:
-   sólo se colapsan duplicados exactos sobre clave de identidad explícita; los cambios materiales se preservan y se reconcilian.
-
-7. Consistencia temporal básica:
-   el orden entre `filing_date` y `acceptance_datetime` debe preservarse y verificarse.
-
-8. Conservadurismo ante ambigüedad:
-   ante payload dudoso o conflicto de identidad, el sistema debe registrar y aislar, no reparar silenciosamente.
-
-Estos principios convierten al módulo en infraestructura de cronología regulatoria y no en una utilidad ligera de scraping.
-
-4. Objetivo técnico exacto
-
-Formalmente, la aplicación de ingestión puede representarse como:
-
-`I_sub : (C, T, theta, r, a) -> (S_raw, F_events, R_reconciliation, M_manifest)`
-
-donde:
-
-- `C` es el conjunto de `CIK` objetivo;
-- `T` es la política temporal de filtrado o reconciliación;
-- `theta` es la configuración de ingesta;
-- `r` es el `run_id`;
-- `a` es el `asof`;
-- `S_raw` es el repositorio de submissions raw persistido;
-- `F_events` es la tabla tabular mínima de filings;
-- `R_reconciliation` es el log de reconciliación incremental;
-- `M_manifest` es el manifest auditable de ejecución.
-
-El objetivo económico real del módulo es permitir que downstream pueda responder sin ambigüedad a preguntas como:
-
-- qué filings eran observables en una fecha `asof` dada;
-- cuándo apareció por primera vez un `10-K`, `10-Q`, `8-K` o amendment;
-- qué emisores dejaron de presentar, presentaron tarde o cambiaron metadata previa;
-- cómo debe enlazarse cada fact posterior con su filing y con su orden temporal real.
-
-5. Entradas y contrato mínimo
-
-Entradas requeridas:
-
-- `cik_list_path`
-- `config_path`
-- `run_id`
-- `asof`
-- `start_date` / `end_date` opcionales, si la política temporal lo permite
-
-Notación formal:
-
-`I = {C, T, theta_sub, r, a}`
-
-donde:
-
-- `C` es el conjunto de `CIK`;
-- `T` es la política temporal de ingesta o reconciliación;
-- `theta_sub` contiene parámetros de red, persistencia, concurrencia, incrementalidad, retries y tolerancias;
-- `r` es el identificador único de corrida;
-- `a` es el timestamp lógico de ejecución.
-
-Antes de iniciar llamadas al origen, el módulo debe verificar:
-
-- existencia y legibilidad del universo de `CIK`;
-- ausencia de `CIK` nulos o mal formados;
-- canonización correcta a formato de 10 dígitos con zero-padding;
-- validez del `run_id`;
-- validez de la configuración de concurrencia, timeouts y persistencia;
-- consistencia entre la política incremental y el estado ya persistido.
-
-Si falla cualquiera de estos prechecks, la corrida debe abortarse antes de iniciar la descarga.
-
-6. Representación de datos
-
-El módulo debe trabajar con dos representaciones principales y una representación auxiliar de reconciliación.
-
-6.1. Payload raw
-
-Para cada `CIK = c`, se preserva el payload fuente junto con metadatos de captura:
-
-`omega_c = (cik, payload, http_status, fetched_at, run_id, asof)`
-
-Esta capa raw es imprescindible para:
-
-- reproducibilidad exacta;
-- auditoría ex post;
-- depuración de inconsistencias entre runs;
-- detección de cambios de schema del endpoint.
-
-6.2. Tabla de eventos de filings
-
-Cada filing extraído se representa como una tupla mínima:
-
-`s = (c, accn, form, filing_date, report_date, acceptance_dt, primary_doc, source_url, aux, run_id, asof)`
-
-donde:
-
-- `c` es el `CIK`;
-- `accn` es el `accession_number`;
-- `form` es el `form_type`;
-- `filing_date` es la fecha del filing;
-- `report_date` es la fecha reportada, si existe;
-- `acceptance_dt` es el `acceptance_datetime`;
-- `primary_doc` es el documento principal;
-- `source_url` es la ruta o URL fuente;
-- `aux` es el bloque opcional de campos auxiliares;
-- `run_id` identifica la corrida;
-- `asof` fija el contexto lógico de observación.
-
-6.3. Log de reconciliación
-
-Toda corrida incremental debe emitir una capa explícita de reconciliación que clasifique el destino de cada evento observado respecto del estado previo.
-
-7. Campos mínimos obligatorios
-
-Toda fila válida de submissions debe contener al menos:
-
-- `cik`
-- `accession_number`
-- `form_type`
-- `filing_date`
-- `acceptance_datetime`
-- `run_id`
-- `asof`
-
-Campos de alta prioridad operativa:
-
-- `report_date`
-- `primary_doc`
-- `source_url`
-- `film_number`
-- `file_number`
-- `is_xbrl`
-- `is_inline_xbrl`
-
-Regla operativa:
-
-- si faltan campos obligatorios, el registro no entra en la tabla válida;
-- si faltan campos recomendados, el registro puede persistirse con incidencia explícita;
-- ningún campo crítico puede imputarse silenciosamente dentro de este módulo.
-
-8. Clave de identidad y deduplicación
-
-La identidad operativa mínima de una submission viene dada por:
-
-`k_sub = (cik, accession_number)`
-
-La política de deduplicación debe ser:
-
-1. eliminar duplicados exactos de `k_sub` dentro de una misma corrida;
-2. si la misma clave aparece con contenido distinto entre runs, clasificar el caso como `changed_record`;
-3. si existe conflicto en campos esenciales para una misma clave, preservar ambas versiones raw y registrar incidencia crítica de reconciliación.
-
-La deduplicación aquí debe ser conservadora. No se debe forzar equivalencia entre eventos que comparten clave pero presentan discrepancias materiales de metadata.
-
-9. Principio de incrementalidad real
-
-La incrementalidad del módulo debe definirse formalmente. Sea `S^(t)` el repositorio ya persistido hasta el instante lógico `t`. Una nueva corrida en `a` debe poder descomponer el conjunto observado como:
-
-`S_new(a) = S_seen ∪ S_novel ∪ S_late ∪ S_changed`
-
-donde:
-
-- `S_seen` son filings ya persistidos sin cambio material;
-- `S_novel` son filings nuevos;
-- `S_late` son eventos antiguos que aparecen tardíamente por fallo previo o cambio en la fuente;
-- `S_changed` son entradas cuya representación fuente difiere respecto a una versión previa.
-
-Sin esta descomposición, la etiqueta “incremental” es demasiado débil para una infraestructura regulatoria seria.
-
-10. Idempotencia y reejecución
-
-El módulo debe ser idempotente a nivel operativo. Sea `Phi` la ingestión y `H` el estado observable del endpoint. Se desea:
-
-`Phi(C, theta, r; H) ≈ Phi(C, theta, r; H)`
-
-salvo diferencias justificables por metadatos de ejecución o cambios reales del origen.
-
-Consecuencias operativas:
-
-- no deben generarse duplicados de `(cik, accession_number)`;
-- un rerun parcial no debe sobrescribir silenciosamente resultados correctos previos;
-- debe existir modo explícito para `force_refresh`;
-- la lógica de persistencia debe distinguir entre retry, rerun y refresh completo.
-
-La idempotencia aquí es condición necesaria para que lineage, PIT y QC no se rompan bajo reejecuciones.
-
-11. Política de red, rate limit y reintentos
-
-Cada solicitud `q(c)` para un `CIK = c` puede terminar en:
-
-- `success`
-- `retryable_failure`
-- `permanent_failure`
-- `schema_failure`
-- `local_failure`
-
-Clasificación mínima:
-
-- errores transitorios: timeouts, `429`, `5xx`;
-- errores permanentes: `404` consistente, CIK inválido, recurso inexistente;
-- errores de payload: respuesta técnicamente válida pero incompatible con el contrato esperado;
-- errores locales: fallo de escritura, disco, interrupción del proceso.
-
-La política correcta exige:
-
-1. reintentar sólo errores transitorios;
-2. aplicar backoff exponencial con jitter;
-3. respetar estrictamente el límite operativo definido por la SEC y por la configuración;
-4. no enmascarar como éxito parcial una respuesta corrupta;
-5. distinguir fallos del origen de fallos de persistencia local.
-
-12. Checks estructurales mínimos del payload
-
-Antes de aceptar un payload como válido, el módulo debe verificar:
-
-- que el JSON es parseable;
-- que contiene el bloque esperado de submissions recientes e historial, si aplica;
-- que los arrays críticos tienen longitud y alineación coherentes;
-- que `accession_number`, `filing_date`, `form_type` y `acceptance_datetime` pueden extraerse consistentemente;
-- que las fechas son parseables y normalizables.
-
-Si el payload falla estas condiciones, debe clasificarse como `schema_failure`, no como éxito parcial.
-
-13. Consistencia temporal básica
-
-Aunque este módulo no construye todavía la capa PIT final, sí es responsable de preservar el orden temporal de los eventos regulatorios. Debe verificarse que:
-
-`filing_date <= acceptance_datetime`
-
-cuando ambos campos existan con resolución comparable, salvo excepciones justificadas por convención del origen o parsing.
-
-Además, debe emitirse incidencia si:
-
-- falta `acceptance_datetime` en filings relevantes;
-- el orden temporal aparente es inconsistente;
-- el filtrado por `start_date/end_date` elimina filings necesarios para reconstrucción histórica coherente.
-
-El objetivo aquí es preservar el event ordering, no todavía seleccionar el evento PIT final.
-
-14. Late arrivals y changed records
-
-El módulo debe contemplar explícitamente que un filing antiguo pueda:
-
-- aparecer en una corrida posterior por fallo previo de descarga;
-- aflorar por cambio del payload histórico;
-- incorporarse al reintentar un CIK antes marcado como fallido.
-
-Cuando se detecte un registro `s` tal que:
-
-`filing_date(s) < a_prev` y `s ∉ S^(a_prev)`
-
-el registro debe clasificarse como `late_arrival`.
-
-De forma análoga, si existe la misma clave `k_sub` pero cambia metadata estructural relevante respecto de una corrida anterior, el caso debe clasificarse como `changed_record`.
-
-Ambas clases deben registrarse separadamente en reconciliación porque afectan trazabilidad, cobertura histórica y downstream PIT.
-
-15. Cobertura y métricas operativas
-
-Sea `C` el universo objetivo y `C_ok` el subconjunto descargado y validado con éxito. La cobertura principal se define como:
-
-`rho_sub = |C_ok| / |C|`
-
-Además se computan:
-
-`epsilon_http   = |C_http_fail|   / |C|`
-`epsilon_schema = |C_schema_fail| / |C|`
-`epsilon_local  = |C_local_fail|  / |C|`
-
-El módulo debe emitir también, como mínimo:
-
-- número total de submissions extraídas;
-- número medio y percentiles de filings por CIK;
-- distribución por `form_type`;
-- número de CIKs sin submissions útiles;
-- tasa de duplicados exactos eliminados;
-- número de `late_arrivals`;
-- número de `changed_records`;
-- latencia media, p95 y p99 de descarga;
-- ratio de llamadas reintentadas;
-- cobertura por periodo temporal.
-
-Éxito HTTP no equivale a riqueza ni estabilidad del timeline regulatorio capturado.
-
-16. Precedencia de errores
-
-No todos los fallos tienen la misma gravedad. La jerarquía operativa correcta es:
-
-`input_or_config_failure > systemic_source_failure > coverage_collapse > payload_schema_failure > record_level_issue`
-
-Interpretación:
-
-- una configuración inválida o un universo corrupto invalidan toda la corrida;
-- un fallo sistémico del origen no puede tratarse como suma de errores menores;
-- una caída fuerte de cobertura puede bloquear utilidad downstream aunque algunos datos sean válidos;
-- errores fila a fila son menos graves si cobertura, cronología y trazabilidad global siguen siendo robustas.
-
-17. Artefactos obligatorios de salida
-
-El módulo debe generar, como mínimo:
-
-- `data/edgar/raw/submissions/date={asof}/run_id={run_id}/part-*.parquet`
-- `data/edgar/raw/submissions_payloads/date={asof}/run_id={run_id}/part-*.parquet`
-- `data/edgar/raw/submissions_failures_{run_id}.parquet`
-- `data/edgar/raw/submissions_metrics_{run_id}.parquet`
-- `data/edgar/raw/submissions_reconciliation_{run_id}.parquet`
-- `data/edgar/raw/submissions_manifest_{run_id}.json`
-
-El manifest debe incluir, al menos:
-
-- `run_id`
-- `asof`
-- tamaño del universo objetivo
-- número de CIKs con éxito
-- fallos por clase
-- número total de filings extraídas
-- `late_arrivals`
-- `changed_records`
-- hash de configuración
-- timestamps de inicio y fin
-- rutas de los artefactos generados
-
-Un sistema sin manifest completo no es auditable.
-
-18. Flujo de ejecución
-
-El flujo oficial del módulo consta de ocho fases:
-
-1. validación de entradas y configuración;
-2. canonización de `CIK` y carga del universo;
-3. resolución del estado previo para incrementalidad;
-4. planificación de lotes y control de concurrencia;
-5. descarga robusta con `rate limiting`, retries y clasificación de errores;
-6. validación estructural del payload y extracción tabular mínima;
-7. reconciliación incremental, deduplicación y clasificación de `late_arrivals` / `changed_records`;
-8. persistencia auditable de raw, tabla válida, failures, metrics, reconciliation y manifest.
-
-Este flujo debe permanecer estable y versionado.
-
-19. Reglas downstream
-
-La salida de este módulo se considera apta para consumo downstream sólo si:
-
-- la cobertura supera el mínimo configurado;
-- el repositorio raw y tabular ha sido persistido íntegramente;
-- el manifest y el registro de fallos están completos;
-- la identidad por `(cik, accession_number)` es estable;
-- `late_arrivals` y `changed_records` quedan explícitamente trazados.
-
-Aun así, los datos de submissions no deben interpretarse todavía como capa PIT final. Su función es proporcionar la estructura temporal y documental que permitirá a módulos posteriores imponer observabilidad y derivar señales regulatorias.
-
-20. Tests e invariantes obligatorios
-
-La implementación debe incluir, al menos, tests sobre:
-
-1. canonización correcta de `CIK`;
-2. retry sólo sobre errores transitorios;
-3. no retry sobre error permanente;
-4. detección de payload estructuralmente inválido;
-5. unicidad por `(cik, accession_number)`;
-6. clasificación correcta de `late_arrivals`;
-7. clasificación de `changed_records` entre runs;
-8. persistencia idempotente;
-9. escritura íntegra de manifest, failures y reconciliation;
-10. consistencia temporal básica entre `filing_date` y `acceptance_datetime`.
-
-Estos tests definen el contrato institucional del módulo.
-
-21. Definition of Done
-
-El módulo `fetch_submissions.py` se considera terminado únicamente si:
-
-- descarga robustamente submissions para el universo objetivo;
-- preserva el payload raw con trazabilidad completa;
-- extrae una tabla mínima consistente de filings;
-- soporta estrategia incremental real con reconciliación auditable;
-- distingue correctamente entre nuevos, vistos, `late_arrivals` y `changed_records`;
-- registra cobertura, fallos y manifest de forma completa;
-- pasa los tests mínimos de robustez e idempotencia.
-
-En otras palabras, el módulo no está terminado cuando “baja filings”, sino cuando fija la cronología regulatoria observable del sistema con suficiente disciplina para sostener reconstrucción PIT y señales downstream sin autoengaño metodológico.
-
-22. MVP vs versión avanzada
-
-MVP correcto:
-
-- validación de entradas y canonización de `CIK`;
-- descarga robusta con retries y backoff;
-- persistencia triple raw + eventos + reconciliación;
-- validación estructural del payload;
-- identidad estable por `(cik, accession_number)`;
-- incrementalidad real con clasificación de `seen`, `novel`, `late` y `changed`;
-- métricas de cobertura y fallos;
-- manifest auditable;
-- reruns idempotentes o reconciliables.
-
-Versión avanzada justificable:
-
-- watermark CDC explícito;
-- historificación bitemporal de eventos;
-- detección de schema drift del endpoint;
-- garantías más fuertes de consistencia causal entre corridas distribuidas;
-- monitorización de intensidad de filings por emisor o periodo;
-- reconciliación temporal más sofisticada por versiones de payload.
-
-No es obligatorio, en esta fase, introducir modelado Hawkes, causal consistency distribuida completa o infraestructura event-sourcing más pesada como núcleo del módulo oficial. Son extensiones plausibles para un stack muy maduro, pero la prioridad correcta aquí es cronología fiable, incrementalidad real y trazabilidad institucional.
-
-23. Interpretación correcta
-
-Este módulo no debe interpretarse como un simple descargador de metadata, sino como la capa que fija la cronología regulatoria observable del sistema.
-
-Su función correcta es:
-
-- capturar fielmente el endpoint de submissions;
-- preservar payload y eventos con identidad documental estable;
-- registrar cobertura, reconciliación y errores con trazabilidad completa;
-- distinguir entre novedad real, llegada tardía y cambio de fuente;
-- dejar a downstream la resolución PIT y la semántica económica final.
-
-Un ingestor que sólo descarga JSONs pero no fija correctamente la cronología observable no sirve. Un ingestor incremental, idempotente, reconciliable y auditable sí sirve, aunque deje más trabajo a módulos posteriores.
-
-24. Conclusión
-
-`data/edgar/fetch_submissions.py` debe quedar definido como infraestructura institucional de event lineage regulatorio, no como una utilidad de scraping.
-
-La especificación correcta no es “descargar submissions y guardarlas”, sino:
-
-- fijar qué entra;
-- fijar cómo se valida;
-- fijar cómo se identifica cada filing;
-- fijar cómo se clasifica la novedad temporal;
-- fijar cómo se reconcilian corridas;
-- fijar qué artefactos salen;
-- y fijar qué límites de responsabilidad separan ingestión, PIT y feature engineering.
-
-Si cumple esta especificación, el módulo deja de ser un downloader y pasa a ser la base cronológica fiable del stack EDGAR. Si no la cumple, el riesgo no es sólo técnico: es contaminar la historia regulatoria observable sobre la que luego descansan PIT, flags, señales y backtests.
+- Parse de submission JSON sintético: campos correctos.
+- Rate limiter: N requests en T segundos ≤ rate_per_second * T.
+- Idempotencia: segundo run con mismo config → skip.
+- acceptance_datetime parsed como UTC.
+- accession_number normalizado con dashes.

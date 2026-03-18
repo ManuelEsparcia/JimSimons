@@ -1,609 +1,89 @@
-Especificación Cuantitativa: data/price/qc_prices.py
+Especificación: data/price/qc_prices.py
 
-1. Propósito del módulo
+1. Propósito
 
-El módulo `data/price/qc_prices.py` implementa la capa formal de control de calidad de series de precios del sistema. Su función no es corregir datos, imputar observaciones ni “adivinar” la verdad de mercado, sino detectar, clasificar, cuantificar y exponer anomalías estructurales, geométricas, temporales y económicas en datasets de precios brutos y ajustados antes de que contaminen features, labels, validación y backtesting. :contentReference[oaicite:0]{index=0}
+Control de calidad de precios raw y ajustados. Detecta errores de datos
+que corromperían retornos, features y labels si no se atrapan aquí:
+gaps, spikes, OHLC inconsistencias, volumen anómalo, series truncadas,
+duplicados, y desalineación con calendario de trading.
 
-El principio rector del módulo es el siguiente:
+2. Inputs
 
-en un sistema cuantitativo sobre small caps, muchos de los errores más costosos no provienen de señales débiles, sino de defectos silenciosos de datos: barras geométricamente imposibles, sesiones ausentes, ajustes corporativos mal aplicados, retornos extremos que en realidad son corrupción de feed, o inconsistencias entre raw y adjusted. Si estos fallos no quedan gobernados por una política formal de QC, el sistema sobreestima alfa, infravalora riesgo y aprende estructura estadística inexistente. :contentReference[oaicite:1]{index=1}
+raw_prices: OHLCV crudo de fetch_prices.
+adjusted_prices: OHLCV ajustado de adjust_prices (opcional).
+calendar: calendario de trading sessions.
+QCConfig: thresholds por check.
 
-Formalmente, el módulo define un operador de control de calidad:
+3. Dimensiones de QC
 
-`Q_price : (P_raw, P_adj, Cal, Θ_qc, r, a) -> (F_row, F_symbol, S_run, G_gate, M_manifest)`
+Structural:
+  duplicate_date_symbol: (date, symbol) debe ser unique. FAIL.
+  missing_columns: OHLCV columns presentes. FAIL.
+  dtype_coherence: OHLCV numérico, date datetime. FAIL.
 
-donde:
+OHLC geometry (intrabar):
+  high_gte_open_close: high ≥ max(open, close). WARN.
+  low_lte_open_close: low ≤ min(open, close). WARN.
+  high_gte_low: high ≥ low siempre. FAIL.
+  non_negative_volume: volume ≥ 0. FAIL.
+  non_negative_prices: OHLC > 0 (si no delisted). WARN.
 
-- `P_raw` es el dataset de precios brutos;
-- `P_adj` es el dataset ajustado, cuando exista;
-- `Cal` es el calendario oficial de sesiones;
-- `Θ_qc` es la configuración de reglas, thresholds y severidades;
-- `r` es el `run_id`;
-- `a` es el `asof_ts_utc`;
-- `F_row` es la tabla de flags a nivel fila;
-- `F_symbol` es la tabla agregada a nivel símbolo;
-- `S_run` es el resumen agregado de la corrida;
-- `G_gate` es la decisión final `pass / warn / fail`;
-- `M_manifest` es el manifest auditable.
+Temporal:
+  calendar_alignment: dates ⊆ calendar sessions. WARN.
+  gaps_in_series: gaps > max_gap_days por símbolo. WARN.
+  weekend_dates: datos en sábado/domingo. FAIL.
 
-El módulo constituye, por tanto, la frontera entre “tener un dataset de precios” y “tener un dataset de precios metodológicamente defendible”. Si esta capa falla, el resto del pipeline puede funcionar sin errores sintácticos y, aun así, estar aprendiendo artefactos. :contentReference[oaicite:2]{index=2}
+Statistical (per symbol, rolling):
+  spike_detection: |ret| > spike_threshold. WARN.
+  zero_return_streak: >N días consecutivos con ret=0. WARN.
+  volume_anomaly: volume = 0 para >N% de la serie. WARN.
+  stale_price: close unchanged >K días. WARN.
 
-2. Papel dentro de la arquitectura
+Adjusted-specific:
+  adj_factor_positive: factor > 0 siempre. FAIL.
+  adj_continuity: ret_adj continuo a través de events. WARN.
 
-`qc_prices.py` se sitúa lógicamente después de `data/price/fetch_prices.py` y puede ejecutarse tanto antes como después de `data/price/adjust_prices.py`, según el modo de control requerido:
+4. QCConfig
 
-- QC sobre raw:
-  `fetch_prices.py -> qc_prices.py -> adjust_prices.py`
-- QC sobre adjusted:
-  `adjust_prices.py -> qc_prices.py`
+spike_threshold: 0.5 (50% daily return).
+max_gap_days: 5.
+zero_return_max_streak: 10.
+stale_price_max_days: 5.
+volume_zero_max_fraction: 0.3.
+calendar_path: Path to trading calendar.
 
-Los consumidores naturales del resultado son:
+5. Finding pattern
 
-- `data/universe/build_eligible_universe.py`
-- `features/build_features.py`
-- `labels/build_labels.py`
-- `backtest/engine.py`
-- sistemas de observabilidad y auditoría del pipeline
+build_finding_rows(check_name, severity, df_subset, message, details):
+  Produce rows: (check_name, severity, symbol, date, metric, message).
 
-Su responsabilidad es:
+concat_findings(list_of_findings) → DataFrame consolidado.
 
-- verificar integridad estructural;
-- detectar incoherencias intrabarra;
-- medir cobertura frente a calendario;
-- identificar retornos extremos y contextualizarlos;
-- contrastar coherencia entre raw y adjusted;
-- emitir un gate operativo trazable y reproducible.
+6. Gate aggregation
 
-No debe:
+pick_max_severity(findings): FAIL > WARN > PASS.
+Un FAIL en structural → pipeline aborta.
+WARNs se acumulan como findings para revisión.
 
-- limpiar silenciosamente barras;
-- imputar huecos;
-- corregir corporate actions faltantes;
-- excluir activos irreversiblemente sin dejar traza;
-- mezclar detección de anomalías con remediación opaca.
+7. RunArtifacts
 
-La filosofía correcta es: `QC etiqueta, no maquilla`. Cualquier reparación, reingesta o cuarentena definitiva pertenece a otros módulos. :contentReference[oaicite:3]{index=3}
+findings.parquet: todas las findings.
+summary.json: counts por check×severity, coverage stats.
+manifest.json: config_hash, input hashes, run_id.
 
-3. Principios de diseño no negociables
+8. Invariantes
 
-La especificación del módulo se rige por los siguientes principios:
+I1. Un finding de FAIL en (date, symbol) unique → run aborta.
+I2. Findings preservan el (symbol, date) original para trazabilidad.
+I3. Checks son independientes: un FAIL en geometry no impide correr temporal.
+I4. Adjusted QC solo se ejecuta si adjusted_prices no es None.
 
-1. Separación entre detección y remediación:
-   el módulo clasifica y expone problemas; no corrige silenciosamente.
+9. Tests mínimos
 
-2. Disciplina PIT:
-   las validaciones temporales y de cobertura usan el calendario y el universo vigentes.
-
-3. Determinismo:
-   mismos inputs, mismos thresholds y misma configuración producen el mismo output.
-
-4. Triple granularidad:
-   el sistema debe emitir diagnóstico a nivel fila, símbolo y corrida.
-
-5. Robustez a small caps:
-   un movimiento extremo no se clasifica automáticamente como error.
-
-6. Trazabilidad total:
-   todo flag debe poder explicarse por regla, umbral, fecha y valores observados.
-
-7. Jerarquía formal de severidades:
-   no todos los fallos pesan igual y el gate no puede depender de impresiones subjetivas.
-
-8. Conservadurismo ante ambigüedad:
-   si una observación no puede interpretarse con seguridad, debe marcarse y propagarse al gate según política explícita.
-
-Estos principios convierten al módulo en una capa de defensa epistemológica del pipeline y no en una colección informal de sanity checks. :contentReference[oaicite:4]{index=4}
-
-4. Entradas y contrato mínimo
-
-Entradas mínimas requeridas:
-
-- `prices_raw_path`
-- `prices_adjusted_path` opcional
-- `calendar_path`
-- `qc_config_path`
-- `run_id`
-- `asof_ts_utc`
-
-Notación formal:
-
-`I = {P_raw, P_adj, Cal, Θ_qc, r, a}`
-
-donde:
-
-- `P_raw` contiene precios brutos;
-- `P_adj` contiene precios ajustados si se activa el bloque raw-vs-adj;
-- `Cal` define sesiones válidas;
-- `Θ_qc` fija thresholds, severidades y políticas;
-- `r` es el `run_id`;
-- `a` es el `asof_ts_utc`.
-
-El módulo debe exigir, como mínimo, en `P_raw`:
-
-- `symbol`
-- `date`
-- `open`
-- `high`
-- `low`
-- `close`
-- `volume`
-- `source_provider`
-
-Y, si se ejecuta el bloque de comparación:
-
-- `close_adj_split`
-- `close_adj_total`
-- `ret_1d_adj_split`
-- `ret_1d_adj_total`
-
-Antes de ejecutar ningún check, el módulo debe validar:
-
-- existencia y legibilidad de datasets;
-- presencia de columnas obligatorias;
-- parseabilidad de fechas;
-- ausencia de corrupción estructural del schema;
-- validez sintáctica y semántica de `qc_config`;
-- compatibilidad temporal entre precios y calendario.
-
-Si este contrato falla, la corrida debe entrar en `FAIL_STRUCTURAL` y no avanzar a bloques posteriores. :contentReference[oaicite:5]{index=5}
-
-5. Unidades de análisis
-
-El sistema debe producir diagnóstico en tres niveles simultáneos:
-
-1. Nivel fila:
-   identifica observaciones concretas con fallos o anomalías.
-
-2. Nivel símbolo:
-   resume calidad histórica por ticker.
-
-3. Nivel corrida:
-   decide si el lote es apto para consumo downstream.
-
-Esta triple capa es obligatoria. Una corrida puede ser usable aunque contenga unos pocos símbolos problemáticos, y también puede ocurrir lo contrario: que ningún símbolo individual parezca catastrófico, pero la tasa agregada de fallos revele corrupción sistémica. :contentReference[oaicite:6]{index=6}
-
-6. Taxonomía oficial de checks
-
-Para evitar deriva del módulo hacia una colección abierta y mal gobernada de reglas, se fija la siguiente taxonomía obligatoria.
-
-6.1. Bloque A — integridad estructural
-
-Checks mínimos:
-
-- schema requerido presente;
-- tipos válidos;
-- PK lógica válida;
-- ausencia de duplicados irresolubles;
-- fechas no nulas y parseables.
-
-6.2. Bloque B — coherencia intrabarra
-
-Checks mínimos:
-
-- `high` encierra `open`, `close` y `low`;
-- `low` es el mínimo válido de la barra;
-- signos correctos de precios y volumen;
-- ausencia de precios cero o negativos salvo política explícita.
-
-6.3. Bloque C — continuidad temporal
-
-Checks mínimos:
-
-- fechas ordenadas por símbolo;
-- detección de huecos frente a calendario;
-- cálculo de cobertura por símbolo;
-- identificación de fechas fuera del rango de la corrida.
-
-6.4. Bloque D — retornos extremos y saltos
-
-Checks mínimos:
-
-- cálculo de retorno diario;
-- flag de retorno extremo;
-- clasificación contextual de severidad.
-
-6.5. Bloque E — consistencia raw vs adjusted
-
-Checks mínimos, si ambos datasets están presentes:
-
-- coherencia de dirección de retornos fuera de fechas con eventos corporativos;
-- ausencia de reescalados artificiales sin explicación;
-- continuidad de series ajustadas en fechas de split o dividendo;
-- detección de posibles factores futuros aplicados indebidamente.
-
-Esta taxonomía es parte del contrato del módulo. No debe quedar difusa ni cambiar silenciosamente entre versiones. :contentReference[oaicite:7]{index=7}
-
-7. Checks matemáticos fundamentales
-
-Sea una barra diaria del símbolo `i` en fecha `t`:
-
-`(o_(i,t), h_(i,t), l_(i,t), c_(i,t), v_(i,t))`
-
-7.1. Coherencia OHLC intrabarra
-
-La definición geométrica correcta exige:
-
-`h_(i,t) >= max(o_(i,t), c_(i,t), l_(i,t))`
-
-`l_(i,t) <= min(o_(i,t), c_(i,t), h_(i,t))`
-
-Equivalentemente, una barra es inválida si:
-
-`flag_ohlc_invalid_(i,t) =
-  1[ h_(i,t) < max(o_(i,t), c_(i,t), l_(i,t))
-     or
-     l_(i,t) > min(o_(i,t), c_(i,t), h_(i,t)) ]`
-
-7.2. Validez de signos
-
-`flag_nonpositive_price_(i,t) =
-  1[ o_(i,t) <= 0 or h_(i,t) <= 0 or l_(i,t) <= 0 or c_(i,t) <= 0 ]`
-
-`flag_negative_volume_(i,t) = 1[ v_(i,t) < 0 ]`
-
-Además, para small caps debe existir un flag informativo separado:
-
-`flag_penny_price_(i,t) = 1[ c_(i,t) < tau_penny ]`
-
-donde `tau_penny` es configurable, por ejemplo `1.0` USD. Este flag no implica automáticamente fallo. :contentReference[oaicite:8]{index=8}
-
-7.3. Retorno diario
-
-`r_raw_(i,t) = c_(i,t) / c_(i,t-1) - 1`
-
-La bandera de retorno extremo es:
-
-`flag_extreme_return_(i,t) = 1[ |r_raw_(i,t)| > tau_ret ]`
-
-Pero esta condición por sí sola no clasifica el dato como error. El módulo debe distinguir entre:
-
-- retorno extremo pero económicamente plausible;
-- retorno extremo acompañado de imposibilidad geométrica;
-- retorno extremo acompañado de inconsistencia raw-vs-adj;
-- patrones repetidos de extremos sobre símbolo ilíquido y mal cubierto.
-
-Esta distinción es estructural y no opcional en small caps. :contentReference[oaicite:9]{index=9}
-
-7.4. Cobertura temporal por símbolo
-
-Sea `N_i^exp` el número de sesiones esperadas para el símbolo `i` y `N_i^obs` el número observado. Entonces:
-
-`pct_missing_sessions_i = (N_i^exp - N_i^obs) / N_i^exp`
-
-Esta métrica debe calcularse frente al calendario oficial, no mediante diferencias ingenuas de fechas. :contentReference[oaicite:10]{index=10}
-
-7.5. Comparativa raw vs adjusted
-
-Sea:
-
-`r_adj_split_(i,t) = c_adj_split_(i,t) / c_adj_split_(i,t-1) - 1`
-
-`r_adj_total_(i,t) = c_adj_total_(i,t) / c_adj_total_(i,t-1) - 1`
-
-Fuera de fechas con corporate actions visibles, debe cumplirse que:
-
-`sign(r_raw_(i,t)) = sign(r_adj_split_(i,t))`
-
-salvo tolerancias numéricas pequeñas.
-
-Si aparecen cambios de signo sistemáticos o reescalados incompatibles sin explicación de corporate actions, debe activarse un check de inconsistencia de ajuste. :contentReference[oaicite:11]{index=11}
-
-8. Política de extremos plausibles vs errores de datos
-
-Este punto debe quedar completamente blindado en la especificación. En small caps, un movimiento extremo no es sinónimo de corrupción.
-
-La matriz operativa mínima es:
-
-- Caso A:
-  retorno extremo + OHLC coherente + volumen plausible + sin inconsistencia raw-vs-adj
-  => `WARN` o `INFO_extreme`
-
-- Caso B:
-  retorno extremo + OHLC imposible
-  => `FAIL_ROW`
-
-- Caso C:
-  retorno extremo + salto incompatible entre raw y adjusted sin corporate action
-  => `FAIL_ROW`
-
-- Caso D:
-  múltiples retornos extremos consecutivos en símbolo ilíquido con cobertura pobre
-  => `WARN_SYMBOL` reforzado y posible exclusión downstream
-
-Con esta regla, el módulo evita el error clásico de “limpiar” precisamente los movimientos económicamente más relevantes del universo. :contentReference[oaicite:12]{index=12}
-
-9. Jerarquía oficial de severidades
-
-La política de severidades debe quedar cerrada. Se define la siguiente jerarquía:
-
-- `FAIL_STRUCTURAL`
-- `FAIL_ROW`
-- `WARN_SYMBOL`
-- `INFO`
-
-Semántica:
-
-`FAIL_STRUCTURAL`
-- schema roto
-- columnas obligatorias ausentes
-- tipos incompatibles
-- duplicados de PK irresolubles
-- fechas ilegibles
-- corrupción de parseo
-
-`FAIL_ROW`
-- barra geométricamente imposible
-- precios no positivos sin política permisiva explícita
-- volumen negativo
-- inconsistencia raw-vs-adjusted incompatible con corporate actions
-
-`WARN_SYMBOL`
-- cobertura insuficiente
-- exceso de retornos extremos
-- ratio alto de barras anómalas
-- soporte incompleto del símbolo
-
-`INFO`
-- precio penny coherente
-- símbolo sin actividad en parte del rango
-- absence de adjusted dataset cuando el modo no lo exige
-- checks opcionales deshabilitados
-
-Regla de precedencia:
-
-`FAIL_STRUCTURAL ≻ FAIL_ROW ≻ WARN_SYMBOL ≻ INFO`
-
-Esto significa que un fallo de nivel superior domina el gate final y no puede ser compensado por métricas agregadas benignas. :contentReference[oaicite:13]{index=13}
-
-10. Reglas exactas del gate `pass / warn / fail`
-
-El gate global de la corrida no debe ser una impresión subjetiva, sino el resultado de una agregación formal.
-
-10.1. Gate = `fail`
-
-La corrida debe clasificarse como `fail` si ocurre alguna de estas condiciones:
-
-1. existe al menos un `FAIL_STRUCTURAL`;
-2. la fracción global de filas con `FAIL_ROW` excede un umbral crítico:
-
-`N_fail_row / N_rows > tau_fail_row`
-
-3. el porcentaje de símbolos con cobertura inaceptable excede un umbral crítico;
-4. la comparativa raw-vs-adjusted revela evidencia sistémica de ajuste mal aplicado.
-
-10.2. Gate = `warn`
-
-La corrida debe clasificarse como `warn` si no hay condiciones de `fail`, pero sí alguna de estas:
-
-- símbolos individuales con cobertura pobre;
-- tasa moderada de retornos extremos no explicados;
-- algunas barras anómalas aisladas;
-- uso de adjusted dataset incompleto o parcialmente no comparable.
-
-10.3. Gate = `pass`
-
-La corrida es `pass` sólo si:
-
-- no existen fallos estructurales;
-- la tasa de barras inválidas está por debajo de umbrales estrictos;
-- la cobertura cumple política mínima;
-- no hay inconsistencias materiales entre raw y adjusted;
-- los warnings restantes son informativos o marginales.
-
-Esta lógica elimina arbitraje informal y deja el gate completamente gobernado. :contentReference[oaicite:14]{index=14}
-
-11. Métricas agregadas obligatorias
-
-Sea `N_rows` el número total de filas y `N_symbols` el número total de símbolos.
-
-11.1. Fracción de barras OHLC inválidas
-
-`pct_rows_ohlc_invalid =
-  sum_(i,t) flag_ohlc_invalid_(i,t) / N_rows`
-
-11.2. Fracción de retornos extremos
-
-`pct_extreme_returns =
-  sum_(i,t) flag_extreme_return_(i,t) / N_rows_ret`
-
-11.3. Porcentaje de símbolos con cobertura insuficiente
-
-`pct_symbols_bad_coverage =
-  #{ i : pct_missing_sessions_i > tau_missing_i } / N_symbols`
-
-11.4. Tasa de inconsistencia raw-vs-adjusted
-
-`pct_raw_adjusted_inconsistent =
-  N_raw_adjusted_flags / N_rows_comparable`
-
-Estas métricas deben persistirse siempre, aunque algunos checks opcionales no se ejecuten. Son parte del contrato institucional del módulo y no un extra de reporting. :contentReference[oaicite:15]{index=15}
-
-12. Flujo de procesamiento oficial
-
-La ejecución debe seguir esta secuencia determinista:
-
-1. cargar datasets, calendario y configuración;
-2. validar presencia de columnas y tipos;
-3. ejecutar bloque estructural:
-   - schema
-   - parseo de fechas
-   - PK lógica
-   - duplicados
-4. ejecutar bloque geométrico:
-   - OHLC intrabarra
-   - precios no positivos
-   - volumen negativo
-5. ejecutar bloque temporal:
-   - orden temporal
-   - huecos frente a calendario
-   - cobertura por símbolo
-6. ejecutar bloque económico:
-   - retornos extremos
-   - análisis contextual de severidad
-7. si existe adjusted dataset, ejecutar bloque raw-vs-adjusted;
-8. consolidar findings a nivel fila, símbolo y corrida;
-9. calcular métricas agregadas y emitir gate;
-10. persistir reportes, manifest y artefactos auxiliares.
-
-Este flujo debe permanecer estable y versionado. Cambios en thresholds, política de penny prices o reglas raw-vs-adjusted deben reflejarse en configuración y manifest. :contentReference[oaicite:16]{index=16}
-
-13. Contrato de salida
-
-El módulo debe producir, como mínimo, los siguientes artefactos.
-
-13.1. `qc_summary.json`
-
-Debe contener:
-
-- `run_id`
-- `n_rows`
-- `n_symbols`
-- `pct_rows_ohlc_invalid`
-- `pct_extreme_returns`
-- `pct_symbols_bad_coverage`
-- `pct_raw_adjusted_inconsistent`
-- `gate`
-- `fail_count`
-- `warn_count`
-- `info_count`
-
-13.2. `qc_symbol_level.parquet`
-
-Debe incluir, por símbolo:
-
-- `symbol`
-- `n_rows`
-- `pct_missing_sessions_symbol`
-- `pct_extreme_returns_symbol`
-- `n_ohlc_violations`
-- `n_nonpositive_prices`
-- `n_raw_adjusted_flags`
-- `severity_max`
-
-13.3. `qc_row_level.parquet`
-
-Artefacto obligatorio de trazabilidad. Debe contener:
-
-- `symbol`
-- `date`
-- `check_name`
-- `severity`
-- `observed_value`
-- `threshold`
-- `message`
-
-13.4. `qc_failures.parquet`
-
-Subset de observaciones con severidad material, listo para revisión manual o reingesta selectiva.
-
-13.5. `manifest.json`
-
-Debe incluir, al menos:
-
-- `run_id`
-- `config_hash`
-- `prices_raw_snapshot`
-- `prices_adjusted_snapshot`
-- `calendar_snapshot`
-- `code_version`
-- `processing_duration_sec`
-- `start_date`
-- `end_date`
-
-Sin estos artefactos, el módulo no es suficientemente auditable para un entorno de research-production. :contentReference[oaicite:17]{index=17}
-
-14. Política de configuración
-
-El fichero `qc_prices.yaml` debe fijar explícitamente, como mínimo:
-
-- `ohlc_invalid_fail_threshold`
-- `extreme_return_threshold`
-- `symbol_bad_coverage_threshold`
-- `pct_symbols_bad_coverage_fail_threshold`
-- `pct_fail_row_fail_threshold`
-- `penny_price_threshold`
-- `require_adjusted_consistency_check`
-
-Los valores concretos pueden variar, pero la existencia de estos parámetros no. Deben formar parte del contrato de gobernanza del módulo. :contentReference[oaicite:18]{index=18}
-
-15. CLI de referencia
-
-La interfaz operativa recomendada es:
-
-`python -m data.price.qc_prices --prices-raw-path data/price/raw --prices-adjusted-path data/price/adjusted --calendar-path data/reference/market_calendar.parquet --config-path configs/data/qc_prices.yaml --as-of-ts-utc 2026-03-05T23:59:59Z --run-id qc_prices_20260305_001`
-
-El uso explícito de `asof_ts_utc` es recomendable para mantener versionado coherente y alineación con el resto del sistema. :contentReference[oaicite:19]{index=19}
-
-16. Tests e invariantes obligatorios
-
-La implementación debe incluir, al menos, tests sobre:
-
-1. schema roto => `FAIL_STRUCTURAL`;
-2. duplicados de PK => `FAIL_STRUCTURAL`;
-3. OHLC imposible => `FAIL_ROW`;
-4. volumen negativo => `FAIL_ROW`;
-5. precio penny coherente => `INFO` o `WARN` según política;
-6. símbolo con muchas sesiones ausentes => `WARN_SYMBOL`;
-7. retorno extremo pero plausible => no `FAIL` automático;
-8. retorno extremo + inconsistencia raw-vs-adjusted => `FAIL_ROW`;
-9. corrida con demasiados símbolos malos => `gate=fail`;
-10. reproducibilidad bit a bit con mismos inputs y configuración.
-
-Estos tests no son cosméticos. Definen el contrato institucional del módulo. :contentReference[oaicite:20]{index=20}
-
-17. Definition of Done
-
-El módulo `qc_prices.py` se considera terminado únicamente si:
-
-- produce un gate reproducible y trazable;
-- separa claramente fallos estructurales, fallos de fila, warnings por símbolo e información contextual;
-- distingue movimientos extremos plausibles de corrupción de datos;
-- valida consistencia temporal frente a calendario oficial;
-- detecta inconsistencias materiales entre raw y adjusted;
-- emite artefactos a nivel resumen, símbolo y fila;
-- deja todo lo necesario para exclusión, reingesta o revisión manual downstream.
-
-En otras palabras, el módulo no está terminado cuando “detecta cosas raras”, sino cuando impide que errores de datos, discontinuidades artificiales y ajustes incoherentes se conviertan en alfa ficticio dentro del sistema. :contentReference[oaicite:21]{index=21}
-
-18. MVP vs versión avanzada
-
-MVP correcto:
-
-- taxonomía de 5 bloques;
-- triple granularidad row/symbol/run;
-- jerarquía formal de severidades;
-- gate determinista;
-- cobertura frente a calendario;
-- tratamiento contextual de retornos extremos;
-- validación raw-vs-adjusted;
-- artefactos auditables y reproducibles;
-- suite mínima de tests con edge cases reales.
-
-Versión avanzada justificable:
-
-- scoring probabilístico de anomalía condicionado por contexto;
-- thresholds dinámicos por volatilidad, liquidez y régimen;
-- cuantificación del impacto downstream sobre IC o performance;
-- validación multi-escala diaria/semanal;
-- DAG causal de propagación de calidad.
-
-No es obligatorio, en esta fase, introducir Bayesian anomaly scoring o causal DAG complejos como núcleo del módulo oficial. Son extensiones plausibles y valiosas, pero la prioridad correcta aquí es cerrar perfectamente la capa rule-based: checks geométricos, cobertura, severidades, gate y trazabilidad. :contentReference[oaicite:22]{index=22}
-
-19. Interpretación correcta
-
-`data/price/qc_prices.py` no debe interpretarse como un “limpiador de datos”, sino como una capa de realidad cuantitativa. Su función no es embellecer el dataset, sino impedir que corrupción de feed, ajustes incoherentes o huecos de calendario se traduzcan en señales, retornos o diagnósticos falsos. En small caps, donde conviven iliquidez real, movimientos extremos plausibles y basura de datos, un QC ingenuo destruye información o deja pasar corrupción. Un QC conservador, jerárquico, trazable y contextualizado sí sirve, aunque genere más warnings y exija más disciplina downstream. :contentReference[oaicite:23]{index=23}
-
-20. Conclusión
-
-`data/price/qc_prices.py` debe quedar definido como una pieza institucional de control de verdad de mercado, no como un bloque auxiliar de validaciones sueltas.
-
-La especificación correcta no es “comprobar si los precios parecen razonables”, sino:
-
-- fijar qué entra;
-- fijar qué bloques de checks existen;
-- fijar qué es un fallo duro y qué es una degradación;
-- fijar cómo se calcula el gate;
-- fijar qué artefactos auditables salen;
-- y fijar qué invariantes protegen a features, labels y backtests de basura estadísticamente peligrosa.
-
-Si cumple esta especificación, el módulo deja de ser un checklist cosmético y pasa a ser una verdadera capa de defensa metodológica del pipeline. Si no la cumple, el riesgo no es sólo técnico: es permitir que el sistema optimice sobre errores de datos creyendo que está descubriendo alfa.
+- Duplicado (date, symbol) → FAIL.
+- high < low → FAIL finding.
+- |ret| = 0.8 con spike_threshold=0.5 → WARN finding.
+- 15 días ret=0 consecutivos con max_streak=10 → WARN.
+- Volume = 0 para 50% de serie con threshold 30% → WARN.
+- Datos en domingo → FAIL.
+- adj_factor = -0.5 → FAIL (factor must be > 0).

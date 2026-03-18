@@ -1,586 +1,86 @@
-Especificación Cuantitativa: data/edgar/edgar_qc.py
+Especificación: data/edgar/edgar_qc.py
 
-1. Propósito del módulo
+1. Propósito
 
-El módulo `data/edgar/edgar_qc.py` implementa la capa formal de control de riesgo de datos del subsistema EDGAR. Su función no es describir la calidad del pipeline de forma decorativa, sino decidir de manera operativa, reproducible y auditable si los artefactos regulatorios generados por la cadena de ingestión y transformación pueden ser consumidos por feature engineering, research, backtesting o validación sin introducir sesgos materiales.
+QC end-to-end del pipeline EDGAR. Valida cada tabla producida por los
+6 módulos upstream: ticker_cik, fetch_submissions, fetch_companyfacts,
+parse_xbrl, point_in_time, filings_flags. Produce un veredicto formal
+(PASS/WARN/FAIL) con métricas cuantitativas que alimentan el gate de
+promoción del pipeline de datos.
 
-Su misión central es bloquear, degradar o autorizar una corrida del pipeline EDGAR en función de un conjunto jerárquico de checks sobre schema, cobertura, identidad, temporalidad, plausibilidad de valores, staleness y lineage. En términos prácticos, el módulo debe impedir que el sistema trate como “fundamental truth” un dataset contaminado por:
+2. Tablas que valida
 
-- survivorship bias implícito por cobertura desigual;
-- look-ahead leakage vía aceptación posterior al `asof`;
-- contaminación por amendments o restatements mal resueltos;
-- conflictos activos de identidad `ticker`/`CIK`;
-- pérdida de trazabilidad desde el dato PIT hasta el filing origen;
-- degradación silenciosa del parse o de la frescura de los facts.
+  ticker_cik: CIK unique, no nulls, zero-padded 10d.
+  submissions: accession unique, dates valid, form_type non-null.
+  companyfacts: (cik, taxonomy, concept, unit, period) non-null.
+  parsed_xbrl: canonical_metric mapped, values finite.
+  point_in_time: PIT invariant (filed_date < asof), staleness bounded.
+  filings_flags: flags coherent (is_late requires deadline_date).
 
-La filosofía del módulo es explícitamente asimétrica: cuando existe ambigüedad entre permitir una corrida o bloquearla, el error admisible no es “ser flexible”, sino evitar que entren datos fundamentales que corrompan la validez del alpha o del backtest. En EDGAR, un pequeño fallo temporal o de identidad puede contaminar meses de research. Ésa es la razón por la que el módulo debe comportarse como un risk gate, no como un dashboard. :contentReference[oaicite:0]{index=0}
+3. Dimensiones de QC
 
-2. Papel dentro de la arquitectura
+Stage coverage:
+  ¿Cuántos CIKs pasaron cada stage? ¿Cuántos se perdieron?
+  StageCoverageThresholds: min_cik_fraction por stage.
 
-`edgar_qc.py` se sitúa al final de la cadena de producción de datos EDGAR y justo antes de cualquier capa cuantitativa consumidora. Opera sobre la salida conjunta de:
+Identity:
+  CIK format válido, symbol non-null, no duplicados en current mapping.
+  IdentityThresholds: max_duplicate_fraction, max_null_symbol_fraction.
 
-- `ticker_cik_map`
-- `submissions_raw`
-- `companyfacts_raw`
-- `parsed_facts`
-- `pit_store`
+Value quality:
+  Valores financieros finite, sin outliers extremos (revenue negativa
+  cuando no aplica), unidades coherentes.
+  ValueQualityThresholds: max_inf_fraction, max_extreme_outlier_fraction.
 
-y produce una decisión de uso downstream.
+Lineage:
+  Cada fact tiene accession_number que existe en submissions.
+  LineageThresholds: max_orphan_fact_fraction.
 
-La secuencia lógica del subsistema es:
+Staleness:
+  Distribución de staleness_days en el panel PIT.
+  StalenessThresholds: max_stale_fraction, stale_days_threshold.
 
-1. resolución de identidad regulatoria;
-2. descarga de submissions y company facts;
-3. parsing y normalización a esquema canónico;
-4. construcción de vista point-in-time;
-5. control de calidad integral y gate final.
+4. Scoring
 
-La separación es esencial. Los módulos previos producen datos; `edgar_qc.py` decide si esos datos son aptos para entrar en producción analítica. No debe reestimar facts ni reparar silenciosamente el pipeline. Sí debe detectar de forma formal qué ha fallado, con qué severidad y con qué implicación operativa. :contentReference[oaicite:1]{index=1}
+ScoreWeights: weight por dimensión (coverage, identity, value, lineage, staleness).
+ScoreThresholds: score_pass, score_warn.
+Weighted average → overall score → PASS/WARN/FAIL.
 
-3. Principios de diseño no negociables
+5. Check pattern
 
-La especificación del módulo se rige por los siguientes principios:
+make_check(name, severity, passed, metric_value, threshold, message, details):
+  Produce un check record estandarizado.
+  checks = list[dict] con: name, severity, passed, metric, threshold, msg.
 
-1. Causalidad estricta:
-   ningún dato PIT puede considerarse válido si su `acceptance_ts` es posterior al `asof`.
+6. EdgarQCConfig
 
-2. Precedencia formal:
-   no todos los checks pesan igual; schema y leakage dominan la decisión final.
+coverage_thresholds: StageCoverageThresholds
+identity_thresholds: IdentityThresholds
+value_quality_thresholds: ValueQualityThresholds
+lineage_thresholds: LineageThresholds
+staleness_thresholds: StalenessThresholds
+score_weights: ScoreWeights
+score_thresholds: ScoreThresholds
 
-3. No compensatoriedad parcial:
-   un fallo duro no puede compensarse con scores altos en otras dimensiones.
+7. Output
 
-4. Trazabilidad completa:
-   todo registro PIT debe poder reconstruirse hasta filing, fact, unidad, periodo y timestamp de aceptación.
+edgar_qc_{run_id}.json: checks, scores, summary, config_hash.
+edgar_qc_findings_{run_id}.parquet: detalle de findings por CIK/tabla.
 
-5. Cobertura contextual:
-   la cobertura no se evalúa sólo en agregado, sino también por fecha, métrica, tamaño, sector y buckets relevantes.
+8. Gate aggregation
 
-6. Robustez estadística:
-   los checks de valores deben usar estadísticas robustas, no supuestos gaussianos ingenuos.
+- FAIL en coverage (CIKs missing > threshold) → FAIL overall.
+- FAIL en identity (duplicates) → FAIL overall.
+- WARN acumula pero no bloquea.
+- Overall score < score_pass → FAIL.
+- score_pass ≤ overall < score_warn → WARN.
 
-7. Configuración externa y versionada:
-   thresholds, pesos, severidades y arbitrajes deben residir en config y no quedar hardcodeados opacamente en lógica dispersa.
+9. Tests mínimos
 
-8. Conservadurismo institucional:
-   un conflicto crítico de identidad, leakage o lineage pesa más que una buena cobertura media.
-
-Estos principios convierten el módulo en una pieza de data governance cuantitativa y no en una simple capa de sanity checks. :contentReference[oaicite:2]{index=2}
-
-4. Alcance exacto del control de calidad
-
-El módulo cubre siete dimensiones de calidad, todas obligatorias:
-
-1. Integridad estructural:
-   schema, columnas obligatorias, tipos, claves, timestamps y unicidad.
-
-2. Cobertura:
-   presencia suficiente del universo objetivo en cada etapa del pipeline.
-
-3. Identidad:
-   consistencia de mappings `ticker` ↔ `CIK`, vigencias y conflictos activos.
-
-4. Temporalidad:
-   ausencia de PIT leakage y orden correcto entre eventos, filings y amendments.
-
-5. Calidad de valores:
-   plausibilidad económica, outliers robustos, coherencia contable y semántica.
-
-6. Staleness:
-   recencia de los datos respecto al `asof` y a la naturaleza de cada métrica.
-
-7. Lineage:
-   reconstrucción completa del origen de cada observación materializada.
-
-Quedan fuera del alcance:
-
-- corregir automáticamente facts corruptos;
-- resolver con heurísticas no auditadas conflictos de identidad;
-- reparsear o redescargar dentro del propio QC;
-- seleccionar features downstream.
-
-El módulo juzga la aptitud del dataset; no debe mutar silenciosamente la fuente de verdad. :contentReference[oaicite:3]{index=3}
-
-5. Entradas y dependencias
-
-Entradas mínimas requeridas:
-
-- `ticker_cik_outputs`
-- `submissions_raw`
-- `companyfacts_raw`
-- `parsed_facts`
-- `pit_store`
-- `qc_config_path`
-- `run_id`
-
-Formalmente, el conjunto de entradas puede modelarse como:
-
-`I = {U, S_raw, C_raw, F_parsed, P_pit, theta_qc, r}`
-
-donde:
-
-- `U` es el universo regulatorio objetivo;
-- `S_raw` es el conjunto de artefactos de submissions;
-- `C_raw` es el conjunto de company facts;
-- `F_parsed` es la tabla canónica de hechos parseados;
-- `P_pit` es la vista point-in-time;
-- `theta_qc` son los parámetros del QC;
-- `r` es el identificador único de corrida.
-
-Si alguna entrada crítica no existe o no puede cargarse bajo contrato mínimo, el gate final debe ser `fail` sin continuar a evaluación sustantiva. :contentReference[oaicite:4]{index=4}
-
-6. Contrato mínimo de schema
-
-Antes de cualquier check económico o temporal, el módulo valida contrato mínimo de schema. Ninguna tabla puede pasar a evaluación si incumple alguno de estos requisitos:
-
-- ausencia de columnas obligatorias;
-- tipos incompatibles;
-- claves nulas en campos de identidad;
-- timestamps no parseables o sin normalización;
-- duplicados sobre claves definidas como únicas;
-- imposibilidad de reconstruir linaje del registro.
-
-Para `pit_store`, como mínimo deben existir:
-
-- `symbol`
-- `cik`
-- `metric`
-- `value`
-- `unit`
-- `period_end`
-- `acceptance_ts`
-- `asof`
-- `source_filing_id`
-- `run_id`
-
-Si este contrato falla, la corrida entra automáticamente en `fail`. No existe base formal para confiar en ningún check posterior si la estructura mínima no está garantizada. :contentReference[oaicite:5]{index=5}
-
-7. Representación formal del pipeline y del QC
-
-Sea el pipeline EDGAR la composición:
-
-`Pi = T_pit o T_parse o T_download o T_map`
-
-donde:
-
-`Omega_id -> Omega_raw -> Omega_dl -> Omega_facts -> Omega_pit`
-
-El módulo define una familia de operadores de validación:
-
-`Q = {Q_schema, Q_coverage, Q_identity, Q_temporal, Q_value, Q_staleness, Q_lineage}`
-
-y una función de gate final:
-
-`G: R^k x E -> {pass, warn, fail}`
-
-donde:
-
-- `q in R^k` es el vector de métricas agregadas;
-- `E` es el conjunto de incidencias;
-- `s in [0,100]` es el score global;
-- `g` es la decisión final.
-
-Esta formalización no es decorativa. Es la base para separar:
-
-- checks bloqueantes;
-- checks penalizables;
-- incidencias informativas;
-- y arbitraje formal entre conflictos. :contentReference[oaicite:6]{index=6}
-
-8. Precedencia jerárquica del gate
-
-La precedencia oficial del módulo es:
-
-`schema > temporal_leakage > identity_integrity > coverage > value_quality > staleness`
-
-Interpretación:
-
-- un fallo estructural invalida toda la corrida;
-- cualquier evidencia de PIT leakage bloquea de inmediato;
-- conflictos activos de identidad tienen severidad crítica;
-- cobertura puede degradar o bloquear según umbral;
-- anomalías de valores y staleness suelen ser `warn`, salvo niveles extremos;
-- lineage crítico perdido puede ascender a `fail` aunque cobertura y valores parezcan razonables.
-
-Esta precedencia elimina el error clásico de compensar con promedios aceptables un fallo que, en realidad, invalida el dataset por completo. :contentReference[oaicite:7]{index=7}
-
-9. Cobertura por etapa
-
-Sea `U` el universo objetivo y `U_j_obs` el subconjunto observado en la etapa `j`. Se define:
-
-`rho_j = |U_j_obs| / |U|`
-
-Se exigen umbrales mínimos por etapa:
-
-- `rho_map >= tau_map`
-- `rho_submissions >= tau_sub`
-- `rho_facts >= tau_facts`
-- `rho_pit >= tau_pit`
-
-Pero la cobertura global no basta. El módulo debe computar también cobertura por:
-
-- fecha;
-- métrica;
-- sector;
-- bucket de capitalización;
-- decil de liquidez.
-
-La razón es crítica en un sistema small-cap: una cobertura media alta puede ocultar un colapso selectivo precisamente en los nombres pequeños o ilíquidos donde los fundamentales son más frágiles y más relevantes. :contentReference[oaicite:8]{index=8}
-
-10. Integridad de identidad regulatoria
-
-Sea `M` el mapping historificado entre `ticker` y `CIK`. El módulo exige:
-
-- unicidad de mapping activo por fecha;
-- `CIK` normalizado de forma canónica;
-- ausencia de solapamientos temporales para el mismo `ticker`;
-- ausencia de múltiples tickers activos para el mismo emisor salvo excepción explícita permitida;
-- precedencia formal entre fuentes:
-
-`official_SEC_source > historical_internal_mapping > heuristic_inference`
-
-Cualquier conflicto de primer nivel no resuelto produce `fail`. En EDGAR, un conflicto de identidad no es un warning cosmético; puede contaminar series enteras y mezclar emisores distintos bajo el mismo símbolo o viceversa. :contentReference[oaicite:9]{index=9}
-
-11. Descarga y parse
-
-11.1. Tasa de fallo de descarga
-
-Sea `R_req` el conjunto de recursos solicitados y `R_ok` el subconjunto descargado con éxito y validado estructuralmente. Se define:
-
-`epsilon_dl = 1 - |R_ok| / |R_req|`
-
-Debe desagregarse por:
-
-- errores permanentes (`404`);
-- errores transitorios (`429`, `5xx`);
-- timeouts;
-- payload corrupto;
-- fallo post-descarga.
-
-No todos los fallos pesan igual. Un `404` documentado sobre filing inexistente no es equivalente a una ola de throttling que deja sin descargar una fracción significativa del universo.
-
-11.2. Tasa de éxito de parse y canonización
-
-Sea `F_raw` el conjunto raw y `F_canon` el conjunto de hechos que superan parse, normalización, resolución de unidades y deduplicación. Se define:
-
-`pi_parse = |F_canon| / |F_raw|`
-
-Además deben informarse:
-
-- tasa de facts descartados por contexto inconsistente;
-- units no normalizables;
-- duplicados semánticos;
-- conflictos de periodos comparables;
-- porcentaje de métricas canónicas sin cobertura mínima. :contentReference[oaicite:10]{index=10}
-
-12. Integridad temporal y ausencia de PIT leakage
-
-Éste es el check más crítico del módulo. Para todo registro `p in P_pit` debe cumplirse:
-
-`acceptance_ts(p) <= asof(p)`
-
-Equivalentemente, el conjunto de leakage:
-
-`L = {p in P_pit : acceptance_ts(p) > asof(p)}`
-
-debe satisfacer:
-
-`|L| = 0`
-
-La tolerancia es cero. Cualquier ocurrencia implica `fail` automático.
-
-Además se verifican reglas complementarias:
-
-- `period_end <= acceptance_ts`
-- orden temporal consistente entre filing original y amendments;
-- desempate determinista cuando múltiples facts compiten;
-- prioridad del último hecho observable ex ante, no del último conocido ex post.
-
-Este punto debe considerarse sagrado. Un solo leakage PIT puede introducir look-ahead silencioso y destruir la validez del research fundamental. :contentReference[oaicite:11]{index=11}
-
-13. Arbitraje entre filings y amendments
-
-Cuando existen varias observaciones candidatas para una misma clave:
-
-`(symbol, metric, asof)`
-
-la política oficial es:
-
-1. excluir todo hecho con `acceptance_ts > asof`;
-2. entre los restantes, seleccionar el de mayor `acceptance_ts`;
-3. si existe empate exacto, priorizar:
-
-`amended_authoritative_filing > original_filing > derived_or_inferred_record`
-
-4. si persiste empate, seleccionar mayor calidad de lineage y unidad canónica;
-5. si aún persiste ambigüedad, registrar incidencia crítica y no materializar el dato.
-
-Esta política es esencial para cerrar una de las mayores fuentes de bugs silenciosos en pipelines fundamentales: la resolución no determinista de observaciones competidoras. :contentReference[oaicite:12]{index=12}
-
-14. Calidad de valores y checks robustos
-
-Para cada métrica `m`, el módulo evalúa:
-
-- reglas de signo permitidas;
-- rangos razonables por familia de métricas;
-- outliers robustos;
-- discontinuidades excesivas;
-- coherencia contable cuando existan variables relacionadas.
-
-La forma preferida de detección es robusta:
-
-`z_rob(i,m) = (x_(i,m) - median(X_m)) / (1.4826 * MAD(X_m))`
-
-Se marca anomalía cuando:
-
-`|z_rob(i,m)| > kappa_m`
-
-Cuando haya activos, pasivos y patrimonio simultáneamente, se calcula:
-
-`r_accounting = assets - liabilities - equity`
-
-y se verifica:
-
-`|r_accounting| / (1 + |assets|) <= epsilon_accounting`
-
-La idea no es borrar automáticamente todos los outliers, sino separar:
-
-- evento económico real;
-- error de unidad;
-- error de parse;
-- duplicado mal resuelto;
-- observación legítima pero extrema. :contentReference[oaicite:13]{index=13}
-
-15. Staleness por métrica
-
-La recencia admisible depende de la naturaleza económica de cada campo. Para cada métrica `m` se calcula:
-
-`d_m(i) = asof_i - acceptance_ts_i`
-
-y la mediana por métrica:
-
-`d_tilde_m = median({d_m(i)})`
-
-Se definen umbrales:
-
-- `delta_m_warn`
-- `delta_m_fail`
-
-con:
-
-`delta_m_warn < delta_m_fail`
-
-Regla:
-
-- `warn` si la staleness supera umbral de advertencia;
-- `fail` si supera umbral crítico para métricas esenciales o si la degradación es suficientemente extensa.
-
-No tiene sentido aplicar el mismo threshold de frescura a shares outstanding, revenues, assets o net income. La política debe ser específica por métrica o, al menos, por familia de métricas. :contentReference[oaicite:14]{index=14}
-
-16. Lineage y auditabilidad
-
-Todo registro PIT debe ser completamente trazable hasta su origen. Como mínimo, deben existir:
-
-- filing origen;
-- tipo de formulario;
-- periodo reportado;
-- acceptance timestamp;
-- unidad original;
-- métrica canónica;
-- referencia al artefacto raw;
-- `run_id`.
-
-Definimos la tasa de trazabilidad:
-
-`lambda_trace = |P_traceable| / |P_pit|`
-
-Para `pass` institucional debe exigirse:
-
-`lambda_trace = 1`
-
-Si `lambda_trace < 1`, el sistema entra al menos en `warn`, y si la pérdida afecta métricas críticas o supera umbral configurado, entra en `fail`.
-
-Sin lineage completo, el sistema pierde capacidad de auditoría, reversión y depuración. En producción seria, eso no es opcional. :contentReference[oaicite:15]{index=15}
-
-17. Score global y función de gate
-
-El módulo distingue entre:
-
-- checks bloqueantes `B`;
-- checks penalizables `N`.
-
-El score agregado se define como:
-
-`s = 100 - sum_{j in N} w_j * l_j`
-
-donde:
-
-- `w_j` es el peso del check `j`;
-- `l_j` es su pérdida normalizada.
-
-Pero la decisión final no depende sólo de `s`. La función de gate es:
-
-- `fail` si existe cualquier `b in B` violado;
-- `fail` si `s < s_fail_min`;
-- `warn` si no hay bloqueo pero `s < s_pass_min`;
-- `warn` si existe acumulación material de incidencias moderadas;
-- `pass` en caso contrario.
-
-Checks típicamente bloqueantes:
-
-- fallo de schema;
-- PIT leakage;
-- conflicto crítico de identidad;
-- cobertura PIT por debajo del mínimo absoluto;
-- pérdida material de lineage en métricas críticas.
-
-Esta separación entre score y gate es obligatoria. Un sistema institucional no usa un score cosmético para suavizar una violación que conceptualmente invalida toda la corrida. :contentReference[oaicite:16]{index=16}
-
-18. Clasificación de severidad
-
-Cada incidencia se clasifica en:
-
-- `info`
-- `warn`
-- `critical`
-
-Además, el sistema puede elevar severidad por acumulación cuando múltiples `warn` afectan:
-
-- la misma fecha;
-- el mismo símbolo;
-- la misma métrica;
-- o la misma dimensión del pipeline.
-
-Esto evita el problema de subestimar degradaciones sistémicas repartidas en muchos fallos aparentemente pequeños. :contentReference[oaicite:17]{index=17}
-
-19. Artefactos obligatorios de salida
-
-El módulo debe persistir, como mínimo:
-
-- `edgar_qc_summary.json`
-- `edgar_qc_metrics.parquet`
-- `edgar_qc_failures.parquet`
-- `edgar_qc_checks.parquet`
-- `manifest.json`
-
-El resumen debe contener:
-
-- `run_id`
-- gate final
-- score
-- métricas clave
-- razones de decisión
-- versiones de configuración
-- timestamps de ejecución
-
-El detalle debe permitir reconstrucción completa por check, fila, umbral y severidad. Un QC sin artefactos auditables no es production-grade. :contentReference[oaicite:18]{index=18}
-
-20. Flujo de ejecución
-
-El flujo oficial del módulo es:
-
-1. resolución de configuración;
-2. carga y validación estructural;
-3. ejecución de checks por capa (`map`, `download`, `parse`, `pit`);
-4. arbitraje determinista de duplicados, amendments y conflictos;
-5. agregación de métricas, incidencias, score y gate;
-6. persistencia auditable por `run_id`.
-
-Este flujo debe permanecer estable y versionado. Cambios en thresholds o en la lógica de arbitraje deben quedar reflejados en la configuración y en el manifest de salida. :contentReference[oaicite:19]{index=19}
-
-21. Uso downstream
-
-La política de consumo es estricta:
-
-- si `gate = fail`, ningún módulo downstream puede consumir la corrida;
-- si `gate = warn`, el consumo sólo se permite si la política del entorno lo autoriza explícitamente;
-- si `gate = pass`, la corrida queda habilitada como versión utilizable del dataset EDGAR.
-
-Esto convierte el QC en una dependencia real de producción y no en un informe descriptivo. En particular, feature engineering y backtest no deben tener la capacidad de “saltarse” el gate sin rastro explícito. :contentReference[oaicite:20]{index=20}
-
-22. Tests e invariantes obligatorios
-
-La implementación debe incluir, al menos, los siguientes tests:
-
-1. bloqueo por `acceptance_ts > asof`;
-2. conflicto de mapping activo `ticker`/`CIK`;
-3. desempate determinista entre filings con igual timestamp;
-4. rechazo ante schema incompleto;
-5. propagación correcta de severidades;
-6. estabilidad del score bajo misma entrada y misma config;
-7. persistencia íntegra de artefactos y manifest;
-8. trazabilidad completa de una muestra PIT;
-9. bloqueo cuando falta lineage crítico;
-10. no compensación de un fallo duro mediante score agregado.
-
-Estos tests no son ornamentales: definen el comportamiento contractual del gate. :contentReference[oaicite:21]{index=21}
-
-23. Definition of Done
-
-El módulo `edgar_qc.py` se considera terminado únicamente si:
-
-- implementa checks críticos de schema, cobertura, identidad, temporalidad, valores, staleness y lineage;
-- aplica precedencia formal cerrada;
-- bloquea correctamente todo caso de PIT leakage;
-- persiste métricas, fallos y artefactos con trazabilidad completa;
-- deja score y gate reproducibles bajo misma entrada y configuración;
-- impide consumo downstream de datasets no aptos;
-- dispone de tests suficientes para los casos límite principales.
-
-En otras palabras, el módulo no está terminado cuando “mide calidad”, sino cuando impone una frontera formal entre datos EDGAR presentes y datos EDGAR realmente utilizables por un stack cuantitativo serio. :contentReference[oaicite:22]{index=22}
-
-24. MVP vs versión avanzada
-
-MVP correcto:
-
-- schema contract completo;
-- zero-tolerance PIT leakage;
-- cobertura por etapa;
-- checks de identidad;
-- robust z-score con MAD;
-- residual contable básico;
-- staleness por métrica;
-- lineage completo;
-- score + gate con precedencia formal;
-- artefactos auditables.
-
-Versión avanzada justificable:
-
-- CUSUM o EWMA para drift silencioso de staleness o parse quality;
-- posterior bayesiano de frescura por métrica;
-- anomaly detection multivariante sobre espacio XBRL;
-- integración de reglas XBRL Formula / DQC;
-- thresholds ajustados por régimen de mercado o régimen regulatorio;
-- residuales multivariantes tipo Mahalanobis.
-
-No es obligatorio, en esta fase, introducir Kalman fusion, HMM complejos o sistemas avanzados de detección no supervisada si el dataset todavía no soporta calibración robusta. Sin base suficiente, esas extensiones añaden complejidad aparente más que robustez institucional. :contentReference[oaicite:23]{index=23}
-
-25. Interpretación correcta
-
-Este módulo no debe interpretarse como un “medidor genérico de limpieza”, sino como risk gate de verdad fundamental regulatoria.
-
-Su función correcta es:
-
-- impedir que research y backtest consuman facts no observables ex ante;
-- impedir que conflictos de identidad mezclen emisores;
-- impedir que cobertura aparente esconda sesgos de universo;
-- imponer trazabilidad completa;
-- y convertir la base EDGAR en un activo cuantitativo confiable.
-
-Un QC que produzca métricas bonitas pero permita leakage PIT no sirve. Un QC conservador, jerárquico, auditable y trazable sí sirve, aunque bloquee más corridas. En fundamentales regulatorios, el mayor error no es perder alguna observación: es permitir que entren observaciones temporal o semánticamente falsas. :contentReference[oaicite:24]{index=24}
-
-26. Conclusión
-
-`data/edgar/edgar_qc.py` debe quedar definido como una pieza central de data risk control, no como un informe auxiliar de QA.
-
-La especificación correcta no es “comprobar si el pipeline parece razonable”, sino:
-
-- fijar qué entra;
-- fijar qué rompe el sistema;
-- fijar qué sólo degrada;
-- fijar cómo se arbitran conflictos;
-- fijar qué artefactos salen;
-- fijar cómo se consume el gate;
-- y fijar qué salvaguardas impiden que los fundamentales regulatorios contaminen el alpha con leakage, sesgos o pérdida de trazabilidad.
-
-Si cumple esta especificación, el módulo deja de ser una capa cosmética y pasa a ser una frontera institucional entre “tener datos EDGAR” y “tener datos EDGAR utilizables”. Si no la cumple, el riesgo no es sólo técnico: es invalidar silenciosamente la investigación fundamental entera.
+- CIK con formato inválido → identity FAIL.
+- Accession number sin match en submissions → lineage WARN/FAIL.
+- 50% CIKs missing en stage → coverage FAIL.
+- Staleness > threshold para >X% del panel → staleness WARN.
+- Revenue = -1e15 → value quality FAIL (extreme outlier).
+- All checks PASS → overall PASS con score > score_pass.
+- Pipeline con datos sintéticos limpios → PASS completo.

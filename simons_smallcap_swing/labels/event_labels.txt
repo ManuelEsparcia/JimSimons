@@ -1,781 +1,96 @@
-Módulo: labels/event_labels.py
+Especificación: labels/event_labels.py
 
-1. Objetivo del módulo
+1. Propósito
 
-El objetivo de labels/event_labels.py es construir la capa canónica de labels event-driven del sistema:
-targets definidos no sobre un panel uniforme fecha-símbolo, sino sobre episodios discretos de información
-que alteran de forma material el estado informativo o de microestructura del activo.
+Labels event-driven: targets definidos sobre episodios discretos de información
+(earnings, noticias, gaps, breakouts, vol shocks, microestructura) en vez de
+panel uniforme fecha-símbolo. Complementa build_labels.py para triggers donde
+el proceso generador de retornos cambia estructuralmente alrededor del evento.
 
-En un sistema serio de small caps swing trading, estos episodios incluyen, entre otros:
-- publicación de resultados,
-- noticias corporativas materiales,
-- gaps de apertura,
-- rupturas técnicas,
-- shocks de volatilidad,
-- shocks de liquidez o microestructura.
+2. Pregunta que responde
 
-La función económica del módulo no es “etiquetar eventos” en abstracto, sino transformar cada trigger elegible
-en una observación PIT con:
-- identidad semántica propia,
-- timestamp operativo,
-- convención explícita de entrada/salida,
-- política formal de solapes,
-- y outcome posterior reproducible y compatible con validación temporal robusta.
+"Dado un trigger event-driven verificable para símbolo i, cuándo pasa a ser
+operable, qué episodio económico define, y cuál es el outcome forward
+económicamente realizable asociado a ese episodio?"
 
-La pregunta exacta que responde el módulo es:
+3. Taxonomía canónica (6 familias)
 
-“Dado un trigger event-driven verificable para un símbolo i, cuándo pasa a ser operable,
-qué episodio económico define, y cuál es el outcome forward económicamente realizable y metodológicamente válido asociado a ese episodio?”
+EARNINGS:              resultados periódicos, guidance. Horizons default: 1,3,5,10d
+CORP_NEWS:             M&A, financiación, litigio, contratos. Horizons: 1,3,5,10d
+OPEN_GAP:              gap de apertura > umbral. Horizons: 1,2,5d
+TECH_BREAK:            breakout, breakdown, reversal extremo. Horizons: 3,5,10d
+VOL_SHOCK:             volumen o volatilidad anómala. Horizons: 1,3,5d
+MICROSTRUCTURE_SHOCK:  halt, spread shock, colapso liquidez. Horizons: 1,2,3d
 
-2. Principios no negociables
+Familias no listadas → event_family_status = "experimental".
 
-2.1 Primacía del timestamp informativo
-Todo evento debe distinguir entre:
-- ocurrencia económica,
-- publicación,
-- conocimiento,
-- y primer instante operable.
+4. Timestamps fundamentales (por evento)
 
-2.2 El episodio es la unidad semántica
-Un evento no es una bandera difusa sobre una fecha.
-Debe poseer:
-- event_id,
-- event_type,
-- timestamps,
-- trigger metadata,
-- entry rule,
-- exit rule,
-- horizon set,
-- overlap policy,
-- y outcome.
+    t_occ:   ocurrencia económica
+    t_pub:   publicación
+    t_known: conocimiento por el sistema
+    t_trad:  primer instante operable (≥ t_known)
 
-2.3 Point-in-time estricto
-El label solo puede depender de información conocida en o antes del instante operativo del evento.
+Resolución: pre_market → next open. after_close → next open.
+intraday → same session si allow_intraday_immediate, else next open.
 
-2.4 Resolución explícita de solapes
-Dos eventos cercanos en el mismo símbolo pueden contaminar el mismo outcome.
-La política de resolución debe ser determinista, versionada y auditable.
+5. Convenciones entry/exit
 
-2.5 Separación entre trigger y outcome
-El evento activa el episodio.
-El label cuantifica el outcome del episodio.
-No deben mezclarse conceptualmente.
+open_to_close, open_to_open, close_to_close,
+event_to_next_close, event_to_next_open.
 
-2.6 Canonicidad por familia
-Cada familia de eventos debe tener una definición oficial, no ambigua y reproducible.
-Las variantes experimentales deben quedar marcadas como non_canonical.
+6. Overlap policy
 
-2.7 Compatibilidad con purged validation
-La ventana efectiva del episodio debe exportarse de manera que los módulos de purga y embargo
-puedan operar sin ambigüedad.
+first_event_wins_with_cooldown (default):
+  Cooldown = max(horizons) del evento. Durante cooldown, nuevos eventos
+  del mismo símbolo son rechazados (OVERLAP_REJECTED).
+merge_same_episode:
+  Eventos del mismo símbolo dentro del cooldown se agrupan bajo episode_group_id.
 
-3. Qué hace y qué no hace
+7. Costes (CORRECCIÓN CRÍTICA v1.1)
 
-3.1 Qué hace
-- carga eventos desde fuente(s) oficiales;
-- canoniza taxonomía de eventos;
-- resuelve timestamps de ocurrencia, publicación, conocimiento y operabilidad;
-- filtra elegibilidad por universo;
-- resuelve solapes y contaminación entre episodios;
-- calcula outcomes brutos y netos;
-- calcula abnormal returns si procede;
-- deriva labels continuos, de ranking y de clasificación;
-- aplica jerarquía formal de exclusión;
-- persiste outputs, coverage, QC y manifest.
+ANTES: config_missing_entry_cost() y config_missing_exit_cost() siempre
+devolvían 0.0. Todos los event labels eran "netos" con coste cero → sesgo
+optimista de 10-30bps/trade en small caps.
 
-3.2 Qué no hace
-- no redefine el universo elegible;
-- no construye features cross-sectional estándar;
-- no sustituye build_labels.py;
-- no realiza validación walk-forward;
-- no implementa point processes complejos;
-- no infiere causalidad económica de las noticias;
-- no hace discovery automático de taxonomías de eventos.
+AHORA: con strict_invalidate (default), devuelven NaN → observación excluida.
+Con fallback_proxy, usan CostPolicy.fallback_entry_bps / fallback_exit_bps.
 
-4. Rol dentro del stack
+Este era el bug con mayor impacto en P&L del módulo labels.
 
-Secuencia correcta:
+8. Abnormal returns
 
-    event sources
-    -> canonicalization / PIT timestamp resolution
-    -> labels/event_labels.py
-    -> labels/purged_splits.py
-    -> event-driven models / hybrid models
+Modos: none, market_adjusted, sector_adjusted, sector_market_adjusted,
+matched_control, factor_adjusted.
+auto → sector_market_adjusted para corporate, none para technical.
 
-Interpretación correcta:
-- build_labels.py cubre outcomes panel estándar;
-- event_labels.py cubre outcomes episódicos condicionados a triggers concretos;
-- purged_splits.py debe poder entender la ventana efectiva de cada evento.
+9. Jerarquía de exclusión (13 razones)
 
-event_labels.py no sustituye al label panel base; lo complementa allí donde el proceso generador
-de retornos cambia estructuralmente alrededor del trigger.
+UNKNOWN_EVENT_TYPE, TIMESTAMP_AMBIGUOUS, NOT_IN_UNIVERSE,
+MISSING_ENTRY_PRICE, MISSING_EXIT_PRICE, INCOMPLETE_OUTCOME_WINDOW,
+OVERLAP_REJECTED, TRADING_HALT_OR_SUSPENSION, CORPORATE_ACTION_UNSAFE,
+DELIST_AMBIGUOUS, MISSING_COST_INPUT, BENCHMARK_UNAVAILABLE, QC_REJECTED.
 
-5. Taxonomía canónica de eventos
+10. Output por episodio
 
-5.1 Familias canónicas mínimas
+event_id, episode_group_id, symbol, event_type, event_family_status,
+timestamps (occ, pub, known, tradable), horizon_days,
+entry/exit session+px, event_ret_gross, event_ret_net, event_alpha,
+cost_entry, cost_exit, cost_carry, event_exclusion_reason,
+event_label_valid_flag, label_event_cont/bin/tri.
 
-El módulo debe soportar como mínimo:
+11. Performance concern
 
-- EARNINGS
-  publicación de resultados periódicos o guidance material.
+16 instancias de iterrows(). En universos grandes (3000 símbolos × 6 tipos ×
+5000 fechas), esto es 100-1000x más lento que vectorización.
+Consolidación pendiente.
 
-- CORP_NEWS
-  noticia corporativa material no periódica:
-  M&A, financiación, oferta, litigio, contrato transformacional, default, etc.
+12. Tests mínimos
 
-- OPEN_GAP
-  gap de apertura por encima de umbral formal.
-
-- TECH_BREAK
-  ruptura técnica canónica:
-  breakout, breakdown o reversal extremo definidos por regla fija.
-
-- VOL_SHOCK
-  shock de volumen o volatilidad anómala.
-
-- MICROSTRUCTURE_SHOCK
-  episodio de dislocación de spread, halt, colapso de liquidez o anomalía de negociación.
-
-5.2 Regla de gobernanza
-Toda familia no incluida en esta lista debe marcarse como:
-    event_family_status = experimental
-salvo que pase formalmente a taxonomía oficial.
-
-6. Entradas contractuales
-
-6.1 Entradas mínimas
-- event_source_path
-- prices_pit_path
-- universe_history_path
-- trading_calendar_path
-- event_label_config_path
-
-6.2 Entradas opcionales
-- execution_costs_path
-- borrow_costs_path
-- carry_costs_path
-- benchmark_returns_path
-- sector_mapping_path
-- factor_exposures_path
-- delisting_returns_path
-- corporate_actions_path
-
-6.3 Configuración mínima
-- canonical_event_types
-- event_to_horizons_map
-- timestamp_policy
-- entry_exit_convention
-- decision_lag
-- overlap_policy
-- cooldown_policy
-- net_of_costs
-- abnormal_mode
-- classification_policy
-- benchmark_policy
-- delisting_policy
-- missing_cost_policy
-- max_event_staleness
-- min_family_sample
-- policy_version
-
-7. Timestamps fundamentales
-
-Para cada evento e del símbolo i, deben persistirse como mínimo:
-
-- t_e^occ
-  instante de ocurrencia económica.
-
-- t_e^pub
-  instante de publicación.
-
-- t_e^known
-  instante en el que el sistema considera el evento conocido.
-
-- t_e^trad
-  primer instante operable bajo la convención oficial.
-
-La restricción central es:
-
-    t_e^trad >= t_e^known
-
-y, normalmente:
-
-    t_e^known >= t_e^pub >= t_e^occ
-
-si bien algunas fuentes pueden tener:
-- ocurrencia simultánea a publicación,
-- o solo publicación observable.
-
-8. Política canónica de operabilidad
-
-8.1 Regla general
-El label del evento se ancla en:
-
-    τ_e = t_e^trad
-
-8.2 Resolución por defecto
-- si el evento se publica antes de la apertura y el sistema opera a apertura:
-  τ_e = open del mismo día
-
-- si el evento se publica tras el cierre:
-  τ_e = open de la siguiente sesión
-
-- si el evento se conoce intradía:
-  la operabilidad depende de la política explícita del sistema;
-  por defecto canónico, no se asume ejecución intradía inmediata salvo soporte formal.
-
-8.3 Timestamp ambiguo
-Si la fuente no permite determinar razonablemente la operabilidad,
-el evento se marca:
-
-    TIMESTAMP_AMBIGUOUS
-
-y se invalida en configuración canónica.
-
-9. Definición formal del episodio
-
-Sea e un evento único asociado al símbolo i.
-
-Definimos:
-- τ_e = t_e^trad
-- h ∈ H_e, conjunto de horizontes válidos para la familia del evento
-- W_e(h) = [τ_e, τ_e + h], ventana efectiva del episodio
-
-El output del módulo debe entenderse como una tabla de episodios:
-
-    {(e, i, τ_e, h, y_e(h), metadata_e)}
-
-no como una mera expansión del panel diario.
-
-10. Outcome económico bruto
-
-10.1 Definición general
-
-    r_gross(e,h)
-    =
-    P_exit(i, τ_e + h) / P_entry(i, τ_e) - 1
-
-donde:
-- P_entry depende de entry_convention
-- P_exit depende de exit_convention
-
-10.2 Convenciones soportadas mínimas
-- open_to_close
-- open_to_open
-- close_to_close
-- event_to_next_close
-- event_to_next_open
-
-10.3 Regla
-La convención usada debe persistirse explícitamente.
-No se admite una convención implícita.
-
-11. Outcome neto de costes
-
-11.1 Definición
-
-    r_net(e,h)
-    =
-    r_gross(e,h)
-    - C_entry(e,h)
-    - C_exit(e,h)
-    - C_carry(e,h)
-
-donde:
-- C_entry incluye costes de entrada,
-- C_exit incluye costes de salida,
-- C_carry incluye borrow, financiación y mantenimiento si procede.
-
-11.2 Default canónico
-Para small caps, el target base recomendado debe ser:
-
-    event_target_base = net_return
-
-11.3 Política de costes faltantes
-Si:
-- net_of_costs = true
-y falta algún componente material de coste,
-
-la política canónica debe ser:
-
-    missing_cost_policy = strict_invalidate
-
-12. Outcome anómalo / abnormal return
-
-12.1 Motivación
-Muchos eventos, especialmente earnings y corp_news,
-deben evaluarse frente a un benchmark nulo razonable,
-no solo por retorno bruto o neto absoluto.
-
-12.2 Definición
-
-    alpha(e,h)
-    =
-    r_star(e,h) - μ_null(e,h)
-
-donde:
-- r_star = r_net por defecto;
-- μ_null es el retorno esperado bajo un benchmark nulo.
-
-12.3 Benchmarks nulos soportados
-- market_adjusted
-- sector_adjusted
-- sector_market_adjusted
-- matched_control
-- factor_adjusted
-
-12.4 Default canónico recomendado
-Para EARNINGS y CORP_NEWS:
-
-    abnormal_mode = sector_market_adjusted
-
-Para eventos técnicos puros, por defecto:
-    abnormal_mode = none
-salvo configuración contraria.
-
-13. Matched controls (opcional pero muy útil)
-
-13.1 Motivación
-El benchmark por media de sector puede ser demasiado burdo en small caps.
-Una mejora realista y todavía implementable es usar controles emparejados.
-
-13.2 Definición conceptual
-Para cada evento e, construir un conjunto de controles c ∈ C_e
-emparejados por variables PIT, por ejemplo:
-- sector
-- size
-- volatility
-- liquidity
-- recent momentum
-
-Entonces:
-
-    alpha_matched(e,h)
-    =
-    r_star(e,h)
-    - Σ_{c∈C_e} w_c r_star(c,h)
-
-13.3 Estado
-No tiene por qué ser default del MVP,
-pero sí merece soporte explícito como modo avanzado serio.
-
-14. Ajuste por calendario (útil y poco costoso)
-
-14.1 Motivación
-Los episodios event-driven pueden estar sesgados por:
-- día de la semana,
-- fin de mes,
-- cercanía a macro prints,
-- patrones de apertura/cierre.
-
-14.2 Forma simple útil
-Puede definirse un ajuste opcional:
-
-    y_cal(e,h)
-    =
-    y_e(h) - μ_cal(bucket_e)
-
-donde bucket_e puede depender de:
-- day_of_week(τ_e)
-- month_end_flag
-- opening_session_flag
-
-14.3 Regla
-Esto no debe sustituir al target base,
-pero sí puede persistirse como metadata o variante avanzada.
-
-15. Transformaciones derivadas
-
-15.1 Label continuo
-
-    y_event(e,h) = r_net(e,h)
-o, si procede:
-    y_event(e,h) = alpha(e,h)
-
-15.2 Z-score intrafamilia
-
-Para comparar episodios heterogéneos dentro de una familia:
-
-    z_event(e,h)
-    =
-    ( y_event(e,h) - μ_{k,h} ) / ( σ_{k,h} + ε )
-
-donde:
-- k es la familia de evento;
-- μ_{k,h}, σ_{k,h} se estiman sobre episodios comparables.
-
-15.3 Label binario
-
-    y_bin(e,h)
-    =
-    1{ y_event(e,h) > θ_{k,h} }
-
-15.4 Label trinario
-
-    y_tri(e,h)
-    =
-    +1 si y_event(e,h) >= q_top(k,h)
-     0 si q_bot(k,h) < y_event(e,h) < q_top(k,h)
-    -1 si y_event(e,h) <= q_bot(k,h)
-
-15.5 Default canónico de clasificación
-
-    classification_default = ternary_tail_20_20_on_net_within_family
-
-Es decir:
-- la discretización se hace dentro de la familia del evento,
-- no mezclando earnings, gaps y shocks técnicos.
-
-16. Horizontes por familia
-
-El módulo debe declarar explícitamente H_e por familia.
-
-Default recomendado:
-
-- EARNINGS:
-  H = {1,3,5,10}
-
-- CORP_NEWS:
-  H = {1,3,5,10}
-
-- OPEN_GAP:
-  H = {1,2,5}
-
-- TECH_BREAK:
-  H = {3,5,10}
-
-- VOL_SHOCK:
-  H = {1,3,5}
-
-- MICROSTRUCTURE_SHOCK:
-  H = {1,2,3}
-
-Toda familia sin horizonte oficial debe quedar marcada como non_canonical.
-
-17. Solapes y conflictos entre episodios
-
-17.1 Tipos de conflicto
-- mismo símbolo, misma familia;
-- mismo símbolo, distinta familia;
-- cascada informativa;
-- un segundo evento entra dentro de la ventana activa del primero.
-
-17.2 Política canónica
-
-    overlap_policy = first_event_wins_with_cooldown
-
-17.3 Regla formal
-Si el evento e1 se activa en τ_e1 y tiene cooldown c_e1,
-un nuevo evento e2 del mismo símbolo queda rechazado si:
-
-    τ_e2 ∈ [τ_e1, τ_e1 + c_e1]
-
-Por defecto:
-
-    c_e = max(H_e)
-
-17.4 Persistencia
-El evento e2 rechazado debe conservarse en la tabla de eventos con:
-
-    label_valid_flag = false
-    exclusion_reason = OVERLAP_REJECTED
-
-18. Fusión de episodios (no canónica por defecto)
-
-Puede existir una política opcional:
-
-    overlap_policy = merge_same_episode
-
-pero solo si:
-- existe lógica formal de fusión,
-- se define episode_group_id,
-- y se persiste la jerarquía causal del merged episode.
-
-No debe usarse como default porque es fácil introducir ambigüedad.
-
-19. Anti-leakage estricto
-
-19.1 Reglas
-- el evento debe estar soportado por timestamp verificable;
-- la entrada se ancla en τ_e = t_e^trad;
-- el outcome usa solo información posterior a τ_e;
-- no se admiten timestamps “solo fecha” en eventos sensibles al tiempo sin política explícita;
-- si el trigger es técnico al cierre, la entrada por defecto es la siguiente apertura;
-- toda convención intradía debe estar formalmente soportada.
-
-19.2 Rechazo por ambigüedad
-Si el sistema no puede demostrar que el evento era operable en τ_e,
-el episodio no es canónico.
-
-20. Jerarquía formal de exclusión
-
-La razón principal de exclusión debe seguir esta prioridad:
-
-1. UNKNOWN_EVENT_TYPE
-2. TIMESTAMP_AMBIGUOUS
-3. NOT_IN_UNIVERSE
-4. MISSING_ENTRY_PRICE
-5. MISSING_EXIT_PRICE
-6. INCOMPLETE_OUTCOME_WINDOW
-7. OVERLAP_REJECTED
-8. TRADING_HALT_OR_SUSPENSION
-9. CORPORATE_ACTION_UNSAFE
-10. DELIST_AMBIGUOUS
-11. MISSING_COST_INPUT
-12. BENCHMARK_UNAVAILABLE
-13. QC_REJECTED
-
-20.1 Regla
-event_label_valid_flag = true solo si ninguna exclusión prioritaria se activa.
-
-21. Delistings y corporate actions
-
-21.1 Delistings
-Si el episodio termina en o cerca de un delisting:
-- usar delisting return PIT si existe;
-- si no puede resolverse fiablemente, marcar DELIST_AMBIGUOUS.
-
-21.2 Prohibición
-No se debe usar el último precio observado como salida “por defecto”
-si ello introduce sesgo optimista.
-
-21.3 Corporate actions
-Splits, mergers, tender offers, spin-offs y operaciones análogas
-deben resolverse bajo precios ajustados PIT consistentes.
-Si no existe seguridad económica suficiente, el evento se invalida.
-
-22. Flujo operativo canónico
-
-1. load_event_config(...)
-2. load_event_source(...)
-3. canonicalize_event_types(...)
-4. resolve_event_timestamps(...)
-5. resolve_tradability(...)
-6. filter_by_universe(...)
-7. resolve_overlaps(...)
-8. compute_event_returns(...)
-9. attach_costs(...)
-10. attach_benchmark_and_abnormal_returns(...)
-11. derive_continuous_labels(...)
-12. derive_rank_or_class_labels(...)
-13. apply_event_validity_hierarchy(...)
-14. run_event_qc(...)
-15. persist_event_outputs(...)
-
-23. Defaults canónicos del sistema
-
-- event_target_base = net_return
-- overlap_policy = first_event_wins_with_cooldown
-- cooldown = max(horizon_set)
-- timestamp_policy = strict
-- missing_cost_policy = strict_invalidate
-- abnormal_mode = sector_market_adjusted for corporate events
-- classification_default = ternary_tail_20_20_on_net_within_family
-
-Todo run que se aparte de estos defaults debe marcarse como:
-    non_canonical_flag = true
-
-24. Validación mínima obligatoria
-
-24.1 Estructura
-- unicidad estricta de event_id
-- coherencia entre event_type y taxonomía oficial
-- monotonía temporal entre occ, pub, known y trad
-
-24.2 Cobertura
-- coverage por familia y horizonte
-- ratio de exclusión por motivo
-- n_events válidos por familia
-
-24.3 Outcome
-- distribución del outcome por familia
-- varianza positiva por familia/horizonte
-- detección de colapso de clases en labels discretos
-
-24.4 Solapes
-- ratio de eventos rechazados por overlap
-- ausencia de contaminación no resuelta dentro de la ventana
-
-24.5 Benchmark
-- abnormal return no puede construirse sin benchmark válido si abnormal_mode activo
-
-24.6 Costes
-- ningún target neto válido puede existir sin inputs de coste requeridos
-
-25. Multiple testing entre familias (avanzado, pero razonable)
-
-25.1 Motivación
-Si se comparan muchas familias, horizontes y thresholds,
-la exploración puede inflar falsos descubrimientos.
-
-25.2 Mejora razonable
-El módulo o una capa downstream pueden persistir p-values o métricas
-que luego se ajusten por Benjamini-Hochberg.
-
-25.3 Regla
-No es imprescindible en el MVP de construcción de labels,
-pero sí es una mejora útil y legítima para research event-driven serio.
-
-26. Persistencia obligatoria
-
-26.1 Output principal
-Ejemplo:
-    labels/events/date=YYYY-MM-DD/part-*.parquet
-
-Campos mínimos:
-- event_id
-- episode_group_id si aplica
-- symbol
-- event_type
-- event_source
-- event_timestamp_occ
-- event_timestamp_pub
-- event_timestamp_known
-- event_timestamp_tradable
-- entry_px
-- exit_px
-- horizon_days
-- event_ret_gross
-- event_ret_net
-- event_alpha si aplica
-- event_zscore si aplica
-- label_event_cont
-- label_event_tri si aplica
-- event_label_valid_flag
-- event_exclusion_reason
-- run_id
-
-26.2 Metadata obligatoria
-- event_labels_summary_{run_id}.json
-- event_manifest_{run_id}.json
-- event_coverage_{run_id}.parquet
-- event_qc_{run_id}.json
-- event_windows_for_splits_{run_id}.json
-
-27. Exportación para purged splits
-
-Para cada episodio e y horizonte h, el módulo debe exportar inequívocamente:
-
-- event_start = τ_e
-- event_end   = τ_e + h
-
-Esto es crítico para purga y embargo.
-Si el episodio no puede mapearse a una ventana clara, no debe considerarse production-grade.
-
-28. Manifest mínimo obligatorio
-
-Debe incluir:
-- run_id
-- config_hash
-- event_source_hash
-- prices_version
-- universe_history_version
-- cost_model_version
-- benchmark_version si aplica
-- taxonomy_version
-- timestamp_policy
-- overlap_policy
-- classification_default
-- abnormal_mode
-- policy_version
-- non_canonical_flag
-
-29. CLI mínima
-
-Ejemplo:
-
-python -m labels.event_labels \
-  --event-source-path data/events/source.parquet \
-  --prices-path data/price/adjusted \
-  --universe-history-path data/universe/history \
-  --costs-path execution/costs/latest.parquet \
-  --benchmark-path risk/event_benchmarks/latest.parquet \
-  --config-path configs/labels/event_labels.yaml \
-  --run-id event_labels_20260305_001
-
-La CLI debe abortar si:
-- la taxonomía no puede canonicalizarse,
-- el timestamp operativo no puede resolverse,
-- se solicita abnormal return sin benchmark válido,
-- o la convención de entrada/salida es inconsistente con el tipo de evento.
-
-30. Criterios de aceptación
-
-Definition of Done:
-- taxonomía canónica implementada
-- timestamps operativos PIT verificables
-- labels event-driven sin leakage temporal
-- política formal de solapes y contaminación
-- soporte para outcome bruto, neto y abnormal
-- exportación compatible con purged splits
-- QC con severidad formal
-- metadata y manifests completos
-
-No basta con detectar triggers y calcular retornos posteriores.
-El módulo debe producir una capa de episodios económicamente interpretable,
-temporalmente válida y reproducible.
-
-31. Casos de prueba mínimos
-
-- earnings pre-market, after-close e intradía con resolución distinta de τ_e
-- gaps detectados al cierre con ejecución al día siguiente
-- rechazo correcto de timestamps ambiguos
-- cálculo correcto de retorno neto con costes
-- resolución determinista de eventos solapados
-- contaminación por segundo evento dentro de la ventana del primero
-- abnormal return correcto con benchmark conocido
-- exportación correcta de ventanas para purged splits
-- persistencia reproducible de manifest, QC y coverage
-
-32. MVP vs versión avanzada
-
-32.1 MVP
-- taxonomía canónica
-- timestamp resolution estricta
-- net returns
-- abnormal return simple
-- overlap policy determinista
-- clasificación trinaria intrafamilia
-- jerarquía formal de exclusión
-- manifests y QC completos
-
-32.2 Avanzado
-- matched controls
-- calendar-adjusted abnormal returns
-- event z-scores más refinados
-- BH multiple testing support
-- merge_same_episode formal
-- richer contamination audit
-- uncertainty-aware event costs
-
-33. Qué NO conviene meter ahora
-
-No conviene introducir:
-- Hawkes intensity models
-- neural event embeddings
-- point processes continuos complejos
-- taxonomías aprendidas automáticamente
-- pipelines bayesianos excesivos
-- demasiadas familias de evento no canonizadas
-
-34. Interpretación correcta
-
-La lectura correcta de labels/event_labels.py no es:
-“calcula retornos tras noticias o gaps”.
-
-La lectura correcta es:
-“convierte triggers discretos y operables en episodios PIT con outcome económico formal,
-controlando timestamps, solapes, contaminación y semántica de validación”.
-
-35. Conclusión
-
-labels/event_labels.py debe ser la infraestructura institucional que:
-- canoniza eventos,
-- resuelve cuándo son realmente operables,
-- define la ventana económica relevante,
-- calcula outcomes netos y anómalos,
-- controla solapes y contaminación entre episodios,
-- y exporta labels event-driven listos para entrenamiento y validación temporal rigurosa.
-
-Ese es exactamente el comportamiento que debe tener una capa seria de event labels
-en un stack cuantitativo orientado a research real y no a demos.
+- strict_invalidate sin tabla de costes → todos los event labels excluidos (NaN cost)
+- fallback_proxy → costes del proxy aplicados
+- Overlap: dos eventos < cooldown del mismo símbolo → segundo OVERLAP_REJECTED
+- Timestamp resolution: after_close → next open session
+- Earnings con horizons [1,3,5,10] → 4 filas por evento
+- Delisting durante outcome window → delisting_return_used si disponible
+- UNKNOWN_EVENT_TYPE para familia no canónica

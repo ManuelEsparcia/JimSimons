@@ -1,540 +1,79 @@
-Especificación Cuantitativa: simons_core/io/parquet_store.py
+Especificación: simons_core/io/parquet_store.py
 
-0. Propósito y papel dentro del stack
+1. Propósito
 
-simons_core/io/parquet_store.py define la capa institucional de persistencia columnar determinista para datasets cuantitativos del stack. Su función no es alterar la lógica estadística ni “mejorar” directamente la calidad de señal, sino publicar snapshots tabulares reproducibles, auditables y eficientes para lectura analítica. El módulo debe separar explícitamente el snapshot lógico del layout físico subyacente, de modo que consumidores y pipelines razonen sobre datasets versionados y completos, no sobre conjuntos accidentales de ficheros sueltos.
-
-En un sistema de small-cap swing trading, este componente debe entenderse como infraestructura crítica de datos: habilita lectura selectiva, pruning, reproducibilidad y trazabilidad, pero no debe reclamar mérito sobre Sharpe, CAGR, hit rate o cualquier otra métrica de performance financiera. Su valor es operacional: menor I/O, mejor contrato de esquema, publicación atómica y consumo estable.
-
-La regla institucional debe ser esta:
-
-    un snapshot visible
-    debe representar un dataset lógico completo,
-    íntegro y validado,
-    o no ser visible en absoluto.
-
-1. Objetivo formal del módulo
-
-Sea T una tabla lógica con N filas y d columnas. El módulo implementa una transformación de persistencia
-
-    P : T -> S = (Π, Σ, M, τ)
-
-donde:
-- Π es el conjunto de ficheros físicos Parquet publicados;
-- Σ es el esquema lógico validado;
-- M es el manifiesto del snapshot;
-- τ es el timestamp de publicación.
-
-El snapshot visible para el consumidor no es un fichero individual, sino la tupla completa S. La semántica correcta del store debe ser:
-
-- write_parquet(T, ...) publica exactamente un snapshot lógico válido;
-- read_parquet(...) materializa un subconjunto coherente del snapshot visible;
-- validate_dataset(...) verifica integridad, esquema y metadatos del snapshot.
-
-La propiedad operativa central del módulo es:
-
-    el consumidor ve dataset completo o nada,
-    nunca una publicación parcial.
-
-2. Principios no negociables
-
-P1. Contrato explícito de esquema.
-Ninguna tabla se persiste sin validación de nombres, tipos y nulabilidad esperada.
-
-P2. Snapshot logical first.
-La unidad semántica visible es el snapshot, no los ficheros sueltos.
-
-P3. Publicación atómica.
-El snapshot sólo es visible cuando manifiesto, esquema y paths físicos quedan publicados de forma coherente.
-
-P4. Lectura sobria y selectiva.
-El lector debe soportar proyección de columnas y filtros sin acoplarse a detalles accidentales del layout.
-
-P5. Separación entre snapshot lógico y layout físico.
-Particionado, compresión y número de ficheros son decisiones físicas, no parte del significado del dataset.
-
-P6. Fallo recuperable.
-Una partición corrupta debe detectarse, aislarse y registrarse, no servirse silenciosamente.
-
-P7. Reproducibilidad fuerte.
-Misma tabla lógica + misma configuración de escritura debe producir snapshots compatibles y auditables.
-
-3. Ámbito y no-objetivos
-
-El módulo cubre:
-
-- escritura de tablas en formato Parquet;
-- lectura selectiva con proyección columnar y filtros;
-- validación de esquema antes y después de escritura;
-- particionado físico por claves de acceso frecuentes;
-- publicación por snapshot con manifiesto;
-- observabilidad de volumen, latencia y cobertura de lectura;
-- detección e aislamiento de particiones corruptas.
-
-Queda fuera de alcance:
-
-- transacciones ACID multiobjeto tipo Delta/Iceberg/Hudi;
-- control distribuido fuerte de concurrencia;
-- evolución automática de esquema sin validación explícita;
-- gobierno completo de data lake;
-- optimización financiera o modelado de señal.
-
-4. Motivación formal y coste de I/O
-
-Si una consulta requiere sólo un subconjunto de columnas C y un predicado F que activa pruning de particiones o row-groups, el coste efectivo de lectura puede aproximarse por:
-
-    IO_eff ≈ S_phys · ρ_C · ρ_P
-
-donde:
-- S_phys es el tamaño físico almacenado;
-- ρ_C ∈ (0,1] es la fracción efectiva de columnas materializadas;
-- ρ_P ∈ (0,1] es la fracción no descartada por pruning.
-
-Este marco resume correctamente por qué Parquet es adecuado para workloads cuantitativos tabulares:
-- proyección columnar reduce columnas cargadas;
-- pruning reduce particiones y row-groups materializados.
-
-El módulo no debe prometer constantes universales de mejora, pero sí debe fijar objetivos operativos razonables. Como guía institucional para datasets bien diseñados, puede aspirarse a:
-
-    ρ_C >= 0.3
-    ρ_P >= 0.5
-
-cuando las consultas y el layout estén alineados con los patrones de acceso previstos.
-
-5. Snapshot formal
-
-Definimos un snapshot como:
+Snapshot store Parquet institucional. Un snapshot es una unidad lógica:
 
     S = (Π, Σ, M, τ)
 
-con:
-- Π = conjunto de paths físicos publicados;
-- Σ = esquema lógico resuelto y validado;
-- M = manifiesto con hashes, conteos, particiones y metadatos;
-- τ = instante de publicación.
+Π = archivos Parquet, Σ = schema validado, M = manifest, τ = timestamp.
+Schema validation antes de publicar. Publicación atómica. Lectura con
+projection y filter. NO es un lakehouse (no Delta/Iceberg/Hudi).
 
-La visibilidad del snapshot debe depender del manifiesto y no de la mera presencia de ficheros en el path. Esto evita que consumidores lean subconjuntos accidentales de una escritura en curso o mezclen particiones de publicaciones distintas.
+2. Garantías
 
-6. Invariantes formales obligatorios
+- Schema validation pre-publicación (fail-fast, NUNCA silent bypass).
+- Publicación atómica: staging -> fsync -> rename -> pointer update.
+- Snapshots versionados con manifest que gobierna visibilidad.
+- Escrituras deterministas opcionales via canonical row ordering.
+- Lectura con projection, filter y partition pruning.
+- Corrupción detectada en validación; nunca servida en modo strict.
 
-El módulo debe respetar, como mínimo, los siguientes invariantes:
+3. Cambio clave: imports fail-fast
 
-INV1. Todo snapshot visible tiene manifiesto íntegro y legible.
+simons_core.schemas es REQUERIDO, no opcional. Si no es importable,
+el módulo no arranca. Un parquet store que silencia schema validation
+y publica datos no validados es peor que uno que se niega a arrancar.
 
-INV2. Todo snapshot visible referencia un esquema compatible con schema_ref.
+Viejo:  except Exception: DataSchema = Any; assert_schema = None
+Nuevo:  except ImportError: raise ImportError("schemas module required")
 
-INV3. Ningún fichero temporal o staging se considera parte del snapshot visible.
+Logging: fallback a stdlib logging si simons_core.logging no disponible.
+Esto es aceptable porque logging no afecta correctitud de datos.
 
-INV4. Una lectura versionada nunca mezcla particiones de snapshots distintos.
+4. API pública
 
-INV5. Toda discrepancia entre esquema esperado y observado produce error explícito o política controlada.
+SnapshotStore(root_dir, schema_ref=None, ...):
+  publish(df, ...) -> SnapshotMetadata
+  read(snapshot_id=None, ...) -> pd.DataFrame
+  read_metadata(snapshot_id) -> SnapshotMetadata
+  list_snapshots() -> list[SnapshotMetadata]
+  current_snapshot() -> SnapshotMetadata | None
+  delete_snapshot(snapshot_id)
+  compact(keep_latest=5)
 
-INV6. Una partición corrupta se detecta, aísla y registra; no se sirve silenciosamente.
+Funciones libres:
+  write_parquet(df, path, schema_ref=None, ...)
+  read_parquet(path, columns=None, filters=None, ...)
 
-INV7. El tamaño de fichero por partición debe mantenerse, cuando sea posible, en un rango operativo razonable para evitar tanto small-file explosion como ficheros excesivamente grandes.
+5. Publicación atómica
 
-7. Esquema y compatibilidad
+    write to staging dir (temp)
+    -> fsync all files
+    -> rename staging to final snapshot dir
+    -> update CURRENT pointer file
+    -> write manifest
 
-Cada dataset debe estar asociado a una referencia de esquema schema_ref. El contrato mínimo debe definir:
+Si falla en cualquier paso, el snapshot parcial no es visible.
 
-- nombres de columnas;
-- tipos;
-- nulabilidad;
-- columnas de partición;
-- claves lógicas esperadas;
-- versión del contrato.
+6. Manifest
 
-7.1. Validación estructural
+JSON con: snapshot_id, schema_ref, schema_hash, row_count, column_count,
+file_count, total_bytes, created_at_utc, data_hash.
 
-Debe comprobar:
-- existencia de columnas requeridas;
-- compatibilidad de tipos;
-- nulabilidad admisible;
-- compatibilidad de orden cuando el contrato así lo requiera.
+7. Invariantes
 
-7.2. Validación semántica ligera
+I1. publish() SIEMPRE valida schema antes de escribir.
+I2. Si schema validation falla, no se escribe nada.
+I3. CURRENT pointer solo se actualiza tras publicación exitosa.
+I4. read() de snapshot inexistente -> raise, no DataFrame vacío.
+I5. Corrupción detectada (hash mismatch) -> raise en modo strict.
 
-Debe poder comprobar propiedades de bajo coste como:
-- ausencia de duplicados sobre clave lógica esperada;
-- no negatividad de columnas de volumen si aplica;
-- consistencia temporal por partición si el dataset lo exige.
+8. Tests mínimos
 
-7.3. Matriz de compatibilidad de esquema
-
-Para elevar el módulo a un estándar más fuerte y reproducible, debe fijarse una política explícita de compatibilidad forward/backward. Una matriz mínima razonable es:
-
-    ┌─────────────────┬────────────┬────────────┬────────────┬────────────┐
-    │ Change          │ Add col    │ Drop col   │ Type widen │ Type narrow│
-    ├─────────────────┼────────────┼────────────┼────────────┼────────────┤
-    │ FORWARD         │ PASS       │ WARN       │ PASS       │ FAIL       │
-    │ BACKWARD        │ PASS       │ FAIL       │ WARN       │ FAIL       │
-    │ NULLABLE        │ PASS       │ PASS       │ PASS       │ FAIL       │
-    └─────────────────┴────────────┴────────────┴────────────┴────────────┘
-
-Esta matriz no debe quedarse como comentario informal; debe formar parte del contrato del store o del validador de esquema.
-
-8. Estrategia de particionado
-
-El particionado debe responder a patrones de acceso reales y no a intuiciones estéticas. En datasets de mercado, una política razonable de partida puede ser:
-
-    partition_cols = ['date']
-    o
-    partition_cols = ['date', 'symbol']
-
-pero sólo si:
-- las consultas filtran frecuentemente por esas columnas;
-- la cardinalidad no crea explosión patológica de pequeños ficheros;
-- el tamaño medio por partición sigue siendo operativo.
-
-8.1. Tensión fundamental
-
-Toda política de particionado debe equilibrar:
-
-    granularidad <-> pruning <-> small-file overhead
-
-Particionar demasiado mejora pruning teórico pero degrada rendimiento real por sobrecarga de metadata y demasiados ficheros pequeños.
-
-8.2. Sweet spot recomendado
-
-Como objetivo operativo razonable para el MVP y primera fase seria, el tamaño de fichero debería mantenerse idealmente en:
-
-    128 MB <= file_size <= 1 GB
-
-salvo casos específicos. Este rango no es un dogma, pero sí una referencia muy útil para diseñar particionado sano.
-
-8.3. Heurística de optimización
-
-Debe ser posible estimar, antes de escribir, una política de partición basada en:
-- cardinalidad de las claves candidatas;
-- tamaño esperado por partición;
-- pruning score sobre patrones de consulta;
-- penalización por small files.
-
-9. Determinismo de escritura Parquet
-
-Este punto es especialmente importante y suele ignorarse. El store debe reconocer que escribir “la misma tabla lógica” no garantiza automáticamente bitwise determinism si cambian:
-- el orden de filas;
-- los parámetros de compresión;
-- la granularidad de row groups;
-- la versión del writer;
-- la coerción de timestamps.
-
-Por tanto, si se desea reproducibilidad fuerte, el módulo debe fijar explícitamente:
-
-- orden canónico de filas antes de persistir;
-- compresión fija;
-- index=False o contrato equivalente;
-- timestamp coercion fija;
-- configuración estable del writer.
-
-Una política razonable por defecto es:
-
-    sort_values(['date', 'symbol'])
-    compression='snappy'
-    index=False
-    coerce_timestamps='ms'
-
-No siempre producirá bitwise identical output entre motores distintos, pero sí eleva mucho la reproducibilidad práctica.
-
-10. API recomendada
-
-~~~python
-from __future__ import annotations
-from typing import Any, Dict, Iterable, List, Optional, Sequence
-import pandas as pd
-
-def write_parquet(
-    df: pd.DataFrame,
-    path: str,
-    schema_ref: str,
-    partition_cols: Optional[Sequence[str]] = None,
-    write_mode: str = "fail_if_exists",
-    dataset_version: Optional[str] = None,
-    metadata: Optional[Dict[str, Any]] = None,
-    deterministic: bool = True,
-) -> Dict[str, Any]:
-    """
-    Publica un snapshot Parquet con validación de esquema y manifiesto.
-    """
-
-def read_parquet(
-    path: str,
-    columns: Optional[Sequence[str]] = None,
-    filters: Optional[Iterable[tuple]] = None,
-    schema_ref: Optional[str] = None,
-    dataset_version: Optional[str] = None,
-    strict_schema: bool = True,
-) -> pd.DataFrame:
-    """
-    Lee un snapshot o dataset aplicando proyección de columnas y filtros.
-    """
-
-def validate_dataset(
-    path: str,
-    schema_ref: str,
-    dataset_version: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Valida integridad básica, esquema y metadatos del dataset.
-    """
-~~~
-
-11. Modos de escritura
-
-11.1. fail_if_exists
-
-Falla si el destino lógico ya existe. Es el modo correcto cuando el snapshot se considera inmutable para una versión dada.
-
-11.2. overwrite_partition
-
-Reemplaza sólo particiones afectadas por la nueva publicación. Debe dejar constancia explícita de:
-- qué particiones se sustituyeron;
-- qué snapshot previo queda invalidado para esas particiones;
-- qué manifiesto gobierna la nueva visibilidad.
-
-11.3. append_versioned
-
-Publica un nuevo snapshot versionado sin destruir los anteriores. Es el modo preferido para:
-- auditoría;
-- reproducibilidad;
-- backtesting trazable;
-- comparaciones históricas entre datasets.
-
-12. Protocolo de escritura
-
-La escritura debe seguir, como mínimo, esta secuencia:
-
-1. resolver schema_ref;
-2. validar esquema estructural de df;
-3. validar reglas semánticas ligeras;
-4. aplicar orden determinista si deterministic=True;
-5. escribir en staging temporal;
-6. validar artefactos físicos generados;
-7. construir manifiesto completo;
-8. publicar el snapshot haciéndolo visible sólo al final;
-9. registrar métricas y trazas.
-
-Pseudocódigo recomendado:
-
-~~~python
-def write_snapshot(
-    df: pd.DataFrame,
-    path: str,
-    schema_ref: str,
-    partition_cols: list[str],
-    deterministic: bool = True,
-):
-    schema = resolve_schema(schema_ref)
-    assert_structural_compat(df, schema)
-    validate_business_constraints(df, schema)
-
-    if deterministic:
-        df = df.sort_values(["date", "symbol"]).reset_index(drop=True)
-
-    staging = allocate_staging_area(path)
-    materialize_parquet(
-        df,
-        staging,
-        partition_cols=partition_cols,
-        compression="snappy",
-        index=False,
-        coerce_timestamps="ms",
-    )
-
-    validate_files(staging, schema)
-    manifest = build_manifest(staging, schema, n_rows=len(df))
-    publish_snapshot(staging, path, manifest)
-    return manifest
-~~~
-
-13. Lectura columnar y pruning
-
-La lectura debe soportar:
-
-- proyección de columnas;
-- filtros sobre particiones;
-- filtros empujables a row groups cuando el backend lo permita;
-- validación opcional de schema_ref;
-- selección de dataset_version.
-
-Ejemplo de uso:
-
-~~~python
-df = read_parquet(
-    path="s3://trading/ohlcv/",
-    columns=["close", "volume", "rsi_14"],
-    filters=[("date", ">=", "2026-01-01"), ("symbol", "in", ["AAPL", "NVDA"])],
-    schema_ref="features_v2",
-)
-~~~
-
-El módulo debe documentar de forma honesta que:
-- projection ayuda siempre si el backend es realmente columnar;
-- pruning ayuda sólo si los filtros están alineados con particiones y/o metadata.
-
-14. Manifiesto
-
-Cada snapshot debe llevar un manifiesto suficiente para reconstrucción y auditoría. Campos mínimos recomendados:
-
-- dataset_version
-- schema_ref
-- schema_hash
-- created_at
-- row_count
-- file_count
-- partition_cols
-- partitions
-- checksums
-- writer_version
-- metadata
-- total_bytes
-- deterministic_write_enabled
-- compression
-- logical_sort_key
-
-El manifiesto es la pieza que distingue entre “ficheros presentes” y “snapshot válido”.
-
-15. Errores y tratamiento de fallos
-
-El módulo debe fallar de forma explícita y tipada. Como mínimo:
-
-- SchemaValidationError
-- ManifestError
-- DatasetNotFoundError
-- CorruptPartitionError
-- InvalidPathError
-- WriteConflictError
-
-15.1. Política ante partición corrupta
-
-La secuencia correcta debe ser:
-1. detectar;
-2. aislar;
-3. registrar;
-4. excluir del conjunto válido;
-5. decidir si abortar o continuar según modo estricto o tolerante.
-
-Regla institucional:
-una partición corrupta no debe servirse nunca de forma silenciosa.
-
-16. Validación y hardening de rutas
-
-El store debe validar rutas para evitar:
-- traversal no permitido;
-- mezcla accidental de entornos;
-- escritura fuera de raíces autorizadas;
-- colisiones entre datasets lógicos.
-
-La validación de rutas es parte del contrato operativo, no un detalle cosmético.
-
-17. Observabilidad
-
-El módulo debe exponer métricas suficientes para entender salud y coste operativo. Métricas mínimas recomendadas:
-
-- rows_written
-- bytes_written
-- write_latency_sec
-- rows_read
-- bytes_read
-- projected_columns
-- pruned_partitions
-- schema_validation_failures
-- corrupt_partitions
-- file_count
-- mean_file_size
-- pct_files_below_128mb
-- pct_files_above_1gb
-- rho_c_est
-- rho_p_est
-
-Esto sí es relevante en parquet_store.py. No lo es atribuirle mejoras directas de performance financiera.
-
-18. CLI sugerida
-
-~~~bash
-python -m simons_core.io.parquet_store validate \
-    --path s3://trading/ohlcv/ \
-    --schema features_v2
-
-python -m simons_core.io.parquet_store inspect \
-    --path s3://trading/ohlcv/ \
-    --version 2026-03-01
-
-python -m simons_core.io.parquet_store read \
-    --path s3://trading/ohlcv/ \
-    --columns close volume rsi_14 \
-    --filter "date>=2026-01-01"
-~~~
-
-19. Criterios de aceptación
-
-El módulo no debe considerarse listo sin pasar, al menos:
-
-- escritura válida produce snapshot visible con manifiesto íntegro;
-- esquema incompatible falla antes de publicación;
-- fail_if_exists rechaza colisión de destino;
-- overwrite_partition sustituye sólo particiones objetivo;
-- lectura versionada no mezcla snapshots;
-- lectura con proyección devuelve exactamente las columnas pedidas;
-- lectura con filtros poda correctamente particiones cuando aplica;
-- partición corrupta se detecta y aísla;
-- validación de ruta rechaza destinos no autorizados;
-- se registran métricas operativas tras lectura y escritura;
-- schema compatibility matrix se aplica de forma reproducible;
-- deterministic write policy queda reflejada en manifest.
-
-20. Definition of Done
-
-La Definition of Done realista del módulo es:
-
-- snapshots publicados con manifiesto y esquema validado;
-- semántica de escritura definida y testeada por modo;
-- lectura con proyección y filtros operativa;
-- trazabilidad de versión, filas, ficheros y checksums;
-- detección e aislamiento de corrupción;
-- política de compatibilidad de esquema explícita;
-- política de determinismo de escritura explícita;
-- documentación clara de garantías y límites del backend.
-
-No forman parte de la DoD afirmaciones absolutas del tipo:
-- zero data loss;
-- 100% bitwise identical across all engines;
-- ACID completo tipo table format moderno.
-
-21. MVP y segunda fase
-
-21.1. MVP obligatorio
-
-El MVP debe incluir:
-- snapshots lógicos (Π, Σ, M, τ);
-- validación de esquema pre y post;
-- publicación guiada por manifiesto;
-- lectura con proyección y filtros;
-- particionado explícito;
-- matrix de compatibilidad de esquema;
-- política de escritura determinista;
-- métricas básicas de I/O y tamaño de ficheros.
-
-21.2. Segunda fase razonable
-
-Como extensiones útiles:
-- coalescing automático de small files;
-- read amplification tracking;
-- optimización más formal de partition_cols;
-- richer schema evolution tooling;
-- controles más finos de row-group sizing.
-
-22. No-objetivos
-
-No pertenece al alcance de este módulo:
-- Delta Lake / Iceberg / Hudi como requisito base;
-- control transaccional distribuido fuerte;
-- evolución automática de esquema sin gobierno explícito;
-- optimización financiera;
-- serving de predicciones.
-
-La misión aquí es persistencia columnar reproducible, eficiente y auditada.
-
-23. Conclusión
-
-simons_core/io/parquet_store.py debe entenderse como la capa institucional de almacenamiento columnar determinista del stack cuantitativo. Su valor no está en “guardar data en Parquet”, sino en formalizar correctamente el contrato entre tabla lógica, esquema, layout físico y publicación por snapshot. En un laboratorio cuantitativo serio, esa diferencia es importante: un store bueno no es el que escribe ficheros que luego “parecen leerse bien”, sino el que garantiza que el dataset visible es completo, validado, trazable y eficiente de consumir bajo proyección y pruning. Ese es exactamente el estándar que este módulo debe imponer.
+- publish + read roundtrip: datos idénticos
+- publish con schema inválido -> SchemaValidationError, nada escrito
+- CURRENT pointer apunta al último snapshot válido
+- list_snapshots ordenado por timestamp
+- delete_snapshot elimina archivos y actualiza pointer si era current
+- read con projection: solo columnas solicitadas

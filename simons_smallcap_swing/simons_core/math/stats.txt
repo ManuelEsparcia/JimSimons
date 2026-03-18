@@ -1,734 +1,108 @@
-Especificación Cuantitativa: simons_core/math/stats.py
+Especificación: simons_core/math/stats.py
 
-0. Propósito y papel dentro del stack
+1. Propósito
 
-simons_core/math/stats.py define la capa institucional de estadística descriptiva y métricas financieras básicas del stack. Su función no es hacer inferencia avanzada ni corregir automáticamente sesgos de backtest, sino proporcionar utilidades estadísticas claras, reproducibles y numéricamente estables para reporting, validación de señales y análisis de resultados. La base que me has pasado ya fijaba muy bien el alcance real del módulo: momentos descriptivos NaN-safe, transformaciones rolling, correlaciones bivariantes, winsorización y métricas financieras básicas como Sharpe, Sortino, Calmar y drawdown. :contentReference[oaicite:0]{index=0}
+Métricas financieras institucionales y estadísticas descriptivas para
+research, validación y backtest. Cada métrica tiene definición explícita,
+convención de anualización documentada y manejo determinista de NaN/Inf.
 
-En un sistema cuantitativo serio, este módulo no debe exagerar su papel. No “demuestra” alpha, no corrige multiple testing y no sustituye capas de inferencia más sofisticadas. Su valor está en algo más fundamental: cerrar definiciones, evitar errores clásicos de implementación y asegurar que toda capa superior calcula las mismas métricas con las mismas convenciones.
+2. Convenciones generales
 
-La regla institucional debe ser esta:
+- NaN handling: omit (no silent zero-imputation). Finite observations only.
+- Annualisation: sqrt(periods_per_year) para ratios. periods_per_year=252.
+- ddof=1 por defecto (sample, no population).
+- eps=1e-12 como floor para divisiones.
+- Simple returns convention: r_t = P_t/P_{t-1} - 1. Válidos en [-1, +inf).
 
-    toda estadística del módulo
-    debe tener una definición explícita,
-    una convención cerrada de NaN,
-    una política numérica estable
-    y una semántica financiera documentada.
+3. API pública — Descriptivas
 
-1. Objetivo formal del módulo
+nanmean1d(x) -> float
+nanvar1d(x, ddof=1) -> float
+nanstd1d(x, ddof=1) -> float
+sem1d(x, ddof=1) -> float
+rolling_mean(x, window, min_periods=None) -> Series
+rolling_std(x, window, ddof=1, min_periods=None) -> Series
+rolling_zscore(x, window, ddof=1, min_periods=None, eps) -> Series
 
-El módulo implementa primitivas estadísticas y financieras sobre series univariantes o bivariantes, en particular:
+4. API pública — Correlación
 
-- nanmean / nanvar / nanstd
-- rolling_mean / rolling_std / rolling_zscore
-- pearson_corr / spearman_corr
-- winsorize
-- sharpe_ratio / sortino_ratio / calmar_ratio
-- drawdown_series / max_drawdown
+pearson_corr(x, y, ddof=1, eps) -> float (pairwise-finite)
+spearman_corr(x, y, ddof=1, eps) -> float (average ranks for ties)
+spearman_ic(scores, fwd_returns) -> float (alias de spearman_corr)
 
-Su misión es proporcionar:
+5. API pública — Performance metrics (THE MONEY LINE)
 
-- descriptivos básicos NaN-safe;
-- transformaciones móviles coherentes;
-- correlaciones lineales y por rangos bien definidas;
-- saneamiento simple por cuantiles;
-- métricas de performance financiera con anualización configurable;
-- una convención clara de drawdown y ratios derivados.
+sharpe_ratio(returns, rf=0, periods_per_year=252, ddof=1):
+  SR = mean(excess) / std(excess) * sqrt(P). IID, sin corrección AC.
 
-2. Principios no negociables
+sharpe_ratio_adjusted(returns, rf=0, ..., max_lag=None):
+  Lo (2002). SR_adj = (mu/sigma) * q / sqrt(eta(q)).
+  eta(q) = q + 2 * sum_{k=1}^{q-1} (q-k) * rho_k.
+  Corrige sobreestimación por autocorrelación positiva en small caps.
+  max_lag default: min(q-1, n//3).
 
-P1. Semántica explícita.
-Cada función debe dejar claro qué estima y con qué convención.
+deflated_sharpe_ratio(observed_sr, sr_benchmark=0, n_trials=1, n_obs=252,
+                       skewness=0, kurtosis_excess=0):
+  Bailey & López de Prado (2014). DSR = Phi((SR - E[max SR|N]) / std(SR)).
+  Var(SR) ajustada por skewness y kurtosis (Mertens 2002).
+  DSR > 0.95 -> señal probablemente real. DSR < 0.50 -> probablemente ruido.
+  Dependencia: scipy.stats.norm (importación diferida).
 
-P2. NaN handling consistente.
-La política por defecto debe ser omit, no imputación silenciosa.
+sortino_ratio(returns, target=0, periods_per_year=252):
+  downside_dev = sqrt(mean(min(r-target, 0)^2)).
+  target=0 por defecto. Para swing 30% anual, usar target ≈ 0.00104/día.
 
-P3. Configurabilidad razonable.
-ddof, periods_per_year, rf y target no deben estar hard-coded como universales.
+information_ratio(returns, benchmark, periods_per_year=252, ddof=1):
+  IR = mean(active) / tracking_error * sqrt(P). Active = r - benchmark.
 
-P4. Separación entre estadística y estrategia.
-El módulo calcula métricas; no decide reglas de trading.
+omega_ratio(returns, threshold=0):
+  sum(max(r-L,0)) / sum(max(L-r,0)). Usa toda la distribución.
+  Omega > 1.0 -> más upside que downside vs threshold.
 
-P5. Robustez numérica.
-Debe evitar divisiones por cero, métricas espurias y salidas silenciosamente inválidas.
+6. API pública — Drawdown
 
-P6. Convenciones financieras coherentes.
-Sharpe anualiza con √P, drawdown se expresa con signo ≤ 0, y Calmar debe fijar explícitamente si usa media anualizada o CAGR.
+drawdown_series(returns) -> ndarray:
+  DD_t = W_t / max_{u<=t}(W_u) - 1. Siempre <= 0.
 
-P7. Honestidad metodológica.
-El módulo no debe fingir correcciones por autocorrelación, sesgo muestral o multiple testing si no las implementa.
+max_drawdown(returns) -> float: min(drawdown_series)
 
-3. Alcance y no-objetivos
+drawdown_details(returns) -> DrawdownDetails:
+  peak_index, trough_index, recovery_index, duration, recovery_duration.
 
-El módulo cubre:
+7. API pública — Compound/ratio
 
-- media, varianza y desviación típica NaN-safe;
-- estadísticas rolling;
-- correlación de Pearson;
-- correlación de Spearman con average ranks;
-- winsorización;
-- Sharpe, Sortino, Calmar;
-- serie de drawdown y máximo drawdown.
+cagr(returns, periods_per_year=252):
+  W_T^(1/years) - 1. Terminal wealth=0 -> -1.0.
 
-Queda fuera de alcance:
+calmar_ratio(returns, ..., method="cagr"):
+  Default "cagr" (estándar institucional, Young 1991).
+  "annual_mean" disponible como opción explícita.
 
-- inferencia estadística avanzada;
-- bootstrap e intervalos de confianza;
-- corrección de autocorrelación de Sharpe en el núcleo base;
-- deflated Sharpe ratio;
-- multiple testing correction;
-- inferencia bayesiana;
-- robustez multivariante.
+hit_ratio(returns, threshold=0): fraction con r > threshold.
+profit_factor(returns, threshold=0): gross_profit / gross_loss.
+tail_ratio(returns, upper_q=0.95, lower_q=0.05): P95 / |P5|.
 
-4. Convenciones numéricas base
+8. Invariantes
 
-4.1. Política de NaN
+I1. Todas las funciones retornan NaN (no raise) con input vacío o insuficiente.
+I2. sharpe_ratio_adjusted(max_lag=0) == sharpe_ratio (exacto).
+I3. Para AC positiva: sharpe_adjusted <= sharpe_iid.
+I4. deflated_sharpe_ratio ∈ [0, 1].
+I5. Con más n_trials, DSR decrece (más probable que SR sea ruido).
+I6. calmar default es "cagr", no "annual_mean".
+I7. hit_ratio ∈ [0, 1]. profit_factor >= 0. tail_ratio >= 0.
+I8. drawdown_series <= 0 en posiciones finitas.
+I9. Simple returns < -1.0 -> InvalidInputError (wealth negativa).
 
-La política institucional por defecto debe ser:
+9. Tests mínimos
 
-    nan_policy = "omit"
-
-Bajo esta convención:
-
-- funciones univariantes trabajan sólo con observaciones finitas;
-- funciones bivariantes filtran por pares finitos;
-- si no queda información suficiente, la función devuelve np.nan o falla explícitamente según el contrato;
-- nunca debe imputarse cero silenciosamente.
-
-4.2. Grados de libertad
-
-La varianza y desviación típica deben aceptar:
-
-    ddof
-
-como parámetro configurable. La convención recomendada para estadística muestral es ddof=1, pero el módulo no debe imponerla como única opción.
-
-4.3. Anualización
-
-La anualización de ratios financieros debe depender de:
-
-    periods_per_year
-
-y no de un √252 hard-coded. La regla correcta para Sharpe y Sortino base es:
-
-    ratio_ann = ratio_per * sqrt(P)
-
-donde P es la periodicidad anual relevante.
-
-5. Estadísticos descriptivos básicos
-
-5.1. Media
-
-Para muestra finita x_1, ..., x_n:
-
-    mean(x) = (1/n) Σ x_i
-
-La versión NaN-safe debe operar sólo sobre observaciones finitas y devolver np.nan si no existe ninguna.
-
-5.2. Varianza
-
-Con ddof configurable:
-
-    var(x) = (1 / (n - ddof)) Σ (x_i - mean(x))^2
-
-si n > ddof; en otro caso debe devolver np.nan.
-
-5.3. Desviación típica
-
-    std(x) = sqrt(var(x))
-
-El módulo no debe fingir que std=0 cuando realmente la varianza es indefinida por falta de muestra.
-
-6. Implementación base univariante
-
-~~~python
-import numpy as np
-import pandas as pd
-
-def _finite_1d(x: np.ndarray) -> np.ndarray:
-    x = np.asarray(x, dtype=float).reshape(-1)
-    return x[np.isfinite(x)]
-
-
-def nanmean1d(x: np.ndarray) -> float:
-    xv = _finite_1d(x)
-    return float(np.mean(xv)) if xv.size else np.nan
-
-
-def nanvar1d(x: np.ndarray, ddof: int = 1) -> float:
-    xv = _finite_1d(x)
-    if xv.size <= ddof:
-        return np.nan
-    return float(np.var(xv, ddof=ddof))
-
-
-def nanstd1d(x: np.ndarray, ddof: int = 1) -> float:
-    xv = _finite_1d(x)
-    if xv.size <= ddof:
-        return np.nan
-    return float(np.std(xv, ddof=ddof))
-~~~
-
-7. Estadísticas rolling
-
-7.1. Media móvil
-
-Para ventana w:
-
-    mean_t^(w) = (1/w) Σ_{j=t-w+1}^t x_j
-
-respetando min_periods.
-
-7.2. Desviación típica móvil
-
-    std_t^(w) = sqrt( (1/(w-ddof)) Σ (x_j - mean_t^(w))^2 )
-
-7.3. Z-score móvil
-
-    z_t^(w) = (x_t - mean_t^(w)) / std_t^(w)
-
-Si std_t^(w) <= eps, la convención razonable es devolver 0.0 en ventanas constantes y NaN cuando no hay observaciones suficientes.
-
-7.4. Implementación base
-
-~~~python
-def rolling_mean(
-    x: pd.Series,
-    window: int,
-    min_periods: int | None = None,
-) -> pd.Series:
-    if window <= 0:
-        raise ValueError("window must be positive.")
-    mp = window if min_periods is None else min_periods
-    return x.rolling(window=window, min_periods=mp).mean()
-
-
-def rolling_std(
-    x: pd.Series,
-    window: int,
-    ddof: int = 1,
-    min_periods: int | None = None,
-) -> pd.Series:
-    if window <= 0:
-        raise ValueError("window must be positive.")
-    mp = window if min_periods is None else min_periods
-    return x.rolling(window=window, min_periods=mp).std(ddof=ddof)
-
-
-def rolling_zscore(
-    x: pd.Series,
-    window: int,
-    ddof: int = 1,
-    min_periods: int | None = None,
-    eps: float = 1e-12,
-) -> pd.Series:
-    mu = rolling_mean(x, window=window, min_periods=min_periods)
-    sd = rolling_std(x, window=window, ddof=ddof, min_periods=min_periods)
-    z = (x - mu) / sd
-    z = z.mask(sd.abs() <= eps, 0.0)
-    return z
-~~~
-
-8. Correlación bivariante
-
-8.1. Filtrado pairwise
-
-Toda correlación debe basarse en una utilidad de filtrado por pares finitos:
-
-~~~python
-def _pairwise_finite(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    x = np.asarray(x, dtype=float).reshape(-1)
-    y = np.asarray(y, dtype=float).reshape(-1)
-
-    if x.shape != y.shape:
-        raise ValueError("x and y must have the same shape.")
-
-    mask = np.isfinite(x) & np.isfinite(y)
-    return x[mask], y[mask]
-~~~
-
-Esto es clave: las correlaciones no deben filtrar cada serie por separado.
-
-8.2. Pearson
-
-La correlación de Pearson es:
-
-    rho_P(x,y) = Cov(x,y) / (std(x) std(y))
-
-Debe devolver np.nan si:
-- quedan menos de 2 observaciones;
-- alguna de las dos series es constante.
-
-Implementación:
-
-~~~python
-def pearson_corr(x: np.ndarray, y: np.ndarray) -> float:
-    xv, yv = _pairwise_finite(x, y)
-    if xv.size < 2:
-        return np.nan
-    if np.std(xv) == 0 or np.std(yv) == 0:
-        return np.nan
-    return float(np.corrcoef(xv, yv)[0, 1])
-~~~
-
-9. Spearman correcto con empates
-
-9.1. Definición
-
-Spearman debe definirse como:
-
-    rho_S(x,y) = rho_P(rank(x), rank(y))
-
-No debe implementarse con argsort bruto como sustituto de rangos. Eso falla especialmente con empates.
-
-9.2. Average ranks
-
-La política correcta de ties en el núcleo base es:
-
-    average ranks
-
-9.3. Implementación recomendada
-
-~~~python
-def _average_ranks(x: np.ndarray) -> np.ndarray:
-    x = np.asarray(x, dtype=float).reshape(-1)
-    order = np.argsort(x, kind="mergesort")
-    ranks = np.empty_like(order, dtype=float)
-
-    i = 0
-    n = x.size
-    while i < n:
-        j = i
-        while j + 1 < n and x[order[j + 1]] == x[order[i]]:
-            j += 1
-        avg_rank = 0.5 * (i + j) + 1.0
-        ranks[order[i:j+1]] = avg_rank
-        i = j + 1
-    return ranks
-
-
-def spearman_corr(x: np.ndarray, y: np.ndarray) -> float:
-    xv, yv = _pairwise_finite(x, y)
-    if xv.size < 2:
-        return np.nan
-
-    rx = _average_ranks(xv)
-    ry = _average_ranks(yv)
-
-    if np.std(rx) == 0 or np.std(ry) == 0:
-        return np.nan
-
-    return float(np.corrcoef(rx, ry)[0, 1])
-~~~
-
-9.4. Information Coefficient
-
-Si el módulo expone spearman_ic, la convención correcta y más informativa es:
-
-    IC = rho_S(scores, forward_returns)
-
-con signo preservado. No debe aplicarse abs(IC) en el núcleo base porque destruye información económica sobre dirección de señal.
-
-~~~python
-def spearman_ic(scores: np.ndarray, fwd_returns: np.ndarray) -> float:
-    return spearman_corr(scores, fwd_returns)
-~~~
-
-10. Winsorización
-
-10.1. Definición
-
-Dados cuantiles lower_q y upper_q válidos:
-
-    x_wins = clip(x, Q_lower, Q_upper)
-
-donde Q_lower y Q_upper se calculan sobre observaciones finitas.
-
-10.2. Semántica
-
-- preserva tamaño muestral;
-- reduce sensibilidad a outliers;
-- no debe modificar NaN positions;
-- no equivale a trimming.
-
-10.3. Implementación
-
-~~~python
-def winsorize(
-    x: np.ndarray,
-    lower_q: float = 0.01,
-    upper_q: float = 0.99,
-) -> np.ndarray:
-    if not (0.0 <= lower_q < upper_q <= 1.0):
-        raise ValueError("Require 0 <= lower_q < upper_q <= 1.")
-
-    x = np.asarray(x, dtype=float).reshape(-1)
-    out = x.copy()
-
-    mask = np.isfinite(x)
-    if not np.any(mask):
-        return out
-
-    xv = x[mask]
-    lo = float(np.quantile(xv, lower_q))
-    hi = float(np.quantile(xv, upper_q))
-    out[mask] = np.clip(xv, lo, hi)
-    return out
-~~~
-
-11. Métricas financieras básicas
-
-11.1. Sharpe ratio
-
-Sea r_t la serie de retornos y rf la tasa libre de riesgo en la misma periodicidad. El Sharpe periódico es:
-
-    SR_per = mean(r - rf) / std(r - rf)
-
-La anualización correcta es:
-
-    SR_ann = SR_per * sqrt(P)
-
-con P = periods_per_year.
-
-Debe devolver np.nan si la volatilidad <= eps.
-
-~~~python
-def sharpe_ratio(
-    returns: np.ndarray,
-    rf: float = 0.0,
-    periods_per_year: int = 252,
-    ddof: int = 1,
-    eps: float = 1e-12,
-) -> float:
-    r = _finite_1d(returns)
-    if r.size <= ddof:
-        return np.nan
-
-    excess = r - rf
-    mu = float(np.mean(excess))
-    sd = float(np.std(excess, ddof=ddof))
-    if sd <= eps:
-        return np.nan
-
-    return mu / sd * np.sqrt(periods_per_year)
-~~~
-
-11.2. Sortino ratio
-
-Con target periódico target:
-
-    diff = r - target
-    downside = min(diff, 0)
-    downside_dev = sqrt(mean(downside^2))
-
-y entonces:
-
-    Sortino_ann = mean(diff) / downside_dev * sqrt(P)
-
-~~~python
-def sortino_ratio(
-    returns: np.ndarray,
-    target: float = 0.0,
-    periods_per_year: int = 252,
-    eps: float = 1e-12,
-) -> float:
-    r = _finite_1d(returns)
-    if r.size == 0:
-        return np.nan
-
-    diff = r - target
-    downside = np.minimum(diff, 0.0)
-    downside_dev = float(np.sqrt(np.mean(downside ** 2)))
-    if downside_dev <= eps:
-        return np.nan
-
-    return float(np.mean(diff)) / downside_dev * np.sqrt(periods_per_year)
-~~~
-
-12. Drawdown
-
-12.1. Curva de patrimonio
-
-    W_t = Π_{s<=t} (1 + r_s)
-
-12.2. Running peak
-
-    M_t = max_{u<=t} W_u
-
-12.3. Serie de drawdown
-
-    DD_t = W_t / M_t - 1
-
-Con esta convención:
-
-    DD_t <= 0
-
-12.4. Implementación
-
-~~~python
-def drawdown_series(returns: np.ndarray) -> np.ndarray:
-    r = np.asarray(returns, dtype=float).reshape(-1)
-    out = np.full_like(r, np.nan, dtype=float)
-
-    mask = np.isfinite(r)
-    if not np.any(mask):
-        return out
-
-    wealth = np.cumprod(1.0 + r[mask])
-    peaks = np.maximum.accumulate(wealth)
-    dd = wealth / peaks - 1.0
-
-    out[mask] = dd
-    return out
-~~~
-
-12.5. Máximo drawdown
-
-El máximo drawdown debe definirse como el mínimo de la serie:
-
-~~~python
-def max_drawdown(returns: np.ndarray) -> float:
-    dd = drawdown_series(returns)
-    ddv = dd[np.isfinite(dd)]
-    return float(np.min(ddv)) if ddv.size else np.nan
-~~~
-
-13. Calmar ratio
-
-La versión base del módulo debe fijar una definición concreta. La opción más simple y coherente con la base que me has pasado es:
-
-    annual_mean = mean(r) * periods_per_year
-    Calmar = annual_mean / abs(MDD)
-
-Esto no es idéntico a CAGR/MDD y debe quedar documentado explícitamente.
-
-~~~python
-def calmar_ratio(
-    returns: np.ndarray,
-    periods_per_year: int = 252,
-    eps: float = 1e-12,
-) -> float:
-    r = _finite_1d(returns)
-    if r.size == 0:
-        return np.nan
-
-    mdd = max_drawdown(r)
-    if not np.isfinite(mdd) or abs(mdd) <= eps:
-        return np.nan
-
-    annual_mean = float(np.mean(r)) * periods_per_year
-    return annual_mean / abs(mdd)
-~~~
-
-14. Mejora razonable de nivel superior
-
-Para llevar el módulo al techo realista 89-90 sin sobrediseñarlo, las ampliaciones más valiosas serían:
-
-14.1. SEM
-
-    SEM = std(x) / sqrt(n_eff)
-
-donde n_eff es el número de observaciones finitas.
-
-14.2. Kendall tau
-
-Útil como alternativa de correlación por rangos con mejor tratamiento conceptual de ties.
-
-14.3. Serial-correlation adjusted Sharpe
-
-Para retornos con autocorrelación AR(1) apreciable, puede añadirse como opción separada:
-
-    SR_adj = SR / sqrt(1 + 2 rho / (1 - rho))
-
-o una generalización por varios lags.
-
-14.4. Drawdown caliper
-
-Además de la serie y MDD, conviene exponer:
-- peak index
-- trough index
-- duration
-- recovery time
-
-Pero esto debe ser una extensión explícita, no contaminar la definición base de drawdown_series.
-
-15. Failure modes que el módulo debe evitar
-
-F1. Spearman implementado con argsort en vez de rangos estadísticos.
-
-F2. IC definido como valor absoluto sin aviso.
-
-F3. Sharpe anualizado con P en vez de sqrt(P).
-
-F4. periods_per_year hard-coded como 252 para cualquier frecuencia.
-
-F5. Drawdown con signo inconsistente y Calmar incompatible con esa convención.
-
-F6. Devolver 0 cuando la métrica es realmente indefinida por falta de datos o varianza nula.
-
-16. API recomendada final
-
-~~~python
-from typing import Literal
-import numpy as np
-import pandas as pd
-
-def nanmean1d(x: np.ndarray) -> float:
-    ...
-
-def nanvar1d(x: np.ndarray, ddof: int = 1) -> float:
-    ...
-
-def nanstd1d(x: np.ndarray, ddof: int = 1) -> float:
-    ...
-
-def rolling_mean(
-    x: pd.Series,
-    window: int,
-    min_periods: int | None = None,
-) -> pd.Series:
-    ...
-
-def rolling_std(
-    x: pd.Series,
-    window: int,
-    ddof: int = 1,
-    min_periods: int | None = None,
-) -> pd.Series:
-    ...
-
-def rolling_zscore(
-    x: pd.Series,
-    window: int,
-    ddof: int = 1,
-    min_periods: int | None = None,
-    eps: float = 1e-12,
-) -> pd.Series:
-    ...
-
-def pearson_corr(
-    x: np.ndarray,
-    y: np.ndarray,
-) -> float:
-    ...
-
-def spearman_corr(
-    x: np.ndarray,
-    y: np.ndarray,
-) -> float:
-    ...
-
-def spearman_ic(
-    scores: np.ndarray,
-    fwd_returns: np.ndarray,
-) -> float:
-    ...
-
-def winsorize(
-    x: np.ndarray,
-    lower_q: float = 0.01,
-    upper_q: float = 0.99,
-) -> np.ndarray:
-    ...
-
-def sharpe_ratio(
-    returns: np.ndarray,
-    rf: float = 0.0,
-    periods_per_year: int = 252,
-    ddof: int = 1,
-    eps: float = 1e-12,
-) -> float:
-    ...
-
-def sortino_ratio(
-    returns: np.ndarray,
-    target: float = 0.0,
-    periods_per_year: int = 252,
-    eps: float = 1e-12,
-) -> float:
-    ...
-
-def drawdown_series(
-    returns: np.ndarray,
-) -> np.ndarray:
-    ...
-
-def max_drawdown(
-    returns: np.ndarray,
-) -> float:
-    ...
-
-def calmar_ratio(
-    returns: np.ndarray,
-    periods_per_year: int = 252,
-    eps: float = 1e-12,
-) -> float:
-    ...
-~~~
-
-17. Pruebas mínimas requeridas
-
-El módulo no debe considerarse listo sin pasar, como mínimo:
-
-- medias y varianzas pequeñas verificables a mano;
-- series con NaN;
-- series constantes;
-- empates en Spearman;
-- rolling_zscore en ventana constante;
-- drawdown y MDD con trayectoria conocida;
-- winsorize con cuantiles válidos e inválidos;
-- Sharpe y Sortino en casos degenerados;
-- IC con signo preservado.
-
-18. MVP y segunda fase
-
-18.1. MVP obligatorio
-
-El MVP debe incluir:
-- descriptivos NaN-safe;
-- rolling transforms;
-- Pearson;
-- Spearman con average ranks;
-- winsorize;
-- Sharpe, Sortino, Calmar;
-- drawdown_series y max_drawdown;
-- tests deterministas básicos.
-
-18.2. Segunda fase razonable
-
-Como extensiones útiles:
-- SEM;
-- Kendall tau;
-- serial-adjusted Sharpe;
-- drawdown caliper;
-- CAGR separado de annual_mean;
-- rolling IC / IC decay;
-- p-values o Fisher transform si alguna capa superior realmente lo necesita.
-
-19. No-objetivos
-
-No pertenece al alcance de este módulo:
-- bootstrap;
-- Bayesian metrics;
-- multiple testing correction;
-- DSR/PSR;
-- robust multivariate stats;
-- inferencia causal;
-- interpretación automática de las métricas.
-
-La misión aquí es estadística descriptiva y financiera básica, bien definida y reusable.
-
-20. Criterios de aceptación
-
-El módulo sólo debe considerarse correcto si cumple simultáneamente:
-
-- define todas sus métricas con convención explícita;
-- trata NaN de forma consistente;
-- implementa Spearman correctamente con ties;
-- anualiza Sharpe y Sortino con sqrt(P);
-- mantiene drawdown con convención DD <= 0;
-- distingue métricas definidas de métricas indefinidas;
-- no introduce inferencia avanzada que no pueda sostener.
-
-21. Conclusión
-
-simons_core/math/stats.py debe ser una base estadística sobria, clara y consistente. Su valor no está en parecer sofisticado, sino en evitar errores clásicos y dar soporte fiable a reporting, validación y backtesting. En un stack cuantitativo serio, una utilidad estadística buena no es la que tiene más métricas, sino la que define bien cada una, trata correctamente NaN y edge cases, y mantiene convenciones coherentes de principio a fin. Ese es exactamente el estándar que este módulo debe imponer.
+- sharpe_adjusted(max_lag=0) == sharpe_ratio con tolerancia 1e-10
+- Serie con AC positiva: sharpe_adjusted < sharpe_iid
+- deflated_sharpe(SR=2.0, n_trials=1) > deflated_sharpe(SR=2.0, n_trials=100)
+- deflated_sharpe(SR=0.3, n_trials=1000, n_obs=60, kurtosis=10) < 0.5
+- calmar default method == calmar(method="cagr")
+- hit_ratio([0.01, -0.02, 0.03, -0.01, 0.02]) == 0.6
+- profit_factor > 0 para returns con ganancia neta
+- drawdown max_drawdown([0.10, -0.20, 0.05, -0.10, 0.20]) ≈ -0.244
+- sortino con target=0 y todos positivos -> NaN (no downside)
+- omega_ratio con threshold=0 y ganancia neta -> > 1.0

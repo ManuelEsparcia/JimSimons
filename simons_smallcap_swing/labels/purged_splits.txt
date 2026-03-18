@@ -1,602 +1,118 @@
-Módulo: labels/purged_splits.py
+Especificación: labels/purged_splits.py
 
-1. Objetivo del módulo
+1. Propósito
 
-El objetivo de labels/purged_splits.py es construir la capa canónica de particiones
-temporales del sistema para entrenamiento, validación y test sobre paneles (date, symbol),
-garantizando que la evaluación estadística del modelo sea temporalmente válida, reproducible
-y robusta frente a label leakage, serial dependence e interdependencias inducidas por:
+Construye particiones temporales del sistema para train/valid/test sobre
+paneles (date, symbol), garantizando que la evaluación sea temporalmente
+válida y robusta frente a label leakage, serial dependence y dependencias
+inducidas por ventanas forward, decision lag y features con memoria temporal.
 
-- ventanas forward de labels,
-- decision lag,
-- features con memoria temporal,
-- embargo posterior al test,
-- y reutilización indebida de información entre folds.
+No "parte fechas". Define formalmente qué observaciones pueden convivir en
+train y test una vez se tiene en cuenta la ventana efectiva de dependencia.
 
-En un sistema serio de machine learning financiero, este módulo no “parte fechas” sin más.
-Define formalmente qué observaciones pueden convivir en train y test una vez se tiene en cuenta
-la ventana efectiva de dependencia temporal de cada sample.
+2. Modos de split (3)
 
-Su misión es metodológica, no cosmética:
-- impedir validaciones contaminadas,
-- versionar el protocolo temporal,
-- exportar folds reproducibles,
-- y bloquear cualquier run que viole la semántica anti-leakage.
+purged_kfold:      K-fold temporal con purga de ventanas forward + embargo.
+                   Folds sobre bloques de fechas, no sobre rows.
 
-2. Principios no negociables
+walk_forward:      Train creciente o rolling, test sequencial.
+                   WalkForwardSpec: test_size_dates, step_size_dates, valid_size_dates.
 
-2.1 Primacía del intervalo efectivo de evento
-Los samples no se separan solo por su fecha de decisión t, sino por el intervalo completo
-durante el cual su label depende de información futura.
+cpcv:              Combinatorial Purged Cross-Validation (López de Prado).
+                   CPCVSpec: n_groups, n_test_groups.
+                   Genera C(n_groups, n_test_groups) folds combinatoriales.
 
-2.2 Conservadurismo explícito en presencia de multi-horizonte
-Si un experimento usa varios horizontes, la política de purga debe estar fijada formalmente
-y no dejarse abierta a interpretación ad hoc.
+3. Horizonte efectivo
 
-2.3 Separación entre tiempo y densidad cross-sectional
-Los folds se construyen sobre fechas.
-La variación del número de símbolos por fecha se diagnostica, pero no redefine por sí sola
-la lógica temporal del split.
+    h_eff = max(h para h en horizons) + decision_lag
 
-2.4 Embargo con semántica real
-El embargo no puede ser un integer decorativo.
-Debe derivarse de una política reproducible y, preferiblemente, consistente con la memoria
-temporal relevante del pipeline.
+Este es el intervalo durante el cual el label de una observación depende
+de información futura. Ninguna observación cuyo intervalo [t, t+h_eff]
+se solape con un bloque de test puede estar en train.
 
-2.5 Determinismo y versionado
-Si cambian calendario, labels, horizonte efectivo, embargo o split_mode,
-la versión de splits debe cambiar.
+4. Embargo (MEJORA v1.1 — adaptive)
 
-2.6 No-leakage como condición de paso
-Toda violación de purga o embargo es un FAIL estructural.
-No se compensa con mejor cobertura ni con más train size.
+4 políticas:
 
-3. Qué hace y qué no hace
+fixed_days:              Entero fijo configurable.
+pct_of_test:             Fracción del bloque de test.
+feature_memory_aware:    max(feature_memory, h_eff). Default.
+adaptive (NUEVO):        max(feature_memory, h_eff) + h_eff como margen de
+                         seguridad. Para momentum features con lookback 60d y
+                         horizonte 20d → embargo = 80d en vez de 20d.
 
-3.1 Qué hace
-- construye folds temporales reproducibles;
-- resuelve horizonte efectivo de purga;
-- calcula intervalos efectivos de evento por sample;
-- aplica purga por solape train/test;
-- aplica embargo posterior a test;
-- soporta split_mode = purged_kfold, walkforward, cpcv;
-- valida ausencia de leakage;
-- persiste splits, diagnósticos y manifest.
+WARNING automático si embargo < horizonte efectivo:
+  "Embargo (X days) is less than effective horizon (Y days).
+   This is likely insufficient to prevent label leakage."
 
-3.2 Qué no hace
-- no construye labels;
-- no construye features;
-- no decide el universo;
-- no corrige leakage en otros módulos;
-- no reemplaza leakage_audit.py;
-- no optimiza modelos;
-- no decide thresholds de performance.
+5. Event intervals
 
-4. Rol dentro del stack
+Para cada observación:
+    event_start = t + decision_lag (fecha de entrada)
+    event_end = t + decision_lag + max_horizon (fecha de salida)
 
-Secuencia correcta:
+build_event_intervals() produce un DataFrame con:
+    date, symbol, event_start, event_end, effective_horizon
+que purged_splits consume para purgar train de observaciones cuyas
+ventanas se solapan con el test.
 
-    labels/build_labels.py
-    -> labels/neutralized_targets.py
-    -> labels/label_qc.py
-    -> labels/purged_splits.py
-    -> models/*/train_*.py
-    -> validation/*
+6. Fold definition
 
-Interpretación correcta:
-- build_labels.py define outcomes forward;
-- label_qc.py verifica que esos labels son válidos;
-- purged_splits.py define qué muestras pueden ir juntas en train/test
-  sin fuga temporal;
-- train_*.py consume esas máscaras ya purgadas.
+FoldDefinition:
+    fold_id: str
+    train_dates: tuple[Timestamp, ...]
+    valid_dates: tuple[Timestamp, ...] (puede ser vacío)
+    test_dates: tuple[Timestamp, ...]
+    embargo_dates: tuple[Timestamp, ...] (entre train y test)
 
-5. Notación temporal
+Invariante: train ∩ (test ∪ embargo) = ∅ para todo fold.
 
-Sea:
-- t la fecha de decisión de una observación,
-- i el símbolo,
-- l el decision_lag en sesiones,
-- h ∈ H el horizonte forward,
-- T = {t_1, ..., t_N} el calendario maestro de trading.
+7. SplitConfig
 
-Para un sample (t,i,h), definimos el intervalo efectivo de evento:
+    split_mode: purged_kfold | walk_forward | cpcv
+    n_folds: int (para kfold y cpcv)
+    embargo_policy: fixed_days | pct_of_test | feature_memory_aware | adaptive
+    fixed_embargo_days: int | None
+    pct_embargo: float | None
+    primary_feature_memory: int | None
+    walk_forward_spec: WalkForwardSpec | None
+    cpcv_spec: CPCVSpec | None
+    horizons: list[int] (de build_labels)
+    primary_horizon: int
+    decision_lag: int
+    leakage_audit_policy: fail | warn | off
+    policy_version: str
 
-    I_{t,i,h} = [t + l, t + l + h]
+8. Leakage audit
 
-Este intervalo representa la ventana temporal durante la cual el label de la observación
-depende de información futura.
+Tras construir folds, se verifica que ningún event interval de train se
+solape con fechas de test (ni viceversa). Si leakage_audit_policy = "fail"
+→ LeakageError. Si "warn" → log warning.
 
-La purga debe operar sobre I_{t,i,h}, no solo sobre t.
+9. Compatibilidad con build_labels
 
-6. Horizonte efectivo en presencia de multi-horizonte
+Consume split_compatibility_{run_id}.json:
+    event_windows: {h}d → event_start_col, event_end_col
+    primary_target, primary_horizon, decision_lag
 
-El módulo debe soportar explícitamente:
+10. Invariantes
 
-- horizon_policy = primary
-- horizon_policy = max
-- horizon_policy = per_label
-
-Definiciones:
-
-6.1 horizon_policy = primary
-Usa únicamente el horizonte principal declarado por el experimento.
-
-6.2 horizon_policy = max
-Usa:
-
-    h_eff = max(H)
-
-de forma conservadora.
-
-6.3 horizon_policy = per_label
-Construye purga específica por horizonte solo si:
-- el entrenamiento está realmente separado por horizonte,
-- y los artifacts downstream mantienen esa separación.
-
-Default canónico recomendado:
-
-    horizon_policy = max
-
-Bajo esta política:
-
-    I_{t,i} = [t + l, t + l + h_eff]
-
-donde h_eff = max(H).
-
-Razonamiento:
-si el pipeline comparte infraestructura entre horizontes, usar el máximo evita
-fugas sutiles difíciles de detectar después.
-
-7. Ventana efectiva de test y regla de purga
-
-Sea D_test^(k) el conjunto de observaciones asignadas a test en el fold k.
-
-Definimos la cobertura efectiva temporal del test:
-
-    W_test^(k) = U_{(t,i) in D_test^(k)} I_{t,i}
-
-Una observación candidata a train se purga si:
-
-    I_{t,i} ∩ W_test^(k) != ∅
-
-Interpretación:
-ningún sample de train puede tener dependencia futura que se solape con la región temporal
-ya usada por test.
-
-Esta es la regla central del módulo.
-
-8. Embargo temporal
-
-Además de la purga, debe aplicarse un embargo posterior al test.
-
-Sea t_max_test^(k) la última fecha de decisión incluida en el bloque de test del fold k.
-
-Definimos:
-
-    E_test^(k)
-    =
-    { t in T : t > t_max_test^(k) and t <= t_max_test^(k) + b_eff }
-
-donde b_eff es la longitud efectiva de embargo en sesiones.
-
-Una observación queda embargada si su fecha de decisión pertenece a E_test^(k).
-
-Interpretación:
-el embargo protege frente a:
-- memoria rolling de features,
-- normalizaciones recientes,
-- dependencia serial residual,
-- reutilización prematura del entorno temporal de test.
-
-9. Política canónica para elegir el embargo
-
-El módulo debe soportar al menos:
-
-- embargo_policy = fixed_days
-- embargo_policy = pct_of_test
-- embargo_policy = feature_memory_aware
-
-9.1 fixed_days
-b_eff = b_configurado
-
-9.2 pct_of_test
-b_eff = ceil(pct_embargo * |test_block|)
-
-9.3 feature_memory_aware
-b_eff debe ser al menos tan grande como la memoria material máxima del pipeline.
-
-Política institucional recomendada:
-
-    b_eff = max(primary_feature_memory, primary_horizon)
-
-Si no existe metadata suficiente de memoria de features,
-se permite fallback a fixed_days,
-pero el manifest debe marcar:
-
-    non_canonical_flag = true
-
-10. Diseños soportados
-
-10.1 purged_kfold
-El calendario T se divide en K bloques temporales contiguos de test.
-
-Para cada fold k:
-- test = bloque temporal k
-- train_raw = resto de observaciones
-- train_purged = train_raw menos observaciones cuyo intervalo effective solapa test
-- train_final = train_purged menos embargo
-
-Adecuado para estimar robustez media del modelo en distintas regiones temporales.
-
-10.2 walkforward
-Construye secuencias ordenadas de:
-- train
-- valid opcional
-- test
-
-Debe soportar:
-- expanding_train
-- rolling_train
-- train-valid-test
-- train-test directo
-
-En todos los casos:
-purga + embargo siguen siendo obligatorios.
-
-Este es el modo preferido para evaluación final cercana a despliegue real.
-
-10.3 cpcv
-Modo opcional explícito:
-
-    split_mode = cpcv
-
-Debe registrar metadata adicional:
-- bloques base,
-- combinaciones seleccionadas,
-- multiplicidad,
-- reutilización temporal.
-
-Nunca debe activarse implícitamente.
-
-11. Construcción de folds con densidad irregular
-
-En small caps, el número de símbolos por fecha puede variar mucho por:
-- cambios de universo,
-- listados/delistings,
-- filtros de liquidez,
-- suspensiones,
-- huecos de datos.
-
-Regla institucional:
-los folds se construyen sobre fechas, no sobre número de filas.
-
-Pero el módulo debe diagnosticar:
-- n_symbols por fecha,
-- cobertura válida por fecha,
-- concentración de observaciones por fold,
-- posibles folds con densidad materialmente baja.
-
-Política canónica:
-
-    fold_construction = contiguous_date_blocks
-    with row_density_diagnostics = true
-
-12. Relación con labels, features y calendario
-
-El módulo debe consumir como mínimo:
-- labels válidos con label_valid_flag,
-- metadata suficiente para derivar horizonte efectivo,
-- calendario maestro de trading.
-
-Opcionalmente:
-- índice entrenable de features,
-- metadata de feature memory,
-- manifest de labels.
-
-Regla dura:
-purged_splits.py no debe inventar decision_lag, horizonte o calendario.
-Debe resolverlos desde metadata oficial y config declarada.
-
-Toda inconsistencia entre:
-- labels metadata,
-- split config,
-- calendario,
-debe ser FAIL.
-
-13. Construcción formal del split
-
-Para cada fold k:
-
-13.1 Selección de test
-Se selecciona un subconjunto temporal de fechas T_test^(k).
-
-13.2 Selección raw de train
-Train raw = todas las observaciones fuera de T_test^(k),
-salvo reglas adicionales del modo walkforward/cpcv.
-
-13.3 Purga
-Se excluyen de train todas las observaciones (t,i) tales que:
-
-    I_{t,i} ∩ W_test^(k) != ∅
-
-13.4 Embargo
-Se excluyen de train todas las observaciones cuya fecha de decisión cumpla:
-
-    t in E_test^(k)
-
-13.5 Validación
-Se comprueba el invariante:
-
-    For all included train samples:
-    I_train ∩ W_test^(k) = ∅
-
-y además:
-
-    decision_date_train ∉ E_test^(k)
-
-14. Invariantes matemáticos del módulo
-
-Deben cumplirse, para cada fold k:
-
-14.1 Purga exacta
-
-    I_train^(k) ∩ W_test^(k) = ∅
-
-14.2 Embargo exacto
-
-    train_dates^(k) ∩ embargo_dates^(k) = ∅
-
-14.3 Consistencia de horizonte efectivo
-
-    h_eff = resolve_horizon(config, labels_metadata)
-
-14.4 Consistencia de embargo efectivo
-
-    b_eff = resolve_embargo(config, feature_memory_metadata, h_eff)
-
-14.5 Mínimos operativos
-
-    n_train_final^(k) >= min_train_obs
-    n_test^(k) >= min_test_obs
-
-14.6 Determinismo
-
-    hash(inputs, config) -> same split artifacts
-
-15. Validaciones críticas
-
-Constituyen FAIL inmediato:
-
-- solape detectado entre train incluido y ventana efectiva de test;
-- observación de train incluida dentro del embargo;
-- horizonte efectivo no resoluble;
-- calendario inconsistente con las fechas observadas;
-- fold con train o test por debajo del mínimo configurado;
-- labels sin metadata suficiente para construir intervalos efectivos.
-
-16. Warnings metodológicos
-
-Deben marcarse como WARN, no FAIL, salvo magnitud extrema:
-
-- porcentaje de train eliminado por purga demasiado alto;
-- porcentaje de train eliminado por embargo demasiado alto;
-- fuerte desbalance entre folds;
-- densidad cross-sectional muy baja en uno o varios folds;
-- fold coverage temporal demasiado estrecha;
-- split non_canonical por falta de metadata de feature memory.
-
-17. Métricas obligatorias por fold
-
-Cada fold debe reportar al menos:
-
-- fold_id
-- split_mode
-- n_train_raw
-- n_train_purged
-- n_train_final
-- n_valid si aplica
-- n_test
-- pct_removed_by_purge
-- pct_removed_by_embargo
-- leakage_violations_count
-- effective_horizon_days
-- effective_embargo_days
-- first_test_date
-- last_test_date
-- symbols_per_date_mean
-- symbols_per_date_p10
-- symbols_per_date_p90
-
-18. Inputs contractuales
-
-18.1 Inputs mínimos
-- labels_df o labels_path
-- calendar_path
-- config_path
-- run_id
-
-18.2 Inputs opcionales
-- features_index_path
-- labels_manifest_path
-- feature_manifest_path
-- universe_history_path
-
-18.3 Configuración mínima
-- split_mode
-- k_folds o walkforward spec
-- decision_lag
-- horizon_policy
-- embargo_policy
-- fixed_embargo_days si aplica
-- min_train_obs
-- min_test_obs
-- fold_construction
-- policy_version
-
-19. Outputs obligatorios
-
-19.1 splits.parquet
-Cada fila debe incluir:
-
-- fold_id
-- split_role ∈ {train, valid, test}
-- date
-- symbol
-- sample_index si existe
-- inclusion_flag
-- is_purged
-- is_embargoed
-- effective_event_start
-- effective_event_end
-- effective_horizon_days
-- effective_embargo_days
-- run_id
-
-19.2 fold_summary.parquet
-Resumen por fold con métricas estructurales y de tamaño.
-
-19.3 leakage_validation.parquet
-Detalle de checks de no solape y recuentos de violaciones.
-
-19.4 manifest.json
-Con:
-- run_id
-- config_hash
-- labels_version
-- calendar_version
-- split_mode
-- horizon_policy
-- h_eff
-- embargo_policy
-- b_eff
-- non_canonical_flag
-- execution_timestamp
-
-20. Flujo operativo canónico
-
-1. load_labels(...)
-2. load_calendar(...)
-3. load_split_config(...)
-4. resolve_effective_horizon(...)
-5. resolve_effective_embargo(...)
-6. build_event_intervals(...)
-7. construct_time_blocks(...)
-8. assign_test_blocks(...)
-9. build_raw_train(...)
-10. apply_purge(...)
-11. apply_embargo(...)
-12. validate_zero_leakage(...)
-13. compute_fold_diagnostics(...)
-14. persist_outputs(...)
-15. emit_manifest(...)
-
-21. Defaults canónicos
-
-- split_mode = purged_kfold
-- horizon_policy = max
-- embargo_policy = feature_memory_aware
-- fold_construction = contiguous_date_blocks
-- leakage_policy = fail
-- versioning_policy = strict
-
-Para evaluación final de research consolidado:
-- split_mode recomendado = walkforward
-
-Pero para comparativa general reproducible:
-- purged_kfold puede seguir siendo el default institucional.
-
-22. CLI
-
-Ejemplo:
-
-python -m labels.purged_splits \
-  --labels-path labels/store \
-  --calendar-path data/calendar/master.parquet \
-  --config-path configs/validation/purged_splits.yaml \
-  --run-id purged_splits_20260305_001
-
-La CLI debe abortar si:
-- no puede resolverse h_eff;
-- no puede resolverse b_eff;
-- no hay fechas suficientes para folds válidos;
-- o falla validate_zero_leakage.
-
-23. Definition of Done
-
-El módulo se considera terminado solo si:
-
-- los folds son reproducibles y versionados;
-- la purga se aplica sobre intervalos efectivos correctos;
-- el embargo se resuelve con política explícita;
-- no existe leakage temporal en ningún fold;
-- el protocolo multi-horizonte queda completamente resuelto;
-- los outputs son consumibles directamente por train_*.py y validation/*;
-- existe manifest formal con hash de configuración.
-
-No basta con generar train/test indices.
-Deben ser temporalmente válidos, auditables y comparables entre runs.
-
-24. Casos de prueba mínimos
-
-- solape exacto entre train y test -> purge correcto
-- intervalos disjuntos -> no purge
-- embargo correcto sobre calendario con festivos y fines de semana
-- resolución correcta de h_eff bajo primary, max y per_label
-- inconsistencia entre labels metadata y config -> FAIL
-- fold sin tamaño mínimo -> FAIL
-- detección de leakage forzado -> FAIL
-- cambio en horizonte o embargo -> cambio de version/hash
-- walkforward correcto con expanding_train
-- cpcv explícito con metadata persistida
-
-25. MVP vs versión avanzada
-
-25.1 MVP
-- split_mode = purged_kfold y walkforward
-- horizon_policy = max
-- embargo explícito configurable
-- interval arithmetic correcta
-- purge + embargo
-- validate_zero_leakage
-- artifacts reproducibles y manifest
-
-25.2 Avanzado
-- embargo_policy = feature_memory_aware completo
-- diagnóstico de densidad cross-sectional por fold
-- soporte CPCV más rico
-- reconciliación exacta con features_index
-- validación adicional por bucket de horizonte o familia de labels
-
-26. Qué NO conviene meter ahora
-
-No conviene introducir en este módulo:
-- optimal block bootstrap
-- dynamic programming de folds
-- Gaussian process contamination modeling
-- splits adaptativos por performance
-- Bayesian temporal partitioning
-- sobrearquitectura de multiplicidad si no se usa CPCV en serio
-
-Todo eso pertenece, como mucho, a research metodológico aparte.
-
-27. Interpretación correcta del módulo
-
-La lectura correcta de labels/purged_splits.py no es:
-“hacer cross-validation temporal”.
-
-La lectura correcta es:
-“definir formalmente el conjunto de muestras entrenables y evaluables
-bajo restricciones estrictas de no solape temporal entre información de train y test”.
-
-28. Conclusión
-
-labels/purged_splits.py debe ser la autoridad institucional del sistema para:
-
-- construir folds temporales válidos,
-- imponer purge + embargo con semántica formal,
-- resolver correctamente el caso multi-horizonte,
-- bloquear cualquier contaminación train/test,
-- y dejar una traza reproducible exacta del protocolo de validación.
-
-Ese es exactamente el comportamiento que debe tener una capa seria de temporal splitting
-en un stack cuantitativo institucional de small caps.
+I1. Folds se construyen sobre fechas, no sobre rows.
+I2. El número de símbolos por fecha puede variar pero no redefine la lógica.
+I3. train ∩ test = ∅ siempre. train ∩ embargo = ∅ siempre.
+I4. embargo ≥ horizonte efectivo (warning si no).
+I5. Con n_folds y walk_forward, todas las fechas aparecen en al menos 1 test.
+I6. CPCV genera C(n,k) folds. Con n=6, k=2 → 15 folds.
+I7. Determinismo: mismos inputs + config → mismos folds.
+
+11. Tests mínimos
+
+- purged_kfold: train ∩ test = ∅ en todos los folds
+- walk_forward: test blocks secuenciales sin gaps
+- cpcv: número de folds = C(n_groups, n_test_groups)
+- Embargo adaptive con feature_memory=60, horizon=20 → embargo ≥ 80
+- Embargo < horizon → warning emitido
+- Embargo fixed_days=0 con horizon=20 → warning
+- Leakage audit: event interval de train solapando test → LeakageError
+- Todas las fechas del dataset aparecen en al menos 1 fold de test
+- Determinismo: 2 ejecuciones con mismos inputs → folds idénticos

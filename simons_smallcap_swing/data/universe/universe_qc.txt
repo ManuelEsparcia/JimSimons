@@ -1,507 +1,84 @@
-Especificación Cuantitativa: data/universe/universe_qc.py
+Especificación: data/universe/universe_qc.py
 
-1. Propósito del módulo
+1. Propósito
 
-El módulo `data/universe/universe_qc.py` implementa la capa formal de certificación de integridad, causalidad temporal y coherencia semántica del universo PIT construido por `build_universe.py`. Su función no es redefinir reglas de elegibilidad ni reconstruir el universo, sino verificar que el artefacto histórico persistido como universo daily sea internamente consistente, temporalmente válido, semánticamente coherente y suficientemente estable como para ser promovido a research, validación y backtesting. :contentReference[oaicite:0]{index=0}
+QC end-to-end del pipeline de universo. Valida los outputs de build_universe,
+corporate_actions y survivorship como un todo coherente. Produce el veredicto
+formal (PASS/WARN/FAIL) que decide si el universo es usable por el resto
+del pipeline (features, labels, backtest).
 
-El principio rector del módulo es el siguiente: el universo debe tratarse como un objeto histórico con semántica fuerte, no como una tabla cualquiera. Por tanto, el QC no puede limitarse a nulls y duplicados; debe validar simultáneamente identidad económica, ventana de vida del instrumento, reglas de elegibilidad, razones de exclusión, estabilidad temporal y continuidad PIT. Ésta es la razón por la que `universe_qc.py` actúa como control de calidad de última milla entre la construcción del universo y su consumo downstream. :contentReference[oaicite:1]{index=1}
+2. Dimensiones de QC (CheckType — 15+ checks)
 
-2. Papel dentro de la arquitectura
+Structural:
+  unique_date_symbol: (date, symbol) unique en universe_history. FAIL.
+  valid_membership_states: membership_state ∈ MembershipState. FAIL.
+  valid_exclusion_reasons: exclusion_reason ∈ ExclusionReason. FAIL.
+  consistent_flags: eligible_flag ↔ membership_state coherent. FAIL.
 
-`universe_qc.py` se sitúa aguas abajo de:
+Temporal:
+  calendar_alignment: dates ⊆ trading calendar. WARN.
+  date_range_coverage: universe cubre el rango esperado. WARN.
+  no_future_dates: ninguna date > asof. FAIL.
 
-- `data/universe/build_universe.py`
-- `data/universe/source/listings_master`
-- `data/universe/corporate_actions.py`
-- `data/reference/market_calendar`
+Cross-sectional:
+  daily_eligible_count: ≥ min_eligible_per_date (default 50). WARN.
+  churn_rate: entry+exit rate por fecha dentro de bounds. WARN.
+  sector_concentration: ningún sector > max_sector_pct (default 40%). WARN.
 
-y aguas arriba de:
+Lifecycle:
+  survivorship_gate_pass: survivorship audit pasó. FAIL si no.
+  corporate_actions_coverage: % symbols con corporate actions data. WARN.
 
-- `features/*`
-- `labels/*`
-- `backtest/*`
-- promoción de datasets oficiales de research
+Statistical:
+  eligible_count_stability: CV of daily eligible count < threshold. WARN.
+  exclusion_reason_distribution: ninguna razón domina >90%. WARN.
 
-Su misión es auditar cuatro capas al mismo tiempo:
+3. CriticalRulesConfig
 
-1. integridad estructural del dataset;
-2. consistencia PIT y lifecycle;
-3. coherencia semántica de elegibilidad;
-4. estabilidad temporal, churn y cobertura de nombres muertos o delisted. :contentReference[oaicite:2]{index=2}
+Checks que son FAIL (abortan pipeline):
+  unique_date_symbol, valid_membership_states, consistent_flags,
+  no_future_dates, survivorship_gate_pass.
 
-No debe limpiar, recomputar ni reinterpretar silenciosamente el universo. Debe detectar, clasificar y bloquear si procede. En un stack serio, este módulo es el que convierte sospechas difusas sobre “algo raro en el universo” en un diagnóstico formal y accionable. :contentReference[oaicite:3]{index=3}
+Checks que son WARN (degradan pero no abortan):
+  todos los demás.
 
-3. Principios de diseño no negociables
+4. ThresholdConfig
 
-La especificación del módulo se rige por los siguientes principios:
+min_eligible_per_date: 50.
+max_churn_daily_pct: 10.0.
+max_sector_concentration_pct: 40.0.
+min_calendar_coverage_pct: 95.0.
+max_eligible_count_cv: 0.5.
+min_corporate_actions_coverage_pct: 50.0.
 
-1. Primacía de `instrument_id`: la unidad auditada es la identidad económica, no el ticker.
-2. Determinismo total: mismos inputs y misma configuración producen exactamente el mismo resultado de QC.
-3. Separación entre construcción y certificación: `build_universe.py` construye; `universe_qc.py` certifica.
-4. Jerarquía formal de severidades: `PASS < WARN < FAIL`.
-5. Gates reales: un `FAIL` debe bloquear promoción downstream salvo override explícito.
-6. PIT estricto: ninguna fila puede existir fuera de la ventana de vida del instrumento.
-7. Trazabilidad completa: toda anomalía debe persistirse con check, evidencia y severidad.
-8. Integración con survivorship: la pérdida de historia de nombres muertos o delisted debe auditarse explícitamente. :contentReference[oaicite:4]{index=4}
+5. GateResult (usa shared de universe.__init__)
 
-4. Modelo de identidad y unidad lógica de auditoría
+Un GateResult por check, con:
+  name, severity, observed, threshold, message, passed.
 
-La corrección estructural más importante del módulo es que la unidad primaria de QC no es `symbol`, sino `instrument_id`. El ticker puede cambiar; la identidad económica auditada no. Por ello, la unicidad lógica del panel se define sobre:
+Agregación: fail_dominates → un FAIL en critical → overall FAIL.
 
-`(date, instrument_id)`
+6. Output
 
-y solo de manera secundaria se monitoriza unicidad de `(date, symbol)`, ya que esta última puede romperse legítimamente por ticker recycling, mappings defectuosos o errores de proveedor. :contentReference[oaicite:5]{index=5}
+universe_qc_{run_id}.json: GateResults + summary + config_hash.
+universe_qc_findings_{run_id}.parquet: findings detallados por (date, symbol).
+universe_qc_summary_{run_id}.json: stats agregadas.
 
-Formalmente, si `I` es el conjunto de instrumentos y `D` el conjunto de fechas, el universo PIT auditado queda representado como:
+7. Invariantes
 
-`U_t^PIT = { i in I : is_eligible(i,t) = 1 }`
+I1. Un FAIL en structural → pipeline aborta antes de labels/features.
+I2. WARN acumula pero no bloquea — usuario decide si procede.
+I3. QC es read-only: no modifica el universo.
+I4. Todos los checks son deterministas y reproducibles.
+I5. universe_qc consume outputs de los otros 3 módulos, no inputs raw.
 
-donde `symbol` es un atributo versionado del instrumento, no la clave de la verdad económica. Esta decisión evita inflar turnover artificialmente y evita clasificar ticker changes como errores de continuidad. :contentReference[oaicite:6]{index=6}
+8. Tests mínimos
 
-5. Datasets de entrada y contrato mínimo
-
-El módulo consume como mínimo:
-
-- `df_universe`
-- `listings_master`
-- `calendar`
-- `corporate_actions_canonical` en modo recomendado o estricto
-- `universe_config`
-- `run_id`
-
-El schema mínimo esperado en `df_universe` incluye:
-
-- `date`
-- `instrument_id`
-- `issuer_id` si aplica
-- `symbol`
-- `is_eligible`
-- `membership_state`
-- `primary_exclusion_reason`
-- `all_failed_reasons`
-- `market_cap_usd`
-- `adv20_usd`
-- `price_ref`
-- `listing_exchange`
-- `security_type`
-- `trading_status`
-- `config_hash`
-- `run_id` :contentReference[oaicite:7]{index=7}
-
-Además, el lifecycle master debe aportar como mínimo:
-
-- `list_date`
-- `delist_date`
-- `ticker_start_date`
-- `ticker_end_date`
-- `status`
-
-y define la ventana de vida económica:
-
-`W_i = [tau_birth_i, tau_death_i]`
-
-con `tau_birth_i = list_date(i)` y `tau_death_i = delist_date(i)` salvo que corporate actions canónicas definan una terminación económica anterior o continuidad especial. :contentReference[oaicite:8]{index=8}
-
-Si faltan columnas obligatorias, si `instrument_id` no existe, si el schema está roto o si el calendario no es coherente con el panel, el resultado debe ser `FAIL` estructural y la auditoría no debe seguir como si nada. :contentReference[oaicite:9]{index=9}
-
-6. Capas auditadas
-
-El módulo audita exactamente cuatro capas:
-
-1. Integridad estructural.
-2. Consistencia PIT y lifecycle.
-3. Coherencia semántica de elegibilidad.
-4. Estabilidad temporal, churn y cobertura de nombres muertos/delisted. :contentReference[oaicite:10]{index=10}
-
-Esta partición no es decorativa. Permite separar errores de contrato duro de errores de lógica semántica y de degradaciones temporales graduales. Un universo puede ser estructuralmente correcto pero semánticamente incoherente; también puede ser semánticamente correcto pero históricamente inestable por fallo upstream. El módulo debe distinguir estos casos con precisión. :contentReference[oaicite:11]{index=11}
-
-7. Checks estructurales obligatorios
-
-7.1. Unicidad lógica
-
-Debe cumplirse:
-
-`forall (t,i) != (t',i') => (date, instrument_id) es único en df_universe`
-
-Cualquier duplicado de clave lógica implica:
-
-`severity = FAIL`
-
-porque destruye la unicidad del estado del universo en una fecha dada. :contentReference[oaicite:12]{index=12}
-
-7.2. Dominio válido de `is_eligible`
-
-Debe cumplirse:
-
-`is_eligible(t,i) in {0,1}`
-
-Valores nulos, floats ambiguos o cualquier otro dominio implican `FAIL`. :contentReference[oaicite:13]{index=13}
-
-7.3. Catálogo válido de estados
-
-Debe cumplirse:
-
-`membership_state(t,i) in Omega_state`
-
-donde `Omega_state` es el catálogo oficial del sistema. Estados no reconocidos implican `FAIL`, no `WARN`, porque hacen indeterminado el significado operativo de la fila. :contentReference[oaicite:14]{index=14}
-
-7.4. Razones de exclusión válidas
-
-Debe cumplirse:
-
-`primary_exclusion_reason(t,i) in Omega_reason U {empty}`
-
-Razones fuera del enum estable, textos libres o valores no documentados deben bloquear promoción por defecto. La razón de exclusión es parte de la semántica del universo, no solo una columna explicativa. :contentReference[oaicite:15]{index=15}
-
-8. Checks PIT y lifecycle
-
-8.1. Existencia temporal
-
-Para toda fila persistida en el universo:
-
-`t in W_i`
-
-Equivalentemente:
-
-`tau_birth_i <= t <= tau_death_i`
-
-si `tau_death_i` es finita.
-
-Cualquier fila pre-listing o post-death es `FAIL`. Éste es un invariante duro de causalidad histórica. :contentReference[oaicite:16]{index=16}
-
-8.2. Coherencia del ticker en su ventana PIT
-
-Si existe historial PIT de símbolos, debe verificarse que el símbolo observado en `(t,i)` esté dentro de su ventana válida:
-
-`t in [ticker_start_date(i,symbol), ticker_end_date(i,symbol)]`
-
-Si falla pero existe una corporate action canónica compatible aún no reconciliada, puede degradarse a `WARN`; si no hay explicación plausible, debe ser `FAIL`. :contentReference[oaicite:17]{index=17}
-
-8.3. Coherencia con terminación económica
-
-Si `corporate_actions` contiene un evento terminal confirmado para `i` con fecha efectiva `t*`, entonces:
-
-`t > t* => is_eligible(t,i) = 0`
-
-Un instrumento elegible tras una muerte económica confirmada es un `FAIL` duro. Este check blinda uno de los fallos más peligrosos: mantener vivos activos que deberían haber salido definitivamente del dominio invertible. :contentReference[oaicite:18]{index=18}
-
-9. Checks semánticos de elegibilidad
-
-9.1. Coherencia binaria entre elegibilidad y razón
-
-Debe cumplirse:
-
-`is_eligible(t,i) = 1 => primary_exclusion_reason(t,i) = empty`
-
-y también:
-
-`is_eligible(t,i) = 0 => primary_exclusion_reason(t,i) != empty`
-
-Violaciones de esta equivalencia implican `FAIL`, porque rompen la semántica mínima del dataset. :contentReference[oaicite:19]{index=19}
-
-9.2. Coherencia entre razón primaria y razones completas
-
-Si existe `all_failed_reasons`, debe verificarse que:
-
-`primary_exclusion_reason(t,i) = first(all_failed_reasons(t,i))`
-
-según la precedencia oficial de filtros de `build_universe.py`. Si no se cumple, existe deriva semántica entre el constructor y el certificador del universo. Ese caso debe escalarse al menos a `FAIL` en modo estricto. :contentReference[oaicite:20]{index=20}
-
-9.3. Revalidación de reglas críticas
-
-En modo estricto o sobre una muestra configurable, el módulo debe recomputar independientemente reglas clave:
-
-- precio mínimo
-- liquidez mínima
-- banda de market cap
-- edad mínima desde listing
-- tipo de activo
-- exchange permitido
-
-Si un instrumento marcado como elegible viola estas reglas bajo la misma configuración PIT, debe emitirse `FAIL`. Si la discrepancia está asociada a imputaciones o a casos de baja confianza documentados, puede degradarse a `WARN` solo bajo política explícita. :contentReference[oaicite:21]{index=21}
-
-10. Checks temporales y de estabilidad
-
-10.1. Tamaño diario del universo
-
-Sea:
-
-`N_t = |U_t^PIT|`
-
-El módulo debe monitorizar:
-
-- media
-- mediana
-- desviación típica
-- percentiles
-- z-score temporal
-- saltos absolutos y relativos
-
-Un salto grande no es siempre error, pero si no existe explicación por calendario, rebalance natural o corporate action masiva, debe escalarse. :contentReference[oaicite:22]{index=22}
-
-10.2. Turnover diario
-
-El turnover debe definirse a nivel `instrument_id`:
-
-`turnover_t =
- (|U_t^PIT \ U_(t-1)^PIT| + |U_(t-1)^PIT \ U_t^PIT|)
- / |U_t^PIT U U_(t-1)^PIT|`
-
-si el denominador es no nulo.
-
-Con umbrales:
-
-- `tau_turnover_warn`
-- `tau_turnover_fail`
-
-entonces:
-
-`turnover_t > tau_turnover_fail => FAIL`
-`turnover_t > tau_turnover_warn => WARN`
-
-si no existe explicación estructural registrada. Esta métrica es especialmente importante porque un universo técnicamente “correcto” puede estar operativamente roto si churnea de forma incompatible con su propia lógica histórica. :contentReference[oaicite:23]{index=23}
-
-10.3. Churn por razón
-
-Debe medirse el número de entradas y salidas por causa raíz. Si explota de forma repentina una razón como `MISSING_ADV20` o `MISSING_PRICE`, la interpretación correcta suele ser fallo upstream, no dinámica real del mercado. Por ello este check debe persistirse explícitamente y participar en la severidad global del run. :contentReference[oaicite:24]{index=24}
-
-11. Checks de coverage y survivorship
-
-11.1. Cobertura de delistings
-
-Sea `I_dead` el conjunto de instrumentos con muerte económica observada. Definimos:
-
-`E_t^dead = { i in I_dead : t in W_i }`
-
-y la ratio:
-
-`delisted_coverage_ratio(t) =
- |{ i in E_t^dead : i aparece en df_universe(t) }| / |E_t^dead|`
-
-si el denominador es no nulo.
-
-Esta métrica debe interpretarse conjuntamente con `survivorship.py`, pero una caída abrupta es una señal clara de pérdida de historia o de relinking incorrecto. :contentReference[oaicite:25]{index=25}
-
-11.2. Continuidad de identidad
-
-Si un ticker desaparece y otro aparece en una ventana muy corta, el QC debe contrastarlo contra mappings PIT y corporate actions para decidir si se trata de:
-
-- continuidad legítima
-- relisting
-- ticker recycling
-- error de linkage
-
-Los casos de continuidad correcta no deben inflar turnover ni delisted coverage failures. Este check evita penalizar falsamente al sistema por cambios puramente nominales. :contentReference[oaicite:26]{index=26}
-
-12. Checks de calendario y anomalías operativas
-
-12.1. Sesiones válidas
-
-Toda fecha del universo debe pertenecer al calendario oficial:
-
-`t in D_market`
-
-Fechas fuera de calendario son `FAIL`. :contentReference[oaicite:27]{index=27}
-
-12.2. Huecos temporales inesperados
-
-Si entre dos sesiones consecutivas del dataset falta una sesión esperada del calendario sin explicación operativa, debe emitirse `FAIL` a nivel run. Un universo diario que “salta” sesiones sin control destruye la validez de cualquier métrica rolling downstream. :contentReference[oaicite:28]{index=28}
-
-12.3. Reactivaciones anómalas
-
-Si un instrumento aparece elegible, luego desaparece y más tarde vuelve a aparecer tras una supuesta muerte económica sin evento canónico que lo justifique, el caso debe marcarse como `FAIL`. Si existe relisting formal o continuidad explícita, se tratará bajo la política correspondiente. :contentReference[oaicite:29]{index=29}
-
-13. Jerarquía de severidad y agregación
-
-Cada check produce una severidad en:
-
-`PASS < WARN < FAIL`
-
-Para cada fila `(t,i)` puede definirse:
-
-`row_severity(t,i) = max(severity of all checks affecting (t,i))`
-
-y el estado global del run se define como:
-
-`gate_status = max(severity of all checks in the run)`
-
-Además del máximo, el sistema debe persistir conteos por severidad y por tipo de check, porque un único `FAIL` aislado no tiene la misma lectura operativa que miles de `WARN` sistemáticos. :contentReference[oaicite:30]{index=30}
-
-La política de promoción debe ser:
-
-- si existe cualquier `FAIL`, el universo no se promueve a producción ni a backtests oficiales sin override explícito;
-- si solo existen `WARN`, la promoción puede permitirse, pero la degradación debe quedar reflejada en manifest y accesible downstream. :contentReference[oaicite:31]{index=31}
-
-14. Gates de aceptación
-
-14.1. Gate 1: integridad PIT crítica
-
-Si existe cualquiera de estas condiciones:
-
-- duplicados en `(date, instrument_id)`
-- filas fuera de `W_i`
-- fechas fuera de calendario
-- `is_eligible` nulo o fuera de dominio
-- elegibles tras muerte económica confirmada
-
-entonces:
-
-`Gate1 = FAIL`
-
-14.2. Gate 2: coherencia semántica
-
-Si la proporción de filas con incoherencia entre `is_eligible`, `membership_state` y razones de exclusión supera `tau_semantic`, entonces:
-
-`Gate2 in {WARN, FAIL}`
-
-según magnitud.
-
-14.3. Gate 3: cobertura de delistings
-
-Por defecto:
-
-`delisted_coverage_ratio_mean >= 0.95 => PASS`
-`0.90 <= delisted_coverage_ratio_mean < 0.95 => WARN`
-`delisted_coverage_ratio_mean < 0.90 => FAIL`
-
-14.4. Gate 4: estabilidad temporal
-
-Se usan métricas como:
-
-`pct_days_high_turnover`
-`pct_days_extreme_turnover`
-
-y se clasifican según umbrales de warning y fallo.
-
-14.5. Gate 5: missing metadata crítica
-
-Si:
-
-`pct_missing_critical_meta`
-
-supera umbral duro, el run debe degradarse al menos a `WARN`, y a `FAIL` si compromete checks PIT materiales. :contentReference[oaicite:32]{index=32}
-
-15. Métricas obligatorias
-
-El módulo debe producir, como mínimo:
-
-Tamaño del universo:
-`N_t = |U_t^PIT|`
-
-Turnover diario:
-`turnover_t`
-
-Entradas y salidas:
-`n_enter_t = |U_t^PIT \ U_(t-1)^PIT|`
-`n_exit_t = |U_(t-1)^PIT \ U_t^PIT|`
-
-Missingness crítica:
-`pct_missing_critical_meta(t)`
-
-Cobertura de delistings:
-`delisted_coverage_ratio(t)`
-
-Counts por razón primaria:
-`n_(r,t)^ineligible = |{ i : primary_exclusion_reason(t,i)=r }|`
-
-Estas series son esenciales para diferenciar un problema local de una degradación sistémica del universo. :contentReference[oaicite:33]{index=33}
-
-16. Flujo de ejecución oficial
-
-El flujo del módulo debe constar de nueve etapas:
-
-1. cargar universo histórico, lifecycle master, calendario y corporate actions;
-2. validar schema, tipos, enums y unicidad lógica;
-3. ejecutar checks PIT/lifecycle;
-4. ejecutar checks semánticos de elegibilidad;
-5. calcular métricas temporales y coverage;
-6. reconciliar discontinuidades con corporate actions y mappings PIT;
-7. construir tabla de failures con severidad y causa raíz;
-8. agregar severidad y emitir `gate_status`;
-9. persistir artefactos y manifest. :contentReference[oaicite:34]{index=34}
-
-La regla de reproducibilidad es fuerte: con mismos inputs, mismo `config_hash` y misma versión de código, el resultado del QC debe ser exactamente el mismo salvo timestamps de generación si así se decide. :contentReference[oaicite:35]{index=35}
-
-17. Artefactos obligatorios de salida
-
-El módulo debe persistir, como mínimo:
-
-Resumen agregado:
-`data/universe/qc/{run_id}/universe_qc_summary.json`
-
-Serie diaria:
-`data/universe/qc/{run_id}/universe_qc_daily.parquet`
-
-Failures detallados:
-`data/universe/qc/{run_id}/universe_qc_failures.parquet`
-
-Manifest:
-`data/universe/qc/{run_id}/manifest.json` :contentReference[oaicite:36]{index=36}
-
-El `summary` debe incluir al menos:
-
-- `gate_status`
-- `n_rows_processed`
-- `n_distinct_instruments`
-- `n_fail`
-- `n_warn`
-- `delisted_coverage_ratio_mean`
-- `pct_days_high_turnover`
-- `pct_days_extreme_turnover`
-- `pct_missing_critical_meta`
-- `top_failure_types`
-- `run_id`
-- `config_hash`
-- `code_version` :contentReference[oaicite:37]{index=37}
-
-La tabla de failures debe contener, como mínimo:
-
-- `date`
-- `instrument_id`
-- `symbol`
-- `check_type`
-- `severity`
-- `flag_reason`
-- `evidence_summary`
-- `linked_corporate_action_id` si aplica :contentReference[oaicite:38]{index=38}
-
-18. CLI sugerida
-
-La interfaz operativa recomendada es:
-
-`python -m data.universe.universe_qc --universe-history-path data/universe/history --listings-master-path data/universe/source/listings.parquet --corporate-actions-path data/universe/corporate_actions/history.parquet --calendar-path data/reference/us_market_calendar.parquet --config-path configs/data/universe_qc.yaml --run-id universe_qc_20260305_001`
-
-Esta CLI debe construir una corrida totalmente reproducible y dejar trazabilidad completa de inputs materiales y thresholds usados. :contentReference[oaicite:39]{index=39}
-
-19. Definition of Done
-
-El módulo `universe_qc.py` se considera terminado únicamente si:
-
-1. valida el universo a nivel de identidad económica y no solo de ticker;
-2. detecta y clasifica de forma determinista violaciones estructurales, PIT y semánticas;
-3. traduce las anomalías detectadas a una jerarquía formal de `PASS/WARN/FAIL`;
-4. genera artefactos reproducibles y trazables por `run_id`;
-5. produce un `gate_status` consumible automáticamente por pipelines de validación, research y backtest. :contentReference[oaicite:40]{index=40}
-
-Dicho de otro modo, el módulo no está terminado cuando “revisa columnas y duplicados”, sino cuando certifica que el universo PIT es lo bastante correcto, estable y coherente como para tratarse como verdad histórica operativa. :contentReference[oaicite:41]{index=41}
-
-20. Interpretación correcta
-
-`data/universe/universe_qc.py` no debe interpretarse como un validador auxiliar ni como un linter del dataset. Es la capa final de certificación causal del universo antes de que éste alimente señales, filtros y backtests. Su trabajo es garantizar que el universo no esté contaminado por errores de lifecycle, mappings defectuosos, semántica inconsistente de exclusiones, pérdida de historia muerta o discontinuidades no explicadas. :contentReference[oaicite:42]{index=42}
-
-Un universo aparentemente bien formado puede seguir estando metodológicamente roto. `universe_qc.py` es precisamente el módulo que convierte esa posibilidad en una auditoría formal, reproducible y accionable. Si esta capa falla, el sistema no solo arriesga errores técnicos: arriesga optimizar sobre una realidad histórica falsa. :contentReference[oaicite:43]{index=43}
-
-21. Conclusión
-
-`data/universe/universe_qc.py` debe quedar definido como una pieza institucional de truth certification del universo PIT, no como una rutina secundaria de validación.
-
-La especificación correcta no es “comprobar si el universo parece razonable”, sino:
-
-- fijar qué es la clave lógica real;
-- fijar qué checks estructurales, PIT, semánticos y temporales existen;
-- fijar cómo se agregan severidades;
-- fijar qué gates bloquean el run;
-- fijar qué métricas cuantifican estabilidad y coverage;
-- y fijar qué artefactos permiten explicar cada fallo.
-
-Si cumple esta especificación, el módulo deja de ser un checker cosmético y pasa a ser la última frontera de verdad histórica antes del consumo cuantitativo. Si no la cumple, el riesgo no es solo técnico: es dar por bueno un universo que parece correcto pero no lo es.
+- Duplicado (date, symbol) → FAIL.
+- membership_state = "INVALID_VALUE" → FAIL.
+- eligible_flag=True con exclusion_reason not None → FAIL.
+- Fecha > asof → FAIL (future date).
+- 10 eligible por fecha con min=50 → WARN.
+- Sector "Technology" = 95% → WARN (concentration).
+- Universo sintético limpio → all gates PASS.
+- survivorship audit que falló → survivorship_gate FAIL propagado.
